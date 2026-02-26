@@ -30,7 +30,7 @@ class InstanceEvent:
     stage_id: int
     event_type: str  # "update" | "heartbeat"
     status: StageStatus
-    queue_length: int | None = None
+    queue_length: int
 
 
 @dataclass
