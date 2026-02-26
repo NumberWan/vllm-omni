@@ -26,7 +26,11 @@ from starlette.datastructures import State
 from starlette.routing import Route
 from vllm import SamplingParams
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+# vLLM >= 0.15.1 renamed anthropic.serving_messages to anthropic.serving
+try:
+    from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+except ModuleNotFoundError:
+    from vllm.entrypoints.anthropic.serving_messages import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
