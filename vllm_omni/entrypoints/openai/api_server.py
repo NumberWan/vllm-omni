@@ -26,6 +26,7 @@ from starlette.datastructures import State
 from starlette.routing import Route
 from vllm import SamplingParams
 from vllm.engine.protocol import EngineClient
+
 # vLLM >= 0.15.1 renamed anthropic.serving_messages to anthropic.serving
 try:
     from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
