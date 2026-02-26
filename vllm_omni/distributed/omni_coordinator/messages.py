@@ -7,11 +7,7 @@ from enum import Enum
 
 
 class StageStatus(str, Enum):
-    """Enumeration for stage instance status.
-
-    This mirrors the design documented in ``docs/design/clean_up.md`` and is
-    used consistently across OmniCoordinator and its clients.
-    """
+    """Enumeration for stage instance status."""
 
     UP = "up"  # Instance is ready and available
     DOWN = "down"  # Instance is shutdown gracefully
