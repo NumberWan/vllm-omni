@@ -195,9 +195,11 @@ class OmniCoordinator:
             try:
                 data = json.loads(payload.decode("utf-8"))
                 event = self._parse_instance_event(data)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                logger.warning("Invalid JSON in instance event, dropping: %s", e)
                 continue
             if event is None:
+                logger.warning("Malformed instance event, dropping")
                 continue
 
             self._handle_event(event)
@@ -265,7 +267,7 @@ class OmniCoordinator:
         info = self._instances[zmq_addr]
 
         if event.status is not None:
-            info.status = StageStatus(event.status)
+            info.status = event.status
 
         if event.queue_length is not None:
             info.queue_length = event.queue_length
