@@ -154,6 +154,15 @@ class OmniCoordinator:
         except zmq.ZMQError:
             pass
 
+    def get_bind_addresses(self) -> tuple[str, str]:
+        """Return the actual bound (router_addr, pub_addr) after bind.
+
+        Useful when binding to port 0 (ephemeral port).
+        """
+        router_addr = self._router.getsockopt(zmq.LAST_ENDPOINT).decode("ascii")
+        pub_addr = self._pub.getsockopt(zmq.LAST_ENDPOINT).decode("ascii")
+        return (router_addr, pub_addr)
+
     def _parse_instance_event(self, data: dict[str, Any]) -> InstanceEvent | None:
         """Parse wire payload dict into InstanceEvent. Returns None if invalid."""
         try:
@@ -161,7 +170,7 @@ class OmniCoordinator:
                 zmq_addr=str(data["zmq_addr"]),
                 stage_id=int(data["stage_id"]),
                 event_type=str(data["event_type"]),
-                status=data.get("status"),
+                status=StageStatus(data.get("status")),
                 queue_length=data.get("queue_length"),
             )
         except (KeyError, ValueError, TypeError):
@@ -205,7 +214,6 @@ class OmniCoordinator:
         """Dispatch an incoming event to the appropriate handler."""
         try:
             zmq_addr = event.zmq_addr
-            status_str = event.status
 
             # Heartbeat: only update last_heartbeat, do not publish.
             if event.event_type == "heartbeat":
@@ -215,17 +223,21 @@ class OmniCoordinator:
                         info.last_heartbeat = time()
                 return
 
-            # Ignore stray "down" events for unknown instances.
-            if status_str == StageStatus.DOWN.value and zmq_addr not in self._instances:
-                return
+            # Check-and-act under single lock to avoid TOCTOU race (duplicate
+            # registration when concurrent events arrive for the same instance).
+            with self._lock:
+                if event.status == StageStatus.DOWN and zmq_addr not in self._instances:
+                    return  # Ignore stray down for unknown instances
 
-            if zmq_addr not in self._instances:
-                self.add_new_instance(event)
-            else:
-                if status_str == StageStatus.DOWN.value:
-                    self.remove_instance(event)
+                if zmq_addr not in self._instances:
+                    self._add_new_instance_locked(event)
                 else:
-                    self.update_instance_info(event)
+                    if event.status == StageStatus.DOWN:
+                        self._remove_instance_locked(event)
+                    else:
+                        self._update_instance_info_locked(event)
+
+            self.publish_instance_list_update()
         except (KeyError, ValueError, TypeError) as e:
             logger.warning("Dropping malformed event: %s", e)
 
@@ -236,15 +248,13 @@ class OmniCoordinator:
         stage_id = event.stage_id
         if stage_id < 0:
             raise KeyError("stage_id required and must be non-negative")
-        status_str = event.status or StageStatus.UP.value
-        queue_length = event.queue_length if event.queue_length is not None else 0
 
         now = time()
         info = InstanceInfo(
             zmq_addr=zmq_addr,
             stage_id=stage_id,
-            status=StageStatus(status_str),
-            queue_length=queue_length,
+            status=event.status,
+            queue_length=event.queue_length,
             last_heartbeat=now,
             registered_at=now,
         )

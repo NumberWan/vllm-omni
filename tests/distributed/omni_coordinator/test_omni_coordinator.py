@@ -42,11 +42,11 @@ def test_omni_coordinator_registration_broadcast():
     OmniCoordinator publishes an InstanceList containing all registered instances.
     """
     coordinator = OmniCoordinator(
-        router_zmq_addr="tcp://127.0.0.1:15555",
-        pub_zmq_addr="tcp://127.0.0.1:15556",
+        router_zmq_addr="tcp://127.0.0.1:0",
+        pub_zmq_addr="tcp://127.0.0.1:0",
         heartbeat_timeout=1000.0,
     )
-    router_addr, pub_addr = "tcp://127.0.0.1:15555", "tcp://127.0.0.1:15556"
+    router_addr, pub_addr = coordinator.get_bind_addresses()
 
     sub_ctx = zmq.Context.instance()
     sub = sub_ctx.socket(zmq.SUB)
@@ -85,11 +85,11 @@ def test_omni_coordinator_heartbeat_timeout_handling():
     OmniCoordinator marks it as unhealthy and excludes it from the active list.
     """
     coordinator = OmniCoordinator(
-        router_zmq_addr="tcp://127.0.0.1:25555",
-        pub_zmq_addr="tcp://127.0.0.1:25556",
+        router_zmq_addr="tcp://127.0.0.1:0",
+        pub_zmq_addr="tcp://127.0.0.1:0",
         heartbeat_timeout=5.0,
     )
-    router_addr, pub_addr = "tcp://127.0.0.1:25555", "tcp://127.0.0.1:25556"
+    router_addr, pub_addr = coordinator.get_bind_addresses()
 
     sub_ctx = zmq.Context.instance()
     sub = sub_ctx.socket(zmq.SUB)
@@ -146,11 +146,11 @@ def test_omni_coordinator_instance_shutdown_handling():
     OmniCoordinator removes it from the active list and broadcasts an updated list.
     """
     coordinator = OmniCoordinator(
-        router_zmq_addr="tcp://127.0.0.1:35555",
-        pub_zmq_addr="tcp://127.0.0.1:35556",
+        router_zmq_addr="tcp://127.0.0.1:0",
+        pub_zmq_addr="tcp://127.0.0.1:0",
         heartbeat_timeout=1000.0,
     )
-    router_addr, pub_addr = "tcp://127.0.0.1:35555", "tcp://127.0.0.1:35556"
+    router_addr, pub_addr = coordinator.get_bind_addresses()
 
     sub_ctx = zmq.Context.instance()
     sub = sub_ctx.socket(zmq.SUB)
