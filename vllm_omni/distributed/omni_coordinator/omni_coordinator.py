@@ -228,9 +228,6 @@ class OmniCoordinator:
             # Check-and-act under single lock to avoid TOCTOU race (duplicate
             # registration when concurrent events arrive for the same instance).
             with self._lock:
-                if event.status == StageStatus.DOWN and zmq_addr not in self._instances:
-                    return  # Ignore stray down for unknown instances
-
                 if zmq_addr not in self._instances:
                     self._add_new_instance_locked(event)
                 else:
