@@ -154,15 +154,6 @@ class OmniCoordinator:
         except zmq.ZMQError:
             pass
 
-    def get_bind_addresses(self) -> tuple[str, str]:
-        """Return the actual bound (router_addr, pub_addr) after bind.
-
-        Useful when binding to port 0 (ephemeral port).
-        """
-        router_addr = self._router.getsockopt(zmq.LAST_ENDPOINT).decode("ascii")
-        pub_addr = self._pub.getsockopt(zmq.LAST_ENDPOINT).decode("ascii")
-        return (router_addr, pub_addr)
-
     def _parse_instance_event(self, data: dict[str, Any]) -> InstanceEvent | None:
         """Parse wire payload dict into InstanceEvent. Returns None if invalid."""
         try:

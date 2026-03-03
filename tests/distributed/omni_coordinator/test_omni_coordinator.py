@@ -5,6 +5,7 @@ import json
 import time
 
 import zmq
+from vllm.v1.utils import get_engine_client_zmq_addr
 
 from vllm_omni.distributed.omni_coordinator import (
     OmniCoordClientForStage,
@@ -41,12 +42,21 @@ def test_omni_coordinator_registration_broadcast():
     """Verify that after multiple OmniCoordClientForStage instances register,
     OmniCoordinator publishes an InstanceList containing all registered instances.
     """
+    router_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
+    pub_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
     coordinator = OmniCoordinator(
-        router_zmq_addr="tcp://127.0.0.1:0",
-        pub_zmq_addr="tcp://127.0.0.1:0",
+        router_zmq_addr=router_addr,
+        pub_zmq_addr=pub_addr,
         heartbeat_timeout=1000.0,
     )
-    router_addr, pub_addr = coordinator.get_bind_addresses()
 
     sub_ctx = zmq.Context.instance()
     sub = sub_ctx.socket(zmq.SUB)
@@ -84,12 +94,21 @@ def test_omni_coordinator_heartbeat_timeout_handling():
     """Verify that when a stage instance stops sending heartbeats,
     OmniCoordinator marks it as unhealthy and excludes it from the active list.
     """
+    router_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
+    pub_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
     coordinator = OmniCoordinator(
-        router_zmq_addr="tcp://127.0.0.1:0",
-        pub_zmq_addr="tcp://127.0.0.1:0",
+        router_zmq_addr=router_addr,
+        pub_zmq_addr=pub_addr,
         heartbeat_timeout=5.0,
     )
-    router_addr, pub_addr = coordinator.get_bind_addresses()
 
     sub_ctx = zmq.Context.instance()
     sub = sub_ctx.socket(zmq.SUB)
@@ -145,12 +164,21 @@ def test_omni_coordinator_instance_shutdown_handling():
     """Verify that when a stage instance sends status='down',
     OmniCoordinator removes it from the active list and broadcasts an updated list.
     """
+    router_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
+    pub_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
     coordinator = OmniCoordinator(
-        router_zmq_addr="tcp://127.0.0.1:0",
-        pub_zmq_addr="tcp://127.0.0.1:0",
+        router_zmq_addr=router_addr,
+        pub_zmq_addr=pub_addr,
         heartbeat_timeout=1000.0,
     )
-    router_addr, pub_addr = coordinator.get_bind_addresses()
 
     sub_ctx = zmq.Context.instance()
     sub = sub_ctx.socket(zmq.SUB)
