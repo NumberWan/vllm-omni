@@ -50,7 +50,7 @@ class OmniCoordClientForStage:
         )
         self._heartbeat_thread.start()
 
-    def _reconnect(self, max_retries: int = 3) -> bool:
+    def _reconnect(self) -> bool:
         """Best-effort reconnect with up to ``max_retries`` attempts.
 
         Each attempt closes the current socket/context, sleeps 5 seconds,
@@ -58,7 +58,7 @@ class OmniCoordClientForStage:
         Caller must hold ``_send_lock``.
         Returns True on success, False if all attempts fail.
         """
-        for _ in range(max_retries):
+        while not self._stop_event.is_set() and not self._closed:
             try:
                 self._socket.close(0)
             except zmq.ZMQError:
@@ -75,9 +75,13 @@ class OmniCoordClientForStage:
                 self._socket = self._ctx.socket(zmq.DEALER)
                 self._socket.connect(self._coord_zmq_addr)
                 return True
-            except zmq.ZMQError:
+            except zmq.ZMQError as e:
+                logger.error(
+                    "Stage client reconnect failed, will retry in 5s (coord=%s)",
+                    self._coord_zmq_addr,
+                    exc_info=e,
+                )
                 continue
-
         return False
 
     def _send_event(self, event_type: str) -> None:
@@ -112,7 +116,7 @@ class OmniCoordClientForStage:
                 return
             except (RuntimeError, zmq.ZMQError) as e:
                 # First send failed; try reconnecting a few times.
-                if not self._reconnect(max_retries=3):
+                if not self._reconnect:
                     logger.error("Failed to send event and reconnect to coordinator", exc_info=e)
                     raise
 
