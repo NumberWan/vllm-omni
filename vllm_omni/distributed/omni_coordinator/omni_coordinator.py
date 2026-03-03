@@ -58,6 +58,9 @@ class OmniCoordinator:
         self._lock = threading.Lock()
         self._pub_lock = threading.Lock()
 
+        self._publish_min_interval: float = 0.1  # seconds
+        self._pending_broadcast: bool = False
+
         self._running = True
         self._closed = False
         self._stop_event = threading.Event()
@@ -67,8 +70,8 @@ class OmniCoordinator:
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._recv_thread.start()
 
-        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        self._heartbeat_thread.start()
+        self._periodic_thread = threading.Thread(target=self._periodic_loop, daemon=True)
+        self._periodic_thread.start()
 
     def get_active_instances(self) -> InstanceList:
         """Return an :class:`InstanceList` of active (UP) instances only."""
@@ -113,6 +116,18 @@ class OmniCoordinator:
                 # Silently ignore send failures; next update will catch up.
                 return
 
+    def _schedule_broadcast(self, force: bool) -> None:
+        """Schedule a broadcast, optionally bypassing throttling.
+
+        When ``force`` is True, publish immediately. Otherwise, mark a pending
+        broadcast that will be flushed by the periodic loop at most once per
+        ``_publish_min_interval``.
+        """
+        if force:
+            self.publish_instance_list_update()
+        else:
+            self._pending_broadcast = True
+
     def _mark_instance_error_locked(self, info: InstanceInfo) -> None:
         """Mark instance as ERROR (e.g. after heartbeat timeout)."""
         info.status = StageStatus.ERROR
@@ -129,7 +144,8 @@ class OmniCoordinator:
                     timed_out = True
 
         if timed_out:
-            self.publish_instance_list_update()
+            # Instance liveness changed; force immediate broadcast.
+            self._schedule_broadcast(force=True)
 
     def close(self) -> None:
         """Shut down background threads and close all ZMQ sockets."""
@@ -141,7 +157,7 @@ class OmniCoordinator:
         self._stop_event.set()
 
         # Wait for threads to exit before closing sockets.
-        for thread in (self._recv_thread, self._heartbeat_thread):
+        for thread in (self._recv_thread, self._periodic_thread):
             thread.join(timeout=1.0)
 
         try:
@@ -195,12 +211,29 @@ class OmniCoordinator:
 
             self._handle_event(event)
 
-    def _heartbeat_loop(self) -> None:
-        """Periodic loop to check for heartbeat timeouts."""
-        interval = max(1.0, min(self._heartbeat_timeout / 2.0, 5.0))
+    def _periodic_loop(self) -> None:
+        """Periodic loop to check heartbeat timeouts and flush broadcasts.
+
+        Heartbeat timeouts are checked on their original cadence, while
+        queue_length / non-liveness updates are coalesced and flushed at
+        most once per ``_publish_min_interval``.
+        """
+        heartbeat_interval = max(1.0, min(self._heartbeat_timeout / 2.0, 5.0))
+        loop_interval = self._publish_min_interval
+
+        last_heartbeat_check = 0.0
         while self._running:
-            self._check_heartbeat_timeouts()
-            if self._stop_event.wait(timeout=interval):
+            now = time()
+
+            if now - last_heartbeat_check >= heartbeat_interval:
+                self._check_heartbeat_timeouts()
+                last_heartbeat_check = now
+
+            if self._pending_broadcast:
+                self.publish_instance_list_update()
+                self._pending_broadcast = False
+
+            if self._stop_event.wait(timeout=loop_interval):
                 break
 
     def _handle_event(self, event: InstanceEvent) -> None:
@@ -219,15 +252,21 @@ class OmniCoordinator:
             # Check-and-act under single lock to avoid TOCTOU race (duplicate
             # registration when concurrent events arrive for the same instance).
             with self._lock:
+                force_broadcast = False
                 if zmq_addr not in self._instances:
                     self._add_new_instance_locked(event)
+                    force_broadcast = True
                 else:
                     if event.status == StageStatus.DOWN:
                         self._remove_instance_locked(event)
+                        force_broadcast = True
                     else:
                         self._update_instance_info_locked(event)
 
-            self.publish_instance_list_update()
+            # New instances / DOWN events are broadcast immediately; other
+            # updates (e.g. queue_length changes) are throttled via the
+            # periodic loop.
+            self._schedule_broadcast(force=force_broadcast)
         except (KeyError, ValueError, TypeError) as e:
             logger.warning("Dropping malformed event: %s", e)
 
