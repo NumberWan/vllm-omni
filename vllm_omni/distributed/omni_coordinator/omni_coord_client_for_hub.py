@@ -4,7 +4,7 @@
 import json
 import logging
 import threading
-from time import time
+from time import sleep, time
 from typing import Any
 
 import zmq
@@ -26,9 +26,7 @@ class OmniCoordClientForHub:
         """Initialize client and start receive thread (socket created in thread)."""
         self._coord_zmq_addr = coord_zmq_addr
 
-        # Dedicated ZMQ context for this hub client.
         self._ctx = zmq.Context()
-
         self._lock = threading.Lock()
         self._instance_list: InstanceList | None = None
         self._closed = False
@@ -76,17 +74,43 @@ class OmniCoordClientForHub:
         finally:
             self._init_done.set()
 
-        if sub is None:
-            return
-
         try:
             while not self._stop_event.is_set():
+                # (Re)create and connect SUB socket if needed.
+                if sub is None:
+                    try:
+                        sub = self._ctx.socket(zmq.SUB)
+                        sub.setsockopt(zmq.SUBSCRIBE, b"")
+                        sub.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout, avoids busy-wait
+                        sub.connect(self._coord_zmq_addr)
+                    except (zmq.ZMQError, OSError) as e:
+                        logger.error(
+                            "Hub client failed to connect to coordinator at %s, will retry",
+                            self._coord_zmq_addr,
+                            exc_info=e,
+                        )
+                        if sub is not None:
+                            try:
+                                sub.close()
+                            except zmq.ZMQError:
+                                pass
+                            sub = None
+                        sleep(1.0)
+                        continue
+
                 try:
                     data = sub.recv()
                 except zmq.Again:
                     continue
-                except zmq.ZMQError:
-                    break
+                except zmq.ZMQError as e:
+                    logger.error("Hub client recv failed, will reconnect", exc_info=e)
+                    try:
+                        sub.close()
+                    except zmq.ZMQError:
+                        pass
+                    sub = None
+                    sleep(1.0)
+                    continue
 
                 try:
                     payload = json.loads(data.decode("utf-8"))
@@ -103,7 +127,8 @@ class OmniCoordClientForHub:
                     logger.warning("Invalid instance list message, skipping: %s", e)
         finally:
             try:
-                sub.close()
+                if sub is not None:
+                    sub.close()
             except zmq.ZMQError:
                 pass
             try:

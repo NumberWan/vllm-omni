@@ -4,6 +4,7 @@
 import json
 import logging
 import threading
+import time
 from dataclasses import asdict
 
 import zmq
@@ -26,7 +27,6 @@ class OmniCoordClientForStage:
         self._instance_zmq_addr = instance_zmq_addr
         self._stage_id = stage_id
 
-        # Dedicated ZMQ context for this stage client.
         self._ctx = zmq.Context()
         self._socket = self._ctx.socket(zmq.DEALER)
         try:
@@ -50,12 +50,46 @@ class OmniCoordClientForStage:
         )
         self._heartbeat_thread.start()
 
+    def _reconnect(self, max_retries: int = 3) -> bool:
+        """Best-effort reconnect with up to ``max_retries`` attempts.
+
+        Each attempt closes the current socket/context, sleeps 5 seconds,
+        then creates a new DEALER socket and reconnects to the coordinator.
+        Caller must hold ``_send_lock``.
+        Returns True on success, False if all attempts fail.
+        """
+        for _ in range(max_retries):
+            try:
+                self._socket.close(0)
+            except zmq.ZMQError:
+                pass
+            try:
+                self._ctx.term()
+            except zmq.ZMQError:
+                pass
+
+            time.sleep(5.0)
+
+            try:
+                self._ctx = zmq.Context()
+                self._socket = self._ctx.socket(zmq.DEALER)
+                self._socket.connect(self._coord_zmq_addr)
+                return True
+            except zmq.ZMQError:
+                continue
+
+        return False
+
     def _send_event(self, event_type: str) -> None:
         """Send an InstanceEvent to OmniCoordinator.
 
         Wire format: zmq_addr, stage_id, status, queue_length, event_type.
         For "update": includes status and queue_length from instance state.
         For "heartbeat": status and queue_length are null.
+
+        On send failure (ZMQError / RuntimeError), attempts to reconnect up
+        to 3 times (5s sleep each) and retries the send once after a
+        successful reconnect. Raises if reconnect or the retry send fails.
         """
         if self._closed:
             raise RuntimeError("Client already closed")
@@ -68,11 +102,28 @@ class OmniCoordClientForStage:
             queue_length=self._queue_length,
         )
         data = json.dumps(asdict(event)).encode("utf-8")
+
         with self._send_lock:
             try:
                 self._socket.send(data, flags=zmq.NOBLOCK)
+                return
             except zmq.Again:
                 logger.debug("Send buffer full, dropping event")
+                return
+            except (RuntimeError, zmq.ZMQError) as e:
+                # First send failed; try reconnecting a few times.
+                if not self._reconnect(max_retries=3):
+                    logger.error("Failed to send event and reconnect to coordinator", exc_info=e)
+                    raise
+
+                # Reconnected successfully; try sending once more.
+                try:
+                    self._socket.send(data, flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    logger.debug("Send buffer full after reconnect, dropping event")
+                except (RuntimeError, zmq.ZMQError) as e2:
+                    logger.error("Failed to send event after successful reconnect", exc_info=e2)
+                    raise
 
     def update_info(
         self,
