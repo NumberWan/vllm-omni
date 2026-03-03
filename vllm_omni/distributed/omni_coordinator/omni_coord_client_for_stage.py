@@ -26,7 +26,8 @@ class OmniCoordClientForStage:
         self._instance_zmq_addr = instance_zmq_addr
         self._stage_id = stage_id
 
-        self._ctx = zmq.Context.instance()
+        # Dedicated ZMQ context for this stage client.
+        self._ctx = zmq.Context()
         self._socket = self._ctx.socket(zmq.DEALER)
         try:
             self._socket.connect(self._coord_zmq_addr)
@@ -120,6 +121,10 @@ class OmniCoordClientForStage:
         except zmq.ZMQError:
             pass  # Socket may already be broken, proceed with close
 
-        # Close DEALER socket; context is shared and not terminated here.
+        # Close DEALER socket and terminate this client's context.
         self._socket.close(0)
+        try:
+            self._ctx.term()
+        except zmq.ZMQError:
+            pass
         self._closed = True

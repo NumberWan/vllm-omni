@@ -26,6 +26,9 @@ class OmniCoordClientForHub:
         """Initialize client and start receive thread (socket created in thread)."""
         self._coord_zmq_addr = coord_zmq_addr
 
+        # Dedicated ZMQ context for this hub client.
+        self._ctx = zmq.Context()
+
         self._lock = threading.Lock()
         self._instance_list: InstanceList | None = None
         self._closed = False
@@ -63,8 +66,7 @@ class OmniCoordClientForHub:
         """Background loop that receives and caches instance lists."""
         sub = None
         try:
-            ctx = zmq.Context.instance()
-            sub = ctx.socket(zmq.SUB)
+            sub = self._ctx.socket(zmq.SUB)
             sub.setsockopt(zmq.SUBSCRIBE, b"")
             sub.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout, avoids busy-wait
             sub.connect(self._coord_zmq_addr)
@@ -102,6 +104,10 @@ class OmniCoordClientForHub:
         finally:
             try:
                 sub.close()
+            except zmq.ZMQError:
+                pass
+            try:
+                self._ctx.term()
             except zmq.ZMQError:
                 pass
 

@@ -47,7 +47,8 @@ class OmniCoordinator:
         self._pub_zmq_addr = pub_zmq_addr
         self._heartbeat_timeout = heartbeat_timeout
 
-        self._ctx = zmq.Context.instance()
+        # Dedicated ZMQ context for this coordinator instance.
+        self._ctx = zmq.Context()
         self._router = self._ctx.socket(zmq.ROUTER)
         self._router.bind(self._router_zmq_addr)
 
@@ -136,13 +137,20 @@ class OmniCoordinator:
         """Mark instances as ERROR if their heartbeat has timed out."""
         now = time()
         timed_out = False
+        gc_ttl = 600.0  # 10 minutes
 
         with self._lock:
-            for info in self._instances.values():
+            to_delete: list[str] = []
+
+            for zmq_addr, info in self._instances.items():
                 if info.status == StageStatus.UP and now - info.last_heartbeat > self._heartbeat_timeout:
                     self._mark_instance_error_locked(info)
                     timed_out = True
+                elif info.status == StageStatus.DOWN and now - info.last_heartbeat > gc_ttl:
+                    to_delete.append(zmq_addr)
 
+            for zmq_addr in to_delete:
+                del self._instances[zmq_addr]
         if timed_out:
             # Instance liveness changed; force immediate broadcast.
             self._schedule_broadcast(force=True)
@@ -167,6 +175,11 @@ class OmniCoordinator:
 
         try:
             self._pub.close(0)
+        except zmq.ZMQError:
+            pass
+
+        try:
+            self._ctx.term()
         except zmq.ZMQError:
             pass
 
@@ -241,12 +254,19 @@ class OmniCoordinator:
         try:
             zmq_addr = event.zmq_addr
 
-            # Heartbeat: only update last_heartbeat, do not publish.
+            # Heartbeat: only update last_heartbeat; if previously ERROR,
+            # promote back to UP and broadcast once.
             if event.event_type == "heartbeat":
+                promote = False
                 with self._lock:
                     info = self._instances.get(zmq_addr)
                     if info is not None:
                         info.last_heartbeat = time()
+                        if info.status == StageStatus.ERROR:
+                            info.status = StageStatus.UP
+                            promote = True
+                if promote:
+                    self._schedule_broadcast(force=True)
                 return
 
             # Check-and-act under single lock to avoid TOCTOU race (duplicate
