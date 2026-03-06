@@ -23,12 +23,12 @@ class InstanceEvent:
     input_addr, output_addr, stage_id, status, queue_length, event_type.
     """
 
-    input_addr: str
-    output_addr: str
-    stage_id: int
+    input_addr: str  # Stage instance input ZMQ address (e.g., "tcp://host:port")
+    output_addr: str  # Stage instance output ZMQ address (e.g., "tcp://host:port")
+    stage_id: int  # Stage ID
     event_type: str  # "update" | "heartbeat"
-    status: StageStatus
-    queue_length: int
+    status: StageStatus  # Current status
+    queue_length: int  # Current queue length
 
 
 @dataclass
@@ -39,8 +39,8 @@ class InstanceInfo:
     published to hubs via :class:`InstanceList`.
     """
 
-    input_addr: str  # StageCoreProc instance input ZMQ address (e.g., "tcp://host:port")
-    output_addr: str  # StageCoreProc instance output ZMQ address (e.g., "tcp://host:port")
+    input_addr: str  # Stage instance input ZMQ address (e.g., "tcp://host:port")
+    output_addr: str  # Stage instance output ZMQ address (e.g., "tcp://host:port")
     stage_id: int  # Stage ID of this instance
     status: StageStatus  # Current status of the instance
     queue_length: int  # Current queue length of this instance
