@@ -146,7 +146,7 @@ class OmniCoordinator:
                 if info.status == StageStatus.UP and now - info.last_heartbeat > self._heartbeat_timeout:
                     self._mark_instance_error_locked(info)
                     timed_out = True
-                elif info.status == StageStatus.DOWN and now - info.last_heartbeat > gc_ttl:
+                elif info.status in (StageStatus.DOWN, StageStatus.ERROR) and now - info.last_heartbeat > gc_ttl:
                     to_delete.append(input_addr)
 
             for input_addr in to_delete:
