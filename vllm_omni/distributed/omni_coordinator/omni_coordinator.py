@@ -142,15 +142,15 @@ class OmniCoordinator:
         with self._lock:
             to_delete: list[str] = []
 
-            for zmq_addr, info in self._instances.items():
+            for input_addr, info in self._instances.items():
                 if info.status == StageStatus.UP and now - info.last_heartbeat > self._heartbeat_timeout:
                     self._mark_instance_error_locked(info)
                     timed_out = True
                 elif info.status == StageStatus.DOWN and now - info.last_heartbeat > gc_ttl:
-                    to_delete.append(zmq_addr)
+                    to_delete.append(input_addr)
 
-            for zmq_addr in to_delete:
-                del self._instances[zmq_addr]
+            for input_addr in to_delete:
+                del self._instances[input_addr]
         if timed_out:
             # Instance liveness changed; force immediate broadcast.
             self._schedule_broadcast(force=True)
@@ -187,7 +187,8 @@ class OmniCoordinator:
         """Parse wire payload dict into InstanceEvent. Returns None if invalid."""
         try:
             return InstanceEvent(
-                zmq_addr=str(data["zmq_addr"]),
+                input_addr=str(data["input_addr"]),
+                output_addr=str(data["output_addr"]),
                 stage_id=int(data["stage_id"]),
                 event_type=str(data["event_type"]),
                 status=StageStatus(data.get("status")),
@@ -252,14 +253,14 @@ class OmniCoordinator:
     def _handle_event(self, event: InstanceEvent) -> None:
         """Dispatch an incoming event to the appropriate handler."""
         try:
-            zmq_addr = event.zmq_addr
+            input_addr = event.input_addr
 
             # Heartbeat: only update last_heartbeat; if previously ERROR,
             # promote back to UP and broadcast once.
             if event.event_type == "heartbeat":
                 promote = False
                 with self._lock:
-                    info = self._instances.get(zmq_addr)
+                    info = self._instances.get(input_addr)
                     if info is not None:
                         info.last_heartbeat = time()
                         if info.status == StageStatus.ERROR:
@@ -273,7 +274,7 @@ class OmniCoordinator:
             # registration when concurrent events arrive for the same instance).
             with self._lock:
                 force_broadcast = False
-                if zmq_addr not in self._instances:
+                if input_addr not in self._instances:
                     self._add_new_instance_locked(event)
                     force_broadcast = True
                 else:
@@ -291,27 +292,28 @@ class OmniCoordinator:
             logger.warning("Dropping malformed event: %s", e)
 
     def _add_new_instance_locked(self, event: InstanceEvent) -> None:
-        zmq_addr = event.zmq_addr
-        if not zmq_addr:
-            raise KeyError("zmq_addr required")
+        input_addr = event.input_addr
+        if not input_addr:
+            raise KeyError("input_addr required")
         stage_id = event.stage_id
         if stage_id < 0:
             raise KeyError("stage_id required and must be non-negative")
 
         now = time()
         info = InstanceInfo(
-            zmq_addr=zmq_addr,
+            input_addr=input_addr,
+            output_addr=event.output_addr,
             stage_id=stage_id,
             status=event.status,
             queue_length=event.queue_length,
             last_heartbeat=now,
             registered_at=now,
         )
-        self._instances[zmq_addr] = info
+        self._instances[input_addr] = info
 
     def _update_instance_info_locked(self, event: InstanceEvent) -> None:
-        zmq_addr = event.zmq_addr
-        info = self._instances[zmq_addr]
+        input_addr = event.input_addr
+        info = self._instances[input_addr]
 
         if event.status is not None:
             info.status = event.status
@@ -320,8 +322,8 @@ class OmniCoordinator:
             info.queue_length = event.queue_length
 
     def _remove_instance_locked(self, event: InstanceEvent) -> None:
-        zmq_addr = event.zmq_addr
-        info = self._instances.get(zmq_addr)
+        input_addr = event.input_addr
+        info = self._instances.get(input_addr)
         if info is None:
             return
 

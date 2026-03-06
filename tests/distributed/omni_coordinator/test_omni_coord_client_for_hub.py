@@ -41,7 +41,8 @@ def test_hub_client_caches_instance_list_from_pub():
     now = time.time()
     instances_payload = [
         {
-            "zmq_addr": "tcp://stage:10001",
+            "input_addr": "tcp://stage:10001",
+            "output_addr": "tcp://stage:10001-out",
             "stage_id": 0,
             "status": "up",
             "queue_length": 0,
@@ -49,7 +50,8 @@ def test_hub_client_caches_instance_list_from_pub():
             "registered_at": now,
         },
         {
-            "zmq_addr": "tcp://stage:10002",
+            "input_addr": "tcp://stage:10002",
+            "output_addr": "tcp://stage:10002-out",
             "stage_id": 0,
             "status": "up",
             "queue_length": 1,
@@ -57,7 +59,8 @@ def test_hub_client_caches_instance_list_from_pub():
             "registered_at": now,
         },
         {
-            "zmq_addr": "tcp://stage:10003",
+            "input_addr": "tcp://stage:10003",
+            "output_addr": "tcp://stage:10003-out",
             "stage_id": 1,
             "status": "error",
             "queue_length": 5,
@@ -76,7 +79,8 @@ def test_hub_client_caches_instance_list_from_pub():
     assert len(inst_list.instances) == 3
 
     for src, inst in zip(instances_payload, inst_list.instances, strict=True):
-        assert inst.zmq_addr == src["zmq_addr"]
+        assert inst.input_addr == src["input_addr"]
+        assert inst.output_addr == src["output_addr"]
         assert inst.stage_id == src["stage_id"]
         assert inst.status.value == src["status"]
 

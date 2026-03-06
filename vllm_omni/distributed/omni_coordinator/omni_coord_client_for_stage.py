@@ -21,10 +21,17 @@ class OmniCoordClientForStage:
     ROUTER endpoint and sends JSON-encoded events describing instance status.
     """
 
-    def __init__(self, coord_zmq_addr: str, instance_zmq_addr: str, stage_id: int) -> None:
+    def __init__(
+        self,
+        coord_zmq_addr: str,
+        input_addr: str,
+        output_addr: str,
+        stage_id: int,
+    ) -> None:
         """Initialize client and send initial registration / status-up event."""
         self._coord_zmq_addr = coord_zmq_addr
-        self._instance_zmq_addr = instance_zmq_addr
+        self._input_addr = input_addr
+        self._output_addr = output_addr
         self._stage_id = stage_id
 
         self._ctx = zmq.Context()
@@ -87,7 +94,7 @@ class OmniCoordClientForStage:
     def _send_event(self, event_type: str) -> None:
         """Send an InstanceEvent to OmniCoordinator.
 
-        Wire format: zmq_addr, stage_id, status, queue_length, event_type.
+        Wire format: input_addr, output_addr, stage_id, status, queue_length, event_type.
         For "update": includes status and queue_length from instance state.
         For "heartbeat": status and queue_length are null.
 
@@ -99,10 +106,11 @@ class OmniCoordClientForStage:
             raise RuntimeError("Client already closed")
 
         event = InstanceEvent(
-            zmq_addr=self._instance_zmq_addr,
+            input_addr=self._input_addr,
+            output_addr=self._output_addr,
             stage_id=self._stage_id,
             event_type=event_type,
-            status=self._status.value,
+            status=self._status,
             queue_length=self._queue_length,
         )
         data = json.dumps(asdict(event)).encode("utf-8")

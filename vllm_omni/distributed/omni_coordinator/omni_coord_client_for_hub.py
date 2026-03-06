@@ -48,7 +48,8 @@ class OmniCoordClientForHub:
         for inst in instances_payload:
             instances.append(
                 InstanceInfo(
-                    zmq_addr=inst["zmq_addr"],
+                    input_addr=inst["input_addr"],
+                    output_addr=inst["output_addr"],
                     stage_id=int(inst["stage_id"]),
                     status=StageStatus(inst["status"]),
                     queue_length=int(inst["queue_length"]),

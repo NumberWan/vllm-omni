@@ -22,7 +22,8 @@ def test_load_balancer_select_returns_valid_index():
     now = time()
     instances = [
         InstanceInfo(
-            zmq_addr="tcp://host:10001",
+            input_addr="tcp://host:10001",
+            output_addr="tcp://host:10001-out",
             stage_id=0,
             status=StageStatus.UP,
             queue_length=0,
@@ -30,7 +31,8 @@ def test_load_balancer_select_returns_valid_index():
             registered_at=now,
         ),
         InstanceInfo(
-            zmq_addr="tcp://host:10002",
+            input_addr="tcp://host:10002",
+            output_addr="tcp://host:10002-out",
             stage_id=0,
             status=StageStatus.UP,
             queue_length=1,
@@ -38,7 +40,8 @@ def test_load_balancer_select_returns_valid_index():
             registered_at=now,
         ),
         InstanceInfo(
-            zmq_addr="tcp://host:10003",
+            input_addr="tcp://host:10003",
+            output_addr="tcp://host:10003-out",
             stage_id=1,
             status=StageStatus.UP,
             queue_length=2,

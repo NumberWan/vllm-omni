@@ -30,17 +30,19 @@ def test_stage_client_auto_register_on_init():
     """Verify OmniCoordClientForStage automatically sends initial registration/status-up event when created."""
     ctx, router, endpoint = _bind_router()
 
-    instance_addr = "tcp://stage:10001"
+    input_addr = "tcp://stage:10001"
+    output_addr = "tcp://stage:10001-out"
     stage_id = 0
 
-    client = OmniCoordClientForStage(endpoint, instance_addr, stage_id)
+    client = OmniCoordClientForStage(endpoint, input_addr, output_addr, stage_id)
 
     event = _recv_event(router)
 
     assert event["event_type"] == "update"
     assert event["status"] == StageStatus.UP.value
     assert event["stage_id"] == stage_id
-    assert event["zmq_addr"] == instance_addr
+    assert event["input_addr"] == input_addr
+    assert event["output_addr"] == output_addr
 
     client.close()
     router.close(0)
@@ -51,10 +53,11 @@ def test_stage_client_update_info_sends_correct_event():
     """Verify OmniCoordClientForStage.update_info() sends status/load update events with expected fields."""
     ctx, router, endpoint = _bind_router()
 
-    instance_addr = "tcp://stage:10002"
+    input_addr = "tcp://stage:10002"
+    output_addr = "tcp://stage:10002-out"
     stage_id = 1
 
-    client = OmniCoordClientForStage(endpoint, instance_addr, stage_id)
+    client = OmniCoordClientForStage(endpoint, input_addr, output_addr, stage_id)
 
     # Discard initial registration event.
     _recv_event(router)
@@ -67,11 +70,13 @@ def test_stage_client_update_info_sends_correct_event():
 
     assert first["status"] == StageStatus.ERROR.value
     assert first["stage_id"] == stage_id
-    assert first["zmq_addr"] == instance_addr
+    assert first["input_addr"] == input_addr
+    assert first["output_addr"] == output_addr
 
     assert second["queue_length"] == 10
     assert second["stage_id"] == stage_id
-    assert second["zmq_addr"] == instance_addr
+    assert second["input_addr"] == input_addr
+    assert second["output_addr"] == output_addr
 
     client.close()
     router.close(0)
@@ -82,10 +87,11 @@ def test_stage_client_close_sends_down_status():
     """Verify close() sends final status-down event before closing underlying socket."""
     ctx, router, endpoint = _bind_router()
 
-    instance_addr = "tcp://stage:10003"
+    input_addr = "tcp://stage:10003"
+    output_addr = "tcp://stage:10003-out"
     stage_id = 2
 
-    client = OmniCoordClientForStage(endpoint, instance_addr, stage_id)
+    client = OmniCoordClientForStage(endpoint, input_addr, output_addr, stage_id)
 
     # Discard initial registration event.
     _recv_event(router)
@@ -95,7 +101,8 @@ def test_stage_client_close_sends_down_status():
     event = _recv_event(router)
     assert event["status"] == StageStatus.DOWN.value
     assert event["stage_id"] == stage_id
-    assert event["zmq_addr"] == instance_addr
+    assert event["input_addr"] == input_addr
+    assert event["output_addr"] == output_addr
 
     assert client._socket.closed  # DEALER socket no longer usable after close
 
