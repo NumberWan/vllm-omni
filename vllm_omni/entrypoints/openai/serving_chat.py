@@ -1380,14 +1380,41 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         created_time = int(time.time())
         final_res: RequestOutput | None = None
 
+        # Extra debug logging for server-disconnect benchmark investigation.
+        logger.info(
+            "Omni chat completion started: model=%s modalities=%s request_id=%s created_time=%s",
+            getattr(request, "model", None),
+            getattr(request, "modalities", None),
+            getattr(request, "request_id", None),
+            created_time,
+        )
+
         final_outputs: list[OmniRequestOutput] = []
         try:
             async for res in result_generator:
                 final_outputs.append(res)
         except asyncio.CancelledError:
+            logger.warning(
+                "Omni chat completion cancelled: model=%s request_id=%s (client disconnected)",
+                getattr(request, "model", None),
+                getattr(request, "request_id", None),
+            )
             return self.create_error_response("Client disconnected")
         except ValueError as e:
+            logger.error(
+                "Omni chat completion failed with ValueError: %s model=%s request_id=%s",
+                repr(e),
+                getattr(request, "model", None),
+                getattr(request, "request_id", None),
+            )
             return self.create_error_response(e)
+        except Exception:
+            logger.exception(
+                "Omni chat completion raised unexpected exception: model=%s request_id=%s",
+                getattr(request, "model", None),
+                getattr(request, "request_id", None),
+            )
+            return self.create_error_response("Internal server error during omni chat completion")
 
         assert final_outputs is not None
 

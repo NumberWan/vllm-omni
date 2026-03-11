@@ -124,7 +124,21 @@ async def async_request_openai_chat_omni_completions(
     timestamp = st
     audio_generate_time = 0.0
     try:
+        logger.info(
+            "Sending omni benchmark request: url=%s model=%s prompt_len=%s output_len=%s",
+            api_url,
+            payload.get("model"),
+            request_func_input.prompt_len,
+            request_func_input.output_len,
+        )
+        logger.debug("Omni benchmark payload (truncated): %s", json.dumps(payload)[:1000])
+
         async with session.post(url=api_url, json=payload, headers=headers) as response:
+            logger.info(
+                "Received HTTP response from omni benchmark: status=%s reason=%s",
+                response.status,
+                response.reason,
+            )
             if response.status == 200:
                 handler = StreamedResponseHandler()
                 async for chunk_bytes in response.content.iter_any():
@@ -193,10 +207,24 @@ async def async_request_openai_chat_omni_completions(
             else:
                 output.error = response.reason or ""
                 output.success = False
+    except aiohttp.ClientError as e:
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error(
+            "ClientError in omni benchmark request: %s\nurl=%s model=%s",
+            repr(e),
+            api_url,
+            payload.get("model"),
+        )
     except Exception:
         output.success = False
         output.error = traceback.format_exc()
-        logger.error(f"ERROR: send request failed, reason is: {output.error}")
+        logger.error(
+            "ERROR: omni benchmark request failed, reason is: %s\nurl=%s model=%s",
+            output.error,
+            api_url,
+            payload.get("model"),
+        )
 
     if pbar:
         pbar.update(1)
