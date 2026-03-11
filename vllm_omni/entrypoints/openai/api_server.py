@@ -272,6 +272,13 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                 vllm_config.parallel_config._api_process_rank,
                 listen_address,
             )
+        # NOTE: envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE 默認來自上游 vLLM（通常為 5 秒），
+        # 對於 omni 多模態高併發壓測偏短。這裏在未指定其他值時，將其提升到 30 秒，
+        # 以減少 idle timeout 導致的短暫斷線。
+        timeout_keep_alive = envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+        if timeout_keep_alive <= 5:
+            timeout_keep_alive = 30
+
         shutdown_task = await serve_http(
             app,
             sock=sock,
@@ -282,7 +289,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             # NOTE: When the 'disable_uvicorn_access_log' value is True,
             # no access log will be output.
             access_log=not args.disable_uvicorn_access_log,
-            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+            timeout_keep_alive=timeout_keep_alive,
             ssl_keyfile=args.ssl_keyfile,
             ssl_certfile=args.ssl_certfile,
             ssl_ca_certs=args.ssl_ca_certs,

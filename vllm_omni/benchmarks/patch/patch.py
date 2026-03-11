@@ -123,108 +123,131 @@ async def async_request_openai_chat_omni_completions(
     most_recent_timestamp = st
     timestamp = st
     audio_generate_time = 0.0
-    try:
-        logger.info(
-            "Sending omni benchmark request: url=%s model=%s prompt_len=%s output_len=%s",
-            api_url,
-            payload.get("model"),
-            request_func_input.prompt_len,
-            request_func_input.output_len,
-        )
-        logger.debug("Omni benchmark payload (truncated): %s", json.dumps(payload)[:1000])
-
-        async with session.post(url=api_url, json=payload, headers=headers) as response:
+    max_retries = 3
+    for attempt in range(max_retries + 1):
+        try:
             logger.info(
-                "Received HTTP response from omni benchmark: status=%s reason=%s",
-                response.status,
-                response.reason,
+                "Sending omni benchmark request (attempt %d/%d): url=%s model=%s prompt_len=%s output_len=%s",
+                attempt + 1,
+                max_retries + 1,
+                api_url,
+                payload.get("model"),
+                request_func_input.prompt_len,
+                request_func_input.output_len,
             )
-            if response.status == 200:
-                handler = StreamedResponseHandler()
-                async for chunk_bytes in response.content.iter_any():
-                    chunk_bytes = chunk_bytes.strip()
-                    if not chunk_bytes:
-                        continue
+            logger.debug("Omni benchmark payload (truncated): %s", json.dumps(payload)[:1000])
 
-                    messages = handler.add_chunk(chunk_bytes)
-                    for message in messages:
-                        # NOTE: SSE comments (often used as pings) start with
-                        # a colon. These are not JSON data payload and should
-                        # be skipped.
-                        if message.startswith(":"):
+            async with session.post(url=api_url, json=payload, headers=headers) as response:
+                logger.info(
+                    "Received HTTP response from omni benchmark: status=%s reason=%s",
+                    response.status,
+                    response.reason,
+                )
+                if response.status == 200:
+                    handler = StreamedResponseHandler()
+                    async for chunk_bytes in response.content.iter_any():
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
                             continue
 
-                        chunk = message.removeprefix("data: ")
-                        if chunk != "[DONE]":
-                            timestamp = time.perf_counter()
-                            data = json.loads(chunk)
-                            if choices := data.get("choices"):
-                                modality = data.get("modality")
-                                content = choices[0]["delta"].get("content")
-                                if modality == "text":
-                                    # First token
-                                    if ttft == 0.0:
-                                        ttft = timestamp - st
-                                        output.ttft = ttft
-                                    else:
-                                        output.itl.append(timestamp - most_recent_timestamp)
-                                    generated_text += content or ""
-                                    most_recent_timestamp = timestamp
-                                    output.text_latency = timestamp - st
-                                elif modality == "audio":
-                                    if output.audio_ttfp == 0.0:
-                                        output.audio_ttfp = timestamp - st
-                                    audio_generate_time = timestamp - st
-                                    if content != "":
-                                        audio_bytes = base64.b64decode(content)
-                                        seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
-                                        if seg is not None:
-                                            if generated_audio is None:
-                                                generated_audio = seg
-                                            else:
-                                                generated_audio = generated_audio + seg
+                        messages = handler.add_chunk(chunk_bytes)
+                        for message in messages:
+                            # NOTE: SSE comments (often used as pings) start with
+                            # a colon. These are not JSON data payload and should
+                            # be skipped.
+                            if message.startswith(":"):
+                                continue
 
-                            if metrics := data.get("metrics"):
-                                output.output_tokens = metrics.get("num_tokens_out", 0)
+                            chunk = message.removeprefix("data: ")
+                            if chunk != "[DONE]":
+                                timestamp = time.perf_counter()
+                                data = json.loads(chunk)
+                                if choices := data.get("choices"):
+                                    modality = data.get("modality")
+                                    content = choices[0]["delta"].get("content")
+                                    if modality == "text":
+                                        # First token
+                                        if ttft == 0.0:
+                                            ttft = timestamp - st
+                                            output.ttft = ttft
+                                        else:
+                                            output.itl.append(timestamp - most_recent_timestamp)
+                                        generated_text += content or ""
+                                        most_recent_timestamp = timestamp
+                                        output.text_latency = timestamp - st
+                                    elif modality == "audio":
+                                        if output.audio_ttfp == 0.0:
+                                            output.audio_ttfp = timestamp - st
+                                        audio_generate_time = timestamp - st
+                                        if content != "":
+                                            audio_bytes = base64.b64decode(content)
+                                            seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
+                                            if seg is not None:
+                                                if generated_audio is None:
+                                                    generated_audio = seg
+                                                else:
+                                                    generated_audio = generated_audio + seg
 
-                output.latency = timestamp - st
-                output.generated_text = generated_text
-                if generated_audio is not None:
-                    output.audio_duration = len(generated_audio) / 1000.0
-                    frame_width = generated_audio.frame_width
-                    if frame_width > 0:
-                        output.audio_frames = len(generated_audio.raw_data) // frame_width
-                    else:
-                        output.audio_frames = 0
-                        logger.warning("Audio frame width is zero")
-                    audio_duration = output.audio_duration
-                    if audio_duration > 0:
-                        output.audio_rtf = audio_generate_time / output.audio_duration
-                    else:
-                        output.audio_rtf = 0
-                        logger.warning("Audio duration is zero")
-                output.success = True
-            else:
-                output.error = response.reason or ""
-                output.success = False
-    except aiohttp.ClientError as e:
-        output.success = False
-        output.error = traceback.format_exc()
-        logger.error(
-            "ClientError in omni benchmark request: %s\nurl=%s model=%s",
-            repr(e),
-            api_url,
-            payload.get("model"),
-        )
-    except Exception:
-        output.success = False
-        output.error = traceback.format_exc()
-        logger.error(
-            "ERROR: omni benchmark request failed, reason is: %s\nurl=%s model=%s",
-            output.error,
-            api_url,
-            payload.get("model"),
-        )
+                                if metrics := data.get("metrics"):
+                                    output.output_tokens = metrics.get("num_tokens_out", 0)
+
+                    output.latency = timestamp - st
+                    output.generated_text = generated_text
+                    if generated_audio is not None:
+                        output.audio_duration = len(generated_audio) / 1000.0
+                        frame_width = generated_audio.frame_width
+                        if frame_width > 0:
+                            output.audio_frames = len(generated_audio.raw_data) // frame_width
+                        else:
+                            output.audio_frames = 0
+                            logger.warning("Audio frame width is zero")
+                        audio_duration = output.audio_duration
+                        if audio_duration > 0:
+                            output.audio_rtf = audio_generate_time / output.audio_duration
+                        else:
+                            output.audio_rtf = 0
+                            logger.warning("Audio duration is zero")
+                    output.success = True
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+            # 正常完成或收到非 2xx 回應都唔需要再 retry
+            break
+        except aiohttp.ClientError as e:
+            # 只對暫時性傳輸錯誤做有限次 retry
+            output.success = False
+            output.error = traceback.format_exc()
+            if attempt < max_retries:
+                backoff = 0.2 * (2**attempt)
+                logger.warning(
+                    "ClientError in omni benchmark request (will retry): %s\n"
+                    "url=%s model=%s backoff=%.2fs attempt=%d/%d",
+                    repr(e),
+                    api_url,
+                    payload.get("model"),
+                    backoff,
+                    attempt + 1,
+                    max_retries + 1,
+                )
+                await asyncio.sleep(backoff)
+                continue
+            logger.error(
+                "ClientError in omni benchmark request (giving up): %s\nurl=%s model=%s",
+                repr(e),
+                api_url,
+                payload.get("model"),
+            )
+            break
+        except Exception:
+            output.success = False
+            output.error = traceback.format_exc()
+            logger.error(
+                "ERROR: omni benchmark request failed, reason is: %s\nurl=%s model=%s",
+                output.error,
+                api_url,
+                payload.get("model"),
+            )
+            break
 
     if pbar:
         pbar.update(1)
