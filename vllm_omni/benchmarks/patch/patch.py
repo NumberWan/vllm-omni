@@ -72,6 +72,8 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_frames: int = 0
     audio_rtf: float = 0.0
     text_latency: float = 0.0
+    # How many times this request retried due to transient transport errors.
+    retry_count: int = 0
 
 
 async def async_request_openai_chat_omni_completions(
@@ -248,6 +250,9 @@ async def async_request_openai_chat_omni_completions(
                 payload.get("model"),
             )
             break
+
+    # 記錄最終用了多少次 retry（0 表示無 retry）
+    output.retry_count = max(0, attempt)
 
     if pbar:
         pbar.update(1)
