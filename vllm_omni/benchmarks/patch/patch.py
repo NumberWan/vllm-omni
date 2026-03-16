@@ -235,7 +235,6 @@ async def async_request_openai_chat_omni_completions(
             logger.error(f"ERROR: send request failed, reason is: {output.error}")
             break
 
-
     if pbar:
         pbar.update(1)
     return output
