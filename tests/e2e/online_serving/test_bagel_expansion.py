@@ -127,4 +127,3 @@ def test_bagel(
     }
 
     openai_client.send_diffusion_request(request_config)
-
