@@ -1,10 +1,5 @@
 """L4 diffusion feature expansion tests for Bagel.
-
-This file follows the structure of:
-- tests/e2e/online_serving/test_qwen_image_edit_expansion.py
-- RFC #1832 (L4 diffusion e2e tests)
-
-Covered Bagel features (from RFC #1217):
+Coverage:
 - TeaCache
 - Cache-DiT
 - CFG-Parallel
@@ -21,8 +16,6 @@ from tests.conftest import (
 )
 from tests.utils import hardware_marks
 
-BAGEL_MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
-
 PROMPT = "A futuristic city skyline at twilight, cyberpunk style, ultra-detailed, high resolution."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
 
@@ -30,7 +23,7 @@ SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
-def _get_diffusion_feature_cases_for_bagel():
+def _get_diffusion_feature_cases(model: str):
     """Return L4 diffusion feature cases for Bagel.
 
     Each case enables at least one of the Bagel-supported diffusion
@@ -42,7 +35,7 @@ def _get_diffusion_feature_cases_for_bagel():
         # TeaCache (single-card)
         pytest.param(
             OmniServerParams(
-                model=BAGEL_MODEL,
+                model=model,
                 server_args=[
                     "--cache-backend",
                     "tea_cache",
@@ -54,7 +47,7 @@ def _get_diffusion_feature_cases_for_bagel():
         # Cache-DiT (single-card)
         pytest.param(
             OmniServerParams(
-                model=BAGEL_MODEL,
+                model=model,
                 server_args=[
                     "--cache-backend",
                     "cache_dit",
@@ -66,7 +59,7 @@ def _get_diffusion_feature_cases_for_bagel():
         # CFG-Parallel size 2 (2 GPUs, TeaCache backend)
         pytest.param(
             OmniServerParams(
-                model=BAGEL_MODEL,
+                model=model,
                 server_args=[
                     "--cache-backend",
                     "tea_cache",
@@ -80,7 +73,7 @@ def _get_diffusion_feature_cases_for_bagel():
         # Tensor-Parallel size 2 (2 GPUs, Cache-DiT backend)
         pytest.param(
             OmniServerParams(
-                model=BAGEL_MODEL,
+                model=model,
                 server_args=[
                     "--cache-backend",
                     "cache_dit",
@@ -98,10 +91,10 @@ def _get_diffusion_feature_cases_for_bagel():
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
-    _get_diffusion_feature_cases_for_bagel(),
+    _get_diffusion_feature_cases("ByteDance-Seed/BAGEL-7B-MoT"),
     indirect=True,
 )
-def test_bagel_diffusion_features(
+def test_bagel(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
 ):
