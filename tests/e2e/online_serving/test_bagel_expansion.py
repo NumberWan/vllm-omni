@@ -1,4 +1,7 @@
-"""L4 diffusion feature expansion tests for Bagel.
+"""
+Comprehensive tests of diffusion features that are available in online serving mode
+and are supported by the following models:
+- ByteDance-Seed/BAGEL-7B-MoT
 Coverage:
 - TeaCache
 - Cache-DiT
@@ -25,9 +28,6 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 def _get_diffusion_feature_cases(model: str):
     """Return L4 diffusion feature cases for Bagel.
-
-    Each case enables at least one of the Bagel-supported diffusion
-    acceleration features listed in RFC #1217:
     TeaCache, Cache-DiT, CFG-Parallel, Tensor-Parallel.
     """
 
