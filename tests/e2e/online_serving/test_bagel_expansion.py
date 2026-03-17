@@ -7,6 +7,9 @@ Coverage:
 - Cache-DiT
 - CFG-Parallel
 - Tensor-Parallel
+
+Assert_diffusion_response validates successful generation and the expected
+512×512 resolution.
 """
 
 import pytest
