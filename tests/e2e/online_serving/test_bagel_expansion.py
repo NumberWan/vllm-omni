@@ -8,8 +8,8 @@ Coverage:
 - CFG-Parallel
 - Tensor-Parallel
 
-Assert_diffusion_response validates successful generation and the expected
-512×512 resolution.
+assert_diffusion_response validates successful generation and the expected
+512x512 resolution.
 """
 
 import pytest
