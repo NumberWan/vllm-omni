@@ -109,15 +109,22 @@ Multiple API servers, multiple stages, multiple instances. The overall design ta
 
 ### OmniCoordinator process lifecycle
 
-- Started and managed by the **head** (`without --headless`) runtime:
+- **Status**: The end-to-end CLI workflow in this section is **work in progress**. Some flags and flows described below are **not yet supported** by the current `vllm serve` entrypoint.
+
+- Started and managed by the **head** (`without --headless`) runtime (planned):
 
 ```bash
 vllm serve <model> --omni
 ```
 
-- No separate startup command.
+- No separate startup command (planned).
 
-Additional DP arguments:
+Currently supported flags (as of this repo version):
+
+- `--omni-master-address` / `--omni-master-port` – address of the Omni orchestrator (master) used for multi-stage coordination.
+- `--stage-id` – launch a single stage; requires `--omni-master-address` and `--omni-master-port`.
+
+Planned DP flags (not yet supported in `vllm serve`, subject to change):
 
 - `--omni-dp-size-local` – data parallelism size of this runtime.
 - `--omni-dp-address` – IP address of OmniCoordinator.
