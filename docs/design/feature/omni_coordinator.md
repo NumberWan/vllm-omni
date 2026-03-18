@@ -17,10 +17,7 @@
 
 ### Data Parallelism Routing for vLLM‑Omni
 
-OmniCoordinator provides **data parallel routing** for vLLM‑Omni multi‑stage
-pipelines. It is a **singleton process** that collects status of all
-instances of all stages and publishes instance lists to AsyncOmni and API
-servers.
+OmniCoordinator provides **data parallel routing** for vLLM‑Omni multi‑stage pipelines. It is a **singleton process** that collects status of all instances of all stages and publishes instance lists to AsyncOmni and API servers.
 
 ---
 
@@ -29,12 +26,10 @@ servers.
 In enterprise deployments, it is often a must to:
 
 - Deploy **multiple replicas or instances** of each stage.
-- Dispatch incoming user requests to instances according to load balance
-  policies.
+- Dispatch incoming user requests to instances according to load balance policies.
 - Dynamically add or drop instances without restarting the whole service.
 
-OmniCoordinator addresses these requirements by acting as a central
-coordination service for **instance discovery**, **routing**, and **retry**.
+OmniCoordinator addresses these requirements by acting as a central coordination service for **instance discovery**, **routing**, and **retry**.
 
 ### Features
 
@@ -58,20 +53,17 @@ coordination service for **instance discovery**, **routing**, and **retry**.
 
 - Multiple API servers and stage instances to avoid single points of failure.
 - Stage instance **heartbeat mechanism**.
-- Request / task **retry mechanism** by selecting another instance on routing
-  failure.
+- Request / task **retry mechanism** by selecting another instance on routing failure.
 
 ### Performance
 
-- The goodput (TPS) of any stage should be roughly **proportional to the
-  number of instances** of that stage, assuming other resources are sufficient.
+- The goodput (TPS) of any stage should be roughly **proportional to the number of instances** of that stage, assuming other resources are sufficient.
 
 ---
 
 ## Architecture and APIs
 
-Multiple API servers, multiple stages, multiple instances. The overall design
-takes reference from vLLM.
+Multiple API servers, multiple stages, multiple instances. The overall design takes reference from vLLM.
 
 - **API Server**
   - OpenAI‑compatible HTTP API.
@@ -86,8 +78,7 @@ takes reference from vLLM.
 - **LoadBalancer**
   - Select target instances for tasks according to load balance policy.
 - **OmniCoordinator**
-  - Singleton process that collects status of all instances and publishes
-    instance lists to all AsyncOmni / API servers.
+  - Singleton process that collects status of all instances and publishes instance lists to all AsyncOmni / API servers.
   - Not the upstream vLLM OmniCoordinator; extra info is needed such as
     `stage_id` and ZMQ addresses of instances.
 - **StageCoreProc**
@@ -100,8 +91,7 @@ takes reference from vLLM.
 
 ### 1. Single node: all stages with DP
 
-- **Scenario**: A user just wants to quickly serve a model with data
-  parallelism.
+- **Scenario**: A user just wants to quickly serve a model with data parallelism.
 - **Configuration**:
   - In CLI, omit the stage‑related arguments (`--stage-id`) and coordinator
     related arguments (`--omni-dp-address`, `--omni-dp-rpc-port`).
@@ -110,8 +100,7 @@ takes reference from vLLM.
 
 ### 2. Multiple nodes: stages separated across nodes with DP
 
-- **Scenario**: A user wants to boost goodput and fine‑tune the performance of
-  each stage.
+- **Scenario**: A user wants to boost goodput and fine‑tune the performance of each stage.
 - **Configuration**:
   - Provide `--stage-id` and all other `--omni-dp-*` arguments.
   - Add `--headless` for non‑head runtimes.
@@ -215,8 +204,7 @@ Package: `vllm_omni.distributed.omni_coordinator`
   - `ERROR`: instance encountered an error or timeout.
 - **OmniCoordinator**
   - Initializes with `router_zmq_addr`, `pub_zmq_addr`, `heartbeat_timeout`.
-  - Listens for instance events, handles heartbeat timeout, and publishes
-    instance lists.
+  - Listens for instance events, handles heartbeat timeout, and publishes instance lists.
   - `close()` cleans up ZMQ sockets and background threads.
 - **OmniCoordClientForStage**
   - Used in stage instances to send events to OmniCoordinator.
@@ -238,9 +226,7 @@ Package: `vllm_omni.distributed.omni_coordinator`
 
 ## Testing and Validation
 
-Implementation is covered by unit tests under
-`tests/distributed/omni_coordinator/`. When changing OmniCoordinator or
-related components, contributors should at least run these tests:
+Implementation is covered by unit tests under `tests/distributed/omni_coordinator/`. When changing OmniCoordinator or related components, contributors should at least run these tests:
 
 - `test_omni_coordinator.py`
   - Registration broadcast, heartbeat timeout handling, instance shutdown handling.
@@ -257,8 +243,7 @@ For end‑to‑end verification, you can also:
 - Scale the number of stage instances and confirm:
   - Requests are distributed across instances.
   - Failed instances are removed from routing after heartbeat timeout.
-  - Goodput (TPS) increases when adding more healthy instances, up to
-    hardware limits.
+  - Goodput (TPS) increases when adding more healthy instances, up to hardware limits.
 
 ---
 
