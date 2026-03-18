@@ -84,7 +84,7 @@ takes reference from vLLM.
   - Communicates with OmniCoordinator.
   - Collects status of all instances of all stages.
 - **LoadBalancer**
-  - Dispatches tasks according to load balance policy (Random).
+  - Select target instances for tasks according to load balance policy.
 - **OmniCoordinator**
   - Singleton process that collects status of all instances and publishes
     instance lists to all AsyncOmni / API servers.
