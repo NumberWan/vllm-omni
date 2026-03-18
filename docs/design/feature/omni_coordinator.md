@@ -111,13 +111,13 @@ Multiple API servers, multiple stages, multiple instances. The overall design ta
 
 - **Status**: The end-to-end CLI workflow in this section is **work in progress**. Some flags and flows described below are **not yet supported** by the current `vllm serve` entrypoint.
 
-- Started and managed by the **head** (`without --headless`) runtime (planned):
+- Started and managed by the **head** (`without --headless`) runtime:
 
 ```bash
 vllm serve <model> --omni
 ```
 
-- No separate startup command (planned).
+- No separate startup command.
 
 Currently supported flags (as of this repo version):
 
