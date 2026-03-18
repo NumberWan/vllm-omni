@@ -5,13 +5,10 @@
 ## Table of Contents
 
 - [Overview](#overview)
-- [Motivation](#motivation)
-- [Features](#features)
-- [Accuracy, Reliability, Performance](#accuracy-reliability-performance)
-- [Architecture](#architecture)
+- [Motivation and Goals](#motivation-and-goals)
+- [Architecture and APIs](#architecture-and-apis)
 - [Use Cases](#use-cases)
-- [API Design](#api-design)
-- [Test Cases](#test-cases)
+- [Testing and Validation](#testing-and-validation)
 - [References](#references)
 
 ---
@@ -27,7 +24,7 @@ servers.
 
 ---
 
-## Motivation
+## Motivation and Goals
 
 In enterprise deployments, it is often a must to:
 
@@ -39,9 +36,7 @@ In enterprise deployments, it is often a must to:
 OmniCoordinator addresses these requirements by acting as a central
 coordination service for **instance discovery**, **routing**, and **retry**.
 
----
-
-## Features
+### Features
 
 - **Support multiple API Servers**
 - **Support multiple instances among each stage**
@@ -49,12 +44,9 @@ coordination service for **instance discovery**, **routing**, and **retry**.
   - Instances can be added or dropped dynamically.
   - API servers can discover instances in real time.
 - **Task routing via LoadBalancer**
-  - Tasks are dispatched according to a load balance policy
-    (Random for now).
+  - Selects target instances for tasks according to a load balance policy.
 
----
-
-## Accuracy, Reliability, Performance
+### Accuracy, Reliability, Performance
 
 ### Accuracy
 
@@ -76,7 +68,7 @@ coordination service for **instance discovery**, **routing**, and **retry**.
 
 ---
 
-## Architecture
+## Architecture and APIs
 
 Multiple API servers, multiple stages, multiple instances. The overall design
 takes reference from vLLM.
@@ -154,8 +146,6 @@ on the same or different nodes, to provide additional instances for any stage
 (including stage 0).
 
 ---
-
-## API Design
 
 ### Modules
 
@@ -246,7 +236,7 @@ Package: `vllm_omni.distributed.omni_coordinator`
 
 ---
 
-## Test Cases
+## Testing and Validation
 
 Implementation is covered by unit tests under
 `tests/distributed/omni_coordinator/`. When changing OmniCoordinator or
@@ -284,4 +274,3 @@ For end‑to‑end verification, you can also:
   - `tests/distributed/omni_coordinator/test_omni_coord_client_for_stage.py`
   - `tests/distributed/omni_coordinator/test_omni_coord_client_for_hub.py`
   - `tests/distributed/omni_coordinator/test_load_balancer.py`
-
