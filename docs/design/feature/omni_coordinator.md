@@ -15,9 +15,9 @@
 
 ## Overview
 
-### Data Parallelism Routing for vLLM‑Omni
+### What is OmniCoordinator?
 
-OmniCoordinator provides **data parallel routing** for vLLM‑Omni multi‑stage pipelines. It is a **singleton process** that collects status of all instances of all stages and publishes instance lists to AsyncOmni and API servers.
+OmniCoordinator is a **singleton control-plane process** that provides **data-parallel routing** for vLLM‑Omni multi‑stage pipelines. It aggregates liveness and load signals (e.g., status, queue length, heartbeats) from all stage instances, then publishes an up‑to‑date instance list to AsyncOmni and API servers for **instance discovery**, **routing**, and **retry**.
 
 ---
 
