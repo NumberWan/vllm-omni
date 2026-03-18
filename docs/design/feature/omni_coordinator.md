@@ -167,7 +167,8 @@ on the same or different nodes, to provide additional instances for any stage
 
 ```json
 {
-  "zmq_addr": "tcp://host:port",
+  "input_addr": "tcp://host:port",
+  "output_addr": "tcp://host:port",
   "stage_id": 0,
   "status": "up | down | error",
   "queue_length": 5,
@@ -182,7 +183,8 @@ OmniCoordinator → `OmniCoordClientForHub` (AsyncOmni):
 {
   "instances": [
     {
-      "zmq_addr": "tcp://host:port",
+      "input_addr": "tcp://host:port",
+      "output_addr": "tcp://host:port",
       "stage_id": 0,
       "status": "up | down | error",
       "queue_length": 5,
