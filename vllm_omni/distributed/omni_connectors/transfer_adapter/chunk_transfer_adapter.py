@@ -236,6 +236,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.put_req_chunk[request_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
 
+        if is_finished:
+            self.code_prompt_token_ids.pop(request_id, None)
+            cached_ic = getattr(self, "_cached_ic", None)
+            if cached_ic is not None:
+                cached_ic.pop(request_id, None)
+
     ########################################################################
     # Cleanup
     ########################################################################
@@ -269,6 +275,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
+
+        cached_ic = getattr(self, "_cached_ic", None)
+        if cached_ic is not None:
+            cached_ic.pop(external_req_id, None)
 
     ########################################################################
     # Schedule Helper
