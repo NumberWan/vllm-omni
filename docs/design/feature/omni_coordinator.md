@@ -6,7 +6,7 @@
 
 - [Overview](#overview)
 - [Motivation and Goals](#motivation-and-goals)
-- [Architecture and APIs](#architecture-and-apis)
+- [Architecture](#architecture)
 - [Use Cases](#use-cases)
 - [References](#references)
 
@@ -60,7 +60,7 @@ OmniCoordinator addresses these requirements by acting as a central coordination
 
 ---
 
-## Architecture and APIs
+## Architecture
 
 Multiple API servers, multiple stages, multiple instances. The overall design takes reference from vLLM.
 
