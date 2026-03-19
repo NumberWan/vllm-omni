@@ -8,7 +8,6 @@
 - [Motivation and Goals](#motivation-and-goals)
 - [Architecture and APIs](#architecture-and-apis)
 - [Use Cases](#use-cases)
-- [Testing and Validation](#testing-and-validation)
 - [References](#references)
 
 ---
@@ -65,6 +64,12 @@ OmniCoordinator addresses these requirements by acting as a central coordination
 
 Multiple API servers, multiple stages, multiple instances. The overall design takes reference from vLLM.
 
+<p align="center">
+  <picture>
+    <img alt="OmniCoordinator architecture diagram" src="/source/architecture/omni-coordinator-architecture.png" width=55%>
+  </picture>
+</p>
+
 - **API Server**
   - OpenAI‑compatible HTTP API.
   - Supports multiple deployments to prevent single point of failure.
@@ -93,8 +98,8 @@ Multiple API servers, multiple stages, multiple instances. The overall design ta
 
 - **Scenario**: A user just wants to quickly serve a model with data parallelism.
 - **Configuration**:
-  - In CLI, omit the stage‑related arguments (`--stage-id`) and coordinator
-    related arguments (`--omni-dp-address`, `--omni-dp-rpc-port`).
+  - In CLI, run `vllm serve <model> --omni` on the head runtime.
+  - Note: the DP-specific `--omni-dp-*` flags described in this doc are planned but not yet supported by the current `vllm serve` entrypoint.
 - **Benefits**:
   - Simple to use.
 
@@ -102,7 +107,8 @@ Multiple API servers, multiple stages, multiple instances. The overall design ta
 
 - **Scenario**: A user wants to boost goodput and fine‑tune the performance of each stage.
 - **Configuration**:
-  - Provide `--stage-id` and all other `--omni-dp-*` arguments.
+  - Provide `--stage-id` and the currently supported master address flags (`--omni-master-address`, `--omni-master-port`).
+  - Note: additional `--omni-dp-*` flags described in this doc are planned but not yet supported by the current `vllm serve` entrypoint.
   - Add `--headless` for non‑head runtimes.
 - **Benefits**:
   - Flexible: stages and their replicas can be placed across nodes.
@@ -111,13 +117,8 @@ Multiple API servers, multiple stages, multiple instances. The overall design ta
 
 - **Status**: The end-to-end CLI workflow in this section is **work in progress**. Some flags and flows described below are **not yet supported** by the current `vllm serve` entrypoint.
 
-- Started and managed by the **head** (`without --headless`) runtime:
-
-```bash
-vllm serve <model> --omni
-```
-
-- No separate startup command.
+- Started and managed by the **head** (`without --headless`) runtime (planned).
+- No separate startup command (planned).
 
 Currently supported flags (as of this repo version):
 
@@ -154,107 +155,6 @@ on the same or different nodes, to provide additional instances for any stage
 | **OmniCoordClientForStage** | Used in stage instance side for sending events to OmniCoordinator                                         | Yes   |
 | **OmniCoordClientForHub**   | Used on the AsyncOmni side for receiving stage instance list and their status (Instance Discovery)        | Yes   |
 | **StageCoreProc**           | Stage instance top‑level controller; receives tasks and sends events to OmniCoordinator                    | No    |
-
-### Message Protocol (control plane)
-
-**Task** (AsyncOmni → StageCoreProc, simplified example):
-
-```json
-{
-  "session_id": "uuid-string",
-  "request_id": "uuid-string",
-  "sampling_params": { ... },
-  "retry_count": 0,
-  "user_inputs": { ... }
-}
-```
-
-**Instance Event**  
-`OmniCoordClientForStage` (StageCoreProc) → OmniCoordinator:
-
-```json
-{
-  "input_addr": "tcp://host:port",
-  "output_addr": "tcp://host:port",
-  "stage_id": 0,
-  "status": "up | down | error",
-  "queue_length": 5,
-  "event_type": "update | heartbeat"
-}
-```
-
-**Instance List**  
-OmniCoordinator → `OmniCoordClientForHub` (AsyncOmni):
-
-```json
-{
-  "instances": [
-    {
-      "input_addr": "tcp://host:port",
-      "output_addr": "tcp://host:port",
-      "stage_id": 0,
-      "status": "up | down | error",
-      "queue_length": 5,
-      "last_heartbeat": 12578.1,
-      "registered_at": 2354.4
-    }
-  ],
-  "timestamp": 12345.6
-}
-```
-
-### Major API
-
-Package: `vllm_omni.distributed.omni_coordinator`
-
-- **InstanceStatus**
-  - `UP`: instance is ready and available.
-  - `DOWN`: instance is shut down gracefully.
-  - `ERROR`: instance encountered an error or timeout.
-- **OmniCoordinator**
-  - Initializes with `router_zmq_addr`, `pub_zmq_addr`, `heartbeat_timeout`.
-  - Listens for instance events, handles heartbeat timeout, and publishes instance lists.
-  - `close()` cleans up ZMQ sockets and background threads.
-- **OmniCoordClientForStage**
-  - Used in stage instances to send events to OmniCoordinator.
-  - Automatically registers on `__init__`.
-  - `update_info(status, queue_length)` sends status / load updates.
-  - `close()` sends a final `DOWN` event and closes the socket.
-- **OmniCoordClientForHub**
-  - Used on AsyncOmni side to receive instance lists.
-  - Subscribes to OmniCoordinator via PUB/SUB.
-  - `get_instance_list()` returns current cached list.
-  - `get_instances_for_stage(stage_id)` filters by stage id.
-  - `close()` closes the SUB socket and stops background thread.
-- **LoadBalancer**
-  - Abstract base class with:
-    - `select(task, instances) -> int`
-  - `RandomBalancer` is a simple implementation that returns a random index.
-
----
-
-## Testing and Validation
-
-Implementation is covered by unit tests under `tests/distributed/omni_coordinator/`. When changing OmniCoordinator or related components, contributors should at least run these tests:
-
-- `test_omni_coordinator.py`
-  - Registration broadcast, heartbeat timeout handling, instance shutdown handling.
-- `test_load_balancer.py`
-  - Basic sanity checks for `LoadBalancer.select()`.
-- `test_omni_coord_client_for_stage.py`
-  - Auto‑registration on init, status / queue length updates, graceful close.
-- `test_omni_coord_client_for_hub.py`
-  - Caching of instance lists, filtering by `stage_id`, close behavior.
-
-For end‑to‑end verification, you can also:
-
-- Start an **omni** serving deployment with DP>1 (single node or multi‑node).
-- Scale the number of stage instances and confirm:
-  - Requests are distributed across instances.
-  - Failed instances are removed from routing after heartbeat timeout.
-  - Goodput (TPS) increases when adding more healthy instances, up to hardware limits.
-
----
 
 ## References
 
