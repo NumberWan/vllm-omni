@@ -66,7 +66,8 @@ Multiple API servers, multiple stages, multiple instances. The overall design ta
 
 <p align="center">
   <picture>
-    <img alt="OmniCoordinator architecture diagram" src="/source/architecture/omni-coordinator-architecture.png" width=55%>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-coordinator-architecture.png">
+    <img alt="OmniCoordinator architecture diagram" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-coordinator-architecture.png" width=55%>
   </picture>
 </p>
 
@@ -162,7 +163,7 @@ on the same or different nodes, to provide additional instances for any stage
   - `vllm_omni/distributed/omni_coordinator/omni_coordinator.py`
   - `vllm_omni/distributed/omni_coordinator/omni_coord_client_for_stage.py`
   - `vllm_omni/distributed/omni_coordinator/omni_coord_client_for_hub.py`
-  - `vllm_omni/distributed/omni_coordinator/messages.py`
+  - `vllm_omni/distributed/omni_coordinator/load_balancer.py`
 - **Tests**:
   - `tests/distributed/omni_coordinator/test_omni_coordinator.py`
   - `tests/distributed/omni_coordinator/test_omni_coord_client_for_stage.py`
