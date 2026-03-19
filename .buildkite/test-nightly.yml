@@ -150,7 +150,7 @@ steps:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
                   - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
-                    value: "60"
+                    value: "120"
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:
