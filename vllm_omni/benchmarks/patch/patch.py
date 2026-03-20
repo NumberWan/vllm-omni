@@ -129,6 +129,7 @@ async def async_request_openai_chat_omni_completions(
         audio_generate_time = 0.0
         output.itl = []
         output.generated_text = ""
+        output.ttft = 0.0
         output.audio_ttfp = 0.0
         output.audio_duration = 0.0
         output.audio_frames = 0
