@@ -221,7 +221,7 @@ async def async_request_openai_chat_omni_completions(
                     attempt + 1,
                     max_retries + 1,
                     retry_delay,
-                    str(e)
+                    str(e),
                 )
                 await asyncio.sleep(retry_delay)
                 continue
