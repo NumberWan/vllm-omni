@@ -218,7 +218,10 @@ async def async_request_openai_chat_omni_completions(
             if attempt < max_retries:
                 logger.warning(
                     "ClientError in omni benchmark request (will retry): attempt=%d/%d delay=%.2fs: %s",
-                    attempt + 1, max_retries + 1, retry_delay, str(e),
+                    attempt + 1,
+                    max_retries + 1,
+                    retry_delay,
+                    str(e)
                 )
                 await asyncio.sleep(retry_delay)
                 continue
