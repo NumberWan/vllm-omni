@@ -211,17 +211,14 @@ async def async_request_openai_chat_omni_completions(
                     output.error = response.reason or ""
                     output.success = False
             break
-        except aiohttp.ClientError:
+        except aiohttp.ClientError as e:
             # transient transport error: may retry
             output.success = False
             output.error = traceback.format_exc()
             if attempt < max_retries:
                 logger.warning(
-                    "ClientError in omni benchmark request (will retry): attempt=%d/%d delay=%.2fs\n%s",
-                    attempt + 1,
-                    max_retries + 1,
-                    retry_delay,
-                    output.error,
+                    "ClientError in omni benchmark request (will retry): attempt=%d/%d delay=%.2fs: %s",
+                    attempt + 1, max_retries + 1, retry_delay, str(e),
                 )
                 await asyncio.sleep(retry_delay)
                 continue
