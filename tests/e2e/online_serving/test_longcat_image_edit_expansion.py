@@ -8,8 +8,7 @@ Coverage:
 - SP (Ulysses)
 
 This validates:
- - The presence of all supported diffusion features in the generation request
- - Successful image generation at the expected 1024x1024 resolution
+ - Successful image generation at the expected 1024x1024 resolution with recommended feature combinations
 """
 
 import pytest
