@@ -9,7 +9,7 @@ Coverage:
 
 This validates:
  - The presence of all supported diffusion features in the generation request
- - Successful image generation at the expected 512x512 resolution
+ - Successful image generation at the expected 1024x1024 resolution
 """
 
 import pytest
@@ -72,8 +72,8 @@ def test_longcat_image_edit(omni_server: OmniServer, openai_client: OpenAIClient
         "model": omni_server.model,
         "messages": messages,
         "extra_body": {
-            "height": 512,
-            "width": 512,
+            "height": 1024,
+            "width": 1024,
             "num_inference_steps": 2,
             "negative_prompt": NEGATIVE_PROMPT,
             "guidance_scale": 4.0,
