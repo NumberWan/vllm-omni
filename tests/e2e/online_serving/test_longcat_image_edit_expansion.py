@@ -1,5 +1,5 @@
 """
-Comprehensive tests of diffusion features that are available in online serving mode
+Recommended tests of diffusion features that are available in online serving mode
 and are supported by the following model:
 - LongCat-Image-Edit: image-to-image edit with a single image + single edit prompt input
 Coverage:
@@ -36,7 +36,7 @@ def _get_diffusion_feature_cases(model: str):
                 model=model,
                 server_args=["--enable-cpu-offload"],
             ),
-            id="single_card_cpu_offload",
+            id="single_card_001",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
         pytest.param(
