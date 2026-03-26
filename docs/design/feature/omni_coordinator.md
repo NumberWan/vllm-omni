@@ -77,7 +77,13 @@ OmniCoordinator addresses these requirements by acting as a central coordination
 
 Multiple API servers, multiple stages, multiple instances. The overall design takes reference from vLLM.
 
-
+<p align="center">
+  <picture>
+    <img alt="OmniCoordinator architecture diagram" src="/source/architecture/omni-coordinator-architecture.png" width=55%>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-coordinator-architecture.png">
+    <img alt="OmniCoordinator architecture diagram" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-coordinator-architecture.png" width=55%>
+  </picture>
+</p>
 
 - **API Server**
   - OpenAI‑compatible HTTP API.
