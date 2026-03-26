@@ -63,7 +63,7 @@ OmniCoordinator addresses these requirements by acting as a central coordination
 
 ### Reliability
 
-- Multiple API servers and stage instances to avoid single points of failure.
+- Multiple API servers and stage instances to avoid single points of failure. [Planned]
 - Stage instance **heartbeat mechanism**. [Implemented]
 - Request / task **retry mechanism** by selecting another instance on routing failure. [Planned]
 
