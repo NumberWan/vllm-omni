@@ -11,6 +11,19 @@
 - [References](#references)
 
 ---
+## Implementation Status (v0.18.0)
+
+### Implemented
+- **OmniCoordinator**
+- **LoadBalancer** 
+- **OmniCoordClientForStage**
+- **OmniCoordClientForHub**
+### Not completed yet
+- End-to-end DP router integration in `vllm serve` path
+- Full request-path routing/retry orchestration across all deployment modes
+- Planned CLI flags wiring for `--omni-dp-*`
+
+
 
 ## Overview
 
@@ -24,7 +37,7 @@ OmniCoordinator is a **singleton control-plane process** that provides **data-pa
 
 In enterprise deployments, it is often a must to:
 
-- Deploy **multiple replicas or instances** of each stage.
+- Deploy **multiple replicas or instances** of each stage. 
 - Dispatch incoming user requests to instances according to load balance policies.
 - Dynamically add or drop instances without restarting the whole service.
 
@@ -32,12 +45,12 @@ OmniCoordinator addresses these requirements by acting as a central coordination
 
 ### Features
 
-- **Support multiple API Servers**
-- **Support multiple instances among each stage**
-- **Automatic instance discovery**
+- **Support multiple API Servers** [Planned]
+- **Support multiple instances among each stage** [Planned]
+- **Automatic instance discovery**  [Implemented]
   - Instances can be added or dropped dynamically.
   - API servers can discover instances in real time.
-- **Task routing via LoadBalancer**
+- **Task routing via LoadBalancer** [Implemented]
   - Selects target instances for tasks according to a load balance policy.
 
 ### Accuracy, Reliability, Performance
@@ -45,14 +58,14 @@ OmniCoordinator addresses these requirements by acting as a central coordination
 ### Accuracy
 
 - There is **no difference in end‑to‑end output** of the same request between:
-  - DP enabled (DP > 1) and
-  - DP disabled (DP = 1) modes.
+  - DP enabled (DP > 1) and [Planned]
+  - DP disabled (DP = 1) modes. [Planned]
 
 ### Reliability
 
 - Multiple API servers and stage instances to avoid single points of failure.
-- Stage instance **heartbeat mechanism**.
-- Request / task **retry mechanism** by selecting another instance on routing failure.
+- Stage instance **heartbeat mechanism**. [Implemented]
+- Request / task **retry mechanism** by selecting another instance on routing failure. [Planned]
 
 ### Performance
 
@@ -64,12 +77,7 @@ OmniCoordinator addresses these requirements by acting as a central coordination
 
 Multiple API servers, multiple stages, multiple instances. The overall design takes reference from vLLM.
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-coordinator-architecture.png">
-    <img alt="OmniCoordinator architecture diagram" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-coordinator-architecture.png" width=55%>
-  </picture>
-</p>
+
 
 - **API Server**
   - OpenAI‑compatible HTTP API.
@@ -86,7 +94,7 @@ Multiple API servers, multiple stages, multiple instances. The overall design ta
 - **OmniCoordinator**
   - Singleton process that collects status of all instances and publishes instance lists to all AsyncOmni / API servers.
   - Not the upstream vLLM OmniCoordinator; extra info is needed such as
-    `stage_id` and ZMQ addresses of instances.
+  `stage_id` and ZMQ addresses of instances.
 - **StageCoreProc**
   - Stage instance top‑level controller.
   - Receives tasks and sends events to OmniCoordinator.
@@ -95,29 +103,28 @@ Multiple API servers, multiple stages, multiple instances. The overall design ta
 
 ## Use Cases
 
-### 1. Single node: all stages with DP
+### 1. Single node: all stages with DP [Planned]
 
 - **Scenario**: A user just wants to quickly serve a model with data parallelism.
 - **Configuration**:
   - In CLI, run `vllm serve <model> --omni` on the head runtime.
-  - Note: the DP-specific `--omni-dp-*` flags described in this doc are planned but not yet supported by the current `vllm serve` entrypoint.
+  - Note: the DP-specific `--omni-dp-`* flags described in this doc are planned but not yet supported by the current `vllm serve` entrypoint.
 - **Benefits**:
   - Simple to use.
 
-### 2. Multiple nodes: stages separated across nodes with DP
+### 2. Multiple nodes: stages separated across nodes with DP [Planned]
 
 - **Scenario**: A user wants to boost goodput and fine‑tune the performance of each stage.
 - **Configuration**:
   - Provide `--stage-id` and the currently supported master address flags (`--omni-master-address`, `--omni-master-port`).
-  - Note: additional `--omni-dp-*` flags described in this doc are planned but not yet supported by the current `vllm serve` entrypoint.
+  - Note: additional `--omni-dp-`* flags described in this doc are planned but not yet supported by the current `vllm serve` entrypoint.
   - Add `--headless` for non‑head runtimes.
 - **Benefits**:
   - Flexible: stages and their replicas can be placed across nodes.
 
-### OmniCoordinator process lifecycle
+### OmniCoordinator process lifecycle [Planned]
 
 - **Status**: The end-to-end CLI workflow in this section is **work in progress**. Some flags and flows described below are **not yet supported** by the current `vllm serve` entrypoint.
-
 - Started and managed by the **head** (`without --headless`) runtime (planned).
 - No separate startup command (planned).
 
@@ -147,15 +154,17 @@ on the same or different nodes, to provide additional instances for any stage
 
 ### Modules
 
-| Module                      | Description                                                                                                | New?  |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------- | ----- |
-| **API Server**              | OpenAI‑compatible HTTP API interface, supporting multiple deployments                                     | No    |
-| **AsyncOmni**               | Python API interface, request / task lifecycle management with retry mechanism                             | No    |
-| **LoadBalancer**            | Base class of routing tasks (subclass like `RandomBalancer`)                                              | Yes   |
-| **OmniCoordinator**         | Singleton process aggregating instance status and publishing instance list                                 | Yes   |
-| **OmniCoordClientForStage** | Used in stage instance side for sending events to OmniCoordinator                                         | Yes   |
-| **OmniCoordClientForHub**   | Used on the AsyncOmni side for receiving stage instance list and their status (Instance Discovery)        | Yes   |
-| **StageCoreProc**           | Stage instance top‑level controller; receives tasks and sends events to OmniCoordinator                    | No    |
+
+| Module                      | Description                                                                                        | New? |
+| --------------------------- | -------------------------------------------------------------------------------------------------- | ---- |
+| **API Server**              | OpenAI‑compatible HTTP API interface, supporting multiple deployments                              | No   |
+| **AsyncOmni**               | Python API interface, request / task lifecycle management with retry mechanism                     | No   |
+| **LoadBalancer**            | Base class of routing tasks (subclass like `RandomBalancer`)                                       | Yes  |
+| **OmniCoordinator**         | Singleton process aggregating instance status and publishing instance list                         | Yes  |
+| **OmniCoordClientForStage** | Used in stage instance side for sending events to OmniCoordinator                                  | Yes  |
+| **OmniCoordClientForHub**   | Used on the AsyncOmni side for receiving stage instance list and their status (Instance Discovery) | Yes  |
+| **StageCoreProc**           | Stage instance top‑level controller; receives tasks and sends events to OmniCoordinator            | No   |
+
 
 ## References
 
@@ -169,3 +178,4 @@ on the same or different nodes, to provide additional instances for any stage
   - `tests/distributed/omni_coordinator/test_omni_coord_client_for_stage.py`
   - `tests/distributed/omni_coordinator/test_omni_coord_client_for_hub.py`
   - `tests/distributed/omni_coordinator/test_load_balancer.py`
+
