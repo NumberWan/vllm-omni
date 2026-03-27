@@ -15,7 +15,7 @@
 
 ### Implemented
 - **OmniCoordinator**
-- **LoadBalancer** 
+- **LoadBalancer**
 - **OmniCoordClientForStage**
 - **OmniCoordClientForHub**
 ### Not completed yet
