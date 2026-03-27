@@ -37,7 +37,7 @@ OmniCoordinator is a **singleton control-plane process** that provides **data-pa
 
 In enterprise deployments, it is often a must to:
 
-- Deploy **multiple replicas or instances** of each stage. 
+- Deploy **multiple replicas or instances** of each stage.
 - Dispatch incoming user requests to instances according to load balance policies.
 - Dynamically add or drop instances without restarting the whole service.
 
@@ -184,4 +184,3 @@ on the same or different nodes, to provide additional instances for any stage
   - `tests/distributed/omni_coordinator/test_omni_coord_client_for_stage.py`
   - `tests/distributed/omni_coordinator/test_omni_coord_client_for_hub.py`
   - `tests/distributed/omni_coordinator/test_load_balancer.py`
-
