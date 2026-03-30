@@ -114,7 +114,7 @@ Multiple API servers, multiple stages, multiple instances. The overall design ta
 - **Scenario**: A user just wants to quickly serve a model with data parallelism.
 - **Configuration**:
   - In CLI, run `vllm serve <model> --omni` on the head runtime.
-  - Note: the DP-specific `--omni-dp-`* flags described in this doc are planned but not yet supported by the current `vllm serve` entrypoint.
+  - Note: the DP-specific `--omni-dp-*` flags described in this doc are planned but not yet supported by the current `vllm serve` entrypoint.
 - **Benefits**:
   - Simple to use.
 
