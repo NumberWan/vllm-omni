@@ -29,7 +29,7 @@
 
 ### What is OmniCoordinator?
 
-OmniCoordinator is a **singleton control-plane process** that provides **data-parallel routing** for vLLM‑Omni multi‑stage pipelines. It aggregates liveness and load signals (e.g., status, queue length, heartbeats) from all stage instances, then publishes an up‑to‑date instance list to AsyncOmni and API servers for **instance discovery**, **routing**, and **retry**.
+OmniCoordinator is a **singleton control-plane process** for vLLM‑Omni **multi-stage pipelines with multiple replicas per stage**. It aggregates liveness and load signals (e.g., status, queue length, heartbeats) from all stage instances, then publishes an up‑to‑date instance list to AsyncOmni and API servers for **instance discovery**. **Routing** and **retry** are handled in other layers (for example `LoadBalancer` and AsyncOmni) using that instance view, rather than by OmniCoordinator acting as the traffic router itself.
 
 ---
 
@@ -92,9 +92,8 @@ Multiple API servers, multiple stages, multiple instances. The overall design is
 - **AsyncOmni**
   - Python API.
   - Request / task lifecycle management with retry mechanism.
-- **Instance Discovery**
-  - Communicates with OmniCoordinator.
-  - Collects status of all instances of all stages.
+- **Instance discovery (`OmniCoordClientForHub`)**
+  - On the AsyncOmni side; receives the stage instance list and instance status from OmniCoordinator.
 - **LoadBalancer**
   - Select target instances for tasks according to load balance policy.
 - **OmniCoordinator**
@@ -103,7 +102,7 @@ Multiple API servers, multiple stages, multiple instances. The overall design is
   `stage_id` and ZMQ addresses of instances.
 - **StageCoreProc**
   - Stage instance top‑level controller.
-  - Receives tasks and sends events to OmniCoordinator.
+  - Receives tasks and reports to OmniCoordinator via `OmniCoordClientForStage`.
 
 ---
 
@@ -157,20 +156,6 @@ on the same or different nodes, to provide additional instances for any stage
 (including stage 0).
 
 ---
-
-### Modules
-
-
-| Module                      | Description                                                                                        | New? |
-| --------------------------- | -------------------------------------------------------------------------------------------------- | ---- |
-| **API Server**              | OpenAI‑compatible HTTP API interface, supporting multiple deployments                              | No   |
-| **AsyncOmni**               | Python API interface, request / task lifecycle management with retry mechanism                     | No   |
-| **LoadBalancer**            | Base class of routing tasks (subclass like `RandomBalancer`)                                       | Yes  |
-| **OmniCoordinator**         | Singleton process aggregating instance status and publishing instance list                         | Yes  |
-| **OmniCoordClientForStage** | Used in stage instance side for sending events to OmniCoordinator                                  | Yes  |
-| **OmniCoordClientForHub**   | Used on the AsyncOmni side for receiving stage instance list and their status (Instance Discovery) | Yes  |
-| **StageCoreProc**           | Stage instance top‑level controller; receives tasks and sends events to OmniCoordinator            | No   |
-
 
 ## References
 
