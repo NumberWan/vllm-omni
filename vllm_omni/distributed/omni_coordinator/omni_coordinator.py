@@ -61,6 +61,7 @@ class OmniCoordinator:
 
         self._publish_min_interval: float = 0.1  # seconds
         self._pending_broadcast: bool = False
+        self._pending_lock = threading.Lock()
 
         self._running = True
         self._closed = False
@@ -103,8 +104,13 @@ class OmniCoordinator:
             self._remove_instance_locked(event)
         self._schedule_broadcast()
 
-    def publish_instance_list_update(self) -> None:
-        """Publish the current active instance list to all subscribers."""
+    def publish_instance_list_update(self) -> bool:
+        """Publish the current active instance list to all subscribers.
+
+        Returns:
+            True if the PUB send succeeded, False if it was dropped (e.g.
+            socket not ready when using ``zmq.NOBLOCK``).
+        """
         active_list = self.get_active_instances()
         payload = asdict(active_list)
         data = json.dumps(payload).encode("utf-8")
@@ -113,9 +119,10 @@ class OmniCoordinator:
             try:
                 # PUB socket is best-effort; drop update if not ready.
                 self._pub.send(data, flags=zmq.NOBLOCK)
+                return True
             except (zmq.Again, zmq.ZMQError):
                 # Silently ignore send failures; next update will catch up.
-                return
+                return False
 
     def _schedule_broadcast(self) -> None:
         """Request a broadcast to be flushed by the periodic loop.
@@ -123,7 +130,8 @@ class OmniCoordinator:
         All broadcast requests are coalesced via ``_pending_broadcast`` and
         flushed at most once per ``_publish_min_interval``.
         """
-        self._pending_broadcast = True
+        with self._pending_lock:
+            self._pending_broadcast = True
 
     def _mark_instance_error_locked(self, info: InstanceInfo) -> None:
         """Mark instance as ERROR (e.g. after heartbeat timeout)."""
@@ -239,9 +247,21 @@ class OmniCoordinator:
                 self._check_heartbeat_timeouts()
                 last_heartbeat_check = now
 
-            if self._pending_broadcast:
-                self.publish_instance_list_update()
-                self._pending_broadcast = False
+            # Atomically "consume" a pending publish request so we don't
+            # clobber a new request that arrives while we are sending.
+            flush_pending_broadcast = False
+            with self._pending_lock:
+                if self._pending_broadcast:
+                    flush_pending_broadcast = True
+                    self._pending_broadcast = False
+
+            if flush_pending_broadcast:
+                send_succeeded = self.publish_instance_list_update()
+                # If the PUB send failed, keep the pending request for the
+                # next periodic iteration.
+                if not send_succeeded:
+                    with self._pending_lock:
+                        self._pending_broadcast = True
 
             if self._stop_event.wait(timeout=loop_interval):
                 break
