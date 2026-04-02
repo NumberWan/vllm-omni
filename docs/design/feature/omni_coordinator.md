@@ -123,7 +123,7 @@ Multiple API servers, multiple stages, multiple instances. The overall design ta
 - **Scenario**: A user wants to boost goodput and fine‑tune the performance of each stage.
 - **Configuration**:
   - Provide `--stage-id` and the currently supported master address flags (`--omni-master-address`, `--omni-master-port`).
-  - Note: additional `--omni-dp-`* flags described in this doc are planned but not yet supported by the current `vllm serve` entrypoint.
+  - Note: additional `--omni-dp-*` flags described in this doc are planned but not yet supported by the current `vllm serve` entrypoint.
   - Add `--headless` for non‑head runtimes.
 - **Benefits**:
   - Flexible: stages and their replicas can be placed across nodes.
