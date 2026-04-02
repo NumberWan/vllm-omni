@@ -41,7 +41,7 @@ In enterprise deployments, it is often a must to:
 - Dispatch incoming user requests to instances according to load balance policies.
 - Dynamically add or drop instances without restarting the whole service.
 
-OmniCoordinator addresses these requirements by acting as a central coordination service for **instance discovery**, **routing**, and **retry**.
+OmniCoordinator addresses these requirements by acting as a central coordination service for **instance discovery**.
 
 ### Features
 
@@ -53,7 +53,7 @@ OmniCoordinator addresses these requirements by acting as a central coordination
 - **Task routing via LoadBalancer** [Implemented]
   - Selects target instances for tasks according to a load balance policy.
 
-### Accuracy, Reliability, Performance
+## Accuracy, Reliability, Performance
 
 ### Accuracy
 
@@ -75,7 +75,7 @@ OmniCoordinator addresses these requirements by acting as a central coordination
 
 ## Architecture
 
-Multiple API servers, multiple stages, multiple instances. The overall design takes reference from vLLM.
+Multiple API servers, multiple stages, multiple instances. The overall design is inspired by vLLM.
 
 <p align="center">
   <picture>
