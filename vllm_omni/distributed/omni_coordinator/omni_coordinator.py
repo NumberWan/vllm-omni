@@ -247,21 +247,16 @@ class OmniCoordinator:
                 self._check_heartbeat_timeouts()
                 last_heartbeat_check = now
 
-            # Atomically "consume" a pending publish request so we don't
-            # clobber a new request that arrives while we are sending.
-            flush_pending_broadcast = False
             with self._pending_lock:
-                if self._pending_broadcast:
-                    flush_pending_broadcast = True
-                    self._pending_broadcast = False
+                if not self._pending_broadcast:
+                    if self._stop_event.wait(timeout=loop_interval):
+                        break
+                    continue
 
-            if flush_pending_broadcast:
-                send_succeeded = self.publish_instance_list_update()
-                # If the PUB send failed, keep the pending request for the
-                # next periodic iteration.
-                if not send_succeeded:
-                    with self._pending_lock:
-                        self._pending_broadcast = True
+            # Publish outside lock. Clear pending only on success.
+            if self.publish_instance_list_update():
+                with self._pending_lock:
+                    self._pending_broadcast = False
 
             if self._stop_event.wait(timeout=loop_interval):
                 break
