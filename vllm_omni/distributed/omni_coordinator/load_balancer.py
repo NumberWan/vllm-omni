@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import threading
 import random
+import threading
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, TypedDict
@@ -29,6 +29,9 @@ class LoadBalancingPolicy(str, Enum):
 
     These policies are used by :class:`LoadBalancer` implementations to route
     tasks to a subset of available instances.
+
+    TODO(NumberWan): Map enum values to balancer classes when OmniCoordinator
+    integration lands. Tracked in https://github.com/vllm-project/vllm-omni/pull/2448
     """
 
     RANDOM = "random"
@@ -80,8 +83,22 @@ class RandomBalancer(LoadBalancer):
 class RoundRobinBalancer(LoadBalancer):
     """Load balancer that selects instances in a round-robin fashion.
 
-    Note: this relies on the ordering of the ``instances`` list passed into
-    :meth:`select`. It maintains internal state across calls.
+    This implementation keeps a running index modulo ``len(instances)``. It
+    therefore depends on the **order and stable meaning** of the ``instances``
+    list between calls. If the list length or ordering changes, the sequence
+    of picks may skip or repeat entries relative to a fixed set of backends.
+
+    When instance membership changes dynamically, callers should reset routing
+    state—for example by constructing a new ``RoundRobinBalancer`` or resetting
+    ``_next_index``—similar to rebuilding ``itertools.cycle`` after mutating
+    the instance list (as in vLLM's disaggregated proxy examples).
+
+    Concurrency: ``select`` is synchronous and is expected to run on the
+    coordinator asyncio event loop thread without ``await`` inside this
+    method, so a single invocation is not interleaved with another on that
+    thread. A :class:`threading.Lock` still serializes updates to
+    ``_next_index`` for callers that might invoke ``select`` from multiple
+    threads or alongside threaded infrastructure (e.g. ZMQ receive threads).
     """
 
     def __init__(self, start_index: int = 0) -> None:
@@ -92,11 +109,10 @@ class RoundRobinBalancer(LoadBalancer):
         if not instances:
             raise ValueError("instances must not be empty")
 
-        # Ensure state updates are consistent even if select() is called
-        # concurrently from multiple coroutines/threads.
+        n = len(instances)
         with self._lock:
-            idx = self._next_index % len(instances)
-            self._next_index += 1
+            idx = self._next_index % n
+            self._next_index = (self._next_index + 1) % n
         return idx
 
 
@@ -105,13 +121,18 @@ class LeastQueueLengthBalancer(LoadBalancer):
 
     If multiple instances share the same minimum queue length, one of them is
     chosen uniformly at random.
+
+    Raises:
+        ValueError: If any instance has a negative ``queue_length``.
     """
 
     def select(self, task: Task, instances: list[InstanceInfo]) -> int:  # noqa: ARG002
         if not instances:
             raise ValueError("instances must not be empty")
 
-        queue_lengths = [max(0, int(inst.queue_length)) for inst in instances]
+        queue_lengths = [inst.queue_length for inst in instances]
+        if any(q < 0 for q in queue_lengths):
+            raise ValueError("queue_length must be non-negative for all instances")
         min_q = min(queue_lengths)
         candidates = [i for i, q in enumerate(queue_lengths) if q == min_q]
         return random.choice(candidates)
