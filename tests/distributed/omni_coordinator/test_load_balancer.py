@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from time import time
-from unittest.mock import patch
 
 import pytest
 
@@ -13,6 +12,8 @@ from vllm_omni.distributed.omni_coordinator import (
     RoundRobinBalancer,
     StageStatus,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_load_balancer_select_returns_valid_index():
@@ -177,7 +178,7 @@ def test_least_queue_length_balancer_empty_instances_raises():
         LeastQueueLengthBalancer().select({}, [])
 
 
-def test_least_queue_length_balancer_equal_queues_uses_choice():
+def test_least_queue_length_balancer_equal_queues_uses_choice(mocker):
     now = time()
     instances = [
         InstanceInfo(
@@ -209,8 +210,11 @@ def test_least_queue_length_balancer_equal_queues_uses_choice():
         ),
     ]
     balancer = LeastQueueLengthBalancer()
-    with patch("vllm_omni.distributed.omni_coordinator.load_balancer.random.choice", return_value=2):
-        assert balancer.select({}, instances) == 2
+    mocker.patch(
+        "vllm_omni.distributed.omni_coordinator.load_balancer.random.choice",
+        return_value=2,
+    )
+    assert balancer.select({}, instances) == 2
 
 
 def test_least_queue_length_balancer_negative_queue_raises():
