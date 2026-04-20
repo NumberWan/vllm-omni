@@ -369,7 +369,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
                 # GLM-Image's _call_hf_processor expects target_h/target_w in mm_processor_kwargs
-                # (t2i and i2i). BAGEL strips unsupported keys in OmniBagelMultiModalProcessor.
                 mm_processor_kwargs: dict[str, Any] = {}
                 if height is not None:
                     mm_processor_kwargs["target_h"] = height
