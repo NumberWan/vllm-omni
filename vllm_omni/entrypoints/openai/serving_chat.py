@@ -369,15 +369,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
                 # GLM-Image's _call_hf_processor expects target_h/target_w in mm_processor_kwargs
-                # for text-to-image. Some img2img processors (e.g. BAGEL) do not accept these kwargs.
-                if not is_img2img:
-                    mm_processor_kwargs: dict[str, Any] = {}
-                    if height is not None:
-                        mm_processor_kwargs["target_h"] = height
-                    if width is not None:
-                        mm_processor_kwargs["target_w"] = width
-                    if mm_processor_kwargs:
-                        tprompt["mm_processor_kwargs"] = mm_processor_kwargs
+                # (t2i and i2i). BAGEL strips unsupported keys in OmniBagelMultiModalProcessor.
+                mm_processor_kwargs: dict[str, Any] = {}
+                if height is not None:
+                    mm_processor_kwargs["target_h"] = height
+                if width is not None:
+                    mm_processor_kwargs["target_w"] = width
+                if mm_processor_kwargs:
+                    tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:
                     tprompt["multi_modal_data"] = engine_prompt_image
 
