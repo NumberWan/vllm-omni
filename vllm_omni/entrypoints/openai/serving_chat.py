@@ -369,13 +369,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
                 # GLM-Image's _call_hf_processor expects target_h/target_w in mm_processor_kwargs
-                mm_processor_kwargs: dict[str, Any] = {}
-                if height is not None:
-                    mm_processor_kwargs["target_h"] = height
-                if width is not None:
-                    mm_processor_kwargs["target_w"] = width
-                if mm_processor_kwargs:
-                    tprompt["mm_processor_kwargs"] = mm_processor_kwargs
+                # for text-to-image. Some img2img processors (e.g. BAGEL) do not accept these kwargs.
+                if not is_img2img:
+                    mm_processor_kwargs: dict[str, Any] = {}
+                    if height is not None:
+                        mm_processor_kwargs["target_h"] = height
+                    if width is not None:
+                        mm_processor_kwargs["target_w"] = width
+                    if mm_processor_kwargs:
+                        tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:
                     tprompt["multi_modal_data"] = engine_prompt_image
 
@@ -1594,7 +1596,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
                 continue
             if omni_outputs.metrics:
-                response_metrics = omni_outputs.metrics
+                response_metrics = dict(omni_outputs.metrics)
+            if omni_outputs.final_output_type == "image":
+                # Expose diffusion profiler metrics on the top-level response for benchmarks / clients.
+                if response_metrics is None:
+                    response_metrics = {}
+                response_metrics.setdefault("stage_durations", omni_outputs.stage_durations or {})
+                response_metrics.setdefault("peak_memory_mb", float(omni_outputs.peak_memory_mb or 0.0))
             choices.extend(choices_data)
 
         response = OmniChatCompletionResponse(
