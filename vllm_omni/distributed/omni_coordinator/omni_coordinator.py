@@ -248,10 +248,12 @@ class OmniCoordinator:
                 last_heartbeat_check = now
 
             with self._pending_lock:
-                if not self._pending_broadcast:
-                    if self._stop_event.wait(timeout=loop_interval):
-                        break
-                    continue
+                has_pending_broadcast = self._pending_broadcast
+
+            if not has_pending_broadcast:
+                if self._stop_event.wait(timeout=loop_interval):
+                    break
+                continue
 
             # Publish outside lock. Clear pending only on success.
             if self.publish_instance_list_update():
