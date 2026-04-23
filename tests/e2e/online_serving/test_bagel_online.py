@@ -90,8 +90,6 @@ def test_bagel_text2img_online(omni_server, openai_client) -> None:
         "messages": _build_text2img_messages(TEXT2IMG_PROMPT),
         "modalities": ["image"],
         "extra_body": {
-            "height": 512,
-            "width": 512,
             "num_inference_steps": 2,
             "guidance_scale": 0.0,
             "seed": 42,
