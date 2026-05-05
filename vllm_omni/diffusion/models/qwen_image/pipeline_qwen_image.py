@@ -42,6 +42,14 @@ from vllm_omni.diffusion.utils.size_utils import (
     normalize_min_aligned_size,
 )
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.utils.qwen_image_parity_log import (
+    parity_enabled,
+    parity_msg,
+    parity_reset_session,
+    parity_section,
+    parity_should_log_denoise_step,
+    parity_tensor,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
@@ -621,6 +629,9 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         Validates inputs, encodes prompts, prepares latents, computes timesteps,
         and returns all intermediate values as a dict.
         """
+        if parity_enabled():
+            parity_reset_session()
+
         self.check_inputs(
             prompt,
             height,
@@ -705,6 +716,21 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         negative_txt_seq_lens = (
             negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
         )
+
+        if parity_enabled():
+            parity_section("prepare_generation_context")
+            parity_tensor("prompt_embeds", prompt_embeds)
+            parity_tensor("prompt_embeds_mask", prompt_embeds_mask)
+            parity_msg(f"txt_seq_lens={txt_seq_lens}")
+            if do_true_cfg:
+                parity_tensor("negative_prompt_embeds", negative_prompt_embeds)
+                parity_tensor("negative_prompt_embeds_mask", negative_prompt_embeds_mask)
+                parity_msg(f"negative_txt_seq_lens={negative_txt_seq_lens}")
+            parity_tensor("initial_packed_latents", latents)
+            parity_msg(f"num_inference_steps={num_inference_steps} latent_tokens={latents.shape[1]}")
+            ts_cpu = timesteps.detach().cpu().float().reshape(-1)
+            parity_msg(f"timesteps_len={ts_cpu.numel()} schedule={ts_cpu.tolist()}")
+            parity_tensor("guidance_tensor", guidance)
 
         return {
             "prompt_embeds": prompt_embeds,
@@ -856,7 +882,13 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             latents.device, latents.dtype
         )
         latents = latents / latents_std + latents_mean
+        if parity_enabled():
+            parity_section("decode_before_vae")
+            parity_tensor("latents_unpacked_normalized", latents)
         image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        if parity_enabled():
+            parity_section("decode_after_vae")
+            parity_tensor("image_pixels", image)
         return DiffusionOutput(
             output=image,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
@@ -906,7 +938,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         true_cfg_scale = state.sampling.true_cfg_scale or 4.0
         cfg_normalize = state.sampling.cfg_normalize
 
-        return self.predict_noise_maybe_with_cfg(
+        noise_pred = self.predict_noise_maybe_with_cfg(
             state.do_true_cfg,
             true_cfg_scale,
             positive_kwargs,
@@ -914,6 +946,16 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             cfg_normalize,
             output_slice,
         )
+
+        if parity_enabled() and parity_should_log_denoise_step(state.step_index):
+            ts = state.total_steps
+            t_scalar = float(t.detach().cpu().reshape(-1)[0]) if torch.is_tensor(t) else float(t)
+            parity_msg(
+                f"denoise step_index={state.step_index} total_steps={ts} t_scalar={t_scalar}"
+            )
+            parity_tensor("noise_pred", noise_pred)
+
+        return noise_pred
 
     def step_scheduler(
         self,
@@ -926,6 +968,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             return
 
         t = state.current_timestep
+        step_for_log = state.step_index
         state.latents = self.scheduler_step_maybe_with_cfg(
             noise_pred,
             t,
@@ -933,6 +976,9 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             state.do_true_cfg,
             per_request_scheduler=state.scheduler,
         )
+
+        if parity_enabled() and parity_should_log_denoise_step(step_for_log):
+            parity_tensor("latents_after_scheduler", state.latents)
 
         state.step_index += 1
 
