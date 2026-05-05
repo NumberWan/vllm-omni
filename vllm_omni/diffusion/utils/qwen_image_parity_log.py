@@ -167,3 +167,35 @@ def parity_section(title: str) -> None:
     if not parity_enabled():
         return
     parity_write(f"### {title} ###")
+
+
+def parity_runtime_snapshot(tag: str = "runtime") -> None:
+    """Record runtime/kernel-related flags for step0 divergence triage."""
+    if not parity_enabled():
+        return
+    parity_section(tag)
+    parity_msg(
+        "tf32 "
+        f"cuda_matmul={getattr(torch.backends.cuda.matmul, 'allow_tf32', None)} "
+        f"cudnn={getattr(torch.backends.cudnn, 'allow_tf32', None)} "
+        f"deterministic_algorithms={torch.are_deterministic_algorithms_enabled()}"
+    )
+    if torch.cuda.is_available():
+        try:
+            dev_idx = torch.cuda.current_device()
+            dev_name = torch.cuda.get_device_name(dev_idx)
+            parity_msg(f"cuda_device index={dev_idx} name={dev_name}")
+        except Exception as e:
+            parity_msg(f"cuda_device unknown error={e}")
+    env_keys = (
+        "CUDA_VISIBLE_DEVICES",
+        "CUBLAS_WORKSPACE_CONFIG",
+        "CUDA_LAUNCH_BLOCKING",
+        "NVIDIA_TF32_OVERRIDE",
+        "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE",
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "HF_HOME",
+        "TRANSFORMERS_CACHE",
+    )
+    for k in env_keys:
+        parity_msg(f"env {k}={os.environ.get(k)}")
