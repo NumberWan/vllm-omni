@@ -46,6 +46,7 @@ from vllm_omni.diffusion.utils.qwen_image_parity_log import (
     parity_enabled,
     parity_msg,
     parity_reset_session,
+    parity_runtime_snapshot,
     parity_section,
     parity_should_log_denoise_step,
     parity_tensor,
@@ -1072,6 +1073,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         if parity_enabled():
             parity_reset_session()
             parity_section("forward.enter")
+            parity_runtime_snapshot("runtime.step0_probe")
             sp = req.sampling_params
             if sp.generator is None:
                 gen_desc = "None"
