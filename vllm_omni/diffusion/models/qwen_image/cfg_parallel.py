@@ -128,6 +128,15 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                 # For editing pipelines, we need to slice the output to remove condition latents
                 output_slice = latents.size(1) if image_latents is not None else None
 
+                if parity_enabled() and i == 0:
+                    parity_section("diffuse.step0_inputs")
+                    parity_tensor("latent_model_input", latent_model_input)
+                    parity_tensor("timestep_for_model", timestep / 1000)
+                    parity_msg(
+                        f"image_latents_present={image_latents is not None} "
+                        f"do_true_cfg={do_true_cfg} cfg_normalize={cfg_normalize}"
+                    )
+
                 # Predict noise with automatic CFG parallel handling
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg,

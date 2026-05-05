@@ -452,6 +452,20 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
         prompt_embeds = prompt_embeds.to(dtype=dtype)
 
+        if parity_enabled():
+            parity_section(f"_get_qwen_prompt_embeds.{prompt_name}")
+            input_ids_head = (
+                txt_tokens.input_ids.detach().cpu().reshape(-1)[:16].tolist()
+            )
+            parity_msg(
+                f"input_ids head16={input_ids_head} "
+                f"input_ids_shape={tuple(txt_tokens.input_ids.shape)}"
+            )
+            parity_tensor("hidden_states_last", hidden_states)
+            parity_tensor("encoder_attention_mask", encoder_attention_mask)
+            parity_tensor("prompt_embeds_pre_dtype", prompt_embeds)
+            parity_msg(f"target_dtype={dtype}")
+
         return prompt_embeds, encoder_attention_mask
 
     def encode_prompt(
@@ -551,6 +565,20 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
 
+        if parity_enabled():
+            parity_section("prepare_latents")
+            if isinstance(generator, list):
+                gen_desc = f"list_len={len(generator)}"
+            elif generator is not None:
+                gen_desc = f"single device={generator.device}"
+            else:
+                gen_desc = "None"
+            parity_msg(
+                f"shape_pre_pack={shape} dtype={dtype} device={device} "
+                f"generator={gen_desc}"
+            )
+            parity_tensor("latents_packed", latents)
+
         return latents
 
     def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len):
@@ -569,6 +597,31 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             sigmas=sigmas,
             mu=mu,
         )
+
+        if parity_enabled():
+            parity_section("prepare_timesteps")
+            sched_cfg = {
+                k: self.scheduler.config.get(k)
+                for k in (
+                    "base_image_seq_len",
+                    "max_image_seq_len",
+                    "base_shift",
+                    "max_shift",
+                    "shift",
+                )
+            }
+            parity_msg(
+                f"image_seq_len={image_seq_len} mu={float(mu):.8g} "
+                f"sched_cfg={sched_cfg}"
+            )
+            sigmas_repr = list(sigmas) if sigmas is not None else None
+            parity_msg(f"sigmas={sigmas_repr}")
+            ts_cpu = timesteps.detach().cpu().float().reshape(-1).tolist()
+            parity_msg(
+                f"num_inference_steps={num_inference_steps} "
+                f"timesteps_len={len(ts_cpu)} schedule={ts_cpu}"
+            )
+
         return timesteps, num_inference_steps
 
     @property
@@ -629,9 +682,6 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         Validates inputs, encodes prompts, prepares latents, computes timesteps,
         and returns all intermediate values as a dict.
         """
-        if parity_enabled():
-            parity_reset_session()
-
         self.check_inputs(
             prompt,
             height,
@@ -1019,6 +1069,30 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 1024,
     ) -> DiffusionOutput:
+        if parity_enabled():
+            parity_reset_session()
+            parity_section("forward.enter")
+            sp = req.sampling_params
+            if sp.generator is None:
+                gen_desc = "None"
+            elif isinstance(sp.generator, list):
+                gen_desc = f"list_len={len(sp.generator)}"
+            else:
+                try:
+                    gen_desc = f"seed={int(sp.generator.initial_seed())}"
+                except Exception:
+                    gen_desc = "single"
+            parity_msg(
+                f"prompts_len={len(req.prompts) if req.prompts else 0} "
+                f"height={sp.height} width={sp.width} "
+                f"num_inference_steps={sp.num_inference_steps} "
+                f"true_cfg_scale={sp.true_cfg_scale} "
+                f"guidance_scale={sp.guidance_scale if sp.guidance_scale_provided else None} "
+                f"num_outputs_per_prompt={sp.num_outputs_per_prompt} "
+                f"max_sequence_length={sp.max_sequence_length} "
+                f"generator={gen_desc}"
+            )
+
         extracted_prompt, negative_prompt = self._extract_prompts(req.prompts)
         prompt = extracted_prompt or prompt
 
