@@ -14,6 +14,13 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.utils.qwen_image_parity_log import (
+    parity_enabled,
+    parity_msg,
+    parity_section,
+    parity_should_log_denoise_step,
+    parity_tensor,
+)
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 
@@ -70,6 +77,16 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         self.transformer.do_true_cfg = do_true_cfg
         additional_transformer_kwargs = additional_transformer_kwargs or {}
 
+        if parity_enabled():
+            parity_section("diffuse_loop")
+            t0 = timesteps[0] if len(timesteps) else None
+            t1 = timesteps[-1] if len(timesteps) else None
+            parity_msg(
+                f"steps={len(timesteps)} "
+                f"t_first={t0.item() if t0 is not None and torch.is_tensor(t0) else t0} "
+                f"t_last={t1.item() if t1 is not None and torch.is_tensor(t1) else t1}"
+            )
+
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -111,6 +128,15 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                 # For editing pipelines, we need to slice the output to remove condition latents
                 output_slice = latents.size(1) if image_latents is not None else None
 
+                if parity_enabled() and i == 0:
+                    parity_section("diffuse.step0_inputs")
+                    parity_tensor("latent_model_input", latent_model_input)
+                    parity_tensor("timestep_for_model", timestep / 1000)
+                    parity_msg(
+                        f"image_latents_present={image_latents is not None} "
+                        f"do_true_cfg={do_true_cfg} cfg_normalize={cfg_normalize}"
+                    )
+
                 # Predict noise with automatic CFG parallel handling
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg,
@@ -121,8 +147,18 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                     output_slice,
                 )
 
+                if parity_enabled() and parity_should_log_denoise_step(i):
+                    t_val = t.item() if torch.is_tensor(t) else float(t)
+                    parity_msg(
+                        f"denoise step_index={i} total_steps={len(timesteps)} t_scalar={t_val}"
+                    )
+                    parity_tensor("noise_pred", noise_pred)
+
                 # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
+                if parity_enabled() and parity_should_log_denoise_step(i):
+                    parity_tensor("latents_after_scheduler", latents)
 
                 pbar.update()
 

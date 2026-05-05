@@ -42,6 +42,14 @@ from vllm_omni.diffusion.utils.size_utils import (
     normalize_min_aligned_size,
 )
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.utils.qwen_image_parity_log import (
+    parity_enabled,
+    parity_msg,
+    parity_reset_session,
+    parity_section,
+    parity_should_log_denoise_step,
+    parity_tensor,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
@@ -444,6 +452,20 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
         prompt_embeds = prompt_embeds.to(dtype=dtype)
 
+        if parity_enabled():
+            parity_section(f"_get_qwen_prompt_embeds.{prompt_name}")
+            input_ids_head = (
+                txt_tokens.input_ids.detach().cpu().reshape(-1)[:16].tolist()
+            )
+            parity_msg(
+                f"input_ids head16={input_ids_head} "
+                f"input_ids_shape={tuple(txt_tokens.input_ids.shape)}"
+            )
+            parity_tensor("hidden_states_last", hidden_states)
+            parity_tensor("encoder_attention_mask", encoder_attention_mask)
+            parity_tensor("prompt_embeds_pre_dtype", prompt_embeds)
+            parity_msg(f"target_dtype={dtype}")
+
         return prompt_embeds, encoder_attention_mask
 
     def encode_prompt(
@@ -543,6 +565,20 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
 
+        if parity_enabled():
+            parity_section("prepare_latents")
+            if isinstance(generator, list):
+                gen_desc = f"list_len={len(generator)}"
+            elif generator is not None:
+                gen_desc = f"single device={generator.device}"
+            else:
+                gen_desc = "None"
+            parity_msg(
+                f"shape_pre_pack={shape} dtype={dtype} device={device} "
+                f"generator={gen_desc}"
+            )
+            parity_tensor("latents_packed", latents)
+
         return latents
 
     def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len):
@@ -561,6 +597,31 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             sigmas=sigmas,
             mu=mu,
         )
+
+        if parity_enabled():
+            parity_section("prepare_timesteps")
+            sched_cfg = {
+                k: self.scheduler.config.get(k)
+                for k in (
+                    "base_image_seq_len",
+                    "max_image_seq_len",
+                    "base_shift",
+                    "max_shift",
+                    "shift",
+                )
+            }
+            parity_msg(
+                f"image_seq_len={image_seq_len} mu={float(mu):.8g} "
+                f"sched_cfg={sched_cfg}"
+            )
+            sigmas_repr = list(sigmas) if sigmas is not None else None
+            parity_msg(f"sigmas={sigmas_repr}")
+            ts_cpu = timesteps.detach().cpu().float().reshape(-1).tolist()
+            parity_msg(
+                f"num_inference_steps={num_inference_steps} "
+                f"timesteps_len={len(ts_cpu)} schedule={ts_cpu}"
+            )
+
         return timesteps, num_inference_steps
 
     @property
@@ -705,6 +766,21 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         negative_txt_seq_lens = (
             negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
         )
+
+        if parity_enabled():
+            parity_section("prepare_generation_context")
+            parity_tensor("prompt_embeds", prompt_embeds)
+            parity_tensor("prompt_embeds_mask", prompt_embeds_mask)
+            parity_msg(f"txt_seq_lens={txt_seq_lens}")
+            if do_true_cfg:
+                parity_tensor("negative_prompt_embeds", negative_prompt_embeds)
+                parity_tensor("negative_prompt_embeds_mask", negative_prompt_embeds_mask)
+                parity_msg(f"negative_txt_seq_lens={negative_txt_seq_lens}")
+            parity_tensor("initial_packed_latents", latents)
+            parity_msg(f"num_inference_steps={num_inference_steps} latent_tokens={latents.shape[1]}")
+            ts_cpu = timesteps.detach().cpu().float().reshape(-1)
+            parity_msg(f"timesteps_len={ts_cpu.numel()} schedule={ts_cpu.tolist()}")
+            parity_tensor("guidance_tensor", guidance)
 
         return {
             "prompt_embeds": prompt_embeds,
@@ -856,7 +932,13 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             latents.device, latents.dtype
         )
         latents = latents / latents_std + latents_mean
+        if parity_enabled():
+            parity_section("decode_before_vae")
+            parity_tensor("latents_unpacked_normalized", latents)
         image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        if parity_enabled():
+            parity_section("decode_after_vae")
+            parity_tensor("image_pixels", image)
         return DiffusionOutput(
             output=image,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
@@ -906,7 +988,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         true_cfg_scale = state.sampling.true_cfg_scale or 4.0
         cfg_normalize = state.sampling.cfg_normalize
 
-        return self.predict_noise_maybe_with_cfg(
+        noise_pred = self.predict_noise_maybe_with_cfg(
             state.do_true_cfg,
             true_cfg_scale,
             positive_kwargs,
@@ -914,6 +996,16 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             cfg_normalize,
             output_slice,
         )
+
+        if parity_enabled() and parity_should_log_denoise_step(state.step_index):
+            ts = state.total_steps
+            t_scalar = float(t.detach().cpu().reshape(-1)[0]) if torch.is_tensor(t) else float(t)
+            parity_msg(
+                f"denoise step_index={state.step_index} total_steps={ts} t_scalar={t_scalar}"
+            )
+            parity_tensor("noise_pred", noise_pred)
+
+        return noise_pred
 
     def step_scheduler(
         self,
@@ -926,6 +1018,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             return
 
         t = state.current_timestep
+        step_for_log = state.step_index
         state.latents = self.scheduler_step_maybe_with_cfg(
             noise_pred,
             t,
@@ -933,6 +1026,9 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             state.do_true_cfg,
             per_request_scheduler=state.scheduler,
         )
+
+        if parity_enabled() and parity_should_log_denoise_step(step_for_log):
+            parity_tensor("latents_after_scheduler", state.latents)
 
         state.step_index += 1
 
@@ -973,6 +1069,30 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 1024,
     ) -> DiffusionOutput:
+        if parity_enabled():
+            parity_reset_session()
+            parity_section("forward.enter")
+            sp = req.sampling_params
+            if sp.generator is None:
+                gen_desc = "None"
+            elif isinstance(sp.generator, list):
+                gen_desc = f"list_len={len(sp.generator)}"
+            else:
+                try:
+                    gen_desc = f"seed={int(sp.generator.initial_seed())}"
+                except Exception:
+                    gen_desc = "single"
+            parity_msg(
+                f"prompts_len={len(req.prompts) if req.prompts else 0} "
+                f"height={sp.height} width={sp.width} "
+                f"num_inference_steps={sp.num_inference_steps} "
+                f"true_cfg_scale={sp.true_cfg_scale} "
+                f"guidance_scale={sp.guidance_scale if sp.guidance_scale_provided else None} "
+                f"num_outputs_per_prompt={sp.num_outputs_per_prompt} "
+                f"max_sequence_length={sp.max_sequence_length} "
+                f"generator={gen_desc}"
+            )
+
         extracted_prompt, negative_prompt = self._extract_prompts(req.prompts)
         prompt = extracted_prompt or prompt
 
