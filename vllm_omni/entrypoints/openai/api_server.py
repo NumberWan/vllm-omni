@@ -71,7 +71,18 @@ try:
     )
 except ImportError:
     from vllm.entrypoints.pooling.pooling.serving import OpenAIServingPooling
-from vllm.entrypoints.pooling.scoring.serving import ServingScores
+try:
+    from vllm.entrypoints.pooling.scoring.serving import ServingScores
+except ImportError:
+    try:
+        from vllm.entrypoints.pooling.score.serving import ServingScores
+    except ImportError:
+        try:
+            from vllm.entrypoints.pooling.score.serving import (
+                ServingScore as ServingScores,
+            )
+        except ImportError:
+            ServingScores = None
 from vllm.entrypoints.serve.disagg.serving import ServingTokens
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
@@ -850,7 +861,9 @@ async def omni_init_app_state(
             score_template=resolved_chat_template,
             log_error_stack=args.log_error_stack,
         )
-        if any(t in supported_tasks for t in ("embed", "score", "token_embed"))
+        if ServingScores is not None and any(
+            t in supported_tasks for t in ("embed", "score", "token_embed")
+        )
         else None
     )
     state.openai_serving_tokenization = OpenAIServingTokenization(
