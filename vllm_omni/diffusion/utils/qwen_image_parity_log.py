@@ -47,6 +47,8 @@ _ENV_ENABLE = "VLLM_OMNI_QWEN_PARITY_LOG"
 _ENV_PATH = "VLLM_OMNI_QWEN_PARITY_LOG_FILE"
 _ENV_MAX_STEPS = "VLLM_OMNI_QWEN_PARITY_MAX_STEPS"
 _ENV_APPEND = "VLLM_OMNI_QWEN_PARITY_APPEND"
+_ENV_TRANSFORMER = "VLLM_OMNI_QWEN_PARITY_TRANSFORMER"
+_ENV_TRANSFORMER_BLOCKS = "VLLM_OMNI_QWEN_PARITY_TRANSFORMER_BLOCKS"
 
 # Fixed relative location under $HOME for cross-branch / cross-run diff.
 _DEFAULT_REL_PATH = (".vllm_omni", "parity", "qwen_image_parity.log")
@@ -68,6 +70,44 @@ _parity_cfg_denoise_step = 0
 
 def parity_enabled() -> bool:
     return os.environ.get(_ENV_ENABLE, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def parity_transformer_enabled() -> bool:
+    return os.environ.get(_ENV_TRANSFORMER, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_int_set(raw: str) -> set[int] | None:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            continue
+    return out if out else None
+
+
+def parity_transformer_should_log_block(block_idx: int) -> bool:
+    """True iff transformer block-level parity logging should run.
+
+    Only logs when:
+    - parity is enabled
+    - transformer hook is enabled
+    - denoise step is 0 (first step divergence triage)
+    - optional block filter passes
+    """
+    if not parity_enabled() or not parity_transformer_enabled():
+        return False
+    if parity_cfg_peek_denoise_step() != 0:
+        return False
+    raw = os.environ.get(_ENV_TRANSFORMER_BLOCKS, "")
+    allowed = _parse_int_set(raw)
+    return True if allowed is None else (block_idx in allowed)
 
 
 def parity_default_log_path() -> str:

@@ -45,8 +45,20 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.utils.qwen_image_parity_log import (
+    parity_enabled,
+    parity_section,
+    parity_tensor,
+    parity_transformer_should_log_block,
+ )
 
 logger = init_logger(__name__)
+
+
+def _parity_blk_tensor(block_idx: int, name: str, t: torch.Tensor | None) -> None:
+    if not parity_transformer_should_log_block(block_idx):
+        return
+    parity_tensor(f"tr.blk{block_idx}.{name}", t)
 
 
 class ImageRopePrepare(nn.Module):
@@ -592,7 +604,14 @@ class QwenImageCrossAttention(nn.Module):
         txt_freqs: torch.Tensor,
         hidden_states_mask: torch.Tensor | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
+        parity_block_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        bidx = -1 if parity_block_idx is None else int(parity_block_idx)
+        if bidx >= 0 and parity_transformer_should_log_block(bidx):
+            parity_section(f"tr.blk{bidx}.xattn.enter")
+            _parity_blk_tensor(bidx, "xattn.hidden_states_in", hidden_states)
+            _parity_blk_tensor(bidx, "xattn.encoder_hidden_states_in", encoder_hidden_states)
+
         img_qkv, _ = self.to_qkv(hidden_states)
         q_size = self.query_num_heads * self.head_dim
         kv_size = self.kv_num_heads * self.head_dim
@@ -611,10 +630,24 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
         txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "xattn.q_img_pre_norm", img_query)
+            _parity_blk_tensor(bidx, "xattn.k_img_pre_norm", img_key)
+            _parity_blk_tensor(bidx, "xattn.v_img", img_value)
+            _parity_blk_tensor(bidx, "xattn.q_txt_pre_norm", txt_query)
+            _parity_blk_tensor(bidx, "xattn.k_txt_pre_norm", txt_key)
+            _parity_blk_tensor(bidx, "xattn.v_txt", txt_value)
+
         img_query = self.norm_q(img_query)
         img_key = self.norm_k(img_key)
         txt_query = self.norm_added_q(txt_query)
         txt_key = self.norm_added_k(txt_key)
+
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "xattn.q_img_post_norm", img_query)
+            _parity_blk_tensor(bidx, "xattn.k_img_post_norm", img_key)
+            _parity_blk_tensor(bidx, "xattn.q_txt_post_norm", txt_query)
+            _parity_blk_tensor(bidx, "xattn.k_txt_post_norm", txt_key)
 
         img_cos = vid_freqs.real.to(img_query.dtype)
         img_sin = vid_freqs.imag.to(img_query.dtype)
@@ -625,6 +658,12 @@ class QwenImageCrossAttention(nn.Module):
         img_key = self.rope(img_key, img_cos, img_sin)
         txt_query = self.rope(txt_query, txt_cos, txt_sin)
         txt_key = self.rope(txt_key, txt_cos, txt_sin)
+
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "xattn.q_img_post_rope", img_query)
+            _parity_blk_tensor(bidx, "xattn.k_img_post_rope", img_key)
+            _parity_blk_tensor(bidx, "xattn.q_txt_post_rope", txt_query)
+            _parity_blk_tensor(bidx, "xattn.k_txt_post_rope", txt_key)
 
         seq_len_txt = encoder_hidden_states.shape[1]
         joint_query = torch.cat([txt_query, img_query], dim=1)
@@ -677,12 +716,23 @@ class QwenImageCrossAttention(nn.Module):
 
             joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
 
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "xattn.joint_hidden_states_raw", joint_hidden_states)
+
         joint_hidden_states = joint_hidden_states.flatten(2, 3).to(joint_query.dtype)
         txt_attn_output = joint_hidden_states[:, :seq_len_txt, :]
         img_attn_output = joint_hidden_states[:, seq_len_txt:, :]
 
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "xattn.img_attn_output_pre_outproj", img_attn_output)
+            _parity_blk_tensor(bidx, "xattn.txt_attn_output_pre_outproj", txt_attn_output)
+
         img_attn_output = self.to_out(img_attn_output)
         txt_attn_output = self.to_add_out(txt_attn_output)
+
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "xattn.img_attn_output", img_attn_output)
+            _parity_blk_tensor(bidx, "xattn.txt_attn_output", txt_attn_output)
 
         return img_attn_output, txt_attn_output
 
@@ -796,7 +846,13 @@ class QwenImageTransformerBlock(nn.Module):
         joint_attention_kwargs: dict[str, Any] | None = None,
         modulate_index: list[int] | None = None,
         hidden_states_mask: torch.Tensor | None = None,
+        parity_block_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        bidx = -1 if parity_block_idx is None else int(parity_block_idx)
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "block.hidden_states_in", hidden_states)
+            _parity_blk_tensor(bidx, "block.encoder_hidden_states_in", encoder_hidden_states)
+
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod(temb)  # [B, 6*dim]
 
@@ -817,6 +873,10 @@ class QwenImageTransformerBlock(nn.Module):
         txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
         txt_modulated = self.txt_norm1(encoder_hidden_states, txt_scale1, txt_shift1)
 
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "block.img_norm1_out", img_modulated)
+            _parity_blk_tensor(bidx, "block.txt_norm1_out", txt_modulated)
+
         # Use QwenAttnProcessor2_0 for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
         # 1. Computes QKV for both streams
@@ -830,14 +890,23 @@ class QwenImageTransformerBlock(nn.Module):
             txt_freqs=image_rotary_emb[1],
             hidden_states_mask=hidden_states_mask,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
+            parity_block_idx=(None if bidx < 0 else bidx),
         )
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
         img_attn_output, txt_attn_output = attn_output
 
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "block.img_attn_output", img_attn_output)
+            _parity_blk_tensor(bidx, "block.txt_attn_output", txt_attn_output)
+
         # Apply attention gates and add residual (like in Megatron)
         hidden_states = hidden_states + img_gate1 * img_attn_output
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "block.hidden_states_after_attn_resid", hidden_states)
+            _parity_blk_tensor(bidx, "block.encoder_hidden_states_after_attn_resid", encoder_hidden_states)
 
         # Process image stream - norm2 + MLP
         img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2, modulate_index)
@@ -846,12 +915,22 @@ class QwenImageTransformerBlock(nn.Module):
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
 
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "block.img_norm2_out", img_modulated2)
+            _parity_blk_tensor(bidx, "block.img_mlp_out", img_mlp_output)
+            _parity_blk_tensor(bidx, "block.hidden_states_out", hidden_states)
+
         # Process text stream - norm2 + MLP
         txt_scale2, txt_shift2, txt_gate2 = self._modulate(txt_mod2)
         txt_modulated2 = self.txt_norm2(encoder_hidden_states, txt_scale2, txt_shift2)
 
         txt_mlp_output = self.txt_mlp(txt_modulated2)
         encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "block.txt_norm2_out", txt_modulated2)
+            _parity_blk_tensor(bidx, "block.txt_mlp_out", txt_mlp_output)
+            _parity_blk_tensor(bidx, "block.encoder_hidden_states_out", encoder_hidden_states)
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
@@ -1100,6 +1179,12 @@ class QwenImageTransformer2DModel(CachedTransformer):
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
+        if parity_enabled():
+            # Block-level logs are additionally gated by parity_transformer_should_log_block (step0 + block filter).
+            parity_section("tr.enter")
+            parity_tensor("tr.hidden_states_after_img_in", hidden_states)
+            parity_tensor("tr.encoder_hidden_states_after_txt_in", encoder_hidden_states)
+
         if guidance is not None:
             guidance = guidance.to(hidden_states.dtype) * 1000
 
@@ -1143,6 +1228,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 joint_attention_kwargs=attention_kwargs,
                 modulate_index=modulate_index,
                 hidden_states_mask=hidden_states_mask,
+                parity_block_idx=index_block,
             )
 
         if self.zero_cond_t:
@@ -1150,6 +1236,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
+
+        if parity_enabled():
+            parity_section("tr.exit")
+            parity_tensor("tr.hidden_states_after_norm_out", hidden_states)
+            parity_tensor("tr.output", output)
 
         # Note: SP gather is handled automatically by _sp_plan's SequenceParallelGatherHook
         # on proj_out output. No manual all_gather needed here.
