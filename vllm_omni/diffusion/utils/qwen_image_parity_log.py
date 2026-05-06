@@ -62,6 +62,9 @@ _first_header_in_session = True
 # First write: truncate unless APPEND=1 (then always append to file).
 _next_open_truncates = not _append_mode_requested()
 
+# Aligns with one diffuse iteration: predict_noise_maybe_with_cfg (peek N) then scheduler_step (still N), bump after scheduler.
+_parity_cfg_denoise_step = 0
+
 
 def parity_enabled() -> bool:
     return os.environ.get(_ENV_ENABLE, "").strip().lower() in ("1", "true", "yes", "on")
@@ -97,11 +100,27 @@ def parity_should_log_denoise_step(step_idx: int) -> bool:
     return step_idx < lim
 
 
+def parity_cfg_peek_denoise_step() -> int:
+    """Current denoise index for CFGParallelMixin tracing (matches diffuse loop step)."""
+    return _parity_cfg_denoise_step
+
+
+def parity_cfg_bump_denoise_step_after_scheduler() -> None:
+    global _parity_cfg_denoise_step
+    _parity_cfg_denoise_step += 1
+
+
+def parity_cfg_reset_denoise_step() -> None:
+    global _parity_cfg_denoise_step
+    _parity_cfg_denoise_step = 0
+
+
 def parity_reset_session() -> None:
     """Start a new trace file for the next generation (overwrite unless APPEND=1)."""
     global _first_header_in_session, _next_open_truncates
     if not parity_enabled():
         return
+    parity_cfg_reset_denoise_step()
     _first_header_in_session = True
     if not _append_mode_requested():
         _next_open_truncates = True
