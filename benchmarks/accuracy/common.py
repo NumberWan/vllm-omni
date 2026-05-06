@@ -135,6 +135,16 @@ class VllmOmniImageClient:
             headers=self._headers,
             timeout=self.timeout,
         )
+        if response.status_code >= 400:
+            detail = response.text
+            raise requests.HTTPError(
+                "Image generation request failed.\n"
+                f"status_code={response.status_code}\n"
+                f"url={response.url}\n"
+                f"request_payload={json.dumps(payload, ensure_ascii=False)}\n"
+                f"response_text={detail}",
+                response=response,
+            )
         response.raise_for_status()
         return decode_base64_image(response.json()["data"][0]["b64_json"])
 
