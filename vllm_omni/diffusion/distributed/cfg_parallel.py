@@ -16,6 +16,15 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
+from vllm_omni.diffusion.utils.qwen_image_parity_log import (
+    parity_cfg_bump_denoise_step_after_scheduler,
+    parity_cfg_peek_denoise_step,
+    parity_enabled,
+    parity_msg,
+    parity_section,
+    parity_should_log_denoise_step,
+    parity_tensor,
+)
 
 logger = init_logger(__name__)
 
@@ -51,6 +60,30 @@ def _dispatch_branches(n_branches: int, n_ranks: int) -> list[list[int]]:
     for i in range(n_branches):
         assignments[i % n_ranks].append(i)
     return assignments
+
+
+def _parity_cfg_should_log_tensors() -> bool:
+    return parity_enabled() and parity_should_log_denoise_step(parity_cfg_peek_denoise_step())
+
+
+def _parity_log_pred_tuple(stage: str, pred: tuple[torch.Tensor, ...]) -> None:
+    if not _parity_cfg_should_log_tensors():
+        return
+    if len(pred) == 1:
+        parity_tensor(stage, pred[0])
+    else:
+        for j, p in enumerate(pred):
+            parity_tensor(f"{stage}.elem{j}", p)
+
+
+def _parity_log_timestep_in(name: str, t: torch.Tensor | tuple[torch.Tensor, ...]) -> None:
+    if not _parity_cfg_should_log_tensors():
+        return
+    if isinstance(t, tuple):
+        for j, tt in enumerate(t):
+            parity_tensor(f"{name}.elem{j}", tt)
+    else:
+        parity_tensor(name, t)
 
 
 class CFGParallelMixin(metaclass=ABCMeta):
@@ -101,9 +134,19 @@ class CFGParallelMixin(metaclass=ABCMeta):
             returns a tuple), override combine_cfg_noise() for per-element CFG
             logic and set self.scheduler to a composite scheduler.
         """
+        if parity_enabled():
+            parity_section(
+                f"cfg.predict_noise_maybe_with_cfg step={parity_cfg_peek_denoise_step()}"
+            )
+            parity_msg(
+                f"do_true_cfg={do_true_cfg} true_cfg_scale={true_cfg_scale} "
+                f"cfg_normalize={cfg_normalize} output_slice={output_slice}"
+            )
         if do_true_cfg:
             # Automatically detect CFG parallel configuration
             cfg_parallel_ready = get_classifier_free_guidance_world_size() > 1
+            if parity_enabled():
+                parity_msg(f"cfg_parallel_ready={cfg_parallel_ready}")
 
             if cfg_parallel_ready:
                 cfg_group = get_cfg_group()
@@ -116,10 +159,23 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 if output_slice is not None:
                     local_pred = _slice_pred(local_pred, output_slice)
 
+                if parity_enabled():
+                    parity_msg(
+                        f"cfg_rank={cfg_rank} local_is_positive_branch={cfg_rank == 0}"
+                    )
+                _parity_log_pred_tuple("cfg.predict_noise.par.local", local_pred)
+
                 # All-gather each element, reconstruct positive/negative tuples
                 gathered = [cfg_group.all_gather(p, separate_tensors=True) for p in local_pred]
                 positive_noise_pred = tuple(g[0] for g in gathered)
                 negative_noise_pred = tuple(g[1] for g in gathered)
+
+                _parity_log_pred_tuple(
+                    "cfg.predict_noise.par.positive_gathered", positive_noise_pred
+                )
+                _parity_log_pred_tuple(
+                    "cfg.predict_noise.par.negative_gathered", negative_noise_pred
+                )
 
                 # All ranks compute combine (deterministic, same result)
                 return self.combine_cfg_noise(
@@ -131,7 +187,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
             else:
                 # Sequential CFG: compute both positive and negative
                 positive_noise_pred = _wrap(self.predict_noise(**positive_kwargs))
+                _parity_log_pred_tuple("cfg.predict_noise.seq.positive", positive_noise_pred)
                 negative_noise_pred = _wrap(self.predict_noise(**negative_kwargs))
+                _parity_log_pred_tuple("cfg.predict_noise.seq.negative", negative_noise_pred)
 
                 if output_slice is not None:
                     positive_noise_pred = _slice_pred(positive_noise_pred, output_slice)
@@ -148,6 +206,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             pred = self.predict_noise(**positive_kwargs)
             if output_slice is not None:
                 pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
+            _parity_log_pred_tuple("cfg.predict_noise.no_cfg.out", _wrap(pred))
             return pred
 
     def cfg_normalize_function(self, noise_pred: torch.Tensor, comb_pred: torch.Tensor) -> torch.Tensor:
@@ -202,11 +261,25 @@ class CFGParallelMixin(metaclass=ABCMeta):
         pos_t = _wrap(positive_noise_pred)
         neg_t = _wrap(negative_noise_pred)
 
+        if parity_enabled():
+            parity_section(f"cfg.combine_cfg_noise step={parity_cfg_peek_denoise_step()}")
+            parity_msg(
+                f"true_cfg_scale={true_cfg_scale} cfg_normalize={cfg_normalize} "
+                f"n_elems={len(pos_t)}"
+            )
+
         results = []
-        for p, n in zip(pos_t, neg_t):
+        for ei, (p, n) in enumerate(zip(pos_t, neg_t)):
+            if _parity_cfg_should_log_tensors():
+                parity_tensor(f"cfg.combine.pos_elem{ei}", p)
+                parity_tensor(f"cfg.combine.neg_elem{ei}", n)
             comb = n + true_cfg_scale * (p - n)
             if cfg_normalize:
+                if _parity_cfg_should_log_tensors():
+                    parity_tensor(f"cfg.combine.comb_pre_norm_elem{ei}", comb)
                 comb = self.cfg_normalize_function(p, comb)
+            if _parity_cfg_should_log_tensors():
+                parity_tensor(f"cfg.combine.out_elem{ei}", comb)
             results.append(comb)
         return _unwrap(tuple(results))
 
@@ -482,15 +555,30 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Returns:
             Updated latents after scheduler step
         """
+        if parity_enabled():
+            parity_section(f"cfg.scheduler_step step={parity_cfg_peek_denoise_step()}")
         sched = per_request_scheduler if per_request_scheduler is not None else getattr(self, "scheduler", None)
         if sched is None:
             raise ValueError("No scheduler is available. Set self.scheduler or pass per_request_scheduler.")
         if not callable(getattr(sched, "step", None)):
             raise TypeError("per_request_scheduler must provide a callable step(...) method.")
+        if parity_enabled():
+            parity_msg(
+                f"scheduler={type(sched).__name__} "
+                f"per_request_scheduler={per_request_scheduler is not None} "
+                f"generator={'set' if generator is not None else 'none'}"
+            )
+        _parity_log_pred_tuple("cfg.scheduler_step.noise_pred_in", _wrap(noise_pred))
+        _parity_log_timestep_in("cfg.scheduler_step.t_in", t)
+        _parity_log_pred_tuple("cfg.scheduler_step.latents_in", _wrap(latents))
         step_kwargs = dict(return_dict=False)
         if generator is not None:
             step_kwargs["generator"] = generator
-        return sched.step(noise_pred, t, latents, **step_kwargs)[0]
+        out = sched.step(noise_pred, t, latents, **step_kwargs)[0]
+        _parity_log_pred_tuple("cfg.scheduler_step.latents_out", _wrap(out))
+        if parity_enabled():
+            parity_cfg_bump_denoise_step_after_scheduler()
+        return out
 
     def scheduler_step_maybe_with_cfg(
         self,
