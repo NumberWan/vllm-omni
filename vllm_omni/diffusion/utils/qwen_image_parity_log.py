@@ -43,6 +43,17 @@ import time
 
 import torch
 
+try:
+    import torch._dynamo as _torch_dynamo  # type: ignore
+
+    def _dynamo_disable(fn):  # type: ignore
+        return _torch_dynamo.disable(fn)
+
+except Exception:  # pragma: no cover
+
+    def _dynamo_disable(fn):  # type: ignore
+        return fn
+
 _ENV_ENABLE = "VLLM_OMNI_QWEN_PARITY_LOG"
 _ENV_PATH = "VLLM_OMNI_QWEN_PARITY_LOG_FILE"
 _ENV_MAX_STEPS = "VLLM_OMNI_QWEN_PARITY_MAX_STEPS"
@@ -166,6 +177,7 @@ def parity_reset_session() -> None:
         _next_open_truncates = True
 
 
+@_dynamo_disable
 def _summarize_tensor(name: str, t: torch.Tensor | None) -> str:
     if t is None:
         return f"{name}=None"
@@ -183,6 +195,7 @@ def _summarize_tensor(name: str, t: torch.Tensor | None) -> str:
     )
 
 
+@_dynamo_disable
 def parity_write(line: str) -> None:
     global _first_header_in_session, _next_open_truncates
     if not parity_enabled():
@@ -210,18 +223,21 @@ def parity_write(line: str) -> None:
         f.write(line.rstrip() + "\n")
 
 
+@_dynamo_disable
 def parity_msg(msg: str) -> None:
     if not parity_enabled():
         return
     parity_write(msg)
 
 
+@_dynamo_disable
 def parity_tensor(stage: str, tensor: torch.Tensor | None) -> None:
     if not parity_enabled():
         return
     parity_write(_summarize_tensor(stage, tensor))
 
 
+@_dynamo_disable
 def parity_section(title: str) -> None:
     if not parity_enabled():
         return
