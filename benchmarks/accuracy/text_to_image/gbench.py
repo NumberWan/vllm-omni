@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,6 +35,48 @@ TYPE_TO_FOLDER = {
 }
 SCORE_KEYS = ("goal", "logic", "cons", "ui", "qual")
 DEFAULT_SAMPLES_PER_TYPE = 10
+
+
+def _judge_resize_image(image: Image.Image) -> Image.Image:
+    """Optionally downscale judge images to avoid MM token overflows.
+
+    Controlled by env vars (leave unset to preserve CI behavior):
+    - GEBENCH_JUDGE_MAX_SIDE: max(width, height) after resize
+    - GEBENCH_JUDGE_MAX_PIXELS: max(width*height) after resize
+    """
+
+    max_side_raw = os.environ.get("GEBENCH_JUDGE_MAX_SIDE", "").strip()
+    max_pixels_raw = os.environ.get("GEBENCH_JUDGE_MAX_PIXELS", "").strip()
+    try:
+        max_side = int(max_side_raw) if max_side_raw else None
+    except Exception:
+        max_side = None
+    try:
+        max_pixels = int(max_pixels_raw) if max_pixels_raw else None
+    except Exception:
+        max_pixels = None
+
+    if not max_side and not max_pixels:
+        return image
+
+    w, h = image.size
+    if w <= 0 or h <= 0:
+        return image
+
+    scale = 1.0
+    if max_side and max(w, h) > max_side:
+        scale = min(scale, max_side / float(max(w, h)))
+    if max_pixels and (w * h) > max_pixels:
+        scale = min(scale, (max_pixels / float(w * h)) ** 0.5)
+
+    if scale >= 1.0:
+        return image
+
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    if (new_w, new_h) == (w, h):
+        return image
+    return image.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
 
 
 def _utc_timestamp() -> str:
@@ -440,7 +483,7 @@ class LocalJudgeClient:
     def _request_text(self, prompt: str, images: list[Image.Image]) -> str:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for image in images:
-            content.append({"type": "image_url", "image_url": {"url": pil_to_data_url(image)}})
+            content.append({"type": "image_url", "image_url": {"url": pil_to_data_url(_judge_resize_image(image))}})
 
         response = requests.post(
             build_openai_url(self.base_url, "/chat/completions"),
