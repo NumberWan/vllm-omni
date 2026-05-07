@@ -274,7 +274,14 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         model = od_config.model
         # Check if model is a local path
         local_files_only = os.path.exists(model)
-        force_dtype = torch.float32
+        force_fp32 = os.environ.get("VLLM_OMNI_DIFFUSION_FORCE_FP32", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        force_dtype = torch.float32 if force_fp32 else None
 
         # See pipeline_qwen_image_edit_plus: guard against transformers v5
         # multi-worker race on partial subfolder shard sets (Buildkite #1043).

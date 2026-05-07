@@ -221,7 +221,10 @@ def _build_accuracy_server_config(
 
     if not generate_model:
         pytest.skip("No generate model configured for accuracy benchmark test.")
-    generate_server_args = ["--num-gpus", "1"]
+    visible_gpus = [g.strip() for g in str(shared_gpu).split(",") if g.strip()]
+    if not visible_gpus:
+        pytest.fail("--accuracy-gpu is empty")
+    generate_server_args = ["--num-gpus", str(len(visible_gpus))]
     judge_server_args = [
         "--max-model-len",
         "32768",
@@ -229,14 +232,14 @@ def _build_accuracy_server_config(
         "0.8",
     ]
 
-    judge_env = {"CUDA_VISIBLE_DEVICES": shared_gpu}
+    judge_env = {"CUDA_VISIBLE_DEVICES": ",".join(visible_gpus)}
 
     return AccuracyServerConfig(
         generate_params=OmniServerParams(
             model=generate_model,
             port=port,
             server_args=generate_server_args,
-            env_dict={"CUDA_VISIBLE_DEVICES": shared_gpu},
+            env_dict={"CUDA_VISIBLE_DEVICES": ",".join(visible_gpus)},
             use_omni=True,
             stage_init_timeout=300,
         ),
