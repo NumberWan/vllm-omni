@@ -174,15 +174,6 @@ def gebench_samples_per_type(request: pytest.FixtureRequest) -> int:
 
 
 @pytest.fixture(scope="session")
-def gebench_data_types(request: pytest.FixtureRequest) -> tuple[str, ...]:
-    raw = str(request.config.getoption("gebench_data_types") or "")
-    types = tuple(part.strip() for part in raw.split(",") if part.strip())
-    if not types:
-        pytest.skip("--gebench-data-types is empty")
-    return types
-
-
-@pytest.fixture(scope="session")
 def gedit_samples_per_group(request: pytest.FixtureRequest) -> int:
     return int(request.config.getoption("gedit_samples_per_group"))
 
