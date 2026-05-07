@@ -51,7 +51,7 @@ def test_gebench_h100_smoke(
                         "--num-inference-steps",
                         "8",
                         "--seed",
-                        "42",
+                        "46",
                         "--workers",
                         str(accuracy_workers),
                     ]
