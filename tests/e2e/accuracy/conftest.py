@@ -42,12 +42,6 @@ def pytest_addoption(parser):
         help="Balanced sample count per GEBench type",
     )
     group.addoption(
-        "--gebench-data-types",
-        action="store",
-        default="type3,type4",
-        help="Comma-separated GEBench data types to run (e.g. 'type3' or 'type3,type4')",
-    )
-    group.addoption(
         "--gedit-samples-per-group",
         action="store",
         type=int,
