@@ -283,6 +283,14 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         model = od_config.model
         # Check if model is a local path
         local_files_only = os.path.exists(model)
+        force_fp32 = os.environ.get("VLLM_OMNI_DIFFUSION_FORCE_FP32", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        force_dtype = torch.float32 if force_fp32 else None
 
         # See pipeline_qwen_image_edit_plus: guard against transformers v5
         # multi-worker race on partial subfolder shard sets (Buildkite #1043).
@@ -297,14 +305,16 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        ).to(self.device)
+        ).to(self.device, dtype=force_dtype)
         self.vae = DistributedAutoencoderKLQwenImage.from_pretrained(
             model, subfolder="vae", local_files_only=local_files_only
-        ).to(self.device)
+        ).to(self.device, dtype=force_dtype)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
         self.transformer = QwenImageTransformer2DModel(
             od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
         )
+        if force_dtype is not None:
+            self.transformer = self.transformer.to(self.device, dtype=force_dtype)
 
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
