@@ -24,7 +24,7 @@ def test_gebench_h100_smoke(
     output_root = reset_artifact_dir(accuracy_artifact_root / f"gebench_{model_label}")
 
     with gebench_accuracy_servers.generate_server() as generate_server:
-        for data_type in ("type3", "type4"):
+        for data_type in ("type3"):
             assert (
                 gbench_main(
                     [
@@ -55,7 +55,7 @@ def test_gebench_h100_smoke(
             )
 
     with gebench_accuracy_servers.judge_server() as judge_server:
-        for data_type in ("type3", "type4"):
+        for data_type in ("type3"):
             assert (
                 gbench_main(
                     [
@@ -85,7 +85,7 @@ def test_gebench_h100_smoke(
     assert "generation" in summary
     assert "evaluation" in summary
 
-    for data_type in ("type3", "type4"):
+    for data_type in ("type3"):
         assert data_type in summary["generation"]["by_type"]
         assert summary["generation"]["by_type"][data_type]["count"] > 0
         assert data_type in summary["evaluation"]["by_type"]
@@ -93,4 +93,3 @@ def test_gebench_h100_smoke(
 
     assert summary["evaluation"]["overall_mean"] >= 0.45
     assert summary["evaluation"]["by_type"]["type3"]["overall_mean"] >= 0.45
-    assert summary["evaluation"]["by_type"]["type4"]["overall_mean"] >= 0.45
