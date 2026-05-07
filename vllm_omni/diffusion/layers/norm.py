@@ -84,19 +84,13 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        try:
-            return self._forward_fused(x)
-        except Exception:
-            return self.forward_native(x)
+        return self.forward_native(x)
 
     def forward_hip(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        try:
-            return self._forward_fused(x)
-        except Exception:
-            return self.forward_native(x)
+        return self.forward_native(x)
 
     def forward_npu(
         self,
