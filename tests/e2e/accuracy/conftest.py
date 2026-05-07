@@ -221,7 +221,7 @@ def _build_accuracy_server_config(
 
     if not generate_model:
         pytest.skip("No generate model configured for accuracy benchmark test.")
-    generate_server_args = ["--num-gpus", "1", "--dtype", "float32"]
+    generate_server_args = ["--num-gpus", "1"]
     judge_server_args = [
         "--max-model-len",
         "32768",
