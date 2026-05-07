@@ -19,12 +19,13 @@ def test_gebench_h100_smoke(
     accuracy_artifact_root: Path,
     gebench_dataset_root: Path,
     accuracy_workers: int,
+    gebench_data_types: tuple[str, ...],
 ) -> None:
     model_label = infer_model_label(gebench_accuracy_servers.generate_params.model).lower()
     output_root = reset_artifact_dir(accuracy_artifact_root / f"gebench_{model_label}")
 
     with gebench_accuracy_servers.generate_server() as generate_server:
-        for data_type in ("type3", "type4"):
+        for data_type in gebench_data_types:
             assert (
                 gbench_main(
                     [
@@ -55,7 +56,7 @@ def test_gebench_h100_smoke(
             )
 
     with gebench_accuracy_servers.judge_server() as judge_server:
-        for data_type in ("type3", "type4"):
+        for data_type in gebench_data_types:
             assert (
                 gbench_main(
                     [
@@ -85,12 +86,12 @@ def test_gebench_h100_smoke(
     assert "generation" in summary
     assert "evaluation" in summary
 
-    for data_type in ("type3", "type4"):
+    for data_type in gebench_data_types:
         assert data_type in summary["generation"]["by_type"]
         assert summary["generation"]["by_type"][data_type]["count"] > 0
         assert data_type in summary["evaluation"]["by_type"]
         assert summary["evaluation"]["by_type"][data_type]["count"] > 0
 
     assert summary["evaluation"]["overall_mean"] >= 0.45
-    assert summary["evaluation"]["by_type"]["type3"]["overall_mean"] >= 0.45
-    assert summary["evaluation"]["by_type"]["type4"]["overall_mean"] >= 0.45
+    for data_type in gebench_data_types:
+        assert summary["evaluation"]["by_type"][data_type]["overall_mean"] >= 0.45
