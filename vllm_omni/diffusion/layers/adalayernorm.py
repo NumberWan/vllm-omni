@@ -1,6 +1,7 @@
 from importlib.util import find_spec
 from typing import TYPE_CHECKING
 
+import os
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -84,7 +85,24 @@ class AdaLayerNorm(CustomOp):
         scale: torch.Tensor,
         shift: torch.Tensor,
     ) -> torch.Tensor:
-        return self.layernorm(x) * (1 + scale) + shift
+        # Optional: keep the model in BF16, but compute AdaLN scale/shift in FP32
+        # to reduce BF16 multiply-add error accumulation.
+        force_fp32 = os.environ.get("VLLM_OMNI_DIFFUSION_FORCE_FP32_NORMS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        if not force_fp32:
+            return self.layernorm(x) * (1 + scale) + shift
+
+        out_dtype = x.dtype
+        x_ln = self.layernorm(x).to(torch.float32)
+        scale_f = scale.to(torch.float32)
+        shift_f = shift.to(torch.float32)
+        out = x_ln * (1.0 + scale_f) + shift_f
+        return out.to(out_dtype)
 
 
 class AdaLayerNormZero(nn.Module):

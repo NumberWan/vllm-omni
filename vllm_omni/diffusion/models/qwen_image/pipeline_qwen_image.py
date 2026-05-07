@@ -283,14 +283,31 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         model = od_config.model
         # Check if model is a local path
         local_files_only = os.path.exists(model)
-        force_fp32 = os.environ.get("VLLM_OMNI_DIFFUSION_FORCE_FP32", "").strip().lower() in {
+        # FP32 controls (debug / experimentation):
+        #
+        # - Legacy: VLLM_OMNI_DIFFUSION_FORCE_FP32=1 forces FP32 for all major
+        #   components (text_encoder/vae/transformer), preserving prior behavior.
+        # - Fine-grained: VLLM_OMNI_DIFFUSION_FORCE_FP32_MODE can be one of:
+        #     - "all": text_encoder/vae/transformer -> FP32
+        #     - "text_vae": text_encoder/vae -> FP32 (transformer unchanged)
+        #     - "transformer": transformer -> FP32 (text_encoder/vae unchanged)
+        #     - "off": disable component FP32 forcing (norm-only FP32 can still be
+        #       enabled separately via norm layer switches)
+        legacy_force_all_fp32 = os.environ.get("VLLM_OMNI_DIFFUSION_FORCE_FP32", "").strip().lower() in {
             "1",
             "true",
             "yes",
             "y",
             "on",
         }
-        force_dtype = torch.float32 if force_fp32 else None
+        fp32_mode = os.environ.get("VLLM_OMNI_DIFFUSION_FORCE_FP32_MODE", "").strip().lower()
+        if not fp32_mode and legacy_force_all_fp32:
+            fp32_mode = "all"
+
+        force_text_vae_fp32 = fp32_mode in {"all", "text_vae"}
+        force_transformer_fp32 = fp32_mode in {"all", "transformer"}
+        text_vae_dtype = torch.float32 if force_text_vae_fp32 else None
+        transformer_dtype = torch.float32 if force_transformer_fp32 else None
 
         # See pipeline_qwen_image_edit_plus: guard against transformers v5
         # multi-worker race on partial subfolder shard sets (Buildkite #1043).
@@ -305,16 +322,16 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        ).to(self.device, dtype=force_dtype)
+        ).to(self.device, dtype=text_vae_dtype)
         self.vae = DistributedAutoencoderKLQwenImage.from_pretrained(
             model, subfolder="vae", local_files_only=local_files_only
-        ).to(self.device, dtype=force_dtype)
+        ).to(self.device, dtype=text_vae_dtype)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
         self.transformer = QwenImageTransformer2DModel(
             od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
         )
-        if force_dtype is not None:
-            self.transformer = self.transformer.to(self.device, dtype=force_dtype)
+        if transformer_dtype is not None:
+            self.transformer = self.transformer.to(self.device, dtype=transformer_dtype)
 
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
