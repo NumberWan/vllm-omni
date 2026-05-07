@@ -1,5 +1,6 @@
 from importlib.util import find_spec
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -84,6 +85,15 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        force_fp32 = os.environ.get("VLLM_OMNI_DIFFUSION_FORCE_FP32_NORMS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        if force_fp32:
+            return self.forward_native(x)
         try:
             return self._forward_fused(x)
         except Exception:
@@ -93,6 +103,15 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        force_fp32 = os.environ.get("VLLM_OMNI_DIFFUSION_FORCE_FP32_NORMS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        if force_fp32:
+            return self.forward_native(x)
         try:
             return self._forward_fused(x)
         except Exception:
