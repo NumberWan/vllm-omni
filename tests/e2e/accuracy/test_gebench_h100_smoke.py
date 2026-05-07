@@ -18,6 +18,7 @@ def test_gebench_h100_smoke(
     gebench_accuracy_servers,
     accuracy_artifact_root: Path,
     gebench_dataset_root: Path,
+    gebench_samples_per_type: int,
     accuracy_workers: int,
 ) -> None:
     model_label = infer_model_label(gebench_accuracy_servers.generate_params.model).lower()
@@ -39,6 +40,8 @@ def test_gebench_h100_smoke(
                         generate_server.model,
                         "--data-type",
                         data_type,
+                        "--samples-per-type",
+                        str(gebench_samples_per_type),
                         "--width",
                         "768",
                         "--height",
@@ -47,6 +50,8 @@ def test_gebench_h100_smoke(
                         "98",
                         "--num-inference-steps",
                         "8",
+                        "--seed",
+                        "42",
                         "--workers",
                         str(accuracy_workers),
                     ]
@@ -66,6 +71,8 @@ def test_gebench_h100_smoke(
                         str(output_root),
                         "--data-type",
                         data_type,
+                        "--samples-per-type",
+                        str(gebench_samples_per_type),
                         "--judge-base-url",
                         f"http://{judge_server.host}:{judge_server.port}",
                         "--judge-model",
