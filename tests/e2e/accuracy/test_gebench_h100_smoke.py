@@ -49,7 +49,7 @@ def test_gebench_h100_smoke(
                         "--output-compression",
                         "98",
                         "--num-inference-steps",
-                        "8",
+                        "30",
                         "--seed",
                         "46",
                         "--workers",
