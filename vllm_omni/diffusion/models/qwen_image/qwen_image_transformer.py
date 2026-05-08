@@ -861,16 +861,39 @@ class QwenImageTransformerBlock(nn.Module):
 
         txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
 
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "block.temb", temb)
+            _parity_blk_tensor(bidx, "block.img_mod_params", img_mod_params)
+            _parity_blk_tensor(bidx, "block.txt_mod_params", txt_mod_params)
+            if modulate_index is None:
+                _parity_blk_tensor(bidx, "block.modulate_index", None)
+            else:
+                if isinstance(modulate_index, torch.Tensor):
+                    mi_t = modulate_index
+                else:
+                    mi_t = torch.tensor(modulate_index, device=hidden_states.device, dtype=torch.int)
+                _parity_blk_tensor(bidx, "block.modulate_index", mi_t)
+
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
         img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1, modulate_index)
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "block.img_mod1", img_mod1)
+            _parity_blk_tensor(bidx, "block.img_scale1", img_scale1)
+            _parity_blk_tensor(bidx, "block.img_shift1", img_shift1)
+            _parity_blk_tensor(bidx, "block.img_gate1", img_gate1)
         img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
 
         # Process text stream - norm1 + modulation
         txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
+        if bidx >= 0:
+            _parity_blk_tensor(bidx, "block.txt_mod1", txt_mod1)
+            _parity_blk_tensor(bidx, "block.txt_scale1", txt_scale1)
+            _parity_blk_tensor(bidx, "block.txt_shift1", txt_shift1)
+            _parity_blk_tensor(bidx, "block.txt_gate1", txt_gate1)
         txt_modulated = self.txt_norm1(encoder_hidden_states, txt_scale1, txt_shift1)
 
         if bidx >= 0:
