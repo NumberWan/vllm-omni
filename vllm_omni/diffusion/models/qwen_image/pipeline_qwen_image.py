@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -51,6 +52,8 @@ from vllm_omni.diffusion.utils.qwen_image_parity_log import (
     parity_should_log_denoise_step,
     parity_tensor,
 )
+
+_INIT_LATENTS_PATH_ENV = "VLLM_OMNI_QWEN_IMAGE_INIT_LATENTS_PATH"
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
@@ -563,7 +566,37 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        init_path_raw = os.environ.get(_INIT_LATENTS_PATH_ENV, "").strip()
+        init_path = Path(init_path_raw) if init_path_raw else None
+        loaded = False
+        if init_path is not None and init_path.exists():
+            obj = torch.load(init_path, map_location="cpu")
+            if isinstance(obj, dict) and "latents_unpacked" in obj:
+                latents_cpu = obj["latents_unpacked"]
+            else:
+                latents_cpu = obj
+            if not isinstance(latents_cpu, torch.Tensor):
+                raise TypeError(
+                    f"{_INIT_LATENTS_PATH_ENV} file must contain a Tensor "
+                    f"(or dict with 'latents_unpacked')."
+                )
+            if tuple(latents_cpu.shape) != tuple(shape):
+                raise ValueError(
+                    f"Loaded init latents shape {tuple(latents_cpu.shape)} != expected {shape}. "
+                    f"Delete the file or regenerate with matching args."
+                )
+            latents = latents_cpu.to(device=device, dtype=dtype)
+            loaded = True
+        else:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            if init_path is not None:
+                init_path.parent.mkdir(parents=True, exist_ok=True)
+                to_save = {
+                    "latents_unpacked": latents.detach().to(device="cpu", dtype=torch.float32),
+                    "shape": tuple(shape),
+                    "dtype": str(dtype),
+                }
+                torch.save(to_save, init_path)
         latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
 
         if parity_enabled():
@@ -578,6 +611,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 f"shape_pre_pack={shape} dtype={dtype} device={device} "
                 f"generator={gen_desc}"
             )
+            if init_path is not None:
+                parity_msg(f"init_latents_path={str(init_path)} loaded={loaded}")
             parity_tensor("latents_packed", latents)
 
         return latents
