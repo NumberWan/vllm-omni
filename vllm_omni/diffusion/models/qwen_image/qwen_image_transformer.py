@@ -1188,6 +1188,17 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Prepare hidden_states and RoPE via ImageRopePrepare module
         # _sp_plan will shard hidden_states and vid_freqs together via split_output=True
         # txt_freqs is kept replicated for dual-stream attention
+        if parity_enabled():
+            parity_section("tr.pre_image_rope_prepare")
+            parity_tensor("tr.hidden_states_before_img_in", hidden_states)
+            parity_tensor(
+                "tr.img_shapes",
+                torch.tensor(img_shapes, device=hidden_states.device, dtype=torch.int),
+            )
+            parity_tensor(
+                "tr.txt_seq_lens",
+                torch.tensor(txt_seq_lens, device=hidden_states.device, dtype=torch.int),
+            )
         hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
         image_rotary_emb = (vid_freqs, txt_freqs)
 
