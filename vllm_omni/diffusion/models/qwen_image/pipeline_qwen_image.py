@@ -55,6 +55,24 @@ from vllm_omni.diffusion.utils.qwen_image_parity_log import (
 
 _INIT_LATENTS_PATH_ENV = "VLLM_OMNI_QWEN_IMAGE_INIT_LATENTS_PATH"
 
+def _shape_suffixed_pt_path(base: Path, shape: tuple[int, int, int, int, int]) -> Path:
+    """Derive a stable, resolution-specific path from a user-provided base path.
+
+    If base is a directory, write into it.
+    If base is a file path, add a ".{HxW}" suffix before the extension.
+    """
+    # shape = (B, 1, C, H, W)
+    h, w = int(shape[-2]), int(shape[-1])
+    suffix = f"{h}x{w}"
+    if base.exists() and base.is_dir():
+        return base / f"init_latents.{suffix}.pt"
+    if str(base).endswith(("/", "\\")):
+        # Treat as directory-like even if it doesn't exist yet.
+        return base / f"init_latents.{suffix}.pt"
+    if base.suffix == ".pt":
+        return base.with_suffix(f".{suffix}.pt")
+    return base.with_name(base.name + f".{suffix}.pt")
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
@@ -597,7 +615,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             )
 
         init_path_raw = os.environ.get(_INIT_LATENTS_PATH_ENV, "").strip()
-        init_path = Path(init_path_raw) if init_path_raw else None
+        init_base = Path(init_path_raw) if init_path_raw else None
+        init_path = _shape_suffixed_pt_path(init_base, shape) if init_base is not None else None
         loaded = False
         if init_path is not None and init_path.exists():
             obj = torch.load(init_path, map_location="cpu")
@@ -609,11 +628,6 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 raise TypeError(
                     f"{_INIT_LATENTS_PATH_ENV} file must contain a Tensor "
                     f"(or dict with 'latents_unpacked')."
-                )
-            if tuple(latents_cpu.shape) != tuple(shape):
-                raise ValueError(
-                    f"Loaded init latents shape {tuple(latents_cpu.shape)} != expected {shape}. "
-                    f"Delete the file or regenerate with matching args."
                 )
             latents = latents_cpu.to(device=device, dtype=dtype)
             loaded = True
@@ -642,7 +656,10 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 f"generator={gen_desc}"
             )
             if init_path is not None:
-                parity_msg(f"init_latents_path={str(init_path)} loaded={loaded}")
+                parity_msg(
+                    f"init_latents_base={str(init_base) if init_base is not None else ''} "
+                    f"init_latents_path={str(init_path)} loaded={loaded}"
+                )
             parity_tensor("latents_packed", latents)
 
         return latents
