@@ -330,8 +330,11 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         self.transformer = QwenImageTransformer2DModel(
             od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
         )
-        if transformer_dtype is not None:
-            self.transformer = self.transformer.to(self.device, dtype=transformer_dtype)
+        # Boundary layers (img_in / txt_in / proj_out / norm_out.linear) use quant_config=None and
+        # default to FP32 weights; latents follow od_config.dtype. Align the full module unless
+        # FP32 forcing is enabled for the transformer via env (see transformer_dtype above).
+        target_transformer_dtype = transformer_dtype if transformer_dtype is not None else od_config.dtype
+        self.transformer = self.transformer.to(self.device, dtype=target_transformer_dtype)
 
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
