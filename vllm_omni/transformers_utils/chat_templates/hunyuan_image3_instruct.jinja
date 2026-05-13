@@ -1,0 +1,36 @@
+{# HunyuanImage-3.0-Instruct "instruct" layout (see vllm_omni.diffusion.models.hunyuan_image3.prompt_utils). #}
+{%- macro render_content(content) -%}
+  {%- if content is string -%}
+    {{- content -}}
+  {%- elif content is mapping -%}
+    {{- content.get('text', content | string) -}}
+  {%- else -%}
+    {%- for part in content -%}
+      {%- if part is mapping -%}
+        {%- if part.get('type') == 'text' -%}
+          {{- part.get('text', '') -}}
+        {%- elif part.get('type') == 'image_url' -%}
+          {{- '<img>' -}}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endmacro -%}
+{{- '<|startoftext|>' -}}
+{%- for message in messages -%}
+  {%- if message['role'] == 'system' -%}
+    {{- render_content(message['content']) -}}
+    {{- '\n\n' -}}
+  {%- elif message['role'] == 'user' -%}
+    {{- 'User: ' -}}
+    {{- render_content(message['content']) -}}
+    {%- if add_generation_prompt or not loop.last -%}
+      {{- '\n\nAssistant: ' -}}
+    {%- endif -%}
+  {%- elif message['role'] == 'assistant' -%}
+    {{- render_content(message['content']) -}}
+    {%- if not loop.last -%}
+      {{- '\n\n' -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}

@@ -1534,17 +1534,50 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 _parse_lora_request(request.lora)
                 extra_body["lora"] = request.lora
 
+            request_id = f"img_gen-{random_uuid()}"
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=request.prompt,
                 extra_body=extra_body,
-                request_id=f"img_gen-{random_uuid()}",
+                request_id=request_id,
             )
             if isinstance(generation_result, ErrorResponse):
                 return JSONResponse(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     content=generation_result.model_dump(),
                 )
-            flat_images, _, _ = generation_result
+            flat_images, stage_durations, _ = generation_result
+
+            # Lightweight per-request telemetry for multi-stage diffusion.
+            # Logged as JSON so it can be post-processed into CSV/Excel.
+            try:
+                import json as _json
+
+                logger.info(
+                    "[hunyuan_image3_metrics] %s",
+                    _json.dumps(
+                        {
+                            "request_id": request_id,
+                            "model": model_name,
+                            "width": width,
+                            "height": height,
+                            "size": request.size,
+                            "num_inference_steps": request.num_inference_steps,
+                            "guidance_scale": request.guidance_scale,
+                            "true_cfg_scale": request.true_cfg_scale,
+                            "n": request.n,
+                            "seed": effective_seed,
+                            # Approximate prompt length by whitespace-delimited words.
+                            "prompt_words": len((request.prompt or "").split()),
+                            # Stage durations (ms) are provided by generate_diffusion_images.
+                            "stage_durations_ms": stage_durations,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                )
+            except Exception:
+                logger.debug("Failed to log hunyuan_image3_metrics", exc_info=True)
+
             image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in flat_images]
             return ImageGenerationResponse(created=int(time.time()), data=image_data)
 

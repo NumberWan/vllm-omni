@@ -1,5 +1,6 @@
 import sys
 from functools import cached_property
+from pathlib import Path
 
 from aenum import extend_enum
 from vllm.config import ModelConfig as _OriginalModelConfig
@@ -13,6 +14,9 @@ from vllm.v1.engine import EngineCoreRequest as _OriginalEngineCoreRequest
 from vllm.v1.request import Request as _OriginalRequest
 from vllm.v1.request import RequestStatus
 from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
+from vllm.transformers_utils.chat_templates.registry import (
+    register_chat_template_fallback_path,
+)
 
 import vllm_omni.logger  # noqa: F401
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
@@ -69,6 +73,21 @@ assert _installed is _patched_cp, (
     "is_mm_prefix_lm patch failed to install — bidirectional attention "
     "for HunyuanImage3 will not work. Check vLLM ModelConfig changes."
 )
+
+# =============================================================================
+# Chat template fallback for HunyuanImage-3.0-Instruct (HF model_type)
+# =============================================================================
+# WHY: Hub tokenizer_config.json has no ``chat_template``; transformers v4.44+
+# forbids implicit defaults, so vLLM raises ChatTemplateResolutionError on
+# /v1/chat/completions.  Register a Jinja template matching the instruct layout
+# documented in ``prompt_utils.build_prompt`` so OpenAI-style requests work.
+_HUNYUAN_IMAGE3_CHAT_TEMPLATE = (
+    Path(__file__).resolve().parent
+    / "transformers_utils"
+    / "chat_templates"
+    / "hunyuan_image3_instruct.jinja"
+)
+register_chat_template_fallback_path("hunyuan_image_3_moe", _HUNYUAN_IMAGE3_CHAT_TEMPLATE)
 
 # =============================================================================
 # Patch GlmImageTextConfig to expose mrope_section in rope_parameters

@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import re
 import warnings
+from types import SimpleNamespace
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -1444,7 +1445,16 @@ class StageConfigFactory:
             config_dict = get_hf_file_to_dict("config.json", model, revision=None)
             if config_dict:
                 if "model_type" in config_dict:
-                    return config_dict["model_type"], None
+                    mt = config_dict["model_type"]
+                    # When ``get_config`` fails (e.g. ESTALE on network FS), we still
+                    # need ``architectures`` so ``create_from_model`` can match
+                    # ``PipelineConfig.hf_architectures`` (e.g. HunyuanImage3 reports
+                    # model_type ``hunyuan_image_3_moe`` but registers under
+                    # ``hunyuan_image3``).
+                    archs = config_dict.get("architectures")
+                    if isinstance(archs, list) and archs:
+                        return mt, SimpleNamespace(model_type=mt, architectures=archs)
+                    return mt, None
                 # VoxCPM2-style configs use singular ``architecture`` rather
                 # than HF's standard ``model_type`` / ``architectures``. Accept
                 # it as a fallback so the pipeline registry can still match.
