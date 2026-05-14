@@ -47,9 +47,21 @@ def _parse_log(path: str) -> list[dict[str, Any]]:
                 continue
 
             sd = data.get("stage_durations_ms") or {}
-            # Stage keys are implementation-defined; we normalise common ones.
-            ar_ms = sd.get("stage_0") or sd.get("ar") or sd.get("AR") or 0.0
-            dit_ms = sd.get("stage_1") or sd.get("dit") or sd.get("DiT") or 0.0
+            # Orchestrator uses stage_0_gen_ms / stage_1_gen_ms (milliseconds).
+            ar_ms = (
+                sd.get("stage_0_gen_ms")
+                or sd.get("stage_0")
+                or sd.get("ar")
+                or sd.get("AR")
+                or 0.0
+            )
+            dit_ms = (
+                sd.get("stage_1_gen_ms")
+                or sd.get("stage_1")
+                or sd.get("dit")
+                or sd.get("DiT")
+                or 0.0
+            )
             total_ms = float(ar_ms) + float(dit_ms)
 
             rows.append(

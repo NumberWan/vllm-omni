@@ -945,7 +945,15 @@ async def benchmark(args):
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
-    async with aiohttp.ClientSession() as session:
+    # aiohttp's default read timeout is often ~300s; Hunyuan AR+DiT at 1024^2 routinely exceeds it,
+    # which drops the TCP connection and the server logs "Aborted request".
+    session_timeout: aiohttp.ClientTimeout | None
+    if getattr(args, "client_timeout_sec", 0) and args.client_timeout_sec > 0:
+        session_timeout = aiohttp.ClientTimeout(total=args.client_timeout_sec)
+    else:
+        session_timeout = None
+
+    async with aiohttp.ClientSession(timeout=session_timeout) as session:
         warmup_pairs = await _run_warmups(
             requests_list=requests_list,
             args=args,
@@ -1131,6 +1139,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")
+    parser.add_argument(
+        "--client-timeout-sec",
+        type=float,
+        default=7200.0,
+        help=(
+            "HTTP client total timeout per request (seconds). Default 7200. "
+            "Library default is often ~300s read, which aborts long image generations. "
+            "Use 0 for aiohttp default (not recommended for slow t2i)."
+        ),
+    )
     parser.add_argument(
         "--slo",
         action="store_true",
