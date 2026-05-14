@@ -43,7 +43,7 @@ stages:
       temperature: 0.0
       top_p: 1
       top_k: -1
-      max_tokens: 8192
+      max_tokens: 1024
       detokenize: true
       skip_special_tokens: false
 

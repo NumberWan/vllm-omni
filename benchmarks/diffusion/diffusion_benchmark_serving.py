@@ -8,7 +8,7 @@ If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
 Supports multiple backends:
     - vllm-omni: Uses /v1/chat/completions endpoint (default)
-    - openai: Uses /v1/images/generations endpoint
+    - openai: Uses /v1/images/generations (t2i) or /v1/images/edits when requests include image_paths
     - v1/videos: Use /v1/videos endpoint
 
 Usage:

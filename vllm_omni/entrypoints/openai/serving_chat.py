@@ -107,6 +107,108 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
+def _stage_type_is_llm(stage_type: Any) -> bool:
+    """Match ``llm`` / ``llm_ar`` across strings, ``StageType`` enums, and ``'StageType.LLM'``-style repr."""
+    if stage_type is None:
+        return False
+    tail = str(stage_type).lower().rpartition(".")[-1]
+    return tail in ("llm", "llm_ar")
+
+
+def _stage_config_model_arch(cfg: Any) -> str:
+    """Resolve ``model_arch`` from resolved stage configs (object / dict / OmegaConf-style)."""
+    v = getattr(cfg, "model_arch", None)
+    if v:
+        return str(v)
+    if isinstance(cfg, dict):
+        if (ma := cfg.get("model_arch")):
+            return str(ma)
+    ea = getattr(cfg, "engine_args", None)
+    if ea is None and isinstance(cfg, dict):
+        ea = cfg.get("engine_args")
+    if ea is not None:
+        if isinstance(ea, dict):
+            if (ma := ea.get("model_arch")):
+                return str(ma)
+        elif hasattr(ea, "get"):
+            try:
+                ma = ea.get("model_arch") or ea.get("model-arch")
+                if ma:
+                    return str(ma)
+            except Exception:
+                pass
+        else:
+            ma = getattr(ea, "model_arch", None)
+            if ma:
+                return str(ma)
+    yargs = getattr(cfg, "yaml_engine_args", None)
+    if yargs is not None and hasattr(yargs, "get"):
+        try:
+            ma2 = yargs.get("model_arch")
+            if ma2:
+                return str(ma2)
+        except Exception:
+            pass
+    return ""
+
+
+def _engine_first_llm_is_hunyuan_image3(engine: Any) -> bool:
+    """True when an LLM stage uses HunyuanImage3 AR (needs ``<img>`` for cond-image requests)."""
+    for cfg in getattr(engine, "stage_configs", None) or []:
+        if not _stage_type_is_llm(get_stage_type(cfg)):
+            continue
+        if "HunyuanImage3" in _stage_config_model_arch(cfg):
+            return True
+    return False
+
+
+def _hunyuan_prompt_task_with_reference(bot_task: str | None) -> str:
+    """Map API / CLI ``bot_task`` aliases to ``prompt_utils`` task keys (image+text)."""
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import available_tasks
+
+    known = frozenset(available_tasks())
+    if bot_task and bot_task in known:
+        return bot_task
+    if not bot_task:
+        return "it2i_recaption"
+    b = str(bot_task).strip().lower()
+    if b in ("think", "vanilla"):
+        return "it2i_think"
+    if b == "recaption":
+        return "it2i_recaption"
+    if b == "image":
+        return "it2i_recaption"
+    return "it2i_recaption"
+
+
+def _hunyuan_prompt_task_text_only(bot_task: str) -> str:
+    """Map shorthand ``bot_task`` to text-to-image preset keys."""
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import available_tasks
+
+    known = frozenset(available_tasks())
+    if bot_task in known:
+        return bot_task
+    b = str(bot_task).strip().lower()
+    if b in ("think", "vanilla"):
+        return "t2i_think"
+    if b == "recaption":
+        return "t2i_recaption"
+    if b == "image":
+        return "t2i"
+    return bot_task
+
+
+def _resolve_multistage_prompt_task(engine: Any, bot_task: str | None, reference_images: list[Any]) -> str | None:
+    """Resolve ``task=`` for ``build_prompt`` / ``build_prompt_tokens`` in multistage image gen."""
+    if not _engine_first_llm_is_hunyuan_image3(engine):
+        return bot_task if bot_task else None
+    if reference_images:
+        return _hunyuan_prompt_task_with_reference(bot_task)
+    if bot_task:
+        return _hunyuan_prompt_task_text_only(bot_task)
+    return None
+
+
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     """OpenAI-compatible chat serving for both LLM and Diffusion models.
 
@@ -2250,13 +2352,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         modalities = ["image"]
         if reference_images:
             if len(reference_images) == 1:
-                engine_prompt_data = {"img2img": reference_images[0]}
-                modalities = ["img2img"]
+                # Use the "image" key so vLLM's default MM parser accepts the payload.
+                # "img2img" is not a subparser key for HunyuanImage3 (raises Unsupported modality).
+                # GLM-Image i2i is still detected via multi_modal_data["image"] in ar2diffusion
+                # (_has_source_image); "img2img" in modalities was only a redundant hint there.
+                engine_prompt_data = {"image": reference_images[0]}
             else:
                 engine_prompt_data = {"image": reference_images}
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
-        if bot_task:
+        prompt_task = _resolve_multistage_prompt_task(engine, bot_task, reference_images)
+        if prompt_task:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,
@@ -2265,11 +2371,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             prompt_token_ids: list[int] | None = None
             system_prompt_type: str | None = None
             if tokenizer is not None:
-                result = build_prompt_tokens(prompt, tokenizer, task=bot_task)
+                result = build_prompt_tokens(prompt, tokenizer, task=prompt_task)
                 prompt_token_ids = result.token_ids
                 system_prompt_type = result.system_prompt_type
+                # ``OmniInputPreprocessor._process_tokens`` forwards a parallel plain-text
+                # ``prompt`` into the renderer; keep it consistent with ``prompt_token_ids``
+                # so HunyuanImage-3 multimodal processing finds the ``<img>`` placeholder.
+                engine_prompt["prompt"] = build_prompt(prompt, task=prompt_task)
             else:
-                prompt = build_prompt(prompt, task=bot_task)
+                prompt = build_prompt(prompt, task=prompt_task)
                 engine_prompt["prompt"] = prompt
 
             if reference_images and len(reference_images) == 1:

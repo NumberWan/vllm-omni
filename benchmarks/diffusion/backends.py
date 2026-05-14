@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import mimetypes
 import os
 import time
@@ -81,11 +82,7 @@ async def async_request_chat_completions(
             content.append({"type": "text", "text": input.prompt})
         for img_path in input.image_paths:
             if not os.path.exists(img_path):
-                output.error = f"Image file not found: {img_path}"
-                output.success = False
-                if pbar:
-                    pbar.update(1)
-                return output
+                raise FileNotFoundError(f"Image file not found: {img_path}")
             content.append(
                 {
                     "type": "image_url",
@@ -151,62 +148,132 @@ async def async_request_chat_completions(
     return output
 
 
+def _openai_image_edits_url(generations_url: str) -> str:
+    """Map .../v1/images/generations -> .../v1/images/edits."""
+    g = generations_url.rstrip("/")
+    if g.endswith("/v1/images/generations"):
+        return g[: -len("generations")] + "edits"
+    return f"{g.rsplit('/', 1)[0]}/edits" if "/v1/images/" in g else f"{g}/v1/images/edits"
+
+
+def _form_add_extra_body(form: aiohttp.FormData, extra: dict[str, Any], skip: set[str]) -> None:
+    for key, value in extra.items():
+        if key in skip or value is None:
+            continue
+        if isinstance(value, bool):
+            form.add_field(key, "true" if value else "false")
+        elif isinstance(value, (dict, list)):
+            form.add_field(key, json.dumps(value))
+        elif isinstance(value, (str, int, float)):
+            form.add_field(key, str(value))
+        else:
+            form.add_field(key, json.dumps(value))
+
+
 async def async_request_openai_images(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
 ) -> RequestFuncOutput:
     """
-    Send request to OpenAI's /v1/images/generations endpoint.
+    Send request to /v1/images/generations (text-only) or /v1/images/edits
+    (multipart when input images are present).
     """
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
 
-    # Build size string from width/height
     width = input.width or 1024
     height = input.height or 1024
     size = f"{width}x{height}"
 
-    payload: dict[str, Any] = {
-        "model": input.model,
-        "prompt": input.prompt,
-        "n": 1,
-        "size": size,
-        "response_format": "b64_json",
-    }
+    image_paths = [p for p in (input.image_paths or []) if p]
+    if image_paths:
+        for path in image_paths:
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Image file not found: {path}")
 
-    # Add optional parameters
-    if input.seed is not None:
-        payload["seed"] = input.seed
-    if input.num_inference_steps is not None:
-        payload["num_inference_steps"] = input.num_inference_steps
+    headers_auth = {"Authorization": "Bearer EMPTY"}
 
-    # Add any extra body parameters
-    if input.extra_body:
-        for key, value in input.extra_body.items():
-            if key not in payload:
-                payload[key] = value
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer EMPTY",
-    }
+    opened_files: list[Any] = []
 
     try:
-        async with session.post(input.api_url, json=payload, headers=headers) as response:
-            if response.status == 200:
-                resp_json = await response.json()
-                output.response_body = resp_json
-                output.success = True
-                # Check for usage/memory info if available
-                if "usage" in resp_json and "peak_memory_mb" in resp_json.get("usage", {}):
-                    output.peak_memory_mb = resp_json["usage"]["peak_memory_mb"]
-            else:
-                output.error = f"HTTP {response.status}: {await response.text()}"
-                output.success = False
+        if image_paths:
+            edit_url = _openai_image_edits_url(input.api_url)
+            form = aiohttp.FormData()
+            form.add_field("model", input.model)
+            form.add_field("prompt", input.prompt)
+            form.add_field("n", "1")
+            form.add_field("size", size)
+            form.add_field("response_format", "b64_json")
+            if input.seed is not None:
+                form.add_field("seed", str(input.seed))
+            if input.num_inference_steps is not None:
+                form.add_field("num_inference_steps", str(input.num_inference_steps))
+
+            _form_add_extra_body(
+                form,
+                dict(input.extra_body),
+                skip={"model", "prompt", "n", "size", "response_format", "seed", "num_inference_steps"},
+            )
+
+            for path in image_paths:
+                fh = open(path, "rb")
+                opened_files.append(fh)
+                mime = _guess_mime_type(path)
+                form.add_field(
+                    "image",
+                    fh,
+                    filename=os.path.basename(path),
+                    content_type=mime,
+                )
+
+            async with session.post(edit_url, data=form, headers=headers_auth) as response:
+                if response.status == 200:
+                    resp_json = await response.json()
+                    output.response_body = resp_json
+                    output.success = True
+                    if "usage" in resp_json and "peak_memory_mb" in resp_json.get("usage", {}):
+                        output.peak_memory_mb = resp_json["usage"]["peak_memory_mb"]
+                else:
+                    output.error = f"HTTP {response.status}: {await response.text()}"
+                    output.success = False
+        else:
+            payload: dict[str, Any] = {
+                "model": input.model,
+                "prompt": input.prompt,
+                "n": 1,
+                "size": size,
+                "response_format": "b64_json",
+            }
+            if input.seed is not None:
+                payload["seed"] = input.seed
+            if input.num_inference_steps is not None:
+                payload["num_inference_steps"] = input.num_inference_steps
+            if input.extra_body:
+                for key, value in input.extra_body.items():
+                    if key not in payload:
+                        payload[key] = value
+
+            headers = {**headers_auth, "Content-Type": "application/json"}
+            async with session.post(input.api_url, json=payload, headers=headers) as response:
+                if response.status == 200:
+                    resp_json = await response.json()
+                    output.response_body = resp_json
+                    output.success = True
+                    if "usage" in resp_json and "peak_memory_mb" in resp_json.get("usage", {}):
+                        output.peak_memory_mb = resp_json["usage"]["peak_memory_mb"]
+                else:
+                    output.error = f"HTTP {response.status}: {await response.text()}"
+                    output.success = False
     except Exception as e:
         output.error = str(e)
         output.success = False
+    finally:
+        for fh in opened_files:
+            try:
+                fh.close()
+            except OSError:
+                pass
 
     output.latency = time.perf_counter() - output.start_time
 

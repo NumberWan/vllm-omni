@@ -894,22 +894,43 @@ class ImageKVCacheManager:
 
         bs, q_len, num_kv_heads, head_dim = key.shape
 
-        ar_kv_len = ar_kv_list[0][0].shape[0] if ar_kv_list is not None else 0
-        assert q_len + ar_kv_len == seq_len, f"q_len({q_len}) + ar_kv_len({ar_kv_len}) != seq_len({seq_len})"
-
-        if ar_kv_len > 0:
+        if not ar_kv_list:
+            ar_kv_len = 0
+        else:
+            if len(ar_kv_list) != bs:
+                raise ValueError(
+                    f"AR KV batch mismatch: got {len(ar_kv_list)} entries for bs={bs}"
+                )
+            ar_lens = [int(ar_kv_list[b][0].shape[0]) for b in range(bs)]
+            max_ar = max(ar_lens)
+            assert q_len + max_ar == seq_len, (
+                f"q_len({q_len}) + max_ar({max_ar}) != seq_len({seq_len}), "
+                f"per-batch ar_lens={ar_lens}"
+            )
             new_keys = []
             new_values = []
             for b in range(bs):
                 ar_k, ar_v = ar_kv_list[b]
-                ar_k = ar_k.reshape(1, ar_kv_len, num_kv_heads, head_dim)
-                ar_v = ar_v.reshape(1, ar_kv_len, num_kv_heads, head_dim)
+                cur = int(ar_k.shape[0])
+                if cur < max_ar:
+                    pad_n = max_ar - cur
+                    pad_k = ar_k.new_zeros(pad_n, num_kv_heads, head_dim)
+                    pad_v = ar_v.new_zeros(pad_n, num_kv_heads, head_dim)
+                    ar_k = torch.cat([ar_k, pad_k], dim=0)
+                    ar_v = torch.cat([ar_v, pad_v], dim=0)
+                ar_k = ar_k.reshape(1, max_ar, num_kv_heads, head_dim)
+                ar_v = ar_v.reshape(1, max_ar, num_kv_heads, head_dim)
                 k = torch.cat([ar_k, key[b : b + 1]], dim=1)
                 v = torch.cat([ar_v, value[b : b + 1]], dim=1)
                 new_keys.append(k)
                 new_values.append(v)
             key = torch.cat(new_keys, dim=0)
             value = torch.cat(new_values, dim=0)
+            ar_kv_len = max_ar
+
+        assert q_len + ar_kv_len == seq_len, (
+            f"q_len({q_len}) + ar_kv_len({ar_kv_len}) != seq_len({seq_len})"
+        )
 
         image_size = shard_image_size if self.sp_size > 1 else (self.image_token_len + 1)
         cached_prompt_len = seq_len - image_size
@@ -2755,9 +2776,22 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         input_ids,
         model_kwargs,
         positive_reuse_len,
+        *,
+        ar_fallback_kv_len: int,
     ):
         input_ids = input_ids[:, positive_reuse_len:]
-        model_kwargs["query_lens"] = [q - positive_reuse_len for q in model_kwargs["query_lens"]]
+        old_query_lens = list(model_kwargs["query_lens"])
+        model_kwargs["query_lens"] = [q - positive_reuse_len for q in old_query_lens]
+        # ``ImageKVCacheManager._cache_prompt_kv`` requires ``seq_len == q_len + ar_kv_len``
+        # on the first DiT step.  After CFG negative prefill, pos/neg injected AR KV can
+        # differ in length; use the max across batch so ``seq_lens`` matches the padded
+        # concat in ``_cache_prompt_kv``.  Fallback when nothing is injected yet.
+        inj = getattr(self.model.layers[0].self_attn.image_attn, "_injected_ar_kv", None) or []
+        if inj:
+            max_ar = max(int(p[0].shape[0]) for p in inj)
+        else:
+            max_ar = ar_fallback_kv_len
+        model_kwargs["seq_lens"] = [q - positive_reuse_len + max_ar for q in old_query_lens]
         model_kwargs["attention_mask"] = model_kwargs["attention_mask"][:, :, positive_reuse_len:, :]
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, positive_reuse_len:]
 
@@ -2798,6 +2832,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         if positive_reuse_len <= 0:
             return input_ids
 
+        # Physical AR KV length can be shorter than ``positive_reuse_len`` (DiT tokenizer
+        # ``think_recaption_end_pos``); ``inject_ar_kv_into_layers`` slices with the min.
+        first_layer_idx = min(ar_kv_data.keys())
+        ar_kv_seq_len = int(ar_kv_data[first_layer_idx]["key"].shape[0])
+        ar_effective_kv_len = min(positive_reuse_len, ar_kv_seq_len)
+
         # 2. inject positive kv
         self.model.inject_ar_kv_into_layers(ar_kv_data, positive_reuse_len)
 
@@ -2819,6 +2859,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             input_ids=input_ids,
             model_kwargs=model_kwargs,
             positive_reuse_len=positive_reuse_len,
+            ar_fallback_kv_len=ar_effective_kv_len,
         )
 
         return input_ids

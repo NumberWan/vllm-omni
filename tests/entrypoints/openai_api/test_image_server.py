@@ -1170,8 +1170,8 @@ def test_image_edit_ignores_mock_like_multimodal_limit(async_omni_test_client):
     assert response.status_code == 200
     captured_prompt = engine.captured_prompt
     assert captured_prompt is not None
-    # Multi-stage path uses "img2img" key for single reference image
-    processed_images = captured_prompt["multi_modal_data"]["img2img"]
+    # Multi-stage path uses "image" key (vLLM MM parser rejects "img2img" for HunyuanImage3).
+    processed_images = captured_prompt["multi_modal_data"]["image"]
     assert isinstance(processed_images, Image.Image)
     assert processed_images.size == (16, 16)
 
