@@ -2786,7 +2786,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # on the first DiT step.  After CFG negative prefill, pos/neg injected AR KV can
         # differ in length; use the max across batch so ``seq_lens`` matches the padded
         # concat in ``_cache_prompt_kv``.  Fallback when nothing is injected yet.
-        inj = getattr(self.model.layers[0].self_attn.image_attn, "_injected_ar_kv", None) or []
+        # ``self.model`` is ``HunyuanImage3Pipeline`` (see ``pipeline_hunyuan_image3``:
+        # ``HunyuanImage3Text2ImagePipeline(model=self, ...)``); DiT blocks live on
+        # ``self.model.model``, same as ``_keep_negative_kv_only``.
+        inj = getattr(self.model.model.layers[0].self_attn.image_attn, "_injected_ar_kv", None) or []
         if inj:
             max_ar = max(int(p[0].shape[0]) for p in inj)
         else:

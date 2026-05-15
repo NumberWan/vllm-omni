@@ -1659,6 +1659,14 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # Extract images from result
         images = _extract_images_from_result(result)
 
+        # Extract CoT output from the result if available
+        cot_output = None
+        if hasattr(result, "request_output") and result.request_output:
+            if hasattr(result.request_output, "outputs"):
+                for output in result.request_output.outputs:
+                    if hasattr(output, "text") and output.text:
+                        cot_output = output.text
+                        break
         logger.debug(f"Successfully generated {len(images)} image(s)")
 
         # Determine output format (default to png)
@@ -1674,6 +1682,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             "created": int(time.time()),
             "data": image_data,
             "output_format": output_format,
+            "cot_output": cot_output,
         }
         if request.size:
             response_kwargs["size"] = size_str
@@ -1953,7 +1962,35 @@ async def edit_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     detail=generation_result.message,
                 )
-            images, _, _ = generation_result
+            images, stage_durations, _ = generation_result
+
+            # Match /v1/images/generations: per-request JSON for analyze_hunyuan_log.py.
+            try:
+                import json as _json
+
+                logger.info(
+                    "[hunyuan_image3_metrics] %s",
+                    _json.dumps(
+                        {
+                            "request_id": request_id,
+                            "model": model_name,
+                            "width": width,
+                            "height": height,
+                            "size": size_str,
+                            "num_inference_steps": num_inference_steps,
+                            "guidance_scale": guidance_scale,
+                            "true_cfg_scale": true_cfg_scale,
+                            "n": n,
+                            "seed": effective_seed,
+                            "prompt_words": len((prompt_text or "").split()),
+                            "stage_durations_ms": stage_durations,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                )
+            except Exception:
+                logger.debug("Failed to log hunyuan_image3_metrics", exc_info=True)
         else:
             # Single-stage diffusion: use the direct path.
             result = await _generate_with_async_omni(
