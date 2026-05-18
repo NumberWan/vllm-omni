@@ -7,7 +7,9 @@ Benchmark online serving for diffusion models (Image/Video Generation).
 If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
 Supports multiple backends:
-    - vllm-omni: Uses /v1/chat/completions endpoint (default)
+    - vllm-omni: Uses /v1/chat/completions for t2i and for any image+text task that is
+      not image-output (e.g. a future i2t). For --task i2i/ti2i with image_paths + prompt,
+      auto-routes to /v1/images/edits unless --disable-auto-edits (bot_task: think).
     - openai: Uses /v1/images/generations endpoint
     - v1/videos: Use /v1/videos endpoint
 
@@ -929,6 +931,26 @@ async def benchmark(args):
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
+    if args.backend == "vllm-omni":
+        from backends import IMAGE_OUTPUT_TASKS, _should_use_image_edits
+
+        for req in requests_list:
+            req.task = args.task
+            req.auto_edits_for_image_input = not args.disable_auto_edits
+            req.default_bot_task = args.bot_task
+        if not args.disable_auto_edits:
+            edits_count = sum(1 for req in requests_list if _should_use_image_edits(req))
+            if edits_count:
+                print(
+                    f"vllm-omni: {edits_count}/{len(requests_list)} request(s) for task={args.task!r} "
+                    f"will use /v1/images/edits (bot_task={args.bot_task!r})."
+                )
+            elif args.task in IMAGE_OUTPUT_TASKS:
+                print(
+                    f"vllm-omni: task={args.task!r} is image-output but no requests have "
+                    "image_paths+prompt; using /v1/chat/completions."
+                )
+
     # Limit concurrency
     if args.max_concurrency is not None:
         semaphore = asyncio.Semaphore(args.max_concurrency)
@@ -980,6 +1002,14 @@ async def benchmark(args):
     metrics["model"] = args.model
     metrics["dataset"] = args.dataset
     metrics["task"] = args.task
+    if args.backend == "vllm-omni":
+        endpoint_counts: dict[str, int] = {}
+        for out in outputs:
+            ep = out.endpoint_used or "chat/completions"
+            endpoint_counts[ep] = endpoint_counts.get(ep, 0) + 1
+        metrics["endpoint_used_counts"] = endpoint_counts
+        metrics["auto_edits_for_image_input"] = not args.disable_auto_edits
+        metrics["bot_task"] = args.bot_task
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
 
@@ -1173,6 +1203,25 @@ if __name__ == "__main__":
         help=(
             "Number of synthetic input images to attach for image-conditioned tasks "
             "(i2v, ti2v, ti2i, i2i) when using random dataset."
+        ),
+    )
+    parser.add_argument(
+        "--bot-task",
+        type=str,
+        default="think",
+        help=(
+            "bot_task form field for /v1/images/edits when vllm-omni auto-routes "
+            "--task i2i/ti2i (image output only). Use think, recaption, think_recaption, "
+            "or vanilla — not legacy composite names like it2i_think. Ignored for t2i."
+        ),
+    )
+    parser.add_argument(
+        "--disable-auto-edits",
+        action="store_true",
+        default=False,
+        help=(
+            "With --backend vllm-omni, always use /v1/chat/completions even when "
+            "image_paths are set (legacy behavior)."
         ),
     )
 

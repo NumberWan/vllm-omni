@@ -11,6 +11,15 @@ import aiohttp
 from tqdm import tqdm
 
 
+# Hunyuan /v1/images/edits accepts bot_task in {None, think, recaption, ...}.
+# "it2i_think" is a legacy *task* alias in prompt_utils, not a valid bot_task form value.
+DEFAULT_EDITS_BOT_TASK = "think"
+
+# Benchmark tasks that produce an image given image+text input (route to /v1/images/edits).
+# Image+text with other tasks (e.g. future i2t) must stay on /v1/chat/completions.
+IMAGE_OUTPUT_TASKS = frozenset({"i2i", "ti2i"})
+
+
 @dataclass
 class RequestFuncInput:
     prompt: str
@@ -27,6 +36,11 @@ class RequestFuncInput:
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # Benchmark --task (e.g. i2i, ti2i, t2i). Used to choose edits vs chat for image+text.
+    task: str | None = None
+    # When True (default), vllm-omni uses /v1/images/edits only for IMAGE_OUTPUT_TASKS.
+    auto_edits_for_image_input: bool = True
+    default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
 
 
 @dataclass
@@ -39,6 +53,8 @@ class RequestFuncOutput:
     stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
+    # Populated by vllm-omni router: "chat/completions" or "images/edits".
+    endpoint_used: str | None = None
 
 
 def _guess_mime_type(path: str) -> str:
@@ -51,6 +67,149 @@ def _encode_image_as_data_url(path: str) -> str:
         encoded = base64.b64encode(f.read()).decode("utf-8")
     mime = _guess_mime_type(path)
     return f"data:{mime};base64,{encoded}"
+
+
+def _edits_url_from_chat_url(chat_api_url: str) -> str:
+    """Derive /v1/images/edits URL from the benchmark's chat completions URL."""
+    if chat_api_url.rstrip("/").endswith("/v1/chat/completions"):
+        return chat_api_url.replace("/v1/chat/completions", "/v1/images/edits")
+    # Fallback: strip path and append edits (supports custom base-url paths).
+    base = chat_api_url.rsplit("/", 3)[0]
+    return f"{base}/v1/images/edits"
+
+
+def _should_use_image_edits(input: RequestFuncInput) -> bool:
+    """True only when the benchmark task is image-output (i2i/ti2i), not i2t-style comprehension."""
+    if not input.auto_edits_for_image_input:
+        return False
+    if not (input.image_paths and len(input.image_paths) > 0 and input.prompt):
+        return False
+
+    extra = input.extra_body
+    if extra.get("use_images_edits") is False:
+        return False
+    if extra.get("use_images_edits") is True:
+        return True
+
+    # Task-aware default: image+text does not imply image generation (could be i2t).
+    if input.task is not None:
+        return input.task in IMAGE_OUTPUT_TASKS
+    # No task set: do not guess; keep chat to avoid mis-routing comprehension requests.
+    return False
+
+
+async def async_request_image_edits(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+    enable_diffusion_pipeline_profiler: bool = False,
+) -> RequestFuncOutput:
+    """POST /v1/images/edits (multipart). Used for IT2I / i2i with reference images."""
+    del enable_diffusion_pipeline_profiler  # reserved for parity with chat backend
+    output = RequestFuncOutput()
+    output.endpoint_used = "images/edits"
+    output.start_time = time.perf_counter()
+
+    extra_body = dict(input.extra_body)
+    width = input.width or extra_body.get("width") or 1024
+    height = input.height or extra_body.get("height") or 1024
+    edits_url = _edits_url_from_chat_url(input.api_url)
+
+    form = aiohttp.FormData()
+    form.add_field("model", input.model)
+    form.add_field("prompt", input.prompt)
+    form.add_field("size", f"{width}x{height}")
+    form.add_field("response_format", "b64_json")
+
+    if input.num_inference_steps is not None:
+        form.add_field("num_inference_steps", str(input.num_inference_steps))
+    elif extra_body.get("num_inference_steps") is not None:
+        form.add_field("num_inference_steps", str(extra_body["num_inference_steps"]))
+
+    if input.seed is not None:
+        form.add_field("seed", str(input.seed))
+    elif extra_body.get("seed") is not None:
+        form.add_field("seed", str(extra_body["seed"]))
+
+    if extra_body.get("guidance_scale") is not None:
+        form.add_field("guidance_scale", str(extra_body["guidance_scale"]))
+    if extra_body.get("negative_prompt") is not None:
+        form.add_field("negative_prompt", str(extra_body["negative_prompt"]))
+    if extra_body.get("true_cfg_scale") is not None:
+        form.add_field("true_cfg_scale", str(extra_body["true_cfg_scale"]))
+    if extra_body.get("sys_type") is not None:
+        form.add_field("sys_type", str(extra_body["sys_type"]))
+    if extra_body.get("system_prompt") is not None:
+        form.add_field("system_prompt", str(extra_body["system_prompt"]))
+
+    bot_task = extra_body.get("bot_task")
+    if bot_task is None and input.default_bot_task is not None:
+        bot_task = input.default_bot_task
+    if bot_task is not None:
+        form.add_field("bot_task", str(bot_task))
+
+    assert input.image_paths is not None
+    for img_path in input.image_paths:
+        if not os.path.exists(img_path):
+            output.error = f"Image file not found: {img_path}"
+            output.success = False
+            if pbar:
+                pbar.update(1)
+            return output
+        with open(img_path, "rb") as img_f:
+            image_bytes = img_f.read()
+        form.add_field(
+            "image",
+            image_bytes,
+            filename=os.path.basename(img_path),
+            content_type=_guess_mime_type(img_path),
+        )
+
+    try:
+        async with session.post(edits_url, data=form) as response:
+            if response.status == 200:
+                resp_json = await response.json()
+                output.response_body = resp_json
+                output.success = True
+            else:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+
+    output.latency = time.perf_counter() - output.start_time
+
+    if output.success and input.slo_ms is not None:
+        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_vllm_omni(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+    enable_diffusion_pipeline_profiler: bool = False,
+) -> RequestFuncOutput:
+    """vllm-omni backend: chat for text-only; /v1/images/edits when image+text."""
+    if _should_use_image_edits(input):
+        return await async_request_image_edits(
+            input,
+            session,
+            pbar=pbar,
+            enable_diffusion_pipeline_profiler=enable_diffusion_pipeline_profiler,
+        )
+    result = await async_request_chat_completions(
+        input,
+        session,
+        pbar=pbar,
+        enable_diffusion_pipeline_profiler=enable_diffusion_pipeline_profiler,
+    )
+    result.endpoint_used = "chat/completions"
+    return result
 
 
 async def async_request_chat_completions(
@@ -350,7 +509,7 @@ async def async_request_v1_videos(
 
 backends_function_mapping = {
     "2i": {
-        "vllm-omni": (async_request_chat_completions, "/v1/chat/completions"),
+        "vllm-omni": (async_request_vllm_omni, "/v1/chat/completions"),
         "openai": (async_request_openai_images, "/v1/images/generations"),
     },
     "2v": {
