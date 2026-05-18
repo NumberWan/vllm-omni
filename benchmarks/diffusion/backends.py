@@ -16,8 +16,9 @@ from tqdm import tqdm
 DEFAULT_EDITS_BOT_TASK = "think"
 
 # Benchmark tasks that produce an image given image+text input (route to /v1/images/edits).
+# ``it2i`` matches Hunyuan ``prompt_utils`` naming; ``i2i``/``ti2i`` are benchmark aliases.
 # Image+text with other tasks (e.g. future i2t) must stay on /v1/chat/completions.
-IMAGE_OUTPUT_TASKS = frozenset({"i2i", "ti2i"})
+IMAGE_OUTPUT_TASKS = frozenset({"i2i", "ti2i", "it2i"})
 
 
 @dataclass
@@ -36,7 +37,7 @@ class RequestFuncInput:
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    # Benchmark --task (e.g. i2i, ti2i, t2i). Used to choose edits vs chat for image+text.
+    # Benchmark --task (e.g. i2i, ti2i, it2i, t2i). Used to choose edits vs chat for image+text.
     task: str | None = None
     # When True (default), vllm-omni uses /v1/images/edits only for IMAGE_OUTPUT_TASKS.
     auto_edits_for_image_input: bool = True
@@ -79,7 +80,7 @@ def _edits_url_from_chat_url(chat_api_url: str) -> str:
 
 
 def _should_use_image_edits(input: RequestFuncInput) -> bool:
-    """True only when the benchmark task is image-output (i2i/ti2i), not i2t-style comprehension."""
+    """True only when the benchmark task is image-output (i2i/ti2i/it2i), not i2t-style comprehension."""
     if not input.auto_edits_for_image_input:
         return False
     if not (input.image_paths and len(input.image_paths) > 0 and input.prompt):

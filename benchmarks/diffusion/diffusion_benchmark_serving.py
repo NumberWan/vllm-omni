@@ -8,7 +8,7 @@ If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
 Supports multiple backends:
     - vllm-omni: Uses /v1/chat/completions for t2i and for any image+text task that is
-      not image-output (e.g. a future i2t). For --task i2i/ti2i with image_paths + prompt,
+      not image-output (e.g. a future i2t). For --task i2i/ti2i/it2i with image_paths + prompt,
       auto-routes to /v1/images/edits unless --disable-auto-edits (bot_task: think).
     - openai: Uses /v1/images/generations endpoint
     - v1/videos: Use /v1/videos endpoint
@@ -129,7 +129,7 @@ class VBenchDataset(BaseDataset):
     def _load_data(self) -> list[dict[str, Any]]:
         if self.args.task == "t2v":
             return self._load_t2v_prompts()
-        elif self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
+        elif self.args.task in ["i2v", "ti2v", "ti2i", "i2i", "it2i"]:
             return self._load_i2v_data()
         else:
             return self._load_t2v_prompts()
@@ -521,7 +521,7 @@ class TraceDataset(BaseDataset):
             single = row.get("image_path")
             image_paths = [single] if single else None
 
-        if not image_paths and self.args.task in ["i2v", "i2i", "ti2v", "ti2i"]:
+        if not image_paths and self.args.task in ["i2v", "i2i", "ti2v", "ti2i", "it2i"]:
             raise ValueError(
                 f"Task {self.args.task} requires image input, but no image_path or image_paths found in trace row."
             )
@@ -582,7 +582,7 @@ class RandomDataset(BaseDataset):
             self._sampled_requests = None
 
         # Random image generate
-        if self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
+        if self.args.task in ["i2v", "ti2v", "ti2i", "i2i", "it2i"]:
             self._random_image_path = self._generate_random_image_paths()
         else:
             self._random_image_path = None
@@ -891,7 +891,7 @@ async def benchmark(args):
         args.base_url = f"http://{args.host}:{args.port}"
 
     VIDEO_TASKS = {"t2v", "i2v", "ti2v"}
-    IMAGE_TASKS = {"t2i", "i2i", "ti2i"}
+    IMAGE_TASKS = {"t2i", "i2i", "ti2i", "it2i"}
 
     if args.task in VIDEO_TASKS:
         task_type = "2v"
@@ -1095,7 +1095,7 @@ if __name__ == "__main__":
         "--task",
         type=str,
         default="t2v",
-        choices=["t2v", "i2v", "ti2v", "ti2i", "i2i", "t2i"],
+        choices=["t2v", "i2v", "ti2v", "ti2i", "i2i", "it2i", "t2i"],
         help="Task type.",
     )
     parser.add_argument(
@@ -1202,7 +1202,7 @@ if __name__ == "__main__":
         default=1,
         help=(
             "Number of synthetic input images to attach for image-conditioned tasks "
-            "(i2v, ti2v, ti2i, i2i) when using random dataset."
+            "(i2v, ti2v, ti2i, i2i, it2i) when using random dataset."
         ),
     )
     parser.add_argument(
@@ -1211,7 +1211,7 @@ if __name__ == "__main__":
         default="think",
         help=(
             "bot_task form field for /v1/images/edits when vllm-omni auto-routes "
-            "--task i2i/ti2i (image output only). Use think, recaption, think_recaption, "
+            "--task i2i/ti2i/it2i (image output only). Use think, recaption, think_recaption, "
             "or vanilla — not legacy composite names like it2i_think. Ignored for t2i."
         ),
     )
