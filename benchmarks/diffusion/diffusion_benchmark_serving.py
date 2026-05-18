@@ -1220,8 +1220,7 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help=(
-            "With --backend vllm-omni, always use /v1/chat/completions even when "
-            "image_paths are set (legacy behavior)."
+            "With --backend vllm-omni, always use /v1/chat/completions even when image_paths are set (legacy behavior)."
         ),
     )
 

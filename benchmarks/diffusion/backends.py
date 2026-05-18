@@ -95,7 +95,7 @@ def _should_use_image_edits(input: RequestFuncInput) -> bool:
     # Task-aware default: image+text does not imply image generation (could be i2t).
     if input.task is not None:
         return input.task in IMAGE_OUTPUT_TASKS
-    # No task set: do not guess; keep chat to avoid mis-routing comprehension requests.
+    # No task set: do not guess; keep chat to avoid routing comprehension requests to edits.
     return False
 
 
