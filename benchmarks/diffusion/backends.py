@@ -11,13 +11,9 @@ import aiohttp
 from tqdm import tqdm
 
 
-# Hunyuan /v1/images/edits accepts bot_task in {None, think, recaption, ...}.
-# "it2i_think" is a legacy *task* alias in prompt_utils, not a valid bot_task form value.
 DEFAULT_EDITS_BOT_TASK = "think"
 
-# Benchmark tasks that produce an image given image+text input (route to /v1/images/edits).
-# ``it2i`` matches Hunyuan ``prompt_utils`` naming; ``i2i``/``ti2i`` are benchmark aliases.
-# Image+text with other tasks (e.g. future i2t) must stay on /v1/chat/completions.
+# Image+text tasks that route to /v1/images/edits (not /v1/chat/completions).
 IMAGE_OUTPUT_TASKS = frozenset({"i2i", "ti2i", "it2i"})
 
 

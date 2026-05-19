@@ -1210,9 +1210,8 @@ if __name__ == "__main__":
         type=str,
         default="think",
         help=(
-            "bot_task form field for /v1/images/edits when vllm-omni auto-routes "
-            "--task i2i/ti2i/it2i (image output only). Use think, recaption, think_recaption, "
-            "or vanilla — not legacy composite names like it2i_think. Ignored for t2i."
+            "bot_task for /v1/images/edits when auto-routing i2i/ti2i/it2i "
+            "(think, recaption, think_recaption, vanilla). Ignored for t2i."
         ),
     )
     parser.add_argument(
