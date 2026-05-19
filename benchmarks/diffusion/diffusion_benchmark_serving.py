@@ -6,33 +6,35 @@
 Benchmark online serving for diffusion models (Image/Video Generation).
 If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
-Supports multiple backends:
-    - vllm-omni: Uses /v1/chat/completions for t2i and for any image+text task that is
-      not image-output (e.g. a future i2t). For --task i2i/ti2i/it2i with image_paths + prompt,
-      auto-routes to /v1/images/edits unless --disable-auto-edits (bot_task: think).
-    - openai: Uses /v1/images/generations endpoint
-    - v1/videos: Use /v1/videos endpoint
+Supports multiple endpoints:
+    - /v1/chat/completions: OpenAI chat-compatible image requests. For --task i2i/ti2i/it2i
+      with image_paths + prompt, auto-routes to /v1/images/edits unless --disable-auto-edits.
+    - /v1/images/edits: Multipart image edit (e.g. Hunyuan IT2I); use --bot-task think.
+    - /v1/images/generations: OpenAI image generation requests
+    - /v1/videos: Async video jobs
+
+Legacy --backend vllm-omni and openai are aliases for chat/completions and images/generations.
 
 Usage:
-    # Video (v1/videos backend)
+    # Video (/v1/videos endpoint)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend v1/videos --dataset vbench --task t2v --num-prompts 10 \
+        --endpoint /v1/videos --dataset vbench --task t2v --num-prompts 10 \
         --height 480 --width 640 --fps 16 --num-frames 80
 
     i2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend v1/videos --dataset vbench --task i2v --num-prompts 10
+        --endpoint /v1/videos --dataset vbench --task i2v --num-prompts 10
 
 
-    # Image (vllm-omni backend)
+    # Image (/v1/chat/completions endpoint)
     t2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task t2i --num-prompts 10 \
+        --endpoint /v1/chat/completions --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024
 
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset random --task t2i --num-prompts 1 \
+        --endpoint /v1/chat/completions --dataset random --task t2i --num-prompts 1 \
         --max-concurrency 1 --enable-negative-prompt \
         --random-request-config '[
             {"width":512,"height":512,"num_inference_steps":20,"weight":0.15},
@@ -43,18 +45,18 @@ Usage:
 
     i2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task i2i --num-prompts 10
+        --endpoint /v1/chat/completions --dataset vbench --task i2i --num-prompts 10
 
-    # Image (openai backend)
+    # Image (/v1/images/generations endpoint)
     t2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend openai --dataset vbench --task t2i --num-prompts 10 \
+        --endpoint /v1/images/generations --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024 --port 3000
 
     # Video (v1/videos)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend v1/videos --dataset random --task t2v --num-prompts 1 \
+        --endpoint /v1/videos --dataset random --task t2v --num-prompts 1 \
         --max-concurrency 1 --enable-negative-prompt \
         --random-request-config '[
             {"width":854,"height":480,"num_inference_steps":18,"num_frames":120,"fps":24,"weight":1}
@@ -82,7 +84,12 @@ from typing import Any
 import aiohttp
 import numpy as np
 import requests
-from backends import RequestFuncInput, RequestFuncOutput, backends_function_mapping
+from backends import (
+    RequestFuncInput,
+    RequestFuncOutput,
+    backends_function_mapping,
+    normalize_endpoint,
+)
 from PIL import Image
 from tqdm.asyncio import tqdm
 
@@ -885,6 +892,14 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
         time.sleep(1)
 
 
+def _default_endpoint_for_task(task: str) -> str:
+    if task in {"t2v", "i2v", "ti2v"}:
+        return "/v1/videos"
+    if task in {"t2i", "i2i", "ti2i", "it2i"}:
+        return "/v1/chat/completions"
+    raise ValueError(f"Unsupported task for endpoint resolution: {task}")
+
+
 async def benchmark(args):
     # Construct base_url if not provided
     if args.base_url is None:
@@ -904,19 +919,30 @@ async def benchmark(args):
             f"Valid image tasks: {sorted(IMAGE_TASKS)}"
         )
 
-    valid_backends = sorted(backends_function_mapping[task_type].keys())
+    raw_endpoint = args.endpoint if args.endpoint is not None else args.backend
+    if raw_endpoint is None:
+        raw_endpoint = _default_endpoint_for_task(args.task)
+    args.endpoint = normalize_endpoint(raw_endpoint)
 
-    if args.backend not in valid_backends:
+    valid_endpoints = sorted(backends_function_mapping[task_type].keys())
+
+    if args.endpoint not in valid_endpoints:
         logger.error(
-            f"Invalid backend '{args.backend}' for task '{args.task}' (task type: '{task_type}').\n"
-            f"Valid backends for this task type: {valid_backends}\n"
-            f"Example usage: --task {args.task} --backend {valid_backends[0]}"
+            f"Invalid endpoint '{args.endpoint}' for task '{args.task}' (task type: '{task_type}').\n"
+            f"Valid endpoints for this task type: {valid_endpoints}\n"
+            f"Example usage: --task {args.task} --endpoint {valid_endpoints[0]}"
         )
-        raise ValueError("Backend validation failed. See log above for valid options.")
+        raise ValueError("Endpoint validation failed. See log above for valid options.")
 
-    # Setup API URL and request function based on backend
-    request_func, api_url = backends_function_mapping[task_type][args.backend]
+    # Setup API URL and request function based on endpoint.
+    request_func, api_url = backends_function_mapping[task_type][args.endpoint]
     api_url = f"{args.base_url}{api_url}"
+
+    use_auto_edits = args.endpoint == "/v1/chat/completions" and not args.disable_auto_edits
+    if use_auto_edits:
+        from backends import IMAGE_OUTPUT_TASKS, _should_use_image_edits, async_request_vllm_omni
+
+        request_func = async_request_vllm_omni
 
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
@@ -931,25 +957,27 @@ async def benchmark(args):
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
-    if args.backend == "vllm-omni":
-        from backends import IMAGE_OUTPUT_TASKS, _should_use_image_edits
+    from backends import IMAGE_OUTPUT_TASKS, _should_use_image_edits
 
-        for req in requests_list:
-            req.task = args.task
-            req.auto_edits_for_image_input = not args.disable_auto_edits
-            req.default_bot_task = args.bot_task
-        if not args.disable_auto_edits:
-            edits_count = sum(1 for req in requests_list if _should_use_image_edits(req))
-            if edits_count:
-                print(
-                    f"vllm-omni: {edits_count}/{len(requests_list)} request(s) for task={args.task!r} "
-                    f"will use /v1/images/edits (bot_task={args.bot_task!r})."
-                )
-            elif args.task in IMAGE_OUTPUT_TASKS:
-                print(
-                    f"vllm-omni: task={args.task!r} is image-output but no requests have "
-                    "image_paths+prompt; using /v1/chat/completions."
-                )
+    for req in requests_list:
+        req.task = args.task
+        req.auto_edits_for_image_input = use_auto_edits
+        req.default_bot_task = args.bot_task
+
+    if use_auto_edits:
+        edits_count = sum(1 for req in requests_list if _should_use_image_edits(req))
+        if edits_count:
+            print(
+                f"{edits_count}/{len(requests_list)} request(s) for task={args.task!r} "
+                f"will auto-route to /v1/images/edits (bot_task={args.bot_task!r})."
+            )
+        elif args.task in IMAGE_OUTPUT_TASKS:
+            print(
+                f"task={args.task!r} is image-output but no requests have "
+                "image_paths+prompt; using /v1/chat/completions."
+            )
+    elif args.endpoint == "/v1/images/edits":
+        print(f"Using /v1/images/edits for all requests (bot_task={args.bot_task!r}).")
 
     # Limit concurrency
     if args.max_concurrency is not None:
@@ -998,23 +1026,26 @@ async def benchmark(args):
     metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
 
     # Add configuration info to metrics for JSON output
-    metrics["backend"] = args.backend
+    metrics["endpoint"] = args.endpoint
     metrics["model"] = args.model
     metrics["dataset"] = args.dataset
     metrics["task"] = args.task
-    if args.backend == "vllm-omni":
+    if use_auto_edits or args.endpoint == "/v1/images/edits":
         endpoint_counts: dict[str, int] = {}
         for out in outputs:
-            ep = out.endpoint_used or "chat/completions"
+            if args.endpoint == "/v1/images/edits":
+                ep = out.endpoint_used or "images/edits"
+            else:
+                ep = out.endpoint_used or "chat/completions"
             endpoint_counts[ep] = endpoint_counts.get(ep, 0) + 1
         metrics["endpoint_used_counts"] = endpoint_counts
-        metrics["auto_edits_for_image_input"] = not args.disable_auto_edits
+        metrics["auto_edits_for_image_input"] = use_auto_edits
         metrics["bot_task"] = args.bot_task
 
-    print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
+    print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
 
     # Section 1: Configuration
-    print("{:<40} {:<15}".format("Backend:", args.backend))
+    print("{:<40} {:<15}".format("Endpoint:", args.endpoint))
     print("{:<40} {:<15}".format("Model:", args.model))
     print("{:<40} {:<15}".format("Dataset:", args.dataset))
     print("{:<40} {:<15}".format("Task:", args.task))
@@ -1078,11 +1109,16 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8091, help="Server port.")
     parser.add_argument("--model", type=str, default="default", help="Model name.")
     parser.add_argument(
+        "--endpoint",
+        type=str,
+        default=None,
+        help=("Endpoint path to target. Leading '/' is optional, e.g. /v1/videos or v1/videos."),
+    )
+    parser.add_argument(
         "--backend",
         type=str,
-        default="vllm-omni",
-        choices=["vllm-omni", "openai", "v1/videos"],
-        help="Backend to target the benchmark to.",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--dataset",
@@ -1219,7 +1255,7 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help=(
-            "With --backend vllm-omni, always use /v1/chat/completions even when image_paths are set (legacy behavior)."
+            "With --endpoint /v1/chat/completions, always use chat even when image_paths are set."
         ),
     )
 
