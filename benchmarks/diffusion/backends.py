@@ -10,7 +10,6 @@ from typing import Any
 import aiohttp
 from tqdm import tqdm
 
-
 DEFAULT_EDITS_BOT_TASK = "think"
 
 # Image+text tasks that route to /v1/images/edits (not /v1/chat/completions).
