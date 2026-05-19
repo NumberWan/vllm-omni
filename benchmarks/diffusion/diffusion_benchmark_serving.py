@@ -7,9 +7,8 @@ Benchmark online serving for diffusion models (Image/Video Generation).
 If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
 Supports multiple endpoints:
-    - /v1/chat/completions: OpenAI chat-compatible image requests. For --task i2i/ti2i/it2i
-      with image_paths + prompt, auto-routes to /v1/images/edits unless --disable-auto-edits.
-    - /v1/images/edits: Multipart image edit (e.g. Hunyuan IT2I); use --bot-task think.
+    - /v1/chat/completions: OpenAI chat-compatible image requests (e.g. t2i, Qwen i2i)
+    - /v1/images/edits: OpenAI image edit / IT2I (multipart; e.g. Hunyuan --bot-task think)
     - /v1/images/generations: OpenAI image generation requests
     - /v1/videos: Async video jobs
 
@@ -43,7 +42,12 @@ Usage:
             {"width":1536,"height":1536,"num_inference_steps":35,"weight":0.15}
         ]'
 
-    i2i:
+    ti2i (Hunyuan / OpenAI image edit API):
+    python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+        --endpoint /v1/images/edits --dataset random --task ti2i --num-prompts 10 \
+        --bot-task think
+
+    i2i (chat-based models such as Qwen-Image-Edit):
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
         --endpoint /v1/chat/completions --dataset vbench --task i2i --num-prompts 10
 
@@ -895,7 +899,9 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
 def _default_endpoint_for_task(task: str) -> str:
     if task in {"t2v", "i2v", "ti2v"}:
         return "/v1/videos"
-    if task in {"t2i", "i2i", "ti2i", "it2i"}:
+    if task in {"i2i", "ti2i", "it2i"}:
+        return "/v1/images/edits"
+    if task == "t2i":
         return "/v1/chat/completions"
     raise ValueError(f"Unsupported task for endpoint resolution: {task}")
 
@@ -938,12 +944,6 @@ async def benchmark(args):
     request_func, api_url = backends_function_mapping[task_type][args.endpoint]
     api_url = f"{args.base_url}{api_url}"
 
-    use_auto_edits = args.endpoint == "/v1/chat/completions" and not args.disable_auto_edits
-    if use_auto_edits:
-        from backends import IMAGE_OUTPUT_TASKS, _should_use_image_edits, async_request_vllm_omni
-
-        request_func = async_request_vllm_omni
-
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
     elif args.dataset == "trace":
@@ -957,27 +957,9 @@ async def benchmark(args):
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
-    from backends import IMAGE_OUTPUT_TASKS, _should_use_image_edits
-
-    for req in requests_list:
-        req.task = args.task
-        req.auto_edits_for_image_input = use_auto_edits
-        req.default_bot_task = args.bot_task
-
-    if use_auto_edits:
-        edits_count = sum(1 for req in requests_list if _should_use_image_edits(req))
-        if edits_count:
-            print(
-                f"{edits_count}/{len(requests_list)} request(s) for task={args.task!r} "
-                f"will auto-route to /v1/images/edits (bot_task={args.bot_task!r})."
-            )
-        elif args.task in IMAGE_OUTPUT_TASKS:
-            print(
-                f"task={args.task!r} is image-output but no requests have "
-                "image_paths+prompt; using /v1/chat/completions."
-            )
-    elif args.endpoint == "/v1/images/edits":
-        print(f"Using /v1/images/edits for all requests (bot_task={args.bot_task!r}).")
+    if args.endpoint == "/v1/images/edits":
+        for req in requests_list:
+            req.default_bot_task = args.bot_task
 
     # Limit concurrency
     if args.max_concurrency is not None:
@@ -1030,16 +1012,7 @@ async def benchmark(args):
     metrics["model"] = args.model
     metrics["dataset"] = args.dataset
     metrics["task"] = args.task
-    if use_auto_edits or args.endpoint == "/v1/images/edits":
-        endpoint_counts: dict[str, int] = {}
-        for out in outputs:
-            if args.endpoint == "/v1/images/edits":
-                ep = out.endpoint_used or "images/edits"
-            else:
-                ep = out.endpoint_used or "chat/completions"
-            endpoint_counts[ep] = endpoint_counts.get(ep, 0) + 1
-        metrics["endpoint_used_counts"] = endpoint_counts
-        metrics["auto_edits_for_image_input"] = use_auto_edits
+    if args.endpoint == "/v1/images/edits":
         metrics["bot_task"] = args.bot_task
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -1246,16 +1219,8 @@ if __name__ == "__main__":
         type=str,
         default="think",
         help=(
-            "bot_task for /v1/images/edits when auto-routing i2i/ti2i/it2i "
-            "(think, recaption, think_recaption, vanilla). Ignored for t2i."
-        ),
-    )
-    parser.add_argument(
-        "--disable-auto-edits",
-        action="store_true",
-        default=False,
-        help=(
-            "With --endpoint /v1/chat/completions, always use chat even when image_paths are set."
+            "bot_task form field for --endpoint /v1/images/edits "
+            "(think, recaption, think_recaption, vanilla)."
         ),
     )
 
