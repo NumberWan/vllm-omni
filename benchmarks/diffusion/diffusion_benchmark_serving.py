@@ -998,6 +998,11 @@ def calculate_metrics(
         "tpot_p95": float(np.percentile(tpots, 95)) if tpots else 0.0,
         "tpot_p99": float(np.percentile(tpots, 99)) if tpots else 0.0,
         "tpot_count": len(tpots),
+        # Same as tpot_* but in milliseconds (convenient for reports / JSON).
+        "tpot_mean_ms": float(np.mean(tpots)) * 1000.0 if tpots else 0.0,
+        "tpot_median_ms": float(np.median(tpots)) * 1000.0 if tpots else 0.0,
+        "tpot_p95_ms": float(np.percentile(tpots, 95)) * 1000.0 if tpots else 0.0,
+        "tpot_p99_ms": float(np.percentile(tpots, 99)) * 1000.0 if tpots else 0.0,
     }
 
     if slo_enabled:
@@ -1204,7 +1209,7 @@ async def benchmark(args):
 
     if metrics.get("stream_ar") and metrics.get("ttft_count", 0) > 0:
         print(f"{'-' * 50}")
-        print("AR TTFT (streaming, s)  [POST to first ar_delta SSE chunk]:")
+        print("AR TTFT (s):")
         print("{:<40} {:<15.4f}".format("  Mean:", metrics["ttft_mean"]))
         print("{:<40} {:<15.4f}".format("  Median:", metrics["ttft_median"]))
         print("{:<40} {:<15.4f}".format("  P95:", metrics["ttft_p95"]))
@@ -1215,21 +1220,14 @@ async def benchmark(args):
 
     if metrics.get("stream_ar") and metrics.get("tpot_count", 0) > 0:
         print(f"{'-' * 50}")
-        print(
-            "AR TPOT (engine, s/token)  "
-            "[vLLM mean_time_per_output_token on final image chunk metrics.ar_tpot_s]:"
-        )
-        print("{:<40} {:<15.6f}".format("  Mean:", metrics["tpot_mean"]))
-        print("{:<40} {:<15.6f}".format("  Median:", metrics["tpot_median"]))
-        print("{:<40} {:<15.6f}".format("  P95:", metrics["tpot_p95"]))
-        print("{:<40} {:<15.6f}".format("  P99:", metrics["tpot_p99"]))
+        print("AR TPOT (ms):")
+        print("{:<40} {:<15.3f}".format("  Mean:", metrics["tpot_mean_ms"]))
+        print("{:<40} {:<15.3f}".format("  Median:", metrics["tpot_median_ms"]))
+        print("{:<40} {:<15.3f}".format("  P95:", metrics["tpot_p95_ms"]))
+        print("{:<40} {:<15.3f}".format("  P99:", metrics["tpot_p99_ms"]))
     elif metrics.get("stream_ar") and metrics.get("completed_requests", 0) > 0:
         print(f"{'-' * 50}")
-        print(
-            "AR TPOT: unavailable (image chunk missing metrics.ar_tpot_s; "
-            "use a build where StagePool passes IterationStats into the LLM "
-            "output processor when log_stats is on, and do not pass --disable-log-stats)"
-        )
+        print("AR TPOT: unavailable (no timing on final image chunk)")
 
     if args.slo:
         print(f"{'-' * 50}")
@@ -1412,8 +1410,7 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "For /v1/images/edits: set stream=true and measure AR TTFT/TPOT from ar_delta SSE "
-            "(requires multi-stage Hunyuan-style pipeline, PR #3723). "
+            "For /v1/images/edits: set stream=true to measure AR TTFT (s) and AR TPOT (ms). "
             "Default: on for /v1/images/edits, off otherwise."
         ),
     )

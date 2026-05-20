@@ -45,8 +45,8 @@ class RequestFuncOutput:
     stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
-    # TTFT: client POST -> first ar_delta SSE chunk.
-    # TPOT: engine ar_tpot_s from final image chunk metrics (vLLM per-output-token decode).
+    # TTFT: client POST -> first ar_delta SSE chunk (seconds).
+    # TPOT: from final image chunk (seconds internally); benchmark prints ms.
     ttft: float = 0.0
     tpot: float = 0.0
     ar_delta_count: int = 0
