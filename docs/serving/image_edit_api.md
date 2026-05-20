@@ -158,6 +158,19 @@ Example final image event:
 data: {"object":"image.edit.chunk","type":"image","data":[{"b64_json":"<base64-encoded PNG>","url":null,"revised_prompt":null}],"output_format":"png","size":"1024x1024","created":1701234567,"model":"tencent/HunyuanImage-3.0-Instruct"}
 ```
 
+When the AR stage finishes, the final image chunk may include engine timing
+metrics (vLLM per-output-token decode TPOT and first-token latency):
+
+```text
+data: {"object":"image.edit.chunk","type":"image","metrics":{"ar_ttft_s":1.23,"ar_tpot_s":0.045,"ar_num_generation_tokens":512},"data":[...],"output_format":"png","size":"1024x1024","created":1701234567,"model":"tencent/HunyuanImage-3.0-Instruct"}
+```
+
+- `ar_ttft_s`: engine time from request arrival to first generated token.
+- `ar_tpot_s`: decode time divided by `(num_generation_tokens - 1)` (same as vLLM `mean_time_per_output_token`).
+- `ar_num_generation_tokens`: total AR output tokens for the request.
+
+These fields require vLLM request stats on the head-side output processor (do not pass ``--disable-log-stats`` to ``serve`` unless you accept missing SSE metrics).
+
 Terminal event:
 
 ```text

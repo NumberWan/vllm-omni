@@ -827,7 +827,12 @@ def build_vllm_config(
     return vllm_config, executor_class
 
 
-def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_config: Any) -> Any | None:
+def build_llm_stage_output_processor(
+    plan: LogicalStageInitPlan,
+    stage_vllm_config: Any,
+    *,
+    log_stats: bool,
+) -> Any | None:
     """Build one output processor per logical LLM stage."""
 
     metadata = plan.replicas[0].metadata
@@ -839,7 +844,7 @@ def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_conf
         )
     return MultimodalOutputProcessor(
         tokenizer=tokenizer,
-        log_stats=False,
+        log_stats=log_stats,
         engine_core_output_type=metadata.engine_output_type,
     )
 

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
@@ -648,10 +649,16 @@ class StagePool:
             return []
         client = cast(StagePoolLLMClient, raw_client)
         processor = self.output_processor
+        # Match vLLM AsyncLLM: ``OutputProcessor._update_stats_from_output`` is a
+        # no-op when ``iteration_stats`` is None, so per-request ``RequestOutput.metrics``
+        # would never be populated. Create per-poll stats when logging is enabled.
+        iteration_stats: IterationStats | None = None
+        if getattr(processor, "log_stats", False) and raw_outputs.outputs:
+            iteration_stats = IterationStats()
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
-            None,
+            iteration_stats,
         )
 
         if processed.reqs_to_abort:

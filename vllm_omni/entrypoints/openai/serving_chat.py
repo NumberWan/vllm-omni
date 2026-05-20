@@ -2651,6 +2651,57 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output
 
+    @staticmethod
+    def _extract_ar_engine_metrics(request_output: RequestOutput) -> dict[str, float | int]:
+        """vLLM AR metrics from RequestOutput.metrics (RequestStateStats).
+
+        TPOT matches vLLM ``mean_time_per_output_token``: decode wall time divided by
+        generated tokens excluding the first (prefill) token.
+        """
+        metrics = getattr(request_output, "metrics", None)
+        if metrics is None:
+            return {}
+
+        num_gen = int(getattr(metrics, "num_generation_tokens", 0) or 0)
+        first_token_latency = float(getattr(metrics, "first_token_latency", 0.0) or 0.0)
+        first_ts = float(getattr(metrics, "first_token_ts", 0.0) or 0.0)
+        last_ts = float(getattr(metrics, "last_token_ts", 0.0) or 0.0)
+        decode_time = max(0.0, last_ts - first_ts) if first_ts > 0.0 else 0.0
+        ar_tpot_s = decode_time / (num_gen - 1) if num_gen > 1 else 0.0
+
+        result: dict[str, float | int] = {}
+        if first_token_latency > 0.0:
+            result["ar_ttft_s"] = first_token_latency
+        if num_gen > 0:
+            result["ar_num_generation_tokens"] = num_gen
+        if num_gen > 1:
+            result["ar_tpot_s"] = ar_tpot_s
+        return result
+
+    @staticmethod
+    def _iter_image_edit_ar_deltas(
+        output: Any,
+        previous_text_by_index: dict[int, str],
+    ) -> list[tuple[int, str]]:
+        request_output = getattr(output, "request_output", None)
+        completions = getattr(request_output, "outputs", None) or []
+        deltas: list[tuple[int, str]] = []
+        for completion in completions:
+            index = int(getattr(completion, "index", 0))
+            text = getattr(completion, "text", "") or ""
+            if not text:
+                continue
+            previous_text = previous_text_by_index.get(index, "")
+            if text.startswith(previous_text):
+                delta = text[len(previous_text) :]
+                previous_text_by_index[index] = text
+            else:
+                delta = text
+                previous_text_by_index[index] = text
+            if delta:
+                deltas.append((index, delta))
+        return deltas
+
     async def _stream_diffusion_image_chunks(
         self,
         result_generator: AsyncIterator[OmniRequestOutput],
@@ -2662,6 +2713,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ) -> AsyncIterator[str]:
         """Yield image edit SSE chunks from multi-stage diffusion outputs."""
         created = int(time.time())
+        previous_text_by_index: dict[int, str] = {}
+        ar_engine_metrics: dict[str, float | int] = {}
         emitted_image = False
         try:
             async for output in result_generator:
@@ -2669,13 +2722,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 stage_id = getattr(output, "stage_id", None)
                 if final_output_type == "text" and stage_id == 0:
                     request_output = output.request_output
-                    for completion in request_output.outputs:
-                        text = completion.text or ""
-                        if not text:
-                            continue
+                    if request_output is not None:
+                        cand = self._extract_ar_engine_metrics(request_output)
+                        if cand:
+                            prev_n = int(ar_engine_metrics.get("ar_num_generation_tokens", 0))
+                            new_n = int(cand.get("ar_num_generation_tokens", 0))
+                            if new_n >= prev_n:
+                                ar_engine_metrics = cand
+                    for index, delta in self._iter_image_edit_ar_deltas(output, previous_text_by_index):
                         chunk = ImageEditARDeltaChunk(
-                            delta=text,
-                            index=completion.index,
+                            delta=delta,
+                            index=index,
                             created=created,
                             model=model,
                         )
@@ -2701,6 +2758,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         size=size,
                         created=created,
                         model=model,
+                        metrics=ar_engine_metrics or None,
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
                     emitted_image = True

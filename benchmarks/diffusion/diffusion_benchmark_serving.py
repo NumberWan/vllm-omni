@@ -969,6 +969,9 @@ def calculate_metrics(
     stage_durations_p50 = {s: float(np.percentile(v, 50)) for s, v in stage_duration_lists.items()}
     stage_durations_p99 = {s: float(np.percentile(v, 99)) for s, v in stage_duration_lists.items()}
 
+    ttfts = [o.ttft for o in success_outputs if o.ttft > 0]
+    tpots = [o.tpot for o in success_outputs if o.tpot > 0]
+
     metrics = {
         "duration": total_duration,
         "completed_requests": num_success,
@@ -985,6 +988,16 @@ def calculate_metrics(
         "stage_durations_mean": stage_durations_mean,
         "stage_durations_p50": stage_durations_p50,
         "stage_durations_p99": stage_durations_p99,
+        "ttft_mean": float(np.mean(ttfts)) if ttfts else 0.0,
+        "ttft_median": float(np.median(ttfts)) if ttfts else 0.0,
+        "ttft_p95": float(np.percentile(ttfts, 95)) if ttfts else 0.0,
+        "ttft_p99": float(np.percentile(ttfts, 99)) if ttfts else 0.0,
+        "ttft_count": len(ttfts),
+        "tpot_mean": float(np.mean(tpots)) if tpots else 0.0,
+        "tpot_median": float(np.median(tpots)) if tpots else 0.0,
+        "tpot_p95": float(np.percentile(tpots, 95)) if tpots else 0.0,
+        "tpot_p99": float(np.percentile(tpots, 99)) if tpots else 0.0,
+        "tpot_count": len(tpots),
     }
 
     if slo_enabled:
@@ -1066,6 +1079,9 @@ async def benchmark(args):
         raw_endpoint = _default_endpoint_for_task(args.task)
     args.endpoint = normalize_endpoint(raw_endpoint)
 
+    if args.stream_ar is None:
+        args.stream_ar = args.endpoint == "/v1/images/edits"
+
     valid_endpoints = sorted(backends_function_mapping[task_type].keys())
 
     if args.endpoint not in valid_endpoints:
@@ -1098,6 +1114,7 @@ async def benchmark(args):
     if args.endpoint == "/v1/images/edits":
         for req in requests_list:
             req.default_bot_task = args.bot_task
+            req.stream_ar = args.stream_ar
 
     # Limit concurrency
     if args.max_concurrency is not None:
@@ -1152,6 +1169,7 @@ async def benchmark(args):
     metrics["task"] = args.task
     if args.endpoint == "/v1/images/edits":
         metrics["bot_task"] = args.bot_task
+        metrics["stream_ar"] = args.stream_ar
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
 
@@ -1160,6 +1178,8 @@ async def benchmark(args):
     print("{:<40} {:<15}".format("Model:", args.model))
     print("{:<40} {:<15}".format("Dataset:", args.dataset))
     print("{:<40} {:<15}".format("Task:", args.task))
+    if args.endpoint == "/v1/images/edits":
+        print("{:<40} {:<15}".format("Stream AR (TTFT/TPOT):", str(args.stream_ar)))
 
     # Section 2: Execution & Traffic
     print(f"{'-' * 50}")
@@ -1181,6 +1201,35 @@ async def benchmark(args):
     print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
     print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
     print("{:<40} {:<15.4f}".format("Latency P95 (s):", metrics["latency_p95"]))
+
+    if metrics.get("stream_ar") and metrics.get("ttft_count", 0) > 0:
+        print(f"{'-' * 50}")
+        print("AR TTFT (streaming, s)  [POST to first ar_delta SSE chunk]:")
+        print("{:<40} {:<15.4f}".format("  Mean:", metrics["ttft_mean"]))
+        print("{:<40} {:<15.4f}".format("  Median:", metrics["ttft_median"]))
+        print("{:<40} {:<15.4f}".format("  P95:", metrics["ttft_p95"]))
+        print("{:<40} {:<15.4f}".format("  P99:", metrics["ttft_p99"]))
+    elif metrics.get("stream_ar") and metrics.get("completed_requests", 0) > 0:
+        print(f"{'-' * 50}")
+        print("AR TTFT: unavailable (no ar_delta chunks; check stream=true / multi-stage pipeline)")
+
+    if metrics.get("stream_ar") and metrics.get("tpot_count", 0) > 0:
+        print(f"{'-' * 50}")
+        print(
+            "AR TPOT (engine, s/token)  "
+            "[vLLM mean_time_per_output_token on final image chunk metrics.ar_tpot_s]:"
+        )
+        print("{:<40} {:<15.6f}".format("  Mean:", metrics["tpot_mean"]))
+        print("{:<40} {:<15.6f}".format("  Median:", metrics["tpot_median"]))
+        print("{:<40} {:<15.6f}".format("  P95:", metrics["tpot_p95"]))
+        print("{:<40} {:<15.6f}".format("  P99:", metrics["tpot_p99"]))
+    elif metrics.get("stream_ar") and metrics.get("completed_requests", 0) > 0:
+        print(f"{'-' * 50}")
+        print(
+            "AR TPOT: unavailable (image chunk missing metrics.ar_tpot_s; "
+            "use a build where StagePool passes IterationStats into the LLM "
+            "output processor when log_stats is on, and do not pass --disable-log-stats)"
+        )
 
     if args.slo:
         print(f"{'-' * 50}")
@@ -1357,6 +1406,16 @@ if __name__ == "__main__":
         type=str,
         default="think",
         help=("bot_task form field for --endpoint /v1/images/edits (think, recaption, think_recaption, vanilla)."),
+    )
+    parser.add_argument(
+        "--stream-ar",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "For /v1/images/edits: set stream=true and measure AR TTFT/TPOT from ar_delta SSE "
+            "(requires multi-stage Hunyuan-style pipeline, PR #3723). "
+            "Default: on for /v1/images/edits, off otherwise."
+        ),
     )
 
     args = parser.parse_args()

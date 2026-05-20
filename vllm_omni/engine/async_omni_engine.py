@@ -289,6 +289,10 @@ class AsyncOmniEngine:
             ea_dict.pop("model", None)
             kwargs = {**ea_dict, **kwargs}
 
+        # Must match vLLM ``EngineArgs.disable_log_stats`` so the head-side
+        # ``MultimodalOutputProcessor`` attaches ``RequestOutput.metrics``.
+        self._llm_output_processor_log_stats: bool = not bool(kwargs.get("disable_log_stats", False))
+
         self.tokenizer: str | None = kwargs.get("tokenizer")
 
         # ------------------------------------------------------------------ #
@@ -1229,7 +1233,12 @@ class AsyncOmniEngine:
             if plan.replicas[0].metadata.stage_type != "diffusion":
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 assert stage_vllm_config is not None
-                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
+                log_pp = getattr(self, "_llm_output_processor_log_stats", True)
+                output_processor = build_llm_stage_output_processor(
+                    plan,
+                    stage_vllm_config,
+                    log_stats=log_pp,
+                )
 
             stage_pools.append(
                 StagePool(

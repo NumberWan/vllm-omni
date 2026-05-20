@@ -949,6 +949,21 @@ def merge_pipeline_deploy(
                 runtime["env"] = ds.env
         runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
+        # Deploy YAML may put topology overrides (e.g. ``final_output``) in
+        # ``engine_extras`` because they are not StageDeployConfig fields.
+        # HunyuanImage3 needs stage-0 ``final_output: true`` so the orchestrator
+        # forwards AR outputs to clients (e.g. SSE ``ar_delta`` on /v1/images/edits).
+        deploy_extras = ds.engine_extras if ds is not None else {}
+        merged_final_output = ps.final_output
+        merged_final_output_type = ps.final_output_type
+        if "final_output" in deploy_extras:
+            merged_final_output = bool(deploy_extras["final_output"])
+        if "final_output_type" in deploy_extras:
+            merged_final_output_type = deploy_extras["final_output_type"]
+        merged_is_comprehension = ps.owns_tokenizer
+        if "is_comprehension" in deploy_extras:
+            merged_is_comprehension = bool(deploy_extras["is_comprehension"])
+
         result.append(
             StageConfig(
                 stage_id=ps.stage_id,
@@ -956,12 +971,12 @@ def merge_pipeline_deploy(
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
                 custom_process_input_func=input_proc,
-                final_output=ps.final_output,
-                final_output_type=ps.final_output_type,
+                final_output=merged_final_output,
+                final_output_type=merged_final_output_type,
                 worker_type=worker_type,
                 scheduler_cls=_scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
-                is_comprehension=ps.owns_tokenizer,
+                is_comprehension=merged_is_comprehension,
                 yaml_engine_args=engine_args,
                 yaml_runtime=runtime,
                 yaml_extras=extras,

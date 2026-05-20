@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import mimetypes
 import os
 import time
@@ -30,6 +31,8 @@ class RequestFuncInput:
     image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
+    # When True, POST /v1/images/edits with stream=true and measure TTFT/TPOT from ar_delta SSE.
+    stream_ar: bool = False
 
 
 @dataclass
@@ -42,6 +45,11 @@ class RequestFuncOutput:
     stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
+    # TTFT: client POST -> first ar_delta SSE chunk.
+    # TPOT: engine ar_tpot_s from final image chunk metrics (vLLM per-output-token decode).
+    ttft: float = 0.0
+    tpot: float = 0.0
+    ar_delta_count: int = 0
 
 
 def _guess_mime_type(path: str) -> str:
@@ -56,21 +64,11 @@ def _encode_image_as_data_url(path: str) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-async def async_request_image_edits(
-    input: RequestFuncInput,
-    session: aiohttp.ClientSession,
-    pbar: tqdm | None = None,
-    enable_diffusion_pipeline_profiler: bool = False,
-) -> RequestFuncOutput:
-    """POST /v1/images/edits (multipart)."""
-    del enable_diffusion_pipeline_profiler
-    output = RequestFuncOutput()
-    output.start_time = time.perf_counter()
-
+def _build_image_edits_form(input: RequestFuncInput) -> tuple[aiohttp.FormData, str]:
+    """Build multipart form for /v1/images/edits."""
     extra_body = dict(input.extra_body)
     width = input.width or extra_body.get("width") or 1024
     height = input.height or extra_body.get("height") or 1024
-    edits_url = input.api_url
 
     form = aiohttp.FormData()
     form.add_field("model", input.model)
@@ -105,6 +103,74 @@ async def async_request_image_edits(
     if bot_task is not None:
         form.add_field("bot_task", str(bot_task))
 
+    return form, input.api_url
+
+
+async def _consume_image_edit_sse(
+    response: aiohttp.ClientResponse,
+    output: RequestFuncOutput,
+    start_time: float,
+) -> None:
+    """Parse image.edit.chunk SSE; TTFT from ar_delta, TPOT from engine metrics on image chunk."""
+    ttft = 0.0
+    got_image = False
+    buf = b""
+
+    async for chunk in response.content.iter_any():
+        buf += chunk
+        while b"\n" in buf:
+            line_bytes, buf = buf.split(b"\n", 1)
+            line = line_bytes.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data: "):
+                continue
+            data = line[len("data: ") :]
+            if data == "[DONE]":
+                break
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("object") == "error":
+                err = payload.get("error") or {}
+                output.error = str(err.get("message", payload))
+                return
+            chunk_type = payload.get("type")
+            if chunk_type == "ar_delta":
+                now = time.perf_counter()
+                output.ar_delta_count += 1
+                if ttft <= 0.0:
+                    ttft = now - start_time
+            elif chunk_type == "image":
+                got_image = True
+                output.response_body = payload
+                metrics_block = payload.get("metrics")
+                if isinstance(metrics_block, dict):
+                    engine_tpot = metrics_block.get("ar_tpot_s")
+                    if engine_tpot is not None:
+                        output.tpot = float(engine_tpot)
+
+    output.ttft = ttft
+    if got_image and output.error == "":
+        output.success = True
+    elif output.error == "":
+        output.error = "Streaming image edit completed without final image chunk"
+        output.success = False
+
+
+async def async_request_image_edits(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+    enable_diffusion_pipeline_profiler: bool = False,
+) -> RequestFuncOutput:
+    """POST /v1/images/edits (multipart)."""
+    del enable_diffusion_pipeline_profiler
+    output = RequestFuncOutput()
+    output.start_time = time.perf_counter()
+    start_time = output.start_time
+
     assert input.image_paths is not None
     for img_path in input.image_paths:
         if not os.path.exists(img_path):
@@ -113,6 +179,12 @@ async def async_request_image_edits(
             if pbar:
                 pbar.update(1)
             return output
+
+    form, edits_url = _build_image_edits_form(input)
+    if input.stream_ar:
+        form.add_field("stream", "true")
+
+    for img_path in input.image_paths:
         with open(img_path, "rb") as img_f:
             image_bytes = img_f.read()
         form.add_field(
@@ -124,13 +196,22 @@ async def async_request_image_edits(
 
     try:
         async with session.post(edits_url, data=form) as response:
-            if response.status == 200:
+            if response.status != 200:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+            elif input.stream_ar:
+                content_type = response.headers.get("Content-Type", "")
+                if "text/event-stream" not in content_type:
+                    output.error = (
+                        f"Expected text/event-stream for stream=true, got {content_type!r}"
+                    )
+                    output.success = False
+                else:
+                    await _consume_image_edit_sse(response, output, start_time)
+            else:
                 resp_json = await response.json()
                 output.response_body = resp_json
                 output.success = True
-            else:
-                output.error = f"HTTP {response.status}: {await response.text()}"
-                output.success = False
     except Exception as e:
         output.error = str(e)
         output.success = False
