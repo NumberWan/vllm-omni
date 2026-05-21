@@ -31,7 +31,7 @@ class RequestFuncInput:
     image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
-    # When True, POST /v1/images/edits with stream=true and measure TTFT/TPOT from ar_delta SSE.
+    # When True, POST /v1/images/edits with stream=true and measure TTFC/TPOT from ar_delta SSE.
     stream_ar: bool = False
 
 
@@ -45,9 +45,9 @@ class RequestFuncOutput:
     stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
-    # TTFT: client POST -> first ar_delta SSE chunk (seconds).
+    # TTFC: client POST -> first ar_delta SSE chunk (seconds).
     # TPOT: from final image chunk (seconds internally); benchmark prints ms.
-    ttft: float = 0.0
+    ttfc: float = 0.0
     tpot: float = 0.0
     ar_delta_count: int = 0
 
@@ -111,8 +111,8 @@ async def _consume_image_edit_sse(
     output: RequestFuncOutput,
     start_time: float,
 ) -> None:
-    """Parse image.edit.chunk SSE; TTFT from ar_delta, TPOT from engine metrics on image chunk."""
-    ttft = 0.0
+    """Parse image.edit.chunk SSE; TTFC from ar_delta, TPOT from engine metrics on image chunk."""
+    ttfc = 0.0
     got_image = False
     buf = b""
 
@@ -140,8 +140,8 @@ async def _consume_image_edit_sse(
             if chunk_type == "ar_delta":
                 now = time.perf_counter()
                 output.ar_delta_count += 1
-                if ttft <= 0.0:
-                    ttft = now - start_time
+                if ttfc <= 0.0:
+                    ttfc = now - start_time
             elif chunk_type == "image":
                 got_image = True
                 output.response_body = payload
@@ -150,8 +150,14 @@ async def _consume_image_edit_sse(
                     engine_tpot = metrics_block.get("ar_tpot_s")
                     if engine_tpot is not None:
                         output.tpot = float(engine_tpot)
+                    stage_durations = metrics_block.get("stage_durations")
+                    if isinstance(stage_durations, dict):
+                        output.stage_durations = {str(k): float(v) for k, v in stage_durations.items() if v is not None}
+                top_level_sd = payload.get("stage_durations")
+                if isinstance(top_level_sd, dict) and not output.stage_durations:
+                    output.stage_durations = {str(k): float(v) for k, v in top_level_sd.items() if v is not None}
 
-    output.ttft = ttft
+    output.ttfc = ttfc
     if got_image and output.error == "":
         output.success = True
     elif output.error == "":
@@ -202,9 +208,7 @@ async def async_request_image_edits(
             elif input.stream_ar:
                 content_type = response.headers.get("Content-Type", "")
                 if "text/event-stream" not in content_type:
-                    output.error = (
-                        f"Expected text/event-stream for stream=true, got {content_type!r}"
-                    )
+                    output.error = f"Expected text/event-stream for stream=true, got {content_type!r}"
                     output.success = False
                 else:
                     await _consume_image_edit_sse(response, output, start_time)

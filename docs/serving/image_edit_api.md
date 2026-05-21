@@ -168,6 +168,7 @@ data: {"object":"image.edit.chunk","type":"image","metrics":{"ar_ttft_s":1.23,"a
 - `ar_ttft_s`: engine time from request arrival to first generated token.
 - `ar_tpot_s`: decode time divided by `(num_generation_tokens - 1)` (same as vLLM `mean_time_per_output_token`).
 - `ar_num_generation_tokens`: total AR output tokens for the request.
+- `stage_durations`: per-stage wall times in milliseconds (e.g. `stage_0_gen_ms` for the AR stage, `stage_1_gen_ms` for the diffusion stage).
 
 These fields require vLLM request stats on the head-side output processor (do not pass ``--disable-log-stats`` to ``serve`` unless you accept missing SSE metrics).
 

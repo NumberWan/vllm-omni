@@ -139,7 +139,7 @@ class MockStageResult:
             outputs=outputs,
             images=self.images,
         )
-        self.stage_durations = {}
+        self.stage_durations = stage_durations if stage_durations is not None else {}
         self.peak_memory_mb = 0.0
 
 
@@ -452,6 +452,7 @@ def streaming_image_edit_client():
                 stage_id=1,
                 final_output_type="image",
                 images=[Image.new("RGB", (32, 24), color="purple")],
+                stage_durations={"stage_0_gen_ms": 1200.0, "stage_1_gen_ms": 23000.0},
             )
 
         def __class_getitem__(cls, item):
@@ -811,6 +812,10 @@ def test_image_edits_streaming_returns_ar_delta_then_image(streaming_image_edit_
     image_payload = payloads[2]["data"][0]
     img = Image.open(io.BytesIO(base64.b64decode(image_payload["b64_json"])))
     assert img.size == (32, 24)
+    assert payloads[2]["metrics"]["stage_durations"] == {
+        "stage_0_gen_ms": 1200.0,
+        "stage_1_gen_ms": 23000.0,
+    }
 
 
 def test_image_edits_streaming_ar_delta_chunks_include_index(streaming_image_edit_client):
