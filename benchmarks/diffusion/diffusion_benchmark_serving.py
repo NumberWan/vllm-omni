@@ -1015,11 +1015,7 @@ def calculate_metrics(
 
     ttfc_list = [o.ttfc for o in success_outputs if o.ttfc > 0]
     tpots = [o.tpot for o in success_outputs if o.tpot > 0]
-    ar_gen_tokens = [
-        float(o.ar_num_generation_tokens)
-        for o in success_outputs
-        if o.ar_num_generation_tokens > 0
-    ]
+    ar_gen_tokens = [float(o.ar_num_generation_tokens) for o in success_outputs if o.ar_num_generation_tokens > 0]
 
     metrics = {
         "duration": total_duration,
