@@ -50,6 +50,7 @@ class RequestFuncOutput:
     ttfc: float = 0.0
     tpot: float = 0.0
     ar_delta_count: int = 0
+    ar_num_generation_tokens: int = 0
 
 
 def _guess_mime_type(path: str) -> str:
@@ -150,6 +151,9 @@ async def _consume_image_edit_sse(
                     engine_tpot = metrics_block.get("ar_tpot_s")
                     if engine_tpot is not None:
                         output.tpot = float(engine_tpot)
+                    num_gen = metrics_block.get("ar_num_generation_tokens")
+                    if num_gen is not None:
+                        output.ar_num_generation_tokens = int(num_gen)
                     stage_durations = metrics_block.get("stage_durations")
                     if isinstance(stage_durations, dict):
                         output.stage_durations = {str(k): float(v) for k, v in stage_durations.items() if v is not None}

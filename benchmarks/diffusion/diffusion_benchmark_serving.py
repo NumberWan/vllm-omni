@@ -1015,6 +1015,11 @@ def calculate_metrics(
 
     ttfc_list = [o.ttfc for o in success_outputs if o.ttfc > 0]
     tpots = [o.tpot for o in success_outputs if o.tpot > 0]
+    ar_gen_tokens = [
+        float(o.ar_num_generation_tokens)
+        for o in success_outputs
+        if o.ar_num_generation_tokens > 0
+    ]
 
     metrics = {
         "duration": total_duration,
@@ -1048,6 +1053,11 @@ def calculate_metrics(
         "tpot_median_ms": float(np.median(tpots)) * 1000.0 if tpots else 0.0,
         "tpot_p95_ms": float(np.percentile(tpots, 95)) * 1000.0 if tpots else 0.0,
         "tpot_p99_ms": float(np.percentile(tpots, 99)) * 1000.0 if tpots else 0.0,
+        "ar_num_generation_tokens_mean": float(np.mean(ar_gen_tokens)) if ar_gen_tokens else 0.0,
+        "ar_num_generation_tokens_median": float(np.median(ar_gen_tokens)) if ar_gen_tokens else 0.0,
+        "ar_num_generation_tokens_min": float(np.min(ar_gen_tokens)) if ar_gen_tokens else 0.0,
+        "ar_num_generation_tokens_max": float(np.max(ar_gen_tokens)) if ar_gen_tokens else 0.0,
+        "ar_num_generation_tokens_count": len(ar_gen_tokens),
     }
     _merge_stage_gen_ms_metrics(metrics, stage_duration_lists)
 
@@ -1274,6 +1284,17 @@ async def benchmark(args):
     elif metrics.get("stream_ar") and metrics.get("completed_requests", 0) > 0:
         print(f"{'-' * 50}")
         print("AR TPOT: unavailable (no timing on final image chunk)")
+
+    if metrics.get("stream_ar") and metrics.get("ar_num_generation_tokens_count", 0) > 0:
+        print(f"{'-' * 50}")
+        print("ar_num_generation_tokens:")
+        print("{:<40} {:<15.0f}".format("  Mean:", metrics["ar_num_generation_tokens_mean"]))
+        print("{:<40} {:<15.0f}".format("  Median:", metrics["ar_num_generation_tokens_median"]))
+        print("{:<40} {:<15.0f}".format("  min:", metrics["ar_num_generation_tokens_min"]))
+        print("{:<40} {:<15.0f}".format("  max:", metrics["ar_num_generation_tokens_max"]))
+    elif metrics.get("stream_ar") and metrics.get("completed_requests", 0) > 0:
+        print(f"{'-' * 50}")
+        print("ar_num_generation_tokens: unavailable (missing on final image chunk metrics)")
 
     if metrics.get("stream_ar"):
         printed_stage_gen = False
