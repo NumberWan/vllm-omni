@@ -198,9 +198,12 @@ class ImageEditImageChunk(BaseModel):
     size: str = Field(..., description="The generated image size")
     created: int = Field(..., description="Unix timestamp of when the stream was created")
     model: str = Field(..., description="Model used for the image edit request")
-    metrics: dict[str, float | int] | None = Field(
+    metrics: dict[str, Any] | None = Field(
         None,
-        description="AR stage timing from vLLM request stats (ar_ttft_s, ar_tpot_s, ar_num_generation_tokens).",
+        description=(
+            "AR stage timing from vLLM request stats (ar_ttft_s, ar_tpot_s, ar_num_generation_tokens) "
+            "and optional stage_durations."
+        ),
     )
 
 

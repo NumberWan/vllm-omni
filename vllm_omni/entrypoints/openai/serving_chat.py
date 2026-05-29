@@ -2752,13 +2752,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                         for img in images
                     ]
+                    metrics_payload: dict[str, Any] | None = dict(ar_engine_metrics) if ar_engine_metrics else None
+                    stage_durations = getattr(output, "stage_durations", None)
+                    if isinstance(stage_durations, dict) and stage_durations:
+                        if metrics_payload is None:
+                            metrics_payload = {}
+                        metrics_payload["stage_durations"] = stage_durations
                     chunk = ImageEditImageChunk(
                         data=image_data,
                         output_format=output_format,
                         size=size,
                         created=created,
                         model=model,
-                        metrics=ar_engine_metrics or None,
+                        metrics=metrics_payload,
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
                     emitted_image = True
