@@ -233,6 +233,7 @@ def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], re
     if not prompt_token_ids:
         return
     num_computed_tokens = request.num_computed_tokens
+    old_prompt_len = len(request.prompt_token_ids or [])
     kept_output_tokens = request._all_token_ids[request.num_prompt_tokens : num_computed_tokens]
     del request._all_token_ids[num_computed_tokens:]
     request._output_token_ids.clear()
@@ -245,3 +246,14 @@ def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], re
     request.prompt_token_ids.extend(new_prompt or ())
     request.update_block_hashes()
     request.num_prompt_tokens = len(request.prompt_token_ids)
+    logger.info(
+        "[construct_next_stage_streaming_input_prompt] req=%s old_prompt_len=%d num_computed=%d "
+        "kept_output=%d next_prompt_len=%d new_prompt_len=%d payload_keys=%s",
+        getattr(request, "request_id", None),
+        old_prompt_len,
+        num_computed_tokens,
+        len(kept_output_tokens),
+        next_prompt_len,
+        request.num_prompt_tokens,
+        sorted(payload_data.keys()),
+    )

@@ -518,6 +518,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | IntermediateTensors:
+        # logger.info("[Qwen3-TTS forward] input_ids: %s", input_ids)
+        # logger.info("[Qwen3-TTS forward] positions: %s", positions)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(
@@ -644,6 +646,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 is_prefill = span_len > 1
 
         if not _has_tts_text_conditioning(info_dict, hs):
+            logger.error(
+                "Missing Qwen3-TTS text conditioning in preprocess: keys=%s hidden_state_keys=%s "
+                "text_present=%s precomputed_ids_present=%s request_id=%s is_prefill=%s prompt_len=%s "
+                "num_computed_tokens=%s",
+                sorted(info_dict.keys()),
+                sorted(hs.keys()) if isinstance(hs, dict) else None,
+                bool(info_dict.get("text")),
+                PRECOMPUTED_TEXT_IDS_KEY in info_dict,
+                info_dict.get("request_id"),
+                is_prefill,
+                info_dict.get("_omni_prompt_len"),
+                info_dict.get("_omni_num_computed_tokens"),
+            )
             raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
         task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
@@ -656,6 +671,24 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codec_streaming = codec_streaming_raw
         else:
             codec_streaming = task_type == "Base"
+        logger.info(
+            "[Qwen3-TTS preprocess] req=%s is_prefill=%s span_len=%d prompt_len=%s num_computed=%s "
+            "task_type=%s has_text=%s has_precomputed_ids=%s has_ref_audio=%s x_vector_only=%s "
+            "additional_keys=%s meta_keys=%s hidden_state_keys=%s",
+            info_dict.get("request_id"),
+            is_prefill,
+            span_len,
+            info_dict.get("_omni_prompt_len"),
+            info_dict.get("_omni_num_computed_tokens"),
+            task_type,
+            bool(info_dict.get("text")),
+            PRECOMPUTED_TEXT_IDS_KEY in info_dict,
+            bool(info_dict.get("ref_audio")),
+            info_dict.get("x_vector_only_mode"),
+            sorted(info_dict.keys()),
+            sorted(meta.keys()) if isinstance(meta, dict) else None,
+            sorted(hs.keys()) if isinstance(hs, dict) else None,
+        )
 
         # ``tts_pad_embed`` is a request-independent constant — see
         # :meth:`_init_runtime_buffers`. Materialize once on the right
@@ -791,6 +824,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         }
         if trailing_text_update is not None:
             info_update["hidden_states"] = {"trailing_text": trailing_text_update.detach()}
+        logger.info("[Qwen3-TTS preprocess] info_update: %s", info_update)
+        logger.info("[Qwen3-TTS preprocess] inputs_embeds_out: %s", inputs_embeds_out)
+        logger.info("[Qwen3-TTS preprocess] input_ids: %s", input_ids)
         return input_ids, inputs_embeds_out, info_update
 
     def preprocess_decode_batch(
@@ -833,6 +869,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             meta = payload.get("meta", {})
 
             if not _has_tts_text_conditioning(info_dict, hs):
+                logger.error(
+                    "Missing Qwen3-TTS text conditioning in preprocess_decode_batch: keys=%s hidden_state_keys=%s "
+                    "text_present=%s precomputed_ids_present=%s request_id=%s",
+                    sorted(info_dict.keys()),
+                    sorted(hs.keys()) if isinstance(hs, dict) else None,
+                    bool(info_dict.get("text")),
+                    PRECOMPUTED_TEXT_IDS_KEY in info_dict,
+                    info_dict.get("request_id"),
+                )
                 raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
             task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]

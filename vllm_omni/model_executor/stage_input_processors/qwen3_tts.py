@@ -231,9 +231,21 @@ def talker2code2wav_async_chunk(
         )
         initial_chunk_size = chunk_size
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+    logger.info(
+        "[talker2code2wav_async_chunk] req=%s finished=%s frames_buffered=%d chunk_size=%d "
+        "left_context_cfg=%d initial_chunk_size=%d ref_code_context_frames=%d",
+        request_id,
+        finished,
+        length,
+        chunk_size,
+        left_context_size_config,
+        initial_chunk_size,
+        ref_code_context_frames,
+    )
 
     if length <= 0:
         if finished:
+            logger.info("[talker2code2wav_async_chunk] req=%s emitting terminal empty audio codes", request_id)
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
@@ -318,6 +330,18 @@ def talker2code2wav_async_chunk(
         meta.ref_context_request_id = ref_context_request_id
         meta.ref_context_included = ref_context_included
 
+    logger.info(
+        "[talker2code2wav_async_chunk] req=%s emitting frames=%d context_length=%d left_context_size=%d "
+        "ref_context_size=%d ref_context_included=%s finished=%s flat_codes=%d",
+        request_id,
+        num_frames,
+        context_length,
+        left_context_size,
+        ref_context_size,
+        ref_context_included,
+        finished,
+        int(code_predictor_codes.numel()),
+    )
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
         meta=meta,

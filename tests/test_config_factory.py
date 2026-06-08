@@ -1641,6 +1641,7 @@ class TestAuraOmniDeploy:
         deploy = load_deploy_config(deploy_path)
 
         assert deploy.pipeline == "aura_omni"
+        assert deploy.async_chunk is True
 
     def test_aura_omni_deploy_resolves_four_native_stages(self):
         pipeline_cfg = StageConfigFactory.resolve_pipeline_config("aura_omni")
@@ -1664,6 +1665,12 @@ class TestAuraOmniDeploy:
         assert stages[1].yaml_engine_args["model_arch"] == "AuraQwen3VLForConditionalGeneration"
         assert stages[2].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
+        assert stages[0].yaml_engine_args["custom_process_next_stage_input_func"].endswith("asr2aura_async_chunk")
+        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith("aura2tts_async_chunk")
+        assert stages[2].yaml_engine_args["custom_process_next_stage_input_func"].endswith(
+            "talker2code2wav_async_chunk"
+        )
+        assert stages[3].custom_process_input_func is None
 
 
 class TestDeployCliOverrideFlow:

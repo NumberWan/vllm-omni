@@ -4,9 +4,12 @@
 # `--model` at any local placeholder repo if needed; each stage overrides its
 # own model below.
 pipeline: aura_omni
-# AURA has a semantic ASR -> AURA -> TTS dependency. Do not prewarm downstream
-# stages before AURA text is converted into Qwen3-TTS metadata by aura2tts.
-async_chunk: false
+# AURA has a semantic ASR -> AURA -> TTS dependency. 
+# async_chunk: false
+
+# ASR and AURA run in semantic order; AURA then streams text updates into
+# Qwen3-TTS, and TTS streams codec chunks to Code2Wav via the connector.
+async_chunk: true
 
 connectors:
   connector_of_shared_memory:
@@ -32,7 +35,9 @@ stages:
     max_model_len: 8192
     max_num_batched_tokens: 4096
     devices: "0"
-    model: Qwen/Qwen3-ASR-1.7B
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    model: /data/models/Qwen3-ASR-1.7B
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -48,7 +53,11 @@ stages:
     max_model_len: 262144
     max_num_batched_tokens: 15360
     devices: "0"
-    model: aurateam/AURA
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    model: /data/models/AURA
     default_sampling_params:
       temperature: 0.5
       top_p: 1.0
@@ -65,6 +74,8 @@ stages:
     max_num_batched_tokens: 512
     max_model_len: 4096
     devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
     output_connectors:
       to_stage_3: connector_of_shared_memory
     model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
