@@ -7,9 +7,11 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.engine.serialization import deserialize_additional_information
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
@@ -18,6 +20,63 @@ from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
+
+
+def _request_level_tts_metadata(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        info = value
+    else:
+        try:
+            info = deserialize_additional_information(value)
+        except Exception:
+            return {}
+    return {key: val for key, val in info.items() if isinstance(key, str) and key.startswith("tts_")}
+
+
+def _payload_is_meta_only(payload: dict[str, Any]) -> bool:
+    return set(payload.keys()).issubset({"meta"})
+
+
+def _replace_request_prompt_token_ids(request: Any, prompt_token_ids: list[int]) -> bool:
+    if not prompt_token_ids:
+        return False
+    if int(getattr(request, "num_computed_tokens", 0) or 0) > 0:
+        logger.warning(
+            "Received prompt_token_ids for req=%s after prefill started; keeping existing prompt_len=%s",
+            getattr(request, "request_id", None),
+            len(getattr(request, "prompt_token_ids", []) or []),
+        )
+        return False
+    request.prompt_token_ids = list(prompt_token_ids)
+    request.num_prompt_tokens = len(prompt_token_ids)
+    request._output_token_ids.clear()
+    request._all_token_ids.clear()
+    request._all_token_ids.extend(prompt_token_ids)
+    request.block_hashes.clear()
+    request.update_block_hashes()
+    return True
+
+
+def _payload_summary(payload: Any) -> str:
+    if payload is None:
+        return "None"
+    if isinstance(payload, dict):
+        parts: list[str] = []
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                parts.append(f"{key}={sorted(value.keys())}")
+            elif isinstance(value, torch.Tensor):
+                parts.append(f"{key}=Tensor{tuple(value.shape)}")
+            elif isinstance(value, list):
+                parts.append(f"{key}=list[{len(value)}]")
+            else:
+                parts.append(f"{key}={type(value).__name__}:{value!r}")
+        return "{" + ", ".join(parts) + "}"
+    meta = getattr(payload, "meta", None)
+    codes = getattr(payload, "codes", None)
+    return f"{type(payload).__name__}(meta={meta is not None}, codes={codes is not None})"
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -88,6 +147,32 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+        self._cached_prompt_tokenizer = None
+
+    def _payload_prompt_token_ids(self, payload: dict[str, Any]) -> list[int] | None:
+        prompt = payload.get("prompt")
+        if isinstance(prompt, str):
+            if self._cached_prompt_tokenizer is None:
+                self._cached_prompt_tokenizer = cached_tokenizer_from_config(self.config)
+            return list(self._cached_prompt_tokenizer.encode(prompt))
+
+        prompt_token_ids = payload.get("prompt_token_ids")
+        if isinstance(prompt_token_ids, list) and all(isinstance(token_id, int) for token_id in prompt_token_ids):
+            return list(prompt_token_ids)
+        return None
+
+    def _merge_reused_payload_info(self, req_id: str, payload: dict[str, Any], reuse_tts_info: bool) -> dict[str, Any]:
+        dynamic_keys = {"_qwen3_tts_text_ids", "text", "prompt", "prompt_token_ids", "ids", "meta"}
+        if reuse_tts_info:
+            cached_static = self.request_payload.get(req_id)
+            if isinstance(cached_static, dict):
+                return {**cached_static, **payload}
+            return payload
+
+        static_info = {key: value for key, value in payload.items() if key not in dynamic_keys}
+        if static_info:
+            self.request_payload[req_id] = static_info
+        return payload
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -218,13 +303,49 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if payload_data:
             # Update connector state
             self.get_req_chunk[req_id] += 1
+            reuse_tts_info = False
+            if isinstance(payload_data, dict):
+                reuse_tts_info = bool(payload_data.pop("_reuse_tts_info", False))
 
             meta = payload_data.get("meta", {})
             payload_finished = self._is_truthy_scalar(meta.get("finished"))
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
+            logger.info(
+                "[Stage-%s] recv chunk req=%s ext_req=%s key=%s chunk_id=%d size=%s "
+                "finished=%s segment_finished=%s resumable_before=%s prompt_len=%s payload=%s",
+                stage_id,
+                req_id,
+                external_req_id,
+                connector_get_key,
+                chunk_id,
+                size,
+                payload_finished,
+                payload_segment_finished,
+                bool(getattr(request, "resumable", False)),
+                len(getattr(request, "prompt_token_ids", []) or []),
+                _payload_summary(payload_data),
+            )
             if self.model_mode == "ar":
-                request.additional_information = payload_data
-                if chunk_id > 0 and request.resumable:
+                if isinstance(payload_data, dict):
+                    prompt_token_ids = self._payload_prompt_token_ids(payload_data)
+                    if prompt_token_ids is not None and _replace_request_prompt_token_ids(request, prompt_token_ids):
+                        logger.info(
+                            "[Stage-%s] replaced prompt from chunk req=%s prompt_len=%d",
+                            stage_id,
+                            req_id,
+                            len(prompt_token_ids),
+                        )
+                    payload_data = self._merge_reused_payload_info(req_id, payload_data, reuse_tts_info)
+                tts_metadata = _request_level_tts_metadata(getattr(request, "additional_information", None))
+                if reuse_tts_info and isinstance(getattr(request, "additional_information", None), dict):
+                    merged_additional_information = dict(request.additional_information)
+                    merged_additional_information.update(payload_data)
+                    request.additional_information = merged_additional_information
+                elif tts_metadata and _payload_is_meta_only(payload_data):
+                    request.additional_information = {**tts_metadata, **payload_data}
+                else:
+                    request.additional_information = payload_data
+                if chunk_id > 0 and getattr(request, "resumable", False):
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)
 
@@ -233,6 +354,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
+                logger.info(
+                    "[Stage-%s] updated AR req=%s resumable_after=%s prompt_len=%s additional_keys=%s",
+                    stage_id,
+                    req_id,
+                    bool(getattr(request, "resumable", False)),
+                    len(getattr(request, "prompt_token_ids", []) or []),
+                    sorted(request.additional_information.keys())
+                    if isinstance(getattr(request, "additional_information", None), dict)
+                    else None,
+                )
             else:
                 if payload_finished:
                     self.finished_requests.add(req_id)
@@ -266,7 +397,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         existing_sub = info.get(key)
                         merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                         for sk, sv in value.items():
-                            if key == "meta" and sk == "finished":
+                            if key == "meta" and sk == "finished" and not payload_finished:
                                 continue
                             merged_sub[sk] = sv
                         info[key] = merged_sub
@@ -303,7 +434,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
-        payload_data: OmniPayloadStruct | None = None
+        payload_data: OmniPayloadStruct | dict[str, Any] | None = None
         if self.custom_process_next_stage_input_func:
             try:
                 payload_data = self.custom_process_next_stage_input_func(
@@ -315,7 +446,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 )
 
             except Exception as e:
-                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+                logger.exception(
+                    "[Stage-%s] custom_process_next_stage_input_func failed req=%s ext_req=%s "
+                    "chunk_id=%d is_finished=%s is_segment_finished=%s; skip sending empty payload",
+                    stage_id,
+                    getattr(request, "request_id", None),
+                    external_req_id,
+                    chunk_id,
+                    is_finished,
+                    is_segment_finished,
+                )
+                return
 
         if payload_data is None:
             if not (is_segment_finished or is_finished):
@@ -323,11 +464,31 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Segment/request finish markers must still reach downstream even when
             # the processor has no tensor payload.
             payload_data = OmniPayloadStruct()
-        if payload_data.meta is None:
-            payload_data.meta = MetaStruct()
-        payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
-        payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
+        if isinstance(payload_data, dict):
+            meta = payload_data.setdefault("meta", {})
+            if not isinstance(meta, dict):
+                meta = {}
+                payload_data["meta"] = meta
+            meta["finished"] = torch.tensor(is_finished, dtype=torch.bool)
+            meta["is_segment_finished"] = torch.tensor(is_segment_finished, dtype=torch.bool)
+        else:
+            if payload_data.meta is None:
+                payload_data.meta = MetaStruct()
+            payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
+            payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
+        logger.info(
+            "[Stage-%s] send chunk req=%s ext_req=%s key=%s chunk_id=%d finished=%s "
+            "segment_finished=%s payload=%s",
+            stage_id,
+            getattr(request, "request_id", None),
+            external_req_id,
+            connector_put_key,
+            chunk_id,
+            is_finished,
+            is_segment_finished,
+            _payload_summary(payload_data),
+        )
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
@@ -337,13 +498,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if success:
             self.put_req_chunk[external_req_id] += 1
-            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
-            # Sender uses struct attr access here; the receive path in
+            logger.info(
+                "[Stage-%s] sent chunk key=%s size=%s next_chunk_id=%d metadata_keys=%s",
+                stage_id,
+                connector_put_key,
+                size,
+                self.put_req_chunk[external_req_id],
+                sorted(metadata.keys()) if isinstance(metadata, dict) else None,
+            )
+            # Sender usually uses struct attr access here; the receive path in
             # `_load_one_request` / `_update_request_payload` reads dict keys.
             # That asymmetry is intentional: `OmniMsgpackDecoder` is type-erased
-            # (no target type), so the wire round-trips struct -> dict. If you
-            # change the schema, update both ends — see test_wire_round_trip.
-            finished_flag = payload_data.meta.finished if payload_data.meta is not None else None
+            # (no target type), so the wire round-trips struct -> dict. Dict
+            # payloads are also accepted for model-specific scalar metadata.
+            if isinstance(payload_data, dict):
+                finished_flag = payload_data.get("meta", {}).get("finished")
+            else:
+                finished_flag = payload_data.meta.finished if payload_data.meta is not None else None
             is_payload_finished = False
             if isinstance(finished_flag, torch.Tensor):
                 is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())

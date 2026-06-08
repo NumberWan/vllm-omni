@@ -676,6 +676,43 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_chunk_prewarm_preserves_source_resumable_flag(orchestrator_factory) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=False)
+    stage2 = FakeStageClient(stage_type="llm", final_output=True)
+    processors = [
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-mid", token_ids=[1], finished=True)]),
+        FakeOutputProcessor(),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-mid", token_ids=[20], finished=True)]),
+    ]
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1, stage2],
+        output_processors=processors,
+        async_chunk=True,
+    )
+    request = SimpleNamespace(request_id="req-mid", prompt_token_ids=[1, 2, 3, 4])
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-mid",
+            prompt=request,
+            original_prompt={"prompt": "hello async"},
+            sampling_params_list=[_sampling_params(), _sampling_params(), _sampling_params()],
+            final_stage_id=2,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1 and len(stage2.add_request_calls) == 1)
+
+        intermediate_request = stage1.add_request_calls[0][0]
+        final_request = stage2.add_request_calls[0][0]
+        assert intermediate_request.resumable is False
+        assert final_request.resumable is False
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
 async def test_run_shutdown(orchestrator_factory) -> None:
     stages = [
         FakeStageClient(stage_type="llm", final_output=False),

@@ -31,15 +31,21 @@ class DummyWaitingQueue(list):
 
 
 def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None):
+    all_token_ids: list[int] = []
     return SimpleNamespace(
         request_id=req_id,
         external_req_id=external_req_id or req_id,
         status=status,
         prompt_token_ids=[],
+        _all_token_ids=all_token_ids,
+        _output_token_ids=[],
+        block_hashes=[],
         num_computed_tokens=0,
         num_output_placeholders=0,
         additional_information=None,
+        resumable=False,
         is_finished=lambda: status == RequestStatus.FINISHED_STOPPED,
+        update_block_hashes=lambda: None,
     )
 
 
@@ -138,6 +144,66 @@ def test_load_poll(build_adapter):
     assert "req-1" in adapter._finished_load_reqs
     assert "req-1" in adapter.finished_requests
     assert "req-1" not in adapter._pending_load_reqs
+
+
+def test_load_poll_reencodes_prompt_with_receiver_tokenizer(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-prompt", RequestStatus.WAITING, external_req_id="external-prompt")
+    request.prompt_token_ids = [0, 0]
+    request._all_token_ids.extend([0, 0])
+    request.num_prompt_tokens = 2
+
+    class FakeTokenizer:
+        def encode(self, text):
+            return [len(text), 9]
+
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter.cached_tokenizer_from_config",
+        lambda _config: FakeTokenizer(),
+    )
+    connector.get.return_value = (
+        {
+            "prompt": "AURA prompt",
+            "prompt_token_ids": [1],
+            "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+        },
+        16,
+    )
+
+    adapter._poll_single_request(request)
+
+    assert request.prompt_token_ids == [11, 9]
+    assert request.num_prompt_tokens == 2
+    assert request._all_token_ids == [11, 9]
+
+
+def test_load_poll_reuses_cached_tts_static_information(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-tts", RequestStatus.WAITING, external_req_id="external-tts")
+
+    first_payload = {
+        "_qwen3_tts_text_ids": [[1]],
+        "task_type": ["Base"],
+        "ref_audio": ["ref.wav"],
+        "prompt_token_ids": [0] * 64,
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    connector.get.return_value = (first_payload, 16)
+    adapter._poll_single_request(request)
+    assert request.additional_information["ref_audio"] == ["ref.wav"]
+
+    request.additional_information = None
+    second_payload = {
+        "_qwen3_tts_text_ids": [[2]],
+        "_reuse_tts_info": True,
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    connector.get.return_value = (second_payload, 16)
+    adapter._poll_single_request(request)
+
+    assert request.additional_information["_qwen3_tts_text_ids"] == [[2]]
+    assert request.additional_information["task_type"] == ["Base"]
+    assert request.additional_information["ref_audio"] == ["ref.wav"]
 
 
 def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter):
@@ -350,12 +416,30 @@ def test_load_poll_non_ar_merges_into_existing_additional_information(build_adap
     )
     assert request.additional_information["ids"]["prompt"] == [11, 12]
     assert request.additional_information["ids"]["all"] == [21, 22]
-    # non-ar merge path intentionally doesn't overwrite meta.finished.
-    assert request.additional_information["meta"]["finished"].item() is False
+    assert request.additional_information["meta"]["finished"].item() is True
     assert request.additional_information["meta"]["phase"] == "decode"
     assert request.additional_information["kv_metadata"] == {"foo": "bar"}
     assert "req-non-ar" in adapter._finished_load_reqs
     assert "req-non-ar" in adapter.finished_requests
+
+
+def test_load_poll_non_ar_keeps_existing_finished_for_non_terminal_chunks(build_adapter):
+    adapter, connector = build_adapter(stage_id=3, model_mode="diffusion")
+    request = _req("req-non-terminal", RequestStatus.WAITING, external_req_id="ext-non-terminal")
+    request.additional_information = {
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool), "left_context_size": 1},
+    }
+
+    payload: OmniPayload = {
+        "codes": {"audio": torch.tensor([7, 8], dtype=torch.long)},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool), "left_context_size": 2},
+    }
+    connector.get.return_value = (payload, 8)
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.additional_information["meta"]["finished"].item() is False
+    assert request.additional_information["meta"]["left_context_size"] == 2
 
 
 def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):
@@ -364,7 +448,7 @@ def test_load_poll_ar_request_additional_information_concats_tensors(build_adapt
     request.additional_information = {
         "hidden_states": {"output": torch.tensor([[1.0]])},
         "ids": {"prompt": [11, 12]},
-        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool), "prompt_len": 107},
     }
 
     adapter.request_ids_mapping["req-merged"] = "ext-merged"
@@ -376,9 +460,79 @@ def test_load_poll_ar_request_additional_information_concats_tensors(build_adapt
 
     adapter._poll_single_request(request)
 
-    # AR mode now forwards the latest payload directly.
+    # AR mode forwards the latest connector payload directly.
     assert request.additional_information == payload
     assert request.additional_information["meta"]["finished"].item() is True
+
+
+def test_load_poll_ar_preserves_tts_metadata_for_meta_only_payload(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-aura", RequestStatus.WAITING, external_req_id="ext-aura")
+    request.additional_information = {
+        "tts_ref_audio": ["/tmp/ref.wav"],
+        "tts_ref_text": ["hello"],
+        "unrelated": ["drop-me"],
+    }
+
+    adapter.request_ids_mapping["req-aura"] = "ext-aura"
+    payload: OmniPayload = {
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    connector.get.return_value = (payload, 8)
+
+    adapter._poll_single_request(request)
+
+    assert request.additional_information["tts_ref_audio"] == ["/tmp/ref.wav"]
+    assert request.additional_information["tts_ref_text"] == ["hello"]
+    assert "unrelated" not in request.additional_information
+    assert request.additional_information["meta"]["finished"].item() is True
+
+
+def test_load_poll_ar_keeps_aura_tts_payload_non_resumable(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-aura", RequestStatus.WAITING, external_req_id="ext-aura")
+    adapter.request_ids_mapping["req-aura"] = "ext-aura"
+    connector.get.return_value = (
+        {
+            "_qwen3_tts_text_ids": [[1, 2, 3]],
+            "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+        },
+        8,
+    )
+
+    adapter._poll_single_request(request)
+
+    assert request.resumable is False
+    assert request.additional_information["_qwen3_tts_text_ids"] == [[1, 2, 3]]
+
+
+def test_load_poll_ar_does_not_extend_prompt_without_ids_prompt(build_adapter, mocker: MockerFixture):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-aura", RequestStatus.WAITING, external_req_id="ext-aura")
+    request.resumable = True
+    request.prompt_token_ids = [0, 0]
+    request.num_prompt_tokens = 2
+    request.num_computed_tokens = 4
+    request._all_token_ids = [0, 0, 11, 12]
+    request._output_token_ids = [11, 12]
+    request.update_block_hashes = mocker.MagicMock()
+    adapter.request_ids_mapping["req-aura"] = "ext-aura"
+    adapter.get_req_chunk["req-aura"] = 1
+    connector.get.return_value = (
+        {
+            "_qwen3_tts_text_ids": [[1, 2, 3, 4]],
+            "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+        },
+        8,
+    )
+
+    adapter._poll_single_request(request)
+
+    assert request.prompt_token_ids == [0, 0]
+    assert request._all_token_ids == [0, 0, 11, 12]
+    assert request._output_token_ids == [11, 12]
+    assert request.num_prompt_tokens == 2
+    request.update_block_hashes.assert_not_called()
 
 
 def test_process_and_restore_queues(build_adapter):
