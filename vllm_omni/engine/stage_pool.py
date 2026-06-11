@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -655,20 +656,39 @@ class StagePool:
     def _has_audio_output(self, request_outputs: list[Any]) -> bool:
         for ro in request_outputs:
             for mm_output in self._iter_multimodal_outputs(ro):
-                if isinstance(mm_output, dict) and mm_output.get("audio") is not None:
+                if self._extract_audio_payload(mm_output) is not None:
                     return True
         return False
+
+    @staticmethod
+    def _normalize_multimodal_dict(mm_output: Any) -> dict[str, Any] | None:
+        if mm_output is None:
+            return None
+        if isinstance(mm_output, dict):
+            return mm_output or None
+        to_dict = getattr(mm_output, "to_dict", None)
+        if callable(to_dict):
+            normalized = to_dict()
+            return normalized or None
+        if isinstance(mm_output, Mapping):
+            return dict(mm_output) or None
+        return None
+
+    @staticmethod
+    def _extract_audio_payload(mm_output: dict[str, Any]) -> Any | None:
+        audio = mm_output.get("audio")
+        if audio is not None:
+            return audio
+        return mm_output.get("model_outputs")
 
     def _collect_audio_metrics(self, request_outputs: list[Any]) -> tuple[int, int, float]:
         total_frames = 0
         sample_rate = 0
         for ro in request_outputs:
             for mm_output in self._iter_multimodal_outputs(ro):
-                if not isinstance(mm_output, dict):
-                    continue
                 if sample_rate <= 0:
                     sample_rate = self._infer_audio_sample_rate(mm_output)
-                audio_output = mm_output.get("audio")
+                audio_output = self._extract_audio_payload(mm_output)
                 if audio_output is None:
                     continue
                 items = audio_output if isinstance(audio_output, list) else [audio_output]
@@ -888,12 +908,12 @@ class StagePool:
 
     def _iter_multimodal_outputs(self, request_output: Any) -> list[dict[str, Any]]:
         multimodal_outputs: list[dict[str, Any]] = []
-        outer_mm = getattr(request_output, "multimodal_output", None)
-        if isinstance(outer_mm, dict) and outer_mm:
+        outer_mm = self._normalize_multimodal_dict(getattr(request_output, "multimodal_output", None))
+        if outer_mm is not None:
             multimodal_outputs.append(outer_mm)
         for output in getattr(request_output, "outputs", None) or []:
-            inner_mm = getattr(output, "multimodal_output", None)
-            if isinstance(inner_mm, dict) and inner_mm:
+            inner_mm = self._normalize_multimodal_dict(getattr(output, "multimodal_output", None))
+            if inner_mm is not None:
                 multimodal_outputs.append(inner_mm)
         return multimodal_outputs
 
