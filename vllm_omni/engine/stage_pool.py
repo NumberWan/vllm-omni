@@ -430,37 +430,6 @@ class StagePool:
             return None
         return cast(StagePoolLLMClient, client)
 
-    def replica_monitor_sample(self, replica_id: int) -> tuple[int, int]:
-        """Return (outputs_queue_size, inflight) for orchestrator load diagnostics."""
-        if replica_id < 0 or replica_id >= len(self.clients):
-            return (0, 0)
-        client = self.clients[replica_id]
-        if client is None:
-            return (0, 0)
-
-        outputs_qsize = 0
-        outputs_queue = getattr(client, "outputs_queue", None)
-        if outputs_queue is not None:
-            try:
-                outputs_qsize = max(int(outputs_queue.qsize()), 0)
-            except (AttributeError, NotImplementedError, RuntimeError, ValueError):
-                pass
-
-        if self._hub is not None:
-            input_addr = self._client_input_addr(client)
-            if input_addr is not None:
-                for replica in self._hub.get_replicas_for_stage(self.stage_id).replicas:
-                    if replica.input_addr == input_addr:
-                        return (outputs_qsize, max(int(replica.queue_length), 0))
-            # Distributed dispatch (pick): request_id -> input_addr in _affinity.
-            inflight = sum(
-                1 for input_addr in self._affinity.values() if self._addr_to_replica_id.get(input_addr) == replica_id
-            )
-        else:
-            # Legacy local dispatch (select_replica_id): request_id -> replica_id.
-            inflight = sum(1 for bound_replica_id in self._request_bindings.values() if bound_replica_id == replica_id)
-        return (outputs_qsize, inflight)
-
     def release_binding(self, request_id: str) -> None:
         """Drop the route binding for *request_id* in this stage."""
         self._request_bindings.pop(request_id, None)
@@ -598,6 +567,7 @@ class StagePool:
         batch_id = metrics.batch_seq
         metrics.agg_total_tokens += num_tokens_out
         metrics.agg_total_gen_time_ms += stage_gen_time_ms
+        audio_rtf = defs.compute_audio_rtf(stage_gen_time_ms / 1000.0, audio_duration_s)
 
         return StageRequestMetrics(
             num_tokens_in=num_tokens_in,
@@ -616,6 +586,7 @@ class StagePool:
             audio_generated_frames=audio_generated_frames,
             audio_sample_rate=audio_sample_rate,
             audio_duration_s=audio_duration_s,
+            audio_rtf=audio_rtf,
             image_pixels=image_pixels,
             denoise_step_latency_ms=denoise_step_latency_ms,
             output_unit_type=output_unit_type,
@@ -685,20 +656,39 @@ class StagePool:
     def _has_audio_output(self, request_outputs: list[Any]) -> bool:
         for ro in request_outputs:
             for mm_output in self._iter_multimodal_outputs(ro):
-                if isinstance(mm_output, Mapping) and mm_output.get("audio") is not None:
+                if self._extract_audio_payload(mm_output) is not None:
                     return True
         return False
+
+    @staticmethod
+    def _normalize_multimodal_dict(mm_output: Any) -> dict[str, Any] | None:
+        if mm_output is None:
+            return None
+        if isinstance(mm_output, dict):
+            return mm_output or None
+        to_dict = getattr(mm_output, "to_dict", None)
+        if callable(to_dict):
+            normalized = to_dict()
+            return normalized or None
+        if isinstance(mm_output, Mapping):
+            return dict(mm_output) or None
+        return None
+
+    @staticmethod
+    def _extract_audio_payload(mm_output: dict[str, Any]) -> Any | None:
+        audio = mm_output.get("audio")
+        if audio is not None:
+            return audio
+        return mm_output.get("model_outputs")
 
     def _collect_audio_metrics(self, request_outputs: list[Any]) -> tuple[int, int, float]:
         total_frames = 0
         sample_rate = 0
         for ro in request_outputs:
             for mm_output in self._iter_multimodal_outputs(ro):
-                if not isinstance(mm_output, Mapping):
-                    continue
                 if sample_rate <= 0:
                     sample_rate = self._infer_audio_sample_rate(mm_output)
-                audio_output = mm_output.get("audio")
+                audio_output = self._extract_audio_payload(mm_output)
                 if audio_output is None:
                     continue
                 items = audio_output if isinstance(audio_output, list) else [audio_output]
@@ -778,7 +768,7 @@ class StagePool:
     def _count_images(self, request_output: Any) -> int:
         total_images = self._count_value_units(getattr(request_output, "images", None))
         for mm_output in self._iter_multimodal_outputs(request_output):
-            if isinstance(mm_output, Mapping):
+            if isinstance(mm_output, dict):
                 total_images += self._count_value_units(mm_output.get("image"))
                 total_images += self._count_value_units(mm_output.get("images"))
         return total_images
@@ -788,7 +778,7 @@ class StagePool:
         for ro in request_outputs:
             total_pixels += self._count_image_value_pixels(getattr(ro, "images", None))
             for mm_output in self._iter_multimodal_outputs(ro):
-                if isinstance(mm_output, Mapping):
+                if isinstance(mm_output, dict):
                     total_pixels += self._count_image_value_pixels(mm_output.get("image"))
                     total_pixels += self._count_image_value_pixels(mm_output.get("images"))
         return total_pixels
@@ -823,7 +813,7 @@ class StagePool:
         total_videos = self._count_video_units(getattr(request_output, "video", None))
         total_videos += self._count_video_units(getattr(request_output, "videos", None))
         for mm_output in self._iter_multimodal_outputs(request_output):
-            if isinstance(mm_output, Mapping):
+            if isinstance(mm_output, dict):
                 total_videos += self._count_video_units(mm_output.get("video"))
                 total_videos += self._count_video_units(mm_output.get("videos"))
         return total_videos
@@ -848,7 +838,7 @@ class StagePool:
         if isinstance(custom_output, dict) and custom_output:
             return True
         for mm_output in self._iter_multimodal_outputs(request_output):
-            if isinstance(mm_output, Mapping) and any(self._is_non_empty_value(value) for value in mm_output.values()):
+            if isinstance(mm_output, dict) and any(self._is_non_empty_value(value) for value in mm_output.values()):
                 return True
         for output in getattr(request_output, "outputs", None) or []:
             if getattr(output, "text", None):
@@ -916,14 +906,14 @@ class StagePool:
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
 
-    def _iter_multimodal_outputs(self, request_output: object) -> list[Mapping[str, Any]]:
-        multimodal_outputs: list[Mapping[str, Any]] = []
-        outer_mm = getattr(request_output, "multimodal_output", None)
-        if isinstance(outer_mm, Mapping) and outer_mm:
+    def _iter_multimodal_outputs(self, request_output: Any) -> list[dict[str, Any]]:
+        multimodal_outputs: list[dict[str, Any]] = []
+        outer_mm = self._normalize_multimodal_dict(getattr(request_output, "multimodal_output", None))
+        if outer_mm is not None:
             multimodal_outputs.append(outer_mm)
         for output in getattr(request_output, "outputs", None) or []:
-            inner_mm = getattr(output, "multimodal_output", None)
-            if isinstance(inner_mm, Mapping) and inner_mm:
+            inner_mm = self._normalize_multimodal_dict(getattr(output, "multimodal_output", None))
+            if inner_mm is not None:
                 multimodal_outputs.append(inner_mm)
         return multimodal_outputs
 
@@ -948,17 +938,15 @@ class StagePool:
             params = OmniDiffusionSamplingParams()
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
-            if isinstance(request, list):
-                raise ValueError(
-                    "Diffusion list-prompt batch requests are no longer supported. "
-                    "Submit multiple independent requests to use scheduler batching."
-                )
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
             )
             client = self._diffusion_client(replica_id)
-            await client.add_request_async(request_id, request, params, **submit_kwargs)
+            if isinstance(request, list):
+                await client.add_batch_request_async(request_id, request, params, **submit_kwargs)
+            else:
+                await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
         replica_id = await self._pick_or_select(
@@ -1019,11 +1007,6 @@ class StagePool:
             raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
 
         if self.stage_type == "diffusion":
-            if isinstance(request, list):
-                raise ValueError(
-                    "Diffusion list-prompt batch requests are no longer supported. "
-                    "Submit multiple independent requests to use scheduler batching."
-                )
             await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
         else:
             # Refresh the shared output-processor state before yielding to the
