@@ -131,6 +131,90 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
+    g = parser.add_argument_group("OmniInteract Dataset Options")
+    g.add_argument(
+        "--omniinteract-root",
+        type=str,
+        default=None,
+        help="Local OmniInteract extracted data root (contains 1q1a/1q1a_math/1qna, or a parent with data/). "
+        "If omitted, benchmark downloads data.tar.gz from --dataset-path/--hf-name (default lucky-lance/OmniInteract).",
+    )
+    g.add_argument(
+        "--omniinteract-subsets",
+        type=str,
+        default="1q1a,1q1a_math,1qna",
+        help="Comma-separated subsets to evaluate, e.g. '1q1a,1q1a_math' or '1qna'.",
+    )
+    g.add_argument(
+        "--omniinteract-inline-local-video",
+        action="store_true",
+        default=False,
+        help="Embed local MP4 as data:video URLs instead of file://. Useful when server lacks "
+        "--allowed-local-media-path; increases request body size.",
+    )
+    g.add_argument(
+        "--omniinteract-input-mode",
+        type=str,
+        choices=["video", "aura"],
+        default="video",
+        help=(
+            "OmniInteract request protocol. 'video' sends subvideo_url + text question with "
+            "mm_processor_kwargs.use_audio_in_video=true. 'aura' sends paired audio_url + "
+            "subvideo_url and AURA/TTS extra_body fields for the ASR -> AURA -> TTS pipeline. "
+            "Generate subvideos/ and audios/ under 1q1a before benchmarking."
+        ),
+    )
+    g.add_argument(
+        "--omniinteract-aura-tts-task-type",
+        type=str,
+        choices=["Base", "CustomVoice"],
+        default="Base",
+        help=(
+            "TTS task type for OmniInteract AURA mode. Base requires "
+            "--omniinteract-aura-tts-ref-audio and --omniinteract-aura-tts-ref-text."
+        ),
+    )
+    g.add_argument(
+        "--omniinteract-aura-tts-language",
+        type=str,
+        default="Chinese",
+        help="TTS language passed to OmniInteract AURA TTS.",
+    )
+    g.add_argument(
+        "--omniinteract-aura-tts-speaker",
+        type=str,
+        default=None,
+        help="TTS speaker passed to OmniInteract AURA CustomVoice mode.",
+    )
+    g.add_argument(
+        "--omniinteract-aura-tts-ref-audio",
+        type=str,
+        default=None,
+        help="Reference audio path/URL for OmniInteract AURA Base TTS mode.",
+    )
+    g.add_argument(
+        "--omniinteract-aura-tts-ref-text",
+        type=str,
+        default=None,
+        help="Reference text transcript for OmniInteract AURA Base TTS mode.",
+    )
+    g.add_argument(
+        "--omniinteract-eval",
+        action="store_true",
+        default=False,
+        help="Compute OmniInteract QA metrics (IA-QTF1/IDS/NCCS). Disabled by default; "
+        "use for accuracy runs. Perf-only runs collect serving metrics only.",
+    )
+    g.add_argument(
+        "--omniinteract-save-eval-items",
+        action="store_true",
+        default=False,
+        help="When --omniinteract-eval is set, include per-request OmniInteract eval rows in "
+        "result JSON as omniinteract_eval_items. Alternatively set OMNIINTERACT_SAVE_EVAL_ITEMS=1.",
+    )
+
+
 def add_omni_benchmark_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add vLLM-Omni specific serving benchmark options."""
     group = parser.add_argument_group("vLLM-Omni Multi-stage Benchmark Options")
@@ -158,6 +242,7 @@ def add_omni_benchmark_cli_args(parser: argparse.ArgumentParser) -> None:
 
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
+    "omniinteract",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -197,6 +282,7 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
 
         # Add Daily-Omni specific arguments
         add_daily_omni_cli_args(parser)
+        add_omniinteract_cli_args(parser)
         add_seed_tts_cli_args(parser)
         add_omni_benchmark_cli_args(parser)
 
@@ -206,6 +292,7 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
                     c
                     for c in (
                         "daily-omni",
+                        "omniinteract",
                         "seed-tts",
                         "seed-tts-text",
                         "seed-tts-design",
@@ -260,6 +347,10 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
     def cmd(args: argparse.Namespace) -> None:
         if getattr(args, "daily_omni_save_eval_items", False):
             os.environ["DAILY_OMNI_SAVE_EVAL_ITEMS"] = "1"
+        if getattr(args, "omniinteract_eval", False):
+            os.environ["OMNIINTERACT_EVAL"] = "1"
+        if getattr(args, "omniinteract_save_eval_items", False):
+            os.environ["OMNIINTERACT_SAVE_EVAL_ITEMS"] = "1"
         if getattr(args, "seed_tts_wer_eval", False):
             os.environ["SEED_TTS_WER_EVAL"] = "1"
         if getattr(args, "seed_tts_wer_save_items", False):
