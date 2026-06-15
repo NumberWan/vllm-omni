@@ -31,7 +31,7 @@ from typing import Any
 
 from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilter
 from vllm_omni.entrypoints.openai.video_stream_base import (
-    OmniStreamingVideoHandler,
+    OmniStreamingVideoHandler as OmniStreamingVideoHandlerBase,
     StreamingVideoSessionConfig,
     VideoStreamTurnTrigger,
     _BAD_FRAME,
@@ -46,7 +46,7 @@ __all__ = [
 ]
 
 
-class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandler):
+class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     """Qwen-Omni pipeline: manual ``video.query`` trigger and image_pil prompts."""
 
     def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
@@ -131,3 +131,8 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandler):
         message_history.append({"role": "assistant", "content": response_text})
 
     _build_messages = build_engine_prompt
+
+
+# Default handler for ``/v1/video/chat/stream`` (Qwen3-Omni today).
+# api_server imports this name; swap binding here when adding more pipelines.
+OmniStreamingVideoHandler = QwenOmniStreamingVideoHandler

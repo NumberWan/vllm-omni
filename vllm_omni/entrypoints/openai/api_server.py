@@ -132,7 +132,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
     ReferenceImage,
     ReferenceVideo,
 )
-from vllm_omni.entrypoints.openai.serving_video_stream import QwenOmniStreamingVideoHandler
+from vllm_omni.entrypoints.openai.serving_video_stream import OmniStreamingVideoHandler
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
@@ -1070,7 +1070,7 @@ async def omni_init_app_state(
         speech_service=state.openai_serving_speech,
     )
     state.openai_streaming_video = (
-        QwenOmniStreamingVideoHandler(
+        OmniStreamingVideoHandler(
             chat_service=state.openai_serving_chat,
             engine_client=engine_client,
         )
