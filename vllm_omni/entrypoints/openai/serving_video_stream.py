@@ -29,12 +29,14 @@ from __future__ import annotations
 from typing import Any
 
 from vllm_omni.entrypoints.openai.video_stream_base import (
-    OmniStreamingVideoHandler as OmniStreamingVideoHandlerBase,
-    StreamingVideoSessionConfig,
-    VideoStreamTurnTrigger,
     _BAD_FRAME,
     _DEFAULT_CONFIG_TIMEOUT,
     _DEFAULT_IDLE_TIMEOUT,
+    StreamingVideoSessionConfig,
+    VideoStreamTurnTrigger,
+)
+from vllm_omni.entrypoints.openai.video_stream_base import (
+    OmniStreamingVideoHandler as OmniStreamingVideoHandlerBase,
 )
 
 __all__ = [
