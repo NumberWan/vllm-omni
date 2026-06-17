@@ -432,7 +432,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
                 is_segment_finished = True
-                finished = self._handle_stopped_request(request)
+                if self._should_wait_for_next_chunk(request):
+                    finished = False
+                    self._reset_request_for_next_chunk(request)
+                else:
+                    finished = self._handle_stopped_request(request)
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -614,6 +618,38 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     init_logger(__name__).exception("Failed to free blocks for %s after transfer", req_id)
 
         return engine_core_outputs
+
+    def _should_wait_for_next_chunk(self, request: Request) -> bool:
+        if self.chunk_transfer_adapter is None:
+            return False
+        if getattr(self.vllm_config.model_config, "stage_id", 0) == 0:
+            return False
+        return not self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id)
+
+    def _reset_request_for_next_chunk(self, request: Request) -> None:
+        """Keep a chunk-driven AR request alive after its current segment ends.
+
+        Upstream chunks for a single external request are consumed by the same
+        scheduler request. When the model reaches EOS for one chunk before the
+        upstream stage has sent its terminal marker, reset per-segment execution
+        state so the next connector payload can be scheduled like a fresh prompt.
+        """
+        self.kv_cache_manager.free(request)
+        self.encoder_cache_manager.free(request)
+        request.status = RequestStatus.WAITING
+        request.num_computed_tokens = 0
+        request.num_output_placeholders = 0
+        request.spec_token_ids = []
+        request._output_token_ids.clear()
+        request._all_token_ids.clear()
+        request._all_token_ids.extend(request.prompt_token_ids)
+        request.num_prompt_tokens = len(request.prompt_token_ids)
+        request.async_tokens_to_discard = 0
+        request.block_hashes.clear()
+        request.update_block_hashes()
+        if request in self.skipped_waiting:
+            self.skipped_waiting.remove_requests((request,))
+        self._enqueue_waiting_request(request)
 
     def finish_requests(self, request_ids: Any, finished_status: RequestStatus) -> list[tuple[str, int]]:
         """Handles the finish signal from outside the scheduler.

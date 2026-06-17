@@ -29,6 +29,12 @@ def _partial_source_output(text: str, request_id: str = "req-1", token_ids: list
     return SimpleNamespace(request_id=request_id, outputs=[output], finished=False)
 
 
+def _transfer_manager(aura_tts_chunk_tokens: int = 1):
+    return SimpleNamespace(
+        connector=SimpleNamespace(config={"extra": {"aura_tts_chunk_tokens": aura_tts_chunk_tokens}}),
+    )
+
+
 def test_asr2aura_carries_video_payload_and_transcript():
     prompt = {
         "multi_modal_data": {"video": ["frame-0", "frame-1"]},
@@ -248,7 +254,7 @@ def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
 
 
 def test_aura2tts_async_chunk_packs_tts_conditioning_in_connector_payload():
-    transfer_manager = SimpleNamespace()
+    transfer_manager = _transfer_manager()
     request = SimpleNamespace(
         request_id="req-1",
         external_req_id="req-1",
@@ -273,7 +279,7 @@ def test_aura2tts_async_chunk_packs_tts_conditioning_in_connector_payload():
 
 
 def test_aura2tts_async_chunk_accepts_multimodal_output_keyword():
-    transfer_manager = SimpleNamespace()
+    transfer_manager = _transfer_manager()
     request = SimpleNamespace(
         request_id="req-1",
         external_req_id="req-1",
@@ -297,7 +303,7 @@ def test_aura2tts_async_chunk_accepts_multimodal_output_keyword():
 
 
 def test_aura2tts_async_chunk_emits_updated_text_ids_for_non_final_chunks():
-    transfer_manager = SimpleNamespace()
+    transfer_manager = _transfer_manager()
     request = SimpleNamespace(
         request_id="req-1",
         external_req_id="req-1",
@@ -319,13 +325,14 @@ def test_aura2tts_async_chunk_emits_updated_text_ids_for_non_final_chunks():
     assert "_reuse_tts_info" not in first_payload
     assert second_payload["text"] == ["，第二句"]
     assert second_payload["_reuse_tts_info"] is True
+    assert second_payload["prompt_token_ids"]
     assert "task_type" not in second_payload
     assert "ref_audio" not in second_payload
     assert "next_stage_prompt_len" not in second_payload
 
 
 def test_aura2tts_async_chunk_passes_token_ids_only_when_enabled():
-    transfer_manager = SimpleNamespace()
+    transfer_manager = _transfer_manager()
     request = SimpleNamespace(
         request_id="req-1",
         external_req_id="req-1",
@@ -351,6 +358,46 @@ def test_aura2tts_async_chunk_passes_token_ids_only_when_enabled():
     ]
     assert second_payload["_reuse_tts_info"] is True
     assert "task_type" not in second_payload
+
+
+def test_aura2tts_async_chunk_buffers_until_configured_token_count():
+    transfer_manager = _transfer_manager(aura_tts_chunk_tokens=5)
+    request = SimpleNamespace(
+        request_id="req-1",
+        external_req_id="req-1",
+        output_token_ids=[101, 102],
+        output_text="你好",
+        additional_information={"tts_ref_audio": ["custom.wav"], "tts_ref_text": ["custom transcript"]},
+        is_finished=lambda: False,
+    )
+
+    assert aura2tts_async_chunk(transfer_manager, None, request) is None
+    assert transfer_manager.request_payload["req-1"].get("aura_tts_last_token_count", 0) == 0
+
+    request.output_token_ids = [101, 102, 103, 104, 105]
+    request.output_text = "你好世界啦"
+    payload = aura2tts_async_chunk(transfer_manager, None, request)
+
+    assert payload["text"] == ["你好世界啦"]
+    assert payload["task_type"] == ["Base"]
+    assert transfer_manager.request_payload["req-1"]["aura_tts_last_token_count"] == 5
+
+
+def test_aura2tts_async_chunk_flushes_partial_chunk_when_finished():
+    transfer_manager = _transfer_manager(aura_tts_chunk_tokens=5)
+    request = SimpleNamespace(
+        request_id="req-1",
+        external_req_id="req-1",
+        output_token_ids=[101, 102],
+        output_text="你好",
+        additional_information={"tts_ref_audio": ["custom.wav"], "tts_ref_text": ["custom transcript"]},
+        is_finished=lambda: False,
+    )
+
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+
+    assert payload["text"] == ["你好"]
+    assert payload["task_type"] == ["Base"]
 
 
 def test_aura2tts_async_chunk_holds_silent_token_prefix():
