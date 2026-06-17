@@ -342,6 +342,14 @@ def talker2code2wav_async_chunk(
         finished,
         int(code_predictor_codes.numel()),
     )
+    logger.info(
+        "[talker2code2wav_async_chunk] req=%s emitting payload=%s",
+        request_id,
+        {
+            "codes": {"audio": code_predictor_codes.tolist()},
+            "meta": meta,
+        },
+    )
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
         meta=meta,
@@ -484,6 +492,11 @@ def talker2code2wav_token_only(
                 mm_processor_kwargs=None,
             )
         )
+    logger.info(
+        "[talker2code2wav_token_only] req=%s built %d code2wav inputs",
+        request_id,
+        code2wav_inputs,
+    )
     return code2wav_inputs
 
 

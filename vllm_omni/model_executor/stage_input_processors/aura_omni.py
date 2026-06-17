@@ -54,6 +54,7 @@ DEFAULT_QWEN3_TTS_REF_AUDIO = "vllm-omni/tests/assets/qwen3_tts/clone_2.wav"
 DEFAULT_QWEN3_TTS_REF_TEXT = (
     "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 )
+DEFAULT_AURA_TTS_CHUNK_TOKENS = 5
 
 
 def default_qwen3_tts_ref_audio_path() -> str:
@@ -85,6 +86,38 @@ def _first_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _first_int(value: Any, default: int) -> int:
+    value = value[0] if isinstance(value, list) and value else value
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _connector_extra_config(transfer_manager: Any) -> dict[str, Any]:
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg = getattr(connector, "config", {}) or {}
+    if not isinstance(raw_cfg, dict):
+        return {}
+    extra = raw_cfg.get("extra", raw_cfg)
+    return extra if isinstance(extra, dict) else {}
+
+
+def _aura_tts_chunk_tokens(transfer_manager: Any, additional_info: dict[str, Any]) -> int:
+    request_override = _first_int(
+        additional_info.get("aura_tts_chunk_tokens", additional_info.get("tts_aura_chunk_tokens")),
+        0,
+    )
+    if request_override > 0:
+        return request_override
+
+    cfg = _connector_extra_config(transfer_manager)
+    configured = _first_int(cfg.get("aura_tts_chunk_tokens"), DEFAULT_AURA_TTS_CHUNK_TOKENS)
+    return max(1, configured)
 
 
 def _normalize_qwen3_tts_speaker(speaker: Any) -> Any:
@@ -357,7 +390,9 @@ def asr2aura(
         if src_prompt.get("mm_processor_kwargs") is not None:
             next_input["mm_processor_kwargs"] = src_prompt.get("mm_processor_kwargs")
         tts_additional_info = {
-            key: value for key, value in additional_info.items() if isinstance(key, str) and key.startswith("tts_")
+            key: value
+            for key, value in additional_info.items()
+            if isinstance(key, str) and (key.startswith("tts_") or key == "aura_tts_chunk_tokens")
         }
         if tts_additional_info:
             next_input["additional_information"] = tts_additional_info
@@ -436,7 +471,9 @@ def asr2aura_async_chunk(
     if mm_processor_kwargs is not None:
         payload["mm_processor_kwargs"] = mm_processor_kwargs
     tts_additional_info = {
-        key: value for key, value in additional_info.items() if isinstance(key, str) and key.startswith("tts_")
+        key: value
+        for key, value in additional_info.items()
+        if isinstance(key, str) and (key.startswith("tts_") or key == "aura_tts_chunk_tokens")
     }
     if tts_additional_info:
         payload["additional_information"] = tts_additional_info
@@ -694,15 +731,15 @@ def aura2tts_async_chunk(
         state = {}
         request_payload[str(request_id)] = state
 
+    chunk_tokens = _aura_tts_chunk_tokens(transfer_manager, additional_info)
     last_token_count = int(state.get("aura_tts_last_token_count", 0) or 0)
     delta_content_ids = content_ids[last_token_count:]
-    state["aura_tts_last_token_count"] = len(content_ids)
+    if not finished and len(delta_content_ids) < chunk_tokens:
+        return None
 
     request_text = _request_output_text(request).strip()
     last_text_len = int(state.get("aura_tts_last_text_len", 0) or 0)
     delta_text = request_text[last_text_len:] if request_text else ""
-    if request_text:
-        state["aura_tts_last_text_len"] = len(request_text)
 
     if not delta_content_ids and not delta_text:
         return None
@@ -723,21 +760,27 @@ def aura2tts_async_chunk(
         cached_static_info = static_tts_info
         state["aura_tts_static_info"] = cached_static_info
 
-    payload = {dynamic_key: tts_info[dynamic_key]}
+    payload = {
+        dynamic_key: tts_info[dynamic_key],
+        "prompt_token_ids": [0] * prompt_len,
+    }
     if state.get("aura_tts_static_info_sent"):
         payload["_reuse_tts_info"] = True
     else:
-        payload["prompt_token_ids"] = [0] * prompt_len
         payload.update(cached_static_info)
         state["aura_tts_static_info_sent"] = True
+    state["aura_tts_last_token_count"] = len(content_ids)
+    if request_text:
+        state["aura_tts_last_text_len"] = len(request_text)
     logger.info(
         "[aura2tts_async_chunk] req=%s ext_req=%s finished=%s token_count=%d prompt_len=%d "
-        "mode=%s payload=%s",
+        "chunk_tokens=%d mode=%s payload=%s",
         getattr(request, "request_id", None),
         request_id,
         finished,
         len(delta_content_ids),
         prompt_len,
+        chunk_tokens,
         "token_ids" if use_token_ids else "text",
         payload,
     )
