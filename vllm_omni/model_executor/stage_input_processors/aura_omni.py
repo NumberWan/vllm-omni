@@ -9,12 +9,14 @@ import os
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import soundfile as sf
 import torch
 from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
@@ -52,6 +54,20 @@ QWEN_TEXT_SILENT_PREFIX_TOKEN_IDS = [
 DEFAULT_QWEN3_TTS_REF_AUDIO = "vllm-omni/tests/assets/qwen3_tts/clone_2.wav"
 DEFAULT_QWEN3_TTS_REF_TEXT = (
     "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+)
+
+_AURA_TTS_INFO_KEYS = (
+    "tts_task_type",
+    "tts_language",
+    "tts_instruct",
+    "tts_max_new_tokens",
+    "tts_ref_audio",
+    "tts_ref_text",
+    "tts_x_vector_only_mode",
+    "tts_speaker",
+    "tts_non_streaming_mode",
+    "tts_ref_code_length",
+    "tts_pass_token_ids",
 )
 
 
@@ -560,6 +576,75 @@ def asr2aura_async_chunk(
         tokenizer=tokenizer,
     )
     return payload
+
+
+def _video_tuple_from_aura_turn_video(aura_turn_video: Any) -> tuple[np.ndarray, dict[str, Any]] | None:
+    if not isinstance(aura_turn_video, dict):
+        return None
+    frames = aura_turn_video.get("frames")
+    if frames is None:
+        return None
+    metadata = dict(aura_turn_video.get("metadata") or {})
+    video_array = np.asarray(frames, dtype=np.uint8)
+    if video_array.ndim != 4:
+        return None
+    if video_array.shape[0] < 2:
+        video_array = np.concatenate([video_array, video_array], axis=0)[:2]
+        metadata = dict(metadata)
+        metadata["total_num_frames"] = 2
+        metadata["duration"] = 2 / float(metadata.get("fps", 2.0))
+    return video_array, metadata
+
+
+def _copy_aura_tts_fields(additional_info: dict[str, Any]) -> dict[str, Any]:
+    copied: dict[str, Any] = {}
+    for key in _AURA_TTS_INFO_KEYS:
+        if key in additional_info:
+            copied[key] = additional_info[key]
+    return copied
+
+
+def asr2aura_session(
+    source_outputs: list[Any],
+    prompt: Any = None,
+    requires_multimodal_data: bool = True,
+) -> list[dict[str, Any]]:
+    """Build AURA prompts from ASR transcripts and serialized SessionHistory state."""
+    prompt_by_request_id = _source_prompt_by_request_id(source_outputs, prompt)
+    next_inputs: list[dict[str, Any]] = []
+
+    for idx, source_output in enumerate(source_outputs):
+        src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
+        additional_info = src_prompt.get("additional_information") or {}
+        if additional_info.get("aura_session_state") is None:
+            [next_input] = asr2aura(
+                [source_output],
+                prompt=[src_prompt],
+                requires_multimodal_data=requires_multimodal_data,
+            )
+            next_inputs.append(next_input)
+            continue
+
+        history = SessionHistory.from_dict(additional_info["aura_session_state"])
+        transcript = _extract_text(source_output)
+        video_tuple = _video_tuple_from_aura_turn_video(additional_info.get("aura_turn_video"))
+        history.add_user_message(transcript, video_tuple=video_tuple)
+        vllm_inputs = history.get_vllm_inputs()
+
+        next_input = {
+            "prompt": vllm_inputs["prompt"],
+            "additional_information": _copy_aura_tts_fields(additional_info),
+        }
+        system_prompt = _first_value(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT)
+        next_input["additional_information"]["aura_system_prompt"] = [str(system_prompt)]
+
+        if requires_multimodal_data:
+            next_input["multi_modal_data"] = vllm_inputs.get("multi_modal_data", {})
+        if src_prompt.get("mm_processor_kwargs") is not None:
+            next_input["mm_processor_kwargs"] = src_prompt.get("mm_processor_kwargs")
+        next_inputs.append(next_input)
+
+    return next_inputs
 
 
 def _estimate_ref_code_len_from_ref_audio(ref_audio: Any) -> int | None:

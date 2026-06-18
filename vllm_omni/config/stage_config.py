@@ -572,6 +572,24 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     return DeployConfig(**kwargs)
 
 
+def resolve_pipeline_name_from_config_path(config_path: str | Path | None) -> str | None:
+    """Return ``pipeline:`` from a deploy YAML, if the file exists and defines it."""
+    if config_path is None:
+        return None
+    path = Path(config_path)
+    if not path.exists():
+        if path.parent != Path("."):
+            return None
+        bare_name = path.name if path.name.endswith(".yaml") else f"{path.name}.yaml"
+        candidate = _DEPLOY_DIR / bare_name
+        if not candidate.exists():
+            return None
+        path = candidate
+    deploy_cfg = load_deploy_config(path)
+    pipeline = deploy_cfg.pipeline
+    return str(pipeline) if pipeline else None
+
+
 class PlatformOverrides(NamedTuple):
     overrides: dict[str, Any]
     devices: str | None

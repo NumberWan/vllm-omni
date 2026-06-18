@@ -272,6 +272,9 @@ class AsyncOmniEngine:
             )
 
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
+        from vllm_omni.config.stage_config import resolve_pipeline_name_from_config_path
+
+        self.pipeline_name = resolve_pipeline_name_from_config_path(self.config_path)
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
