@@ -11,8 +11,10 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
     asr2aura,
+    asr2aura_session,
     aura2tts,
 )
+from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -72,6 +74,37 @@ def test_asr2aura_reads_video_stashed_for_downstream_stage():
 
     assert next_input["multi_modal_data"] == {"video": ["frame-0", "frame-1"]}
     assert "<|video_pad|>" in next_input["prompt"]
+
+
+def test_asr2aura_session_restores_history_and_turn_video():
+    history = SessionHistory(pruning_enabled=False)
+    prompt = {
+        "additional_information": {
+            "aura_session_state": history.to_dict(),
+            "aura_turn_video": {
+                "frames": [
+                    [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
+                    [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
+                ],
+                "metadata": {
+                    "fps": 2.0,
+                    "duration": 1.0,
+                    "total_num_frames": 2,
+                    "frames_indices": [0, 1],
+                    "video_backend": "opencv",
+                    "do_sample_frames": False,
+                },
+            },
+            "aura_system_prompt": ["custom system"],
+        }
+    }
+
+    [next_input] = asr2aura_session([_source_output("Hello there.")], prompt=[prompt])
+
+    assert "<|video_pad|>" in next_input["prompt"]
+    assert "Hello there." in next_input["prompt"]
+    assert next_input["multi_modal_data"]["video"]
+    assert next_input["additional_information"]["aura_system_prompt"] == ["custom system"]
 
 
 def test_asr2aura_supports_video_only_observation():

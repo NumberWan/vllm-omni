@@ -33,7 +33,7 @@ import json
 import time as _time
 import uuid
 import wave
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -60,6 +60,8 @@ _MAX_AUDIO_BUFFER_BYTES = 4 * 1024 * 1024
 _MAX_MSG_QUEUE = 200
 _CODEC_FRAME_SAMPLES = 1920  # CausalConv leading-edge artifact length
 _BAD_FRAME = object()
+
+ReleaseTurnLockFn = Callable[..., Awaitable[None]]
 
 
 def _decode_frame_bytes(raw_bytes: bytes) -> Any:
@@ -102,6 +104,7 @@ class VideoStreamTurnTrigger:
 
     frame_count: int
     is_generating: bool
+    is_turn_locked: bool
     config: "StreamingVideoSessionConfig"
 
 
@@ -193,6 +196,18 @@ class OmniStreamingVideoHandler:
         """Hook after a frame is accepted into the session buffer."""
         del raw_bytes, frame_b64, message_history, config
 
+    def supports_manual_query_turn(self) -> bool:
+        """Whether ``video.query`` may start an inference turn."""
+        return True
+
+    def supports_query_interrupt(self) -> bool:
+        """Whether a new turn may interrupt in-flight generation."""
+        return True
+
+    def releases_turn_after_text_done(self) -> bool:
+        """Release turn lock and update history after assistant text (TTS may continue)."""
+        return False
+
     def __init__(
         self,
         chat_service: Any,
@@ -225,9 +240,39 @@ class OmniStreamingVideoHandler:
             active_request_id: str | None = None
             prev_request_id: str | None = None  # abort target iff prev was interrupted
             prev_was_interrupted: bool = False
+            is_turn_locked: bool = False
             interrupt_event = asyncio.Event()
             prewarm_tasks: set[asyncio.Task[Any]] = set()
             query_task: asyncio.Task[Any] | None = None
+            background_query_tasks: set[asyncio.Task[Any]] = set()
+
+            def _register_query_task(task: asyncio.Task[Any]) -> None:
+                background_query_tasks.add(task)
+                task.add_done_callback(background_query_tasks.discard)
+
+            async def _gather_pending_query_tasks() -> None:
+                pending = [t for t in background_query_tasks if not t.done()]
+                if query_task is not None and not query_task.done() and query_task not in pending:
+                    pending.append(query_task)
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+            async def _release_turn_lock(
+                *,
+                message_history: Any,
+                user_message: dict[str, Any],
+                response_text: str,
+                request_id: str,
+            ) -> None:
+                """Commit SessionHistory and allow the next frame trigger while TTS may continue."""
+                nonlocal is_turn_locked, active_request_id, prev_request_id
+                if not is_turn_locked:
+                    return
+                is_turn_locked = False
+                self.on_turn_complete(message_history, user_message, response_text)
+                if active_request_id == request_id:
+                    prev_request_id = request_id
+                    active_request_id = None
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
 
@@ -271,7 +316,7 @@ class OmniStreamingVideoHandler:
 
             async def _cancel_active_query(*, abort_now: bool = False) -> None:
                 """Signal soft interrupt for the active query."""
-                nonlocal active_request_id, prev_was_interrupted, query_task
+                nonlocal active_request_id, prev_was_interrupted, query_task, is_turn_locked
                 if active_request_id is not None:
                     interrupt_event.set()
                     prev_was_interrupted = True
@@ -284,13 +329,27 @@ class OmniStreamingVideoHandler:
                     if query_task is not None and not query_task.done():
                         query_task.cancel()
                         await asyncio.gather(query_task, return_exceptions=True)
+                    if query_task is not None and not query_task.done():
+                        query_task.cancel()
+                        await asyncio.gather(query_task, return_exceptions=True)
                     query_task = None
+                    is_turn_locked = False
 
             async def _start_query_turn(*, query_text: str) -> None:
                 """Schedule a new inference turn from the current buffers."""
-                nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
+                nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task, is_turn_locked
 
-                await _cancel_active_query()
+                if self.releases_turn_after_text_done():
+                    turn_busy = is_turn_locked
+                else:
+                    turn_busy = active_request_id is not None or (
+                        query_task is not None and not query_task.done()
+                    )
+                if turn_busy:
+                    if self.supports_query_interrupt():
+                        await _cancel_active_query()
+                    else:
+                        return
 
                 if not frame_buffer:
                     await self._send_error(websocket, "No frames buffered")
@@ -306,6 +365,8 @@ class OmniStreamingVideoHandler:
 
                 request_id = f"video-{uuid.uuid4().hex[:12]}"
                 active_request_id = request_id
+                if self.releases_turn_after_text_done():
+                    is_turn_locked = True
                 interrupt_event.clear()
                 query_frames = list(frame_buffer)
                 query_audio_buffer = bytearray(audio_buffer)
@@ -313,7 +374,8 @@ class OmniStreamingVideoHandler:
                 query_prewarmed_frames = dict(frame_pil_cache)
 
                 async def _run_query() -> None:
-                    nonlocal active_request_id, prev_request_id
+                    nonlocal active_request_id, prev_request_id, is_turn_locked
+                    release_cb = _release_turn_lock if self.releases_turn_after_text_done() else None
                     try:
                         await self._process_query(
                             websocket,
@@ -325,13 +387,17 @@ class OmniStreamingVideoHandler:
                             request_id,
                             interrupt_event,
                             query_prewarmed_frames,
+                            release_turn_lock=release_cb,
                         )
                     finally:
-                        if active_request_id == request_id:
-                            prev_request_id = request_id
-                            active_request_id = None
+                        if not self.releases_turn_after_text_done():
+                            if active_request_id == request_id:
+                                prev_request_id = request_id
+                                active_request_id = None
+                            is_turn_locked = False
 
                 query_task = asyncio.create_task(_run_query())
+                _register_query_task(query_task)
 
             async def _processor() -> None:
                 """Process enqueued messages."""
@@ -406,10 +472,16 @@ class OmniStreamingVideoHandler:
                         is_generating = active_request_id is not None or (
                             query_task is not None and not query_task.done()
                         )
+                        trigger_turn_locked = (
+                            is_turn_locked
+                            if self.releases_turn_after_text_done()
+                            else is_generating
+                        )
                         if self.should_trigger_turn(
                             VideoStreamTurnTrigger(
                                 frame_count=len(frame_buffer),
                                 is_generating=is_generating,
+                                is_turn_locked=trigger_turn_locked,
                                 config=config,
                             )
                         ):
@@ -428,6 +500,9 @@ class OmniStreamingVideoHandler:
                         audio_buffer.extend(pcm_bytes)
 
                     elif msg_type == "video.query":
+                        if not self.supports_manual_query_turn():
+                            continue
+
                         query_text = msg.get("text", "")
                         audio_data_b64 = msg.get("audio_data")
                         if audio_data_b64:
@@ -441,12 +516,17 @@ class OmniStreamingVideoHandler:
                             except Exception:
                                 pass
 
+                        is_generating = active_request_id is not None or (
+                            query_task is not None and not query_task.done()
+                        )
+                        if is_generating and not self.supports_query_interrupt():
+                            continue
+
                         await _start_query_turn(query_text=query_text)
 
                     elif msg_type == "video.done":
-                        if query_task is not None and not query_task.done():
-                            await asyncio.gather(query_task, return_exceptions=True)
-                            query_task = None
+                        await _gather_pending_query_tasks()
+                        query_task = None
                         await websocket.send_json({"type": "session.done"})
                         return
 
@@ -472,6 +552,7 @@ class OmniStreamingVideoHandler:
                     t.cancel()
                 if prewarm_tasks:
                     await asyncio.gather(*prewarm_tasks, return_exceptions=True)
+                await _gather_pending_query_tasks()
                 if query_task is not None and not query_task.done():
                     await _cancel_active_query(abort_now=True)
 
@@ -537,6 +618,7 @@ class OmniStreamingVideoHandler:
         request_id: str,
         interrupt_event: asyncio.Event,
         prewarmed_frames: dict[str, tuple[Any, str]],
+        release_turn_lock: ReleaseTurnLockFn | None = None,
     ) -> None:
         """Build prompt, run inference, stream text + audio response."""
 
@@ -554,6 +636,7 @@ class OmniStreamingVideoHandler:
             request_id,
             interrupt_event,
             prewarmed_frames,
+            release_turn_lock=release_turn_lock,
         )
 
     # ------------------------------------------------------------------
@@ -571,8 +654,10 @@ class OmniStreamingVideoHandler:
         request_id: str,
         interrupt_event: asyncio.Event,
         prewarmed_frames: dict[str, tuple[Any, str]],
+        release_turn_lock: ReleaseTurnLockFn | None = None,
     ) -> None:
         """Direct engine_client.generate() path for async_chunk audio."""
+        del release_turn_lock
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
         )
