@@ -8,8 +8,17 @@ for type-safe multimodal output routing and tensor merging.
 from __future__ import annotations
 
 import re
-from enum import Enum, Flag, StrEnum, auto
+import sys
+from enum import Enum, Flag, auto
 from typing import Literal, TypeAlias
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+
+    class StrEnum(str, Enum):
+        """Python 3.10 compatibility shim for enum.StrEnum (3.11+)."""
+
 
 FinalOutputModalityType: TypeAlias = Literal["text", "image", "audio", "video"]
 
