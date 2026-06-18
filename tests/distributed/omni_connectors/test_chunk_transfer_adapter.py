@@ -535,6 +535,77 @@ def test_load_poll_ar_does_not_extend_prompt_without_ids_prompt(build_adapter, m
     request.update_block_hashes.assert_not_called()
 
 
+def test_load_poll_ar_buffers_until_request_returns_to_prefill(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-aura", RequestStatus.RUNNING, external_req_id="ext-aura")
+    request.num_computed_tokens = 4
+    request._output_token_ids = [11]
+    adapter.request_ids_mapping["req-aura"] = "ext-aura"
+    connector.get.return_value = (
+        {
+            "_qwen3_tts_text_ids": [[1, 2, 3]],
+            "prompt_token_ids": [0] * 4,
+            "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+        },
+        8,
+    )
+
+    assert adapter._poll_single_request(request) is False
+    assert request.additional_information is None
+    assert adapter.is_done_receiving_chunks("req-aura") is False
+
+    request.num_computed_tokens = 0
+    request._output_token_ids = []
+    assert adapter._poll_single_request(request) is True
+
+    assert request.additional_information["_qwen3_tts_text_ids"] == [[1, 2, 3]]
+    assert adapter.is_done_receiving_chunks("req-aura") is True
+
+
+def test_load_poll_ar_consumes_cached_payloads_fifo_before_finish(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-aura", RequestStatus.WAITING, external_req_id="ext-aura")
+    connector.get.return_value = None
+    adapter._received_payloads["req-aura"].append(
+        (
+            {
+                "_qwen3_tts_text_ids": [[1]],
+                "prompt_token_ids": [0] * 2,
+                "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+            },
+            8,
+            0,
+            "ext-aura",
+            "ext-aura_1_0",
+        )
+    )
+    adapter._received_payloads["req-aura"].append(
+        (
+            {
+                "_qwen3_tts_text_ids": [[2]],
+                "_reuse_tts_info": True,
+                "prompt_token_ids": [0] * 3,
+                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+            },
+            8,
+            1,
+            "ext-aura",
+            "ext-aura_1_1",
+        )
+    )
+    adapter.finished_requests.add("req-aura")
+
+    assert adapter.is_done_receiving_chunks("req-aura") is False
+    assert adapter._poll_single_request(request) is True
+    assert request.additional_information["_qwen3_tts_text_ids"] == [[1]]
+    assert adapter.is_done_receiving_chunks("req-aura") is False
+
+    request.additional_information = {}
+    assert adapter._poll_single_request(request) is True
+    assert request.additional_information["_qwen3_tts_text_ids"] == [[2]]
+    assert adapter.is_done_receiving_chunks("req-aura") is True
+
+
 def test_process_and_restore_queues(build_adapter):
     adapter, _ = build_adapter(stage_id=1, max_num_seqs=8)
     waiting_req = _req("w1", RequestStatus.WAITING)
@@ -545,9 +616,9 @@ def test_process_and_restore_queues(build_adapter):
 
     adapter.process_pending_chunks(waiting_queue, running_queue, scheduler_requests=scheduler_requests)
     assert waiting_req.status == RequestStatus.WAITING_FOR_CHUNK
-    assert running_req.status == RequestStatus.WAITING_FOR_CHUNK
+    assert running_req.status == RequestStatus.RUNNING
     assert waiting_queue == []
-    assert running_queue == []
+    assert running_queue == [running_req]
 
     adapter.restore_queues(waiting_queue, running_queue, scheduler_requests=scheduler_requests)
     assert waiting_queue == [waiting_req]
@@ -954,6 +1025,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     adapter_mock = mocker.MagicMock()
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
     adapter_mock.save_async = lambda *a, **kw: save_calls.append((a, kw))
+    adapter_mock.is_done_receiving_chunks.return_value = True
 
     from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
@@ -997,6 +1069,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
 
     scheduler._update_request_with_output = mocker.MagicMock(return_value=([], True))
     scheduler._process_kv_transfer_trigger = mocker.MagicMock(return_value=False)
+    scheduler._should_wait_for_next_chunk = mocker.MagicMock(return_value=False)
     scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
     scheduler._free_request = mocker.MagicMock(return_value=None)
     scheduler._get_routed_experts = mocker.MagicMock(return_value=None)

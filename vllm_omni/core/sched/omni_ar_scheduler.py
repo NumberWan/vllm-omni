@@ -668,6 +668,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         request.async_tokens_to_discard = 0
         request.block_hashes.clear()
         request.update_block_hashes()
+        if self.chunk_transfer_adapter is not None:
+            external_req_id = getattr(request, "external_req_id", request.request_id)
+            previous_chunks_sent = self.chunk_transfer_adapter.requests_num_chunks_sent.pop(external_req_id, None)
+            logger.info(
+                "[async_chunk_reset] req=%s ext_req=%s cleared_sender_watermark=%s prompt_len=%d",
+                request.request_id,
+                external_req_id,
+                previous_chunks_sent,
+                len(request.prompt_token_ids),
+            )
         if request in self.skipped_waiting:
             self.skipped_waiting.remove_requests((request,))
         self._enqueue_waiting_request(request)
