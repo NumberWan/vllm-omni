@@ -110,9 +110,13 @@ def test_downstream_chunk_stop_resets_request_for_next_connector_chunk() -> None
     freed_encoder = []
     sched.kv_cache_manager = SimpleNamespace(free=lambda request: freed_kv.append(request.request_id))
     sched.encoder_cache_manager = SimpleNamespace(free=lambda request: freed_encoder.append(request.request_id))
-    sched.chunk_transfer_adapter = SimpleNamespace(is_done_receiving_chunks=lambda request_id: False)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        is_done_receiving_chunks=lambda request_id: False,
+        requests_num_chunks_sent={"req-ar-streaming-test": 131},
+    )
 
     request = _make_request()
+    request.external_req_id = request.request_id
     request.status = RequestStatus.FINISHED_STOPPED
     request.num_computed_tokens = 9
     request.num_output_placeholders = 1
@@ -132,4 +136,5 @@ def test_downstream_chunk_stop_resets_request_for_next_connector_chunk() -> None
     assert request._output_token_ids == []
     assert list(request._all_token_ids) == request.prompt_token_ids
     assert request.num_prompt_tokens == len(request.prompt_token_ids)
+    assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}
     assert sched.waiting == [request]

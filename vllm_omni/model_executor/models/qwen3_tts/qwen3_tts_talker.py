@@ -822,6 +822,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         req_infos: list[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        logger.info("[Qwen3-TTS preprocess_decode_batch] input_ids: %s", input_ids)
         """Batch the decode-only preprocess path for Qwen3-TTS.
 
         This mirrors the scalar decode branch in ``preprocess()``, but performs
