@@ -192,7 +192,12 @@ def test_load_poll_reuses_cached_tts_static_information(build_adapter):
     adapter._poll_single_request(request)
     assert request.additional_information["ref_audio"] == ["ref.wav"]
 
-    request.additional_information = None
+    request.additional_information = {
+        "embed": {"prefill": "stale"},
+        "hidden_states": {"trailing_text": "stale"},
+        "codes": {"audio": [1]},
+        "generated_len": 131,
+    }
     second_payload = {
         "_qwen3_tts_text_ids": [[2]],
         "_reuse_tts_info": True,
@@ -204,6 +209,10 @@ def test_load_poll_reuses_cached_tts_static_information(build_adapter):
     assert request.additional_information["_qwen3_tts_text_ids"] == [[2]]
     assert request.additional_information["task_type"] == ["Base"]
     assert request.additional_information["ref_audio"] == ["ref.wav"]
+    assert "embed" not in request.additional_information
+    assert "hidden_states" not in request.additional_information
+    assert "codes" not in request.additional_information
+    assert "generated_len" not in request.additional_information
 
 
 def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter):
@@ -284,6 +293,32 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
 
     assert adapter.requests_num_chunks_sent["external-async"] == 8
     assert len(adapter._pending_save_reqs) == 1
+
+
+def test_send_single_request_separates_processor_flush_from_segment_finished(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-flush", RequestStatus.WAITING, external_req_id="ext-flush")
+    seen = {}
+
+    def _processor(**kwargs):
+        seen["is_finished"] = kwargs["is_finished"]
+        return OmniPayloadStruct(codes=CodesStruct(audio=torch.tensor([1], dtype=torch.long)))
+
+    adapter.custom_process_next_stage_input_func = _processor
+    adapter._send_single_request(
+        {
+            "multimodal_output": None,
+            "request": request,
+            "is_finished": False,
+            "is_segment_finished": False,
+            "processor_is_finished": True,
+        }
+    )
+
+    assert seen["is_finished"] is True
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.finished.item() is False
+    assert sent_payload.meta.is_segment_finished.item() is False
 
 
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
@@ -712,6 +747,26 @@ def test_postprocess_scheduler_output(build_adapter):
     assert cached_info["cached-ready"] == {"k": "v"}
     assert cached_info["missing"] is None
     assert adapter.requests_with_ready_chunks == {"leftover"}
+
+
+def test_postprocess_scheduler_output_defers_fresh_payload_while_running(build_adapter):
+    adapter, _ = build_adapter()
+    request = _req("running", RequestStatus.RUNNING)
+    request.num_computed_tokens = 111
+    request.additional_information = {
+        "_qwen3_tts_text_ids": [[1, 2, 3]],
+        "prompt_token_ids": [0, 0],
+        "meta": {"finished": torch.tensor(False)},
+    }
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=["running"]),
+    )
+
+    adapter.postprocess_scheduler_output(scheduler_output, {"running": request})
+
+    assert scheduler_output.scheduled_cached_reqs.additional_information["running"] is None
+    assert request.additional_information is not None
 
 
 # ---------------------------------------------------------------

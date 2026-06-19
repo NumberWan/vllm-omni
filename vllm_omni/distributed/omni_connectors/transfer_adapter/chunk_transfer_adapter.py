@@ -39,6 +39,24 @@ def _payload_is_meta_only(payload: dict[str, Any]) -> bool:
     return set(payload.keys()).issubset({"meta"})
 
 
+def _is_fresh_chunk_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict) or "prompt_token_ids" not in payload:
+        return False
+    return any(key in payload for key in ("_qwen3_tts_text_ids", "text", "prompt", "ids"))
+
+
+def _request_ready_for_fresh_chunk_payload(request: Any) -> bool:
+    if request is None:
+        return False
+    if int(getattr(request, "num_computed_tokens", 0) or 0) != 0:
+        return False
+    output_token_ids = getattr(request, "_output_token_ids", None)
+    if output_token_ids is not None and len(output_token_ids) != 0:
+        return False
+    status = getattr(request, "status", None)
+    return status != RequestStatus.RUNNING
+
+
 def _replace_request_prompt_token_ids(request: Any, prompt_token_ids: list[int]) -> bool:
     if not prompt_token_ids:
         return False
@@ -249,6 +267,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         multimodal_output: dict[str, Any] | None = None,
         request: Request | None = None,
         is_segment_finished: bool = False,
+        processor_is_finished: bool | None = None,
     ):
         """Build and enqueue one chunk for asynchronous sending.
 
@@ -268,6 +287,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             is_segment_finished: whether the segment of request is finished
         """
         is_finished = request.is_finished() and not request.resumable
+        if processor_is_finished is None:
+            processor_is_finished = is_segment_finished
 
         confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
 
@@ -281,12 +302,27 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
             return
 
+        previous_chunks_sent = self.requests_num_chunks_sent.get(request.external_req_id)
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
+        logger.info(
+            "[Stage-%s] enqueue save_async req=%s ext_req=%s confirmed_tokens=%s previous_tokens=%s "
+            "request_finished=%s segment_finished=%s processor_finished=%s pending_saves=%d",
+            self.connector.stage_id,
+            getattr(request, "request_id", None),
+            request.external_req_id,
+            confirmed_num_computed_tokens,
+            previous_chunks_sent,
+            is_finished,
+            is_segment_finished,
+            processor_is_finished,
+            len(self._pending_save_reqs),
+        )
         task = {
             "multimodal_output": multimodal_output,
             "request": request,
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
+            "processor_is_finished": processor_is_finished,
         }
         self._pending_save_reqs.append(task)
         with self._save_cond:
@@ -400,13 +436,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 req_id,
                 len(prompt_token_ids),
             )
+        previous_info = getattr(request, "additional_information", None)
+        previous_keys = set(previous_info.keys()) if isinstance(previous_info, dict) else set()
         payload_data = self._merge_reused_payload_info(req_id, payload_data, reuse_tts_info)
-        tts_metadata = _request_level_tts_metadata(getattr(request, "additional_information", None))
-        if reuse_tts_info and isinstance(getattr(request, "additional_information", None), dict):
-            merged_additional_information = dict(request.additional_information)
-            merged_additional_information.update(payload_data)
-            request.additional_information = merged_additional_information
-        elif tts_metadata and _payload_is_meta_only(payload_data):
+        if reuse_tts_info and previous_keys:
+            dropped_keys = sorted(previous_keys - set(payload_data.keys()))
+            if dropped_keys:
+                logger.info(
+                    "[Stage-%s] reused static TTS info for req=%s chunk_id=%d; "
+                    "dropped stale request keys=%s",
+                    stage_id,
+                    req_id,
+                    chunk_id,
+                    dropped_keys,
+                )
+        tts_metadata = _request_level_tts_metadata(previous_info)
+        if tts_metadata and _payload_is_meta_only(payload_data):
             request.additional_information = {**tts_metadata, **payload_data}
         else:
             request.additional_information = payload_data
@@ -499,6 +544,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
+        processor_is_finished = task.get("processor_is_finished", is_segment_finished)
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
@@ -513,7 +559,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     multimodal_output=multimodal_output,
                     request=request,
                     # Existing processors use is_finished as a flush signal.
-                    is_finished=is_segment_finished,
+                    is_finished=processor_is_finished,
                 )
 
             except Exception as e:
@@ -550,7 +596,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         logger.info(
             "[Stage-%s] send chunk req=%s ext_req=%s key=%s chunk_id=%d finished=%s "
-            "segment_finished=%s payload=%s",
+            "segment_finished=%s processor_finished=%s payload=%s",
             stage_id,
             getattr(request, "request_id", None),
             external_req_id,
@@ -558,6 +604,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             chunk_id,
             is_finished,
             is_segment_finished,
+            processor_is_finished,
             _payload_summary(payload_data),
         )
         success, size, metadata = self.connector.put(
@@ -612,9 +659,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         waiting for the next streaming input slice.
         """
         has_cached_payloads = bool(self._received_payloads.get(request_id))
-        return not has_cached_payloads and (
+        done = not has_cached_payloads and (
             request_id in self.finished_requests or request_id in self.segment_finished_requests
         )
+        logger.info(
+            "[Stage-%s] is_done_receiving_chunks req=%s done=%s cached=%d finished=%s segment_finished=%s",
+            self.connector.stage_id,
+            request_id,
+            done,
+            len(self._received_payloads.get(request_id, ())),
+            request_id in self.finished_requests,
+            request_id in self.segment_finished_requests,
+        )
+        return done
 
     ########################################################################
     # Cleanup
@@ -934,18 +991,41 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     req_ids.add(req_id)
         return req_ids
 
-    @staticmethod
-    def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:
+    def attach_cached_additional_information(self, scheduler_output: Any, requests: dict[str, Request]) -> None:
         cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if not cached_reqs:
             return
         if not hasattr(cached_reqs, "additional_information"):
             cached_reqs.additional_information = {}
+        stage_id = self.connector.stage_id
         for req_id in cached_reqs.req_ids:
             request = requests.get(req_id) if req_id else None
             additional_info = getattr(request, "additional_information", None) if request else None
+            if _is_fresh_chunk_payload(additional_info) and not _request_ready_for_fresh_chunk_payload(request):
+                cached_reqs.additional_information[req_id] = None
+                logger.info(
+                    "[Stage-%s] Deferred fresh chunk payload attach for req=%s status=%s "
+                    "num_computed=%s output_tokens=%s info_keys=%s",
+                    stage_id,
+                    req_id,
+                    getattr(request, "status", None),
+                    getattr(request, "num_computed_tokens", None),
+                    len(getattr(request, "_output_token_ids", []) or []),
+                    sorted(additional_info.keys()) if isinstance(additional_info, dict) else None,
+                )
+                continue
             cached_reqs.additional_information[req_id] = additional_info
             if request and additional_info:
+                logger.info(
+                    "[Stage-%s] Attached cached additional_information for req=%s status=%s "
+                    "num_computed=%s output_tokens=%s info_keys=%s",
+                    stage_id,
+                    req_id,
+                    getattr(request, "status", None),
+                    getattr(request, "num_computed_tokens", None),
+                    len(getattr(request, "_output_token_ids", []) or []),
+                    sorted(additional_info.keys()) if isinstance(additional_info, dict) else None,
+                )
                 request.additional_information = None
 
     def _process_chunk_queue(
