@@ -1468,7 +1468,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 logger.warning_once(
                     "additional_information on request data is deprecated, use model_intermediate_buffer"
                 )
-                self._update_intermediate_buffer(new_req.req_id, payload_info)
+                self._set_or_update_intermediate_buffer(new_req.req_id, payload_info)
 
         if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
             logger.warning_once(
@@ -1477,7 +1477,40 @@ class OmniGPUModelRunner(GPUModelRunner):
             cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
             if isinstance(cached_infos, dict):
                 for req_id, req_infos in cached_infos.items():
-                    self._update_intermediate_buffer(req_id, req_infos)
+                    self._set_or_update_intermediate_buffer(req_id, req_infos)
+
+    @staticmethod
+    def _is_fresh_chunk_payload(payload_info: Any) -> bool:
+        # Async chunk payloads are new model inputs. They must replace the
+        # prior per-request runtime buffer; merging would leak decode state
+        # such as embed/hidden_states/codes/generated_len into the next chunk.
+        if not isinstance(payload_info, dict):
+            return False
+        if "prompt_token_ids" not in payload_info:
+            return False
+        return any(key in payload_info for key in ("_qwen3_tts_text_ids", "text", "prompt", "ids"))
+
+    def _set_or_update_intermediate_buffer(self, req_id: str, payload_info: Any) -> None:
+        if not isinstance(payload_info, dict) or not payload_info:
+            return
+        if self._is_fresh_chunk_payload(payload_info):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                return
+            previous_keys = sorted(self.model_intermediate_buffer.get(req_id, {}).keys())
+            self.model_intermediate_buffer[req_id] = {}
+            self._update_intermediate_buffer(req_id, payload_info)
+            logger.info(
+                "[OMNI] Replaced model_intermediate_buffer for fresh chunk req=%s "
+                "previous_keys=%s new_keys=%s req_num_computed=%s req_output_tokens=%s",
+                req_id,
+                previous_keys,
+                sorted(payload_info.keys()),
+                getattr(req_state, "num_computed_tokens", None),
+                len(getattr(req_state, "output_token_ids", []) or []),
+            )
+            return
+        self._update_intermediate_buffer(req_id, payload_info)
 
     def _maybe_attach_mimo_audio_req_infos(
         self,
