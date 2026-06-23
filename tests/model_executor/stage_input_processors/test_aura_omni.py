@@ -10,9 +10,11 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
+    _clean_asr_transcript,
     asr2aura,
     asr2aura_session,
     aura2tts,
+    pop_turn_transcript,
 )
 from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory
 
@@ -76,6 +78,11 @@ def test_asr2aura_reads_video_stashed_for_downstream_stage():
     assert "<|video_pad|>" in next_input["prompt"]
 
 
+def test_clean_asr_transcript_strips_qwen3_asr_wrapper():
+    assert _clean_asr_transcript("language Chinese<asr_text>画面有什么？") == "画面有什么？"
+    assert _clean_asr_transcript("  hello  ") == "hello"
+
+
 def test_asr2aura_session_restores_history_and_turn_video():
     history = SessionHistory(pruning_enabled=False)
     prompt = {
@@ -99,12 +106,18 @@ def test_asr2aura_session_restores_history_and_turn_video():
         }
     }
 
-    [next_input] = asr2aura_session([_source_output("Hello there.")], prompt=[prompt])
+    [next_input] = asr2aura_session(
+        [_source_output("language Chinese<asr_text>Hello there.")],
+        prompt=[prompt],
+    )
 
     assert "<|video_pad|>" in next_input["prompt"]
     assert "Hello there." in next_input["prompt"]
+    assert "language Chinese" not in next_input["prompt"]
+    assert "<asr_text>" not in next_input["prompt"]
     assert next_input["multi_modal_data"]["video"]
     assert next_input["additional_information"]["aura_system_prompt"] == ["custom system"]
+    assert pop_turn_transcript("req-1") == "Hello there."
 
 
 def test_asr2aura_supports_video_only_observation():
@@ -228,3 +241,7 @@ def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
 
 def test_aura2tts_drops_silent_response():
     assert aura2tts([_source_output(SILENT_TEXT)]) == []
+
+
+def test_aura2tts_drops_punctuation_only_filler():
+    assert aura2tts([_source_output(" ﹑")]) == []

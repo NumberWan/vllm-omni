@@ -70,6 +70,65 @@ def test_should_trigger_turn_respects_auto_trigger_gate():
     ) is False
 
 
+def test_on_turn_complete_persists_user_video_and_assistant():
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        record_turn_transcript,
+    )
+
+    handler = AuraStreamingVideoHandler(chat_service=object())
+    state = _session_state()
+    state.pending_turn_video = {
+        "frames": [
+            [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
+            [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
+        ],
+        "metadata": {
+            "fps": 2.0,
+            "duration": 1.0,
+            "total_num_frames": 2,
+            "frames_indices": [0, 1],
+            "video_backend": "opencv",
+            "do_sample_frames": False,
+        },
+    }
+    record_turn_transcript("req-1", "画面有什么？")
+
+    handler.on_turn_complete(state, {"role": "user", "content": []}, "好的。", request_id="req-1")
+
+    inputs = state.history.get_vllm_inputs()
+    assert "画面有什么？" in inputs["prompt"]
+    assert "好的。" in inputs["prompt"]
+    assert "<|video_pad|>" in inputs["prompt"]
+    assert len(inputs["multi_modal_data"]["video"]) == 1
+    assert state.pending_turn_video is None
+
+
+def test_on_turn_complete_persists_video_only_user_turn():
+    handler = AuraStreamingVideoHandler(chat_service=object())
+    state = _session_state()
+    state.pending_turn_video = {
+        "frames": [
+            [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
+            [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
+        ],
+        "metadata": {
+            "fps": 2.0,
+            "duration": 1.0,
+            "total_num_frames": 2,
+            "frames_indices": [0, 1],
+            "video_backend": "opencv",
+            "do_sample_frames": False,
+        },
+    }
+
+    handler.on_turn_complete(state, {"role": "user", "content": []}, "<|silent|>", request_id="req-silent")
+
+    inputs = state.history.get_vllm_inputs()
+    assert "<|video_pad|>" in inputs["prompt"]
+    assert "<|silent|>" in inputs["prompt"]
+    assert len(inputs["multi_modal_data"]["video"]) == 1
+
+
 def test_build_engine_prompt_stores_audio_and_session_payload():
     handler = AuraStreamingVideoHandler(chat_service=object())
     config = AuraStreamingVideoSessionConfig(model="test", aura_system_prompt="system-a")
@@ -98,6 +157,21 @@ def test_build_engine_prompt_stores_audio_and_session_payload():
     assert additional["aura_system_prompt"] == ["system-a"]
     assert additional["aura_turn_video"]["metadata"]["total_num_frames"] == 2
     assert len(additional["aura_turn_video"]["frames"]) == 2
+    assert additional["tts_ref_audio"]
+    assert additional["tts_ref_text"]
+
+
+def test_build_engine_prompt_omits_tts_when_text_only():
+    handler = AuraStreamingVideoHandler(chat_service=object())
+    config = AuraStreamingVideoSessionConfig(model="test", modalities=["text"])
+    state = _session_state()
+    state.turn_frame_arrays = [np.zeros((8, 8, 3), dtype=np.uint8)]
+
+    _, user_message = handler.build_engine_prompt(config, [], bytearray(), state, "", {})
+
+    additional = user_message["_aura_additional_information"]
+    assert "tts_ref_audio" not in additional
+    assert "tts_ref_text" not in additional
 
 
 @pytest.mark.asyncio
@@ -147,6 +221,7 @@ async def test_build_engine_prompt_via_preprocess_mock():
     additional = getattr(request, "additional_information")
     assert "aura_session_state" in additional
     assert "aura_turn_video" in additional
+    assert state.pending_turn_video is additional["aura_turn_video"]
     assert request.messages[0]["content"][0]["type"] == "input_audio"
 
 
