@@ -913,6 +913,12 @@ class OmniConnectorModelRunnerMixin:
 
         self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
+    def _empty_finished_connector_payload(self) -> dict[str, Any]:
+        return {
+            "codes": {"audio": torch.empty(0, dtype=torch.long)},
+            "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+        }
+
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
         pending_req_ids = set(self._pending_full_payload_send.keys())
@@ -973,9 +979,16 @@ class OmniConnectorModelRunnerMixin:
                     request_id=req_id,
                     request=request,
                     pooling_output=raw_output,
+                    force_finished=True,
                 )
                 if payload is None:
-                    continue
+                    logger.warning(
+                        "[Stage-%s] send_full_payload_outputs: custom process returned None for "
+                        "finished req=%s; emitting empty finished sentinel",
+                        self._stage_id,
+                        req_id,
+                    )
+                    payload = self._empty_finished_connector_payload()
             if payload is None:
                 logger.debug("[Stage-%s] send_full_payload_outputs: payload is None for %s", self._stage_id, req_id)
                 continue
@@ -1878,6 +1891,8 @@ class OmniConnectorModelRunnerMixin:
         request_id: str | None,
         request: Any | None,
         pooling_output: Any | None,
+        *,
+        force_finished: bool = False,
     ) -> Any | None:
         """Run the custom process hook with a best-effort finished kwarg."""
         if self._custom_process_func is None:
@@ -1893,13 +1908,16 @@ class OmniConnectorModelRunnerMixin:
             "_custom_process_supports_is_finished",
             self._custom_process_supports_is_finished_kwarg(),
         )
+        is_finished = force_finished
         is_finished_fn = getattr(request, "is_finished", None)
-        if callable(is_finished_fn):
+        if not is_finished and callable(is_finished_fn):
             try:
                 if supports_is_finished is not False:
-                    kwargs["is_finished"] = bool(is_finished_fn())
+                    is_finished = bool(is_finished_fn())
             except Exception:
                 logger.debug("request.is_finished() failed for %s", request_id, exc_info=True)
+        if supports_is_finished is not False:
+            kwargs["is_finished"] = is_finished
 
         try:
             return self._custom_process_func(**kwargs)

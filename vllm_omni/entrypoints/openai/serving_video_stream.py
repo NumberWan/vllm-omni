@@ -37,6 +37,12 @@ from vllm_omni.entrypoints.openai.aura_session_history import (
     DEFAULT_AURA_SYSTEM_PROMPT,
     SILENT_TEXT,
     SessionHistory,
+    is_effectively_silent,
+    normalize_assistant_text,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    pop_turn_transcript,
+    video_tuple_from_aura_turn_video,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
     _BAD_FRAME,
@@ -48,6 +54,10 @@ from vllm_omni.entrypoints.openai.video_stream_base import (
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
     OmniStreamingVideoHandler as OmniStreamingVideoHandlerBase,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    DEFAULT_QWEN3_TTS_REF_TEXT,
+    default_qwen3_tts_ref_audio_path,
 )
 
 __all__ = [
@@ -143,7 +153,9 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         message_history: list[dict[str, Any]],
         user_message: dict[str, Any],
         response_text: str,
+        request_id: str | None = None,
     ) -> None:
+        del request_id
         message_history.append(user_message)
         message_history.append({"role": "assistant", "content": response_text})
 
@@ -177,6 +189,26 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
         default_factory=lambda: [3, 4, 5],
         description="N-gram sizes for bad_words hard blocking in cross-turn penalty.",
     )
+    tts_task_type: str = Field(default="Base", description="Qwen3-TTS task type: Base or CustomVoice.")
+    tts_language: str = Field(default="English", description="Qwen3-TTS language.")
+    tts_instruct: str = Field(default="", description="Optional Qwen3-TTS style instruct.")
+    tts_ref_audio: str = Field(
+        default_factory=default_qwen3_tts_ref_audio_path,
+        description="Base-mode reference audio path (server-visible).",
+    )
+    tts_ref_text: str = Field(
+        default=DEFAULT_QWEN3_TTS_REF_TEXT,
+        description="Base-mode reference audio transcript.",
+    )
+    tts_speaker: str = Field(default="Vivian", description="CustomVoice-mode speaker name.")
+    tts_x_vector_only_mode: bool = Field(
+        default=False,
+        description="Base mode: speaker embedding only (no ICL ref_text conditioning).",
+    )
+    tts_pass_token_ids: bool = Field(
+        default=False,
+        description="Pass AURA assistant token ids to Qwen3-TTS instead of decoded text.",
+    )
 
 
 @dataclass
@@ -186,6 +218,7 @@ class AuraSessionState:
     history: SessionHistory
     turn_frame_arrays: list[np.ndarray]
     cross_turn_penalty: CrossTurnPenalty | None = None
+    pending_turn_video: dict[str, Any] | None = None
 
 
 class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
@@ -196,6 +229,24 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
     def supports_query_interrupt(self) -> bool:
         return False
+
+    @staticmethod
+    def _tts_additional_information(config: AuraStreamingVideoSessionConfig) -> dict[str, Any]:
+        if "audio" not in config.modalities:
+            return {}
+        info: dict[str, Any] = {
+            "tts_task_type": config.tts_task_type,
+            "tts_language": config.tts_language,
+            "tts_instruct": config.tts_instruct,
+            "tts_x_vector_only_mode": config.tts_x_vector_only_mode,
+            "tts_pass_token_ids": config.tts_pass_token_ids,
+        }
+        if config.tts_task_type == "Base":
+            info["tts_ref_audio"] = config.tts_ref_audio
+            info["tts_ref_text"] = config.tts_ref_text
+        elif config.tts_task_type == "CustomVoice":
+            info["tts_speaker"] = config.tts_speaker
+        return info
 
     def releases_turn_after_text_done(self) -> bool:
         return True
@@ -279,6 +330,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             },
             "aura_system_prompt": [system_prompt],
         }
+        additional_information.update(self._tts_additional_information(aura_config))
         user_message[_AURA_ADDITIONAL_INFO_KEY] = additional_information
 
         return messages, user_message
@@ -288,14 +340,29 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         message_history: Any,
         user_message: dict[str, Any],
         response_text: str,
+        request_id: str | None = None,
     ) -> None:
         del user_message
         if not isinstance(message_history, AuraSessionState):
             return
-        message_history.history.add_assistant_message(response_text)
+
+        transcript = pop_turn_transcript(request_id)
+        video_tuple = video_tuple_from_aura_turn_video(message_history.pending_turn_video)
+        if video_tuple is None and message_history.turn_frame_arrays:
+            video_tuple = self._frames_to_video_tuple(
+                list(message_history.turn_frame_arrays),
+                fps=2.0,
+                max_frames=16,
+            )
+        if video_tuple is not None or transcript:
+            message_history.history.add_user_message(transcript, video_tuple=video_tuple)
+
+        message_history.pending_turn_video = None
+        normalized = normalize_assistant_text(response_text)
+        message_history.history.add_assistant_message(normalized)
         message_history.turn_frame_arrays.clear()
         if message_history.cross_turn_penalty is not None:
-            if response_text.strip() == SILENT_TEXT:
+            if is_effectively_silent(response_text):
                 message_history.cross_turn_penalty.record(None)
             else:
                 message_history.cross_turn_penalty.record(response_text)
@@ -415,6 +482,10 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             prewarmed_frames,
         )
         additional_information = user_message.pop(_AURA_ADDITIONAL_INFO_KEY, None)
+
+        if isinstance(message_history, AuraSessionState) and isinstance(additional_information, dict):
+            turn_video = additional_information.get("aura_turn_video")
+            message_history.pending_turn_video = turn_video if isinstance(turn_video, dict) else None
 
         aura_config = self._as_aura_config(config)
         penalty_kwargs: dict[str, Any] = {}
@@ -596,7 +667,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
             if release_turn_lock is None and not turn_lock_released:
                 response_text = "".join(text_parts)
-                self.on_turn_complete(message_history, user_message, response_text)
+                self.on_turn_complete(message_history, user_message, response_text, request_id)
 
             t_end = _time.monotonic()
             del t_start, t_first_text, t_first_audio, t_end

@@ -7,7 +7,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory
+from vllm_omni.entrypoints.openai.aura_session_history import (
+    SessionHistory,
+    is_effectively_silent,
+    normalize_assistant_text,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -33,7 +37,7 @@ def test_get_vllm_inputs_includes_video_and_text():
 
     assert "<|video_pad|>" in vllm_inputs["prompt"]
     assert "What is happening?" in vllm_inputs["prompt"]
-    assert vllm_inputs["prompt"].endswith("<|im_start|>assistant")
+    assert vllm_inputs["prompt"].endswith("<|im_start|>assistant\n")
     assert "video" in vllm_inputs["multi_modal_data"]
     assert len(vllm_inputs["multi_modal_data"]["video"]) == 1
 
@@ -56,6 +60,23 @@ def test_to_dict_roundtrip_preserves_history():
     assert len(restored_inputs["multi_modal_data"].get("video", [])) == len(
         original_inputs["multi_modal_data"].get("video", [])
     )
+
+
+def test_is_effectively_silent_treats_punctuation_filler_as_silent():
+    assert is_effectively_silent("")
+    assert is_effectively_silent("  ")
+    assert is_effectively_silent("<|silent|>")
+    assert is_effectively_silent(" ﹑")
+    assert is_effectively_silent("，。")
+    assert not is_effectively_silent("好的")
+    assert not is_effectively_silent(" 好的，")
+
+
+def test_add_assistant_message_normalizes_punctuation_filler_to_silent():
+    history = SessionHistory()
+    history.add_assistant_message(" ﹑")
+    assert history.history[-1]["content"] == "<|silent|>"
+    assert normalize_assistant_text(" ﹑") == "<|silent|>"
 
 
 def test_pruning_moves_old_rounds_to_context_history():

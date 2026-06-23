@@ -7,9 +7,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-_PENALTY_PUNCT = frozenset(
-    ".,!?;:，。！？；：、'\"()[]{}""''…—–\n\t\r /-_@#$%^&*+=<>~`|\\（）【】《》"
-)
+from vllm_omni.entrypoints.openai.aura_text_utils import is_punctuation_only_text
 
 
 class CrossTurnPenalty:
@@ -43,7 +41,7 @@ class CrossTurnPenalty:
             self._penalizable_cache[token_id] = False
             return False
         decoded = self.tokenizer.decode([token_id]).strip()
-        if not decoded or all(c in _PENALTY_PUNCT for c in decoded) or decoded.isdigit():
+        if not decoded or is_punctuation_only_text(decoded) or decoded.isdigit():
             self._penalizable_cache[token_id] = False
             return False
         self._penalizable_cache[token_id] = True
@@ -100,7 +98,7 @@ class CrossTurnPenalty:
                     if ngram in seen:
                         continue
                     phrase = self.tokenizer.decode(list(ngram)).strip()
-                    if not phrase or all(c in _PENALTY_PUNCT for c in phrase):
+                    if not phrase or is_punctuation_only_text(phrase):
                         continue
                     seen.add(ngram)
                     prefix = ngram[:-1]

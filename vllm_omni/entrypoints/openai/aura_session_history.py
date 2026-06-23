@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from vllm_omni.entrypoints.openai.aura_text_utils import is_punctuation_only_text
+
 SILENT_TEXT = "<|silent|>"
 DEFAULT_AURA_SYSTEM_PROMPT = (
     "You are receiving a live video stream where the final frame is the present moment. "
@@ -15,7 +17,30 @@ DEFAULT_AURA_SYSTEM_PROMPT = (
     "Otherwise, output '<|silent|>' to signify silence. Respond in Chinese."
 )
 
-__all__ = ["SessionHistory", "DEFAULT_AURA_SYSTEM_PROMPT", "SILENT_TEXT"]
+__all__ = [
+    "SessionHistory",
+    "DEFAULT_AURA_SYSTEM_PROMPT",
+    "SILENT_TEXT",
+    "is_effectively_silent",
+    "normalize_assistant_text",
+]
+
+
+def is_effectively_silent(text: str) -> bool:
+    """Return True for empty, <|silent|>, or punctuation-only filler (e.g. \" ﹑\")."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if stripped == SILENT_TEXT:
+        return True
+    return is_punctuation_only_text(text)
+
+
+def normalize_assistant_text(text: str) -> str:
+    """Map degenerate non-answers to the canonical silent marker for history/TTS."""
+    if is_effectively_silent(text):
+        return SILENT_TEXT
+    return text
 
 
 class SessionHistory:
@@ -69,7 +94,7 @@ class SessionHistory:
 
     @staticmethod
     def _is_silent_response(content: Any) -> bool:
-        return isinstance(content, str) and content.strip() == SILENT_TEXT
+        return isinstance(content, str) and is_effectively_silent(content)
 
     def _has_user_text(self, user_msg: dict[str, Any]) -> bool:
         content = user_msg.get("content", [])
@@ -267,7 +292,7 @@ class SessionHistory:
             self._prune_history()
 
     def add_assistant_message(self, text: str) -> None:
-        msg = {"role": "assistant", "content": text}
+        msg = {"role": "assistant", "content": normalize_assistant_text(text)}
         self._sliding_window.append(msg)
         self.history.append(msg)
 
@@ -279,7 +304,7 @@ class SessionHistory:
         for msg in self.history:
             role = msg["role"]
             content = msg["content"]
-            full_prompt += f"<|im_start|>{role}"
+            full_prompt += f"<|im_start|>{role}\n"
 
             if isinstance(content, str):
                 full_prompt += content
@@ -296,7 +321,7 @@ class SessionHistory:
 
             full_prompt += "<|im_end|>"
 
-        full_prompt += "<|im_start|>assistant"
+        full_prompt += "<|im_start|>assistant\n"
 
         multi_modal_data: dict[str, Any] = {}
         if all_images:

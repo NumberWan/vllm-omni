@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +18,7 @@ from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.engine.serialization import deserialize_additional_information
-from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory
+from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory, is_effectively_silent
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
@@ -34,6 +36,11 @@ SILENT_TEXT = "<|silent|>"
 QWEN_IM_START_ID = 151644
 QWEN_IM_END_ID = 151645
 QWEN_ASSISTANT_ID = 77091
+
+logger = init_logger(__name__)
+
+_TURN_TRANSCRIPTS_BY_REQUEST: dict[str, str] = {}
+
 QWEN_NEWLINE_ID = 198
 QWEN_ASSISTANT_PREFIX_IDS = [QWEN_IM_START_ID, QWEN_ASSISTANT_ID, QWEN_NEWLINE_ID]
 QWEN_ASSISTANT_SUFFIX_IDS = [
@@ -146,6 +153,27 @@ def _extract_text(source_output: Any) -> str:
             if isinstance(value, list) and value and isinstance(value[0], str):
                 return value[0]
     return ""
+
+
+def _clean_asr_transcript(text: str) -> str:
+    """Strip Qwen3-ASR wrappers like ``language Chinese<asr_text>...``."""
+    if not isinstance(text, str):
+        return ""
+    cleaned = text.strip()
+    if "<asr_text>" in cleaned:
+        cleaned = cleaned.split("<asr_text>", 1)[-1]
+    cleaned = re.sub(r"^language\s+[\w-]+\s*", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def record_turn_transcript(request_id: str, transcript: str) -> None:
+    _TURN_TRANSCRIPTS_BY_REQUEST[str(request_id)] = transcript
+
+
+def pop_turn_transcript(request_id: str | None) -> str:
+    if not request_id:
+        return ""
+    return _TURN_TRANSCRIPTS_BY_REQUEST.pop(str(request_id), "")
 
 
 def _extract_token_ids(source_output: Any) -> list[int]:
@@ -499,7 +527,7 @@ def asr2aura(
     for idx, source_output in enumerate(source_outputs):
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
-        transcript = _extract_text(source_output)
+        transcript = _clean_asr_transcript(_extract_text(source_output))
         multi_modal_data = _merged_vision_multimodal_data(
             src_prompt.get("multi_modal_data") or {},
             additional_info.get("deferred_multi_modal_data") or {},
@@ -578,7 +606,7 @@ def asr2aura_async_chunk(
     return payload
 
 
-def _video_tuple_from_aura_turn_video(aura_turn_video: Any) -> tuple[np.ndarray, dict[str, Any]] | None:
+def video_tuple_from_aura_turn_video(aura_turn_video: Any) -> tuple[np.ndarray, dict[str, Any]] | None:
     if not isinstance(aura_turn_video, dict):
         return None
     frames = aura_turn_video.get("frames")
@@ -604,6 +632,29 @@ def _copy_aura_tts_fields(additional_info: dict[str, Any]) -> dict[str, Any]:
     return copied
 
 
+def _summarize_vllm_inputs(vllm_inputs: dict[str, Any]) -> str:
+    videos = vllm_inputs.get("multi_modal_data", {}).get("video", [])
+    video_info = []
+    for vt in videos:
+        arr, meta = vt
+        arr = np.asarray(arr)
+        video_info.append(
+            {
+                "frames": int(arr.shape[0]),
+                "shape": list(arr.shape),
+                "fps": meta.get("fps"),
+                "duration": meta.get("duration"),
+            }
+        )
+    return json.dumps(
+        {
+            "prompt_text": vllm_inputs.get("prompt", ""),
+            "videos": video_info,
+        },
+        ensure_ascii=False,
+    )
+
+
 def asr2aura_session(
     source_outputs: list[Any],
     prompt: Any = None,
@@ -625,11 +676,19 @@ def asr2aura_session(
             next_inputs.append(next_input)
             continue
 
+        request_id = str(getattr(source_output, "request_id", idx))
         history = SessionHistory.from_dict(additional_info["aura_session_state"])
-        transcript = _extract_text(source_output)
-        video_tuple = _video_tuple_from_aura_turn_video(additional_info.get("aura_turn_video"))
+        transcript = _clean_asr_transcript(_extract_text(source_output))
+        record_turn_transcript(request_id, transcript)
+        video_tuple = video_tuple_from_aura_turn_video(additional_info.get("aura_turn_video"))
         history.add_user_message(transcript, video_tuple=video_tuple)
         vllm_inputs = history.get_vllm_inputs()
+        logger.info(
+            "AURA turn prompt request_id=%s transcript=%r: %s",
+            getattr(source_output, "request_id", idx),
+            transcript,
+            _summarize_vllm_inputs(vllm_inputs),
+        )
 
         next_input = {
             "prompt": vllm_inputs["prompt"],
@@ -779,7 +838,7 @@ def aura2tts(
             # AURA may stream the special silent marker token-by-token. Hold
             # these prefixes until the marker is complete so TTS never speaks it.
             continue
-        if not text or text == SILENT_TEXT:
+        if is_effectively_silent(text):
             continue
 
         src_prompt = prompt_by_request_id.get(str(req_id), {})

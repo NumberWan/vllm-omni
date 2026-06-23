@@ -13,12 +13,14 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     QWEN_IM_START_ID,
     QWEN_TEXT_SILENT_TOKEN_IDS,
     SILENT_TEXT,
+    _clean_asr_transcript,
     _trim_aura_response_token_ids,
     asr2aura,
     asr2aura_async_chunk,
     asr2aura_session,
     aura2tts,
     aura2tts_async_chunk,
+    pop_turn_transcript,
 )
 from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory
 
@@ -111,6 +113,11 @@ def test_asr2aura_reads_video_stashed_for_downstream_stage():
     assert "<|video_pad|>" in next_input["prompt"]
 
 
+def test_clean_asr_transcript_strips_qwen3_asr_wrapper():
+    assert _clean_asr_transcript("language Chinese<asr_text>画面有什么？") == "画面有什么？"
+    assert _clean_asr_transcript("  hello  ") == "hello"
+
+
 def test_asr2aura_session_restores_history_and_turn_video():
     history = SessionHistory(pruning_enabled=False)
     prompt = {
@@ -134,12 +141,18 @@ def test_asr2aura_session_restores_history_and_turn_video():
         }
     }
 
-    [next_input] = asr2aura_session([_source_output("Hello there.")], prompt=[prompt])
+    [next_input] = asr2aura_session(
+        [_source_output("language Chinese<asr_text>Hello there.")],
+        prompt=[prompt],
+    )
 
     assert "<|video_pad|>" in next_input["prompt"]
     assert "Hello there." in next_input["prompt"]
+    assert "language Chinese" not in next_input["prompt"]
+    assert "<asr_text>" not in next_input["prompt"]
     assert next_input["multi_modal_data"]["video"]
     assert next_input["additional_information"]["aura_system_prompt"] == ["custom system"]
+    assert pop_turn_transcript("req-1") == "Hello there."
 
 
 def test_asr2aura_supports_video_only_observation():
@@ -522,3 +535,7 @@ def test_aura2tts_streaming_partial_content_enters_tts():
 
     assert tts_input["additional_information"]["text"] == ["你好"]
     assert PRECOMPUTED_TEXT_IDS_KEY not in tts_input["additional_information"]
+
+
+def test_aura2tts_drops_punctuation_only_filler():
+    assert aura2tts([_source_output(" ﹑")]) == []

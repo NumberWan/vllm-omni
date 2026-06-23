@@ -93,6 +93,7 @@ class VideoStreamPipelineHooks(Protocol):
         message_history: list[dict[str, Any]],
         user_message: dict[str, Any],
         response_text: str,
+        request_id: str | None = None,
     ) -> None:
         """Update session state after a successful turn."""
         ...
@@ -179,6 +180,7 @@ class OmniStreamingVideoHandler:
         message_history: list[dict[str, Any]],
         user_message: dict[str, Any],
         response_text: str,
+        request_id: str | None = None,
     ) -> None:
         raise NotImplementedError
 
@@ -269,7 +271,7 @@ class OmniStreamingVideoHandler:
                 if not is_turn_locked:
                     return
                 is_turn_locked = False
-                self.on_turn_complete(message_history, user_message, response_text)
+                self.on_turn_complete(message_history, user_message, response_text, request_id)
                 if active_request_id == request_id:
                     prev_request_id = request_id
                     active_request_id = None
@@ -812,7 +814,7 @@ class OmniStreamingVideoHandler:
                 await websocket.send_json({"type": "response.audio.done"})
 
             response_text = "".join(text_parts)
-            self.on_turn_complete(message_history, user_message, response_text)
+            self.on_turn_complete(message_history, user_message, response_text, request_id)
 
             t_end = _time.monotonic()
             logger.info(
