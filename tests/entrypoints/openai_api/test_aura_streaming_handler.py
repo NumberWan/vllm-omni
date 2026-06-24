@@ -204,7 +204,7 @@ def test_build_engine_prompt_omits_tts_when_text_only():
     additional = user_message["_aura_additional_information"]
     assert "tts_ref_audio" not in additional
     assert "tts_ref_text" not in additional
-    assert additional["aura_skip_asr"] is True
+    assert additional["omni_skip_stages"] == [0]
 
 
 def test_build_engine_prompt_disables_skip_asr_when_audio_present():
@@ -222,7 +222,7 @@ def test_build_engine_prompt_disables_skip_asr_when_audio_present():
         {},
     )
 
-    assert user_message["_aura_additional_information"]["aura_skip_asr"] is False
+    assert user_message["_aura_additional_information"]["omni_skip_stages"] == []
 
 
 @pytest.mark.asyncio

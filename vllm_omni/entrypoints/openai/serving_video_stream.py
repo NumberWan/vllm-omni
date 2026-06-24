@@ -349,7 +349,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 "metadata": metadata,
             },
             "aura_system_prompt": [system_prompt],
-            "aura_skip_asr": len(audio_buffer) == 0,
+            "omni_skip_stages": [0] if len(audio_buffer) == 0 else [],
         }
         additional_information.update(self._tts_additional_information(aura_config))
         user_message[_AURA_ADDITIONAL_INFO_KEY] = additional_information

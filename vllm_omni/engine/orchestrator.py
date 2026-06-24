@@ -466,16 +466,16 @@ class Orchestrator:
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
 
-        from vllm_omni.model_executor.stage_input_processors.aura_omni_skip import (
-            make_mock_asr_source_output,
-            should_skip_aura_asr,
+        from vllm_omni.model_executor.stage_input_processors.stage_bypass import (
+            make_mock_text_stage_output,
+            should_skip_stage,
         )
 
-        if should_skip_aura_asr(original_prompt) and final_stage_id >= 1:
+        if should_skip_stage(original_prompt, stage_id=0) and final_stage_id >= 1:
             await self._forward_to_next_stage(
                 request_id,
                 stage_id,
-                make_mock_asr_source_output(request_id),
+                make_mock_text_stage_output(request_id),
                 req_state,
                 src_replica_id=0,
             )
