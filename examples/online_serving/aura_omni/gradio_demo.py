@@ -151,6 +151,7 @@ def build_interface(client: OpenAI, model: str):
         tts_ref_text: str,
         tts_x_vector_only_mode: bool,
         tts_pass_token_ids: bool,
+        aura_tts_full_response: bool,
     ):
         audio_url = _audio_to_data_url(audio_file)
         video_url = _video_to_data_url(video_file)
@@ -170,6 +171,7 @@ def build_interface(client: OpenAI, model: str):
             "tts_task_type": tts_task_type,
             "tts_instruct": tts_instruct,
             "tts_pass_token_ids": bool(tts_pass_token_ids),
+            "aura_tts_full_response": bool(aura_tts_full_response),
         }
         if tts_task_type == "CustomVoice":
             additional_information.update(
@@ -210,7 +212,7 @@ def build_interface(client: OpenAI, model: str):
 
     default_system = (
         "You are receiving a live video stream where the final frame is the present moment. "
-        "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in English."
+        "Respond only when a response is needed. Otherwise output '<|silent|>'."
     )
 
     def _toggle_tts_advanced(task_type: str):
@@ -228,7 +230,7 @@ def build_interface(client: OpenAI, model: str):
             video_input = gr.Video(label="Video input (optional)", sources=["upload"])
         prompt = gr.Textbox(
             label="Instruction",
-            value="Use the audio and video together to decide whether a reply is needed. If needed, respond briefly in English.",
+            value="Use the audio and video together to decide whether a reply is needed. If needed, respond briefly.",
             lines=2,
         )
         with gr.Accordion("Advanced", open=False):
@@ -237,6 +239,10 @@ def build_interface(client: OpenAI, model: str):
             tts_instruct = gr.Textbox(label="TTS instruction", value="")
             tts_pass_token_ids = gr.Checkbox(
                 label="Pass AURA token ids directly to TTS",
+                value=False,
+            )
+            aura_tts_full_response = gr.Checkbox(
+                label="Wait for the full AURA answer before TTS",
                 value=False,
             )
 
@@ -287,6 +293,7 @@ def build_interface(client: OpenAI, model: str):
                 tts_ref_text,
                 tts_x_vector_only_mode,
                 tts_pass_token_ids,
+                aura_tts_full_response,
             ],
             outputs=[text_output, audio_output],
         )

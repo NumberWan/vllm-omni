@@ -341,11 +341,7 @@ class OmniBase(PDDisaggregationMixin):
     def _compute_final_output_stage_ids(self, output_modalities: list[str] | None) -> list[int]:
         supported_modalities = {m for m in self.output_modalities if isinstance(m, str)}
         requested_modalities = output_modalities or self.output_modalities
-        requested_modalities = [
-            m
-            for m in requested_modalities
-            if isinstance(m, str) and m in supported_modalities
-        ]
+        requested_modalities = [m for m in requested_modalities if isinstance(m, str) and m in supported_modalities]
         if not requested_modalities:
             requested_modalities = [m for m in self.output_modalities if isinstance(m, str)]
 

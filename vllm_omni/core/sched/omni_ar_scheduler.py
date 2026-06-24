@@ -653,17 +653,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return False
         is_done = self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id)
         should_wait = not is_done
-        logger.info(
-            "[async_chunk_wait_check] req=%s stage=%s should_wait=%s done_receiving=%s "
-            "status=%s num_computed=%s output_tokens=%s",
-            request.request_id,
-            getattr(self.vllm_config.model_config, "stage_id", None),
-            should_wait,
-            is_done,
-            request.status,
-            request.num_computed_tokens,
-            len(getattr(request, "_output_token_ids", []) or []),
-        )
+
         return should_wait
 
     def _reset_request_for_next_chunk(self, request: Request) -> None:
@@ -689,20 +679,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         request.update_block_hashes()
         if self.chunk_transfer_adapter is not None:
             external_req_id = getattr(request, "external_req_id", request.request_id)
-            previous_chunks_sent = self.chunk_transfer_adapter.requests_num_chunks_sent.pop(external_req_id, None)
-            pending_payloads = len(getattr(self.chunk_transfer_adapter, "_received_payloads", {}).get(request.request_id, ()))
-            logger.info(
-                "[async_chunk_reset] req=%s ext_req=%s cleared_sender_watermark=%s prompt_len=%d "
-                "pending_payloads=%d additional_keys=%s",
-                request.request_id,
-                external_req_id,
-                previous_chunks_sent,
-                len(request.prompt_token_ids),
-                pending_payloads,
-                sorted(request.additional_information.keys())
-                if isinstance(getattr(request, "additional_information", None), dict)
-                else None,
-            )
+            self.chunk_transfer_adapter.requests_num_chunks_sent.pop(external_req_id, None)
+
         if request in self.skipped_waiting:
             self.skipped_waiting.remove_requests((request,))
         self._enqueue_waiting_request(request)

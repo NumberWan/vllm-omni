@@ -549,8 +549,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             start = max(0, ctx_frames * upsample)
             end = max(start, actual_frames * upsample)
             logger.info(
-                "[Code2Wav] trim req_index=%d ctx_frames=%d actual_frames=%d upsample=%d "
-                "wav_len=%d start=%d end=%d",
+                "[Code2Wav] trim req_index=%d ctx_frames=%d actual_frames=%d upsample=%d wav_len=%d start=%d end=%d",
                 idx,
                 ctx_frames,
                 actual_frames,

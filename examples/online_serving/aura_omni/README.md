@@ -46,6 +46,7 @@ Expected request shape:
   - `tts_ref_text`
   - `tts_x_vector_only_mode`
   - `tts_pass_token_ids`
+  - `aura_tts_full_response`
 
 If AURA emits `<|silent|>`, the `aura2tts` processor returns no TTS request, so
 the TTS stages are skipped for that turn.
@@ -95,6 +96,14 @@ python examples/online_serving/aura_omni/openai_chat_completion_client.py \
   --tts-pass-token-ids
 ```
 
+Wait until AURA finishes the current answer before sending one complete text
+payload to TTS:
+
+```bash
+python examples/online_serving/aura_omni/openai_chat_completion_client.py \
+  --aura-tts-full-response
+```
+
 CustomVoice mode requires stages 2 and 3 in `aura_omni.yaml` to point at a
 Qwen3-TTS CustomVoice checkpoint:
 
@@ -109,6 +118,11 @@ By default, AURA responses are passed to Qwen3-TTS as text. Set
 to Qwen3-TTS instead. The processor still uses AURA token ids, when available,
 to estimate the Talker prompt length in the default text path.
 
+Set `aura_tts_full_response=true` to buffer AURA output until the current answer
+is finished, then send a single full-text TTS request. This is useful for
+CustomVoice and other non-streaming TTS modes that expect complete text
+conditioning in the Talker prefill.
+
 ## Curl
 
 ```bash
@@ -121,6 +135,7 @@ Set `PORT`, `MODEL`, or `OUTPUT_DIR` to override defaults:
 ```bash
 PORT=8666 MODEL=aurateam/AURA bash run_curl_multimodal_generation.sh
 TTS_PASS_TOKEN_IDS=true PORT=8666 MODEL=aurateam/AURA bash run_curl_multimodal_generation.sh
+AURA_TTS_FULL_RESPONSE=true PORT=8666 MODEL=aurateam/AURA bash run_curl_multimodal_generation.sh
 ```
 
 ## Gradio

@@ -63,6 +63,25 @@ class StageConfigFactory:
         if cli_overrides is None:
             cli_overrides = {}
 
+        if deploy_config_path is not None:
+            deploy_path = Path(deploy_config_path)
+            if deploy_path.exists():
+                deploy_cfg = load_deploy_config(deploy_path)
+                if deploy_cfg.pipeline:
+                    pipeline_cfg = cls.resolve_pipeline_config(deploy_cfg.pipeline)
+                    if pipeline_cfg is None:
+                        raise KeyError(
+                            f"Pipeline {deploy_cfg.pipeline!r} from {deploy_path.name!r} "
+                            f"not found in OMNI_PIPELINES. Available: "
+                            f"{sorted(OMNI_PIPELINES.keys())}"
+                        )
+                    return cls._create_from_registry(
+                        deploy_cfg.pipeline,
+                        pipeline_cfg,
+                        cli_overrides,
+                        deploy_config_path,
+                    )
+
         trust_remote_code = cli_overrides.get("trust_remote_code", True)
         if trust_remote_code is None:
             trust_remote_code = False

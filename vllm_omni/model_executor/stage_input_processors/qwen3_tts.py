@@ -231,21 +231,27 @@ def talker2code2wav_async_chunk(
         )
         initial_chunk_size = chunk_size
     length = len(transfer_manager.code_prompt_token_ids[request_id])
-    logger.info(
-        "[talker2code2wav_async_chunk] req=%s finished=%s frames_buffered=%d chunk_size=%d "
-        "left_context_cfg=%d initial_chunk_size=%d ref_code_context_frames=%d",
-        request_id,
-        finished,
-        length,
-        chunk_size,
-        left_context_size_config,
-        initial_chunk_size,
-        ref_code_context_frames,
-    )
+    emitted_frames_by_req = getattr(transfer_manager, "_qwen3_tts_emitted_frames", None)
+    if emitted_frames_by_req is None:
+        emitted_frames_by_req = {}
+        transfer_manager._qwen3_tts_emitted_frames = emitted_frames_by_req
+    emitted_frames = int(emitted_frames_by_req.get(request_id, 0) or 0)
+    if emitted_frames > length:
+        logger.warning(
+            "[talker2code2wav_async_chunk] req=%s emitted_frames=%d > frames_buffered=%d; resetting cursor",
+            request_id,
+            emitted_frames,
+            length,
+        )
+        emitted_frames = 0
+        emitted_frames_by_req[request_id] = 0
 
     if length <= 0:
+        return None
+
+    new_frames = length - emitted_frames
+    if new_frames <= 0:
         if finished:
-            logger.info("[talker2code2wav_async_chunk] req=%s emitting terminal empty audio codes", request_id)
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
@@ -253,24 +259,13 @@ def talker2code2wav_async_chunk(
         return None
 
     use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
+    target_new_frames = initial_chunk_size if emitted_frames == 0 and use_first_chunk else chunk_size
+    if not finished and new_frames < target_new_frames:
+        return None
 
-    if use_first_chunk and length <= initial_chunk_size:
-        if not finished and length < initial_chunk_size:
-            return None
-        context_length = length if finished and length < initial_chunk_size else initial_chunk_size
-    else:
-        # The initial chunk is only for TTFA. After that, return to the normal
-        # codec chunk size so Code2Wav is not flooded by repeated tiny windows.
-        initial_coverage = initial_chunk_size if use_first_chunk else 0
-        adjusted = length - initial_coverage
-        if not finished and adjusted % chunk_size != 0:
-            return None
-        chunk_length = adjusted % chunk_size
-        context_length = chunk_length if chunk_length != 0 else chunk_size
-
-    end_index = min(length, left_context_size_config + context_length)
-    left_context_size = max(0, end_index - context_length)
-    window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+    context_start = max(0, emitted_frames - left_context_size_config)
+    left_context_size = emitted_frames - context_start
+    window_frames = transfer_manager.code_prompt_token_ids[request_id][context_start:length]
 
     # Prepend the bounded ref_code tail to the first emitted chunk so Code2Wav
     # can cache the same reference context that mainline would otherwise send on
@@ -330,26 +325,8 @@ def talker2code2wav_async_chunk(
         meta.ref_context_request_id = ref_context_request_id
         meta.ref_context_included = ref_context_included
 
-    logger.info(
-        "[talker2code2wav_async_chunk] req=%s emitting frames=%d context_length=%d left_context_size=%d "
-        "ref_context_size=%d ref_context_included=%s finished=%s flat_codes=%d",
-        request_id,
-        num_frames,
-        context_length,
-        left_context_size,
-        ref_context_size,
-        ref_context_included,
-        finished,
-        int(code_predictor_codes.numel()),
-    )
-    logger.info(
-        "[talker2code2wav_async_chunk] req=%s emitting payload=%s",
-        request_id,
-        {
-            "codes": {"audio": code_predictor_codes.tolist()},
-            "meta": meta,
-        },
-    )
+    emitted_frames_by_req[request_id] = length
+
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
         meta=meta,
@@ -493,9 +470,8 @@ def talker2code2wav_token_only(
             )
         )
     logger.info(
-        "[talker2code2wav_token_only] req=%s built %d code2wav inputs",
-        request_id,
-        code2wav_inputs,
+        "[talker2code2wav_token_only] built %d code2wav inputs",
+        len(code2wav_inputs),
     )
     return code2wav_inputs
 

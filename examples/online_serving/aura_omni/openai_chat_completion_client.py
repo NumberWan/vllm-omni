@@ -100,10 +100,11 @@ def save_response(response, output_dir: str) -> None:
         message = choice.message
         if message.content:
             out_txt = os.path.join(output_dir, f"choice_{idx}.txt")
+            content = str(message.content).strip()
             with open(out_txt, "w", encoding="utf-8") as f:
-                f.write(str(message.content).strip() + "\n")
+                f.write(content + "\n")
             print(f"Text saved to {out_txt}")
-            print(message.content)
+            print(" ".join(content.split()))
         if getattr(message, "audio", None):
             audio_bytes = base64.b64decode(message.audio.data)
             audio_np, sample_rate = sf.read(io.BytesIO(audio_bytes))
@@ -140,6 +141,7 @@ def main(args) -> None:
                 "tts_ref_text": args.tts_ref_text,
                 "tts_x_vector_only_mode": args.tts_x_vector_only_mode,
                 "tts_pass_token_ids": args.tts_pass_token_ids,
+                "aura_tts_full_response": args.aura_tts_full_response,
             },
         },
         timeout=args.timeout,
@@ -156,7 +158,7 @@ def parse_args():
     parser.add_argument("--video-path", default=None, help="Video file, URL, or data URL.")
     parser.add_argument(
         "--prompt",
-        default="Use the audio and video together to decide whether a reply is needed. If needed, respond briefly in English.",
+        default="Use the audio and video together to decide whether a reply is needed. If needed, respond briefly.",
     )
     parser.add_argument("--modalities", default="text,audio")
     parser.add_argument("--output-dir", default="output_aura_omni_online")
@@ -164,7 +166,7 @@ def parse_args():
         "--aura-system-prompt",
         default=(
             "You are receiving a live video stream where the final frame is the present moment. "
-            "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in English."
+            "Respond only when a response is needed. Otherwise output '<|silent|>'."
         ),
     )
     parser.add_argument("--tts-task-type", default="Base", choices=["Base", "CustomVoice"])
@@ -190,6 +192,11 @@ def parse_args():
         "--tts-pass-token-ids",
         action="store_true",
         help="Pass AURA-generated assistant token ids directly to Qwen3-TTS. Defaults to sending text.",
+    )
+    parser.add_argument(
+        "--aura-tts-full-response",
+        action="store_true",
+        help="Wait for the full AURA answer before sending one complete payload to TTS.",
     )
     parser.add_argument("--timeout", type=float, default=600.0)
     return parser.parse_args()
