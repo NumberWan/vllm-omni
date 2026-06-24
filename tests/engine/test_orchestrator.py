@@ -1184,6 +1184,51 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
         await _shutdown_orchestrator(orchestrator_fixture)
 
 
+@pytest.mark.asyncio
+async def test_aura_skip_asr_bypasses_stage0(orchestrator_factory) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(
+        stage_type="llm",
+        final_output=True,
+        final_output_type="text",
+        next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
+    )
+    processors = [
+        FakeOutputProcessor(),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-skip-asr", token_ids=[3, 4], finished=True)]),
+    ]
+    orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
+    request = SimpleNamespace(request_id="req-skip-asr", prompt_token_ids=[1, 2, 3])
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-skip-asr",
+            prompt=request,
+            original_prompt={
+                "prompt": "video-only",
+                "additional_information": {"aura_skip_asr": True},
+            },
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        assert len(stage0.add_request_calls) == 0
+        assert stage1.add_request_calls[0][0].request_id == "req-skip-asr"
+        assert stage1.add_request_calls[0][0].prompt_token_ids == [7, 8, 9]
+
+        stage1.push_engine_core_outputs(_engine_core_outputs("stage1-raw", 2.0))
+        output_msg = await _get_output_message(orchestrator_fixture)
+
+        assert output_msg.request_id == "req-skip-asr"
+        assert output_msg.stage_id == 1
+        assert output_msg.finished is True
+        assert "req-skip-asr" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
 def test_orchestrator_does_not_re_introduce_global_stats_throttle() -> None:
     """Regression: each (stage, replica) must independently publish its wrapped
     vllm:* stats when its scheduler emits non-None scheduler_stats.

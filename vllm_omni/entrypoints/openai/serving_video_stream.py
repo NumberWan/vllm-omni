@@ -33,16 +33,17 @@ import numpy as np
 from pydantic import Field
 
 from vllm_omni.entrypoints.openai.aura_cross_turn_penalty import CrossTurnPenalty
+from vllm_omni.entrypoints.openai.aura_session_store import (
+    create_session_id,
+    register_session,
+    unregister_session,
+)
 from vllm_omni.entrypoints.openai.aura_session_history import (
     DEFAULT_AURA_SYSTEM_PROMPT,
     SILENT_TEXT,
     SessionHistory,
     is_effectively_silent,
     normalize_assistant_text,
-)
-from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-    pop_turn_transcript,
-    video_tuple_from_aura_turn_video,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
     _BAD_FRAME,
@@ -54,10 +55,6 @@ from vllm_omni.entrypoints.openai.video_stream_base import (
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
     OmniStreamingVideoHandler as OmniStreamingVideoHandlerBase,
-)
-from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-    DEFAULT_QWEN3_TTS_REF_TEXT,
-    default_qwen3_tts_ref_audio_path,
 )
 
 __all__ = [
@@ -71,6 +68,22 @@ __all__ = [
 
 _AURA_OMNI_PIPELINE = "aura_omni"
 _AURA_ADDITIONAL_INFO_KEY = "_aura_additional_information"
+
+
+def _default_qwen3_tts_ref_audio_path() -> str:
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        default_qwen3_tts_ref_audio_path,
+    )
+
+    return default_qwen3_tts_ref_audio_path()
+
+
+def _default_qwen3_tts_ref_text() -> str:
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        DEFAULT_QWEN3_TTS_REF_TEXT,
+    )
+
+    return DEFAULT_QWEN3_TTS_REF_TEXT
 
 
 class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
@@ -193,11 +206,11 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
     tts_language: str = Field(default="English", description="Qwen3-TTS language.")
     tts_instruct: str = Field(default="", description="Optional Qwen3-TTS style instruct.")
     tts_ref_audio: str = Field(
-        default_factory=default_qwen3_tts_ref_audio_path,
+        default_factory=_default_qwen3_tts_ref_audio_path,
         description="Base-mode reference audio path (server-visible).",
     )
     tts_ref_text: str = Field(
-        default=DEFAULT_QWEN3_TTS_REF_TEXT,
+        default_factory=_default_qwen3_tts_ref_text,
         description="Base-mode reference audio transcript.",
     )
     tts_speaker: str = Field(default="Vivian", description="CustomVoice-mode speaker name.")
@@ -217,6 +230,7 @@ class AuraSessionState:
 
     history: SessionHistory
     turn_frame_arrays: list[np.ndarray]
+    session_id: str = ""
     cross_turn_penalty: CrossTurnPenalty | None = None
     pending_turn_video: dict[str, Any] | None = None
 
@@ -261,7 +275,13 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             max_1qna_rounds=aura_config.max_1qna_rounds,
             system_prompt=aura_config.aura_system_prompt or DEFAULT_AURA_SYSTEM_PROMPT,
         )
-        return AuraSessionState(history=history, turn_frame_arrays=[])
+        session_id = create_session_id()
+        register_session(session_id, history)
+        return AuraSessionState(history=history, turn_frame_arrays=[], session_id=session_id)
+
+    def on_session_end(self, message_history: Any) -> None:
+        if isinstance(message_history, AuraSessionState) and message_history.session_id:
+            unregister_session(message_history.session_id)
 
     def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
         config = self._as_aura_config(trigger.config)
@@ -323,12 +343,13 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
         system_prompt = aura_config.aura_system_prompt or DEFAULT_AURA_SYSTEM_PROMPT
         additional_information: dict[str, Any] = {
-            "aura_session_state": message_history.history.to_dict(),
+            "aura_session_id": message_history.session_id,
             "aura_turn_video": {
                 "frames": video_array.tolist(),
                 "metadata": metadata,
             },
             "aura_system_prompt": [system_prompt],
+            "aura_skip_asr": len(audio_buffer) == 0,
         }
         additional_information.update(self._tts_additional_information(aura_config))
         user_message[_AURA_ADDITIONAL_INFO_KEY] = additional_information
@@ -345,6 +366,11 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         del user_message
         if not isinstance(message_history, AuraSessionState):
             return
+
+        from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+            pop_turn_transcript,
+            video_tuple_from_aura_turn_video,
+        )
 
         transcript = pop_turn_transcript(request_id)
         video_tuple = video_tuple_from_aura_turn_video(message_history.pending_turn_video)

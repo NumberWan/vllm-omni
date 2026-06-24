@@ -37,9 +37,22 @@ def test_get_vllm_inputs_includes_video_and_text():
 
     assert "<|video_pad|>" in vllm_inputs["prompt"]
     assert "What is happening?" in vllm_inputs["prompt"]
-    assert vllm_inputs["prompt"].endswith("<|im_start|>assistant\n")
+    assert vllm_inputs["prompt"].endswith("<|im_start|>assistant")
     assert "video" in vllm_inputs["multi_modal_data"]
     assert len(vllm_inputs["multi_modal_data"]["video"]) == 1
+
+
+def test_preview_vllm_inputs_matches_committed_turn():
+    history = SessionHistory()
+    history.add_user_message("first", video_tuple=_video_tuple())
+    history.add_assistant_message("reply")
+
+    preview = history.preview_vllm_inputs("second", video_tuple=_video_tuple(3))
+    history.add_user_message("second", video_tuple=_video_tuple(3))
+    committed = history.get_vllm_inputs()
+
+    assert preview["prompt"] == committed["prompt"]
+    assert len(preview["multi_modal_data"]["video"]) == len(committed["multi_modal_data"]["video"])
 
 
 def test_to_dict_roundtrip_preserves_history():
@@ -95,3 +108,9 @@ def test_pruning_moves_old_rounds_to_context_history():
     assert history._sw_round_count() <= history.max_rounds
     assert len(history._context_history) >= 1
     assert any("question 0" in msg.get("content", "") for qa in history._context_history for msg in qa)
+    for qa in history._context_history:
+        for msg in qa:
+            content = msg.get("content", "")
+            assert isinstance(content, str), "context_history stores text-only user/assistant content"
+            assert "<|video_pad|>" not in content
+            assert content != "<|silent|>"

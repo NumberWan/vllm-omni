@@ -166,14 +166,30 @@ def _clean_asr_transcript(text: str) -> str:
     return cleaned.strip()
 
 
+def _normalize_request_id_for_transcript(request_id: str) -> str:
+    """Map AsyncOmni internal ids (``{external}-{uuid8}``) to the external id.
+
+    ``AsyncOmni.generate()`` rewrites ``request_id`` to an internal orchestrator id
+    while the streaming handler keeps the external id for ``on_turn_complete``.
+    Transcript storage must use the external id so ``pop_turn_transcript`` works.
+    """
+    rid = str(request_id).strip()
+    if not rid:
+        return rid
+    head, tail = rid.rsplit("-", 1)
+    if len(tail) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in tail):
+        return head
+    return rid
+
+
 def record_turn_transcript(request_id: str, transcript: str) -> None:
-    _TURN_TRANSCRIPTS_BY_REQUEST[str(request_id)] = transcript
+    _TURN_TRANSCRIPTS_BY_REQUEST[_normalize_request_id_for_transcript(request_id)] = transcript
 
 
 def pop_turn_transcript(request_id: str | None) -> str:
     if not request_id:
         return ""
-    return _TURN_TRANSCRIPTS_BY_REQUEST.pop(str(request_id), "")
+    return _TURN_TRANSCRIPTS_BY_REQUEST.pop(_normalize_request_id_for_transcript(str(request_id)), "")
 
 
 def _extract_token_ids(source_output: Any) -> list[int]:
@@ -660,14 +676,24 @@ def asr2aura_session(
     prompt: Any = None,
     requires_multimodal_data: bool = True,
 ) -> list[dict[str, Any]]:
-    """Build AURA prompts from ASR transcripts and serialized SessionHistory state."""
+    """Build AURA prompts from ASR transcripts and server-side or serialized SessionHistory."""
+    from vllm_omni.entrypoints.openai.aura_session_store import get_session_history
+
     prompt_by_request_id = _source_prompt_by_request_id(source_outputs, prompt)
     next_inputs: list[dict[str, Any]] = []
 
     for idx, source_output in enumerate(source_outputs):
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
-        if additional_info.get("aura_session_state") is None:
+        session_id = additional_info.get("aura_session_id")
+        history = get_session_history(str(session_id)) if session_id else None
+        if session_id and history is None:
+            logger.warning(
+                "AURA session_id=%s not found in server-side store; "
+                "falling back to aura_session_state or single-turn asr2aura",
+                session_id,
+            )
+        if history is None and additional_info.get("aura_session_state") is None:
             [next_input] = asr2aura(
                 [source_output],
                 prompt=[src_prompt],
@@ -677,12 +703,15 @@ def asr2aura_session(
             continue
 
         request_id = str(getattr(source_output, "request_id", idx))
-        history = SessionHistory.from_dict(additional_info["aura_session_state"])
         transcript = _clean_asr_transcript(_extract_text(source_output))
         record_turn_transcript(request_id, transcript)
         video_tuple = video_tuple_from_aura_turn_video(additional_info.get("aura_turn_video"))
-        history.add_user_message(transcript, video_tuple=video_tuple)
-        vllm_inputs = history.get_vllm_inputs()
+        if history is None:
+            history = SessionHistory.from_dict(additional_info["aura_session_state"])
+            history.add_user_message(transcript, video_tuple=video_tuple)
+            vllm_inputs = history.get_vllm_inputs()
+        else:
+            vllm_inputs = history.preview_vllm_inputs(transcript, video_tuple=video_tuple)
         logger.info(
             "AURA turn prompt request_id=%s transcript=%r: %s",
             getattr(source_output, "request_id", idx),

@@ -184,6 +184,10 @@ class OmniStreamingVideoHandler:
     ) -> None:
         raise NotImplementedError
 
+    def on_session_end(self, message_history: Any) -> None:
+        """Hook when a WebSocket session ends (default: no-op)."""
+        del message_history
+
     def create_message_history(self, config: StreamingVideoSessionConfig) -> Any:
         """Per-session conversation state (default: empty OpenAI-style list)."""
         return []
@@ -557,6 +561,7 @@ class OmniStreamingVideoHandler:
                 await _gather_pending_query_tasks()
                 if query_task is not None and not query_task.done():
                     await _cancel_active_query(abort_now=True)
+                self.on_session_end(message_history)
 
         except WebSocketDisconnect:
             logger.info("Streaming video: client disconnected")

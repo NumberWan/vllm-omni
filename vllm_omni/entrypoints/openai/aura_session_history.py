@@ -50,7 +50,7 @@ class SessionHistory:
         self,
         max_rounds: int = 20,
         num_rounds_keep: int = 15,
-        pruning_enabled: bool = False,
+        pruning_enabled: bool = True,
         max_context_qas: int = 10,
         max_1qna_rounds: int = 4,
         system_prompt: str | None = None,
@@ -296,15 +296,39 @@ class SessionHistory:
         self._sliding_window.append(msg)
         self.history.append(msg)
 
+    def preview_vllm_inputs(
+        self,
+        text: str = "",
+        video_tuple: tuple[Any, dict[str, Any]] | None = None,
+        images: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build prompt/mm inputs for a pending user turn without mutating history."""
+        pending_content: list[dict[str, Any]] = []
+        if video_tuple:
+            pending_content.append({"type": "video", "video": video_tuple})
+        elif images:
+            pending_content.extend([{"type": "image", "image": img} for img in images])
+        if text:
+            pending_content.append({"type": "text", "text": text})
+
+        messages = list(self.history)
+        if pending_content:
+            messages.append({"role": "user", "content": pending_content})
+        return self._messages_to_vllm_inputs(messages)
+
     def get_vllm_inputs(self) -> dict[str, Any]:
+        return self._messages_to_vllm_inputs(self.history)
+
+    @staticmethod
+    def _messages_to_vllm_inputs(messages: list[dict[str, Any]]) -> dict[str, Any]:
         full_prompt = ""
         all_images: list[Any] = []
         all_videos: list[Any] = []
 
-        for msg in self.history:
+        for msg in messages:
             role = msg["role"]
             content = msg["content"]
-            full_prompt += f"<|im_start|>{role}\n"
+            full_prompt += f"<|im_start|>{role}"
 
             if isinstance(content, str):
                 full_prompt += content
@@ -321,7 +345,7 @@ class SessionHistory:
 
             full_prompt += "<|im_end|>"
 
-        full_prompt += "<|im_start|>assistant\n"
+        full_prompt += "<|im_start|>assistant"
 
         multi_modal_data: dict[str, Any] = {}
         if all_images:
@@ -433,7 +457,7 @@ class SessionHistory:
         history = cls(
             max_rounds=int(data.get("max_rounds", 20)),
             num_rounds_keep=int(data.get("num_rounds_keep", 15)),
-            pruning_enabled=bool(data.get("pruning_enabled", False)),
+            pruning_enabled=bool(data.get("pruning_enabled", True)),
             max_context_qas=int(data.get("max_context_qas", 10)),
             max_1qna_rounds=int(data.get("max_1qna_rounds", 4)),
             system_prompt=data.get("system_prompt"),
