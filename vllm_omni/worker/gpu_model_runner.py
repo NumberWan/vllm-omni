@@ -1497,18 +1497,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             req_state = self.requests.get(req_id)
             if req_state is None:
                 return
-            previous_keys = sorted(self.model_intermediate_buffer.get(req_id, {}).keys())
             self.model_intermediate_buffer[req_id] = {}
             self._update_intermediate_buffer(req_id, payload_info)
-            logger.info(
-                "[OMNI] Replaced model_intermediate_buffer for fresh chunk req=%s "
-                "previous_keys=%s new_keys=%s req_num_computed=%s req_output_tokens=%s",
-                req_id,
-                previous_keys,
-                sorted(payload_info.keys()),
-                getattr(req_state, "num_computed_tokens", None),
-                len(getattr(req_state, "output_token_ids", []) or []),
-            )
+
             return
         self._update_intermediate_buffer(req_id, payload_info)
 

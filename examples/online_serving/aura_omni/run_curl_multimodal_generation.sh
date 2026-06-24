@@ -5,6 +5,7 @@ PORT="${PORT:-8091}"
 MODEL="${MODEL:-aurateam/AURA}"
 OUTPUT_DIR="${OUTPUT_DIR:-output_aura_omni_online}"
 TTS_PASS_TOKEN_IDS="${TTS_PASS_TOKEN_IDS:-false}"
+AURA_TTS_FULL_RESPONSE="${AURA_TTS_FULL_RESPONSE:-true}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_OMNI_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 CLONE_REF_AUDIO="${VLLM_OMNI_ROOT}/tests/assets/qwen3_tts/clone_2.wav"
@@ -25,21 +26,22 @@ request_body=$(cat <<EOF
     {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "max_tokens": 65536, "seed": 42, "repetition_penalty": 1.0}
   ],
   "additional_information": {
-    "aura_system_prompt": "You are receiving a live video stream where the final frame is the present moment. Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in English.",
+    "aura_system_prompt": "You are receiving a live video stream where the final frame is the present moment. Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in Chinese.",
     "tts_task_type": "Base",
     "tts_ref_audio": "file://${CLONE_REF_AUDIO}",
     "tts_ref_text": "${CLONE_REF_TEXT}",
     "tts_language": "English",
     "tts_speaker": "Vivian",
     "tts_instruct": "",
-    "tts_pass_token_ids": ${TTS_PASS_TOKEN_IDS}
+    "tts_pass_token_ids": ${TTS_PASS_TOKEN_IDS},
+    "aura_tts_full_response": ${AURA_TTS_FULL_RESPONSE}
   },
   "messages": [{
     "role": "user",
     "content": [
       {"type": "audio_url", "audio_url": {"url": "$MARY_HAD_LAMB_AUDIO_URL"}},
       {"type": "video_url", "video_url": {"url": "$SAMPLE_VIDEO_URL"}},
-      {"type": "text", "text": "Use the audio and video together to decide whether a reply is needed. If needed, respond briefly in English."}
+      {"type": "text", "text": "Use the audio and video together to decide whether a reply is needed. If needed, respond briefly."}
     ]
   }]
 }

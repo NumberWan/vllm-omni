@@ -811,9 +811,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         }
         if trailing_text_update is not None:
             info_update["hidden_states"] = {"trailing_text": trailing_text_update.detach()}
-        logger.info("[Qwen3-TTS preprocess] info_update: %s", info_update)
-        logger.info("[Qwen3-TTS preprocess] inputs_embeds_out: %s", inputs_embeds_out)
-        logger.info("[Qwen3-TTS preprocess] input_ids: %s", input_ids)
         return input_ids, inputs_embeds_out, info_update
 
     def preprocess_decode_batch(
@@ -822,7 +819,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         req_infos: list[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
-        logger.info("[Qwen3-TTS preprocess_decode_batch] input_ids: %s", input_ids)
         """Batch the decode-only preprocess path for Qwen3-TTS.
 
         This mirrors the scalar decode branch in ``preprocess()``, but performs

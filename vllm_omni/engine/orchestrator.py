@@ -910,10 +910,7 @@ class Orchestrator:
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
         should_forward_stage = stage_id < req_state.final_stage_id and not self.async_chunk
-        should_forward_now = (
-            finished
-            or (req_state.streaming.enabled and req_state.streaming.segment_finished)
-        )
+        should_forward_now = finished or (req_state.streaming.enabled and req_state.streaming.segment_finished)
         allow_repeated_forward = req_state.streaming.enabled
         if (
             should_forward_now
@@ -1481,9 +1478,7 @@ class Orchestrator:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                downstream_resumable = bool(
-                    getattr(source_stage_request, "resumable", req_state.streaming.enabled)
-                )
+                downstream_resumable = bool(getattr(source_stage_request, "resumable", req_state.streaming.enabled))
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,

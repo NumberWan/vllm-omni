@@ -10,13 +10,12 @@ from pathlib import Path
 from typing import Any
 
 import soundfile as sf
-
-from vllm_omni.inputs.data import OmniTokensPrompt
 import torch
 from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
@@ -120,6 +119,15 @@ def _aura_tts_chunk_tokens(transfer_manager: Any, additional_info: dict[str, Any
     return max(1, configured)
 
 
+def _aura_tts_full_response(transfer_manager: Any, additional_info: dict[str, Any]) -> bool:
+    request_override = additional_info.get("aura_tts_full_response", additional_info.get("tts_aura_full_response"))
+    if request_override is not None:
+        return _first_bool(request_override, False)
+
+    cfg = _connector_extra_config(transfer_manager)
+    return _first_bool(cfg.get("aura_tts_full_response"), False)
+
+
 def _normalize_qwen3_tts_speaker(speaker: Any) -> Any:
     if not isinstance(speaker, str):
         return speaker
@@ -209,8 +217,21 @@ def _is_silent_token_prefix(content_ids: list[int]) -> bool:
 def _request_additional_info(request: Any) -> dict[str, Any]:
     raw_info = getattr(request, "additional_information", None)
     if isinstance(raw_info, dict):
-        return raw_info
-    return deserialize_additional_information(raw_info)
+        info = raw_info
+    else:
+        info = deserialize_additional_information(raw_info)
+
+    nested_info = info.get("additional_information") if isinstance(info, dict) else None
+    if nested_info is not None:
+        nested_info = deserialize_additional_information(nested_info)
+        if isinstance(nested_info, dict):
+            # Connector payloads wrap the original OpenAI request metadata under
+            # `additional_information`; expose those tts_* keys at the level
+            # consumed by asr2aura/aura2tts while preserving explicit top-level
+            # overrides.
+            info = {**nested_info, **info}
+
+    return info
 
 
 def _request_output_text(request: Any) -> str:
@@ -238,11 +259,18 @@ def _clean_asr_text(text: Any) -> str:
     return " ".join(cleaned.split()).strip()
 
 
+def _clean_tts_text(text: Any) -> str:
+    if not isinstance(text, str):
+        return ""
+    return " ".join(text.split()).strip()
+
+
 def _tts_info_and_prompt_len(
     additional_info: dict[str, Any],
     *,
     assistant_token_ids: list[int],
     text: str,
+    prompt_len_token_ids: list[int] | None = None,
 ) -> tuple[dict[str, Any], int]:
     task_type_raw = additional_info.get("tts_task_type")
     task_type = task_type_raw[0] if isinstance(task_type_raw, list) and task_type_raw else task_type_raw or "Base"
@@ -264,11 +292,27 @@ def _tts_info_and_prompt_len(
     }
     if assistant_token_ids:
         tts_info[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids]
-        prompt_len = _estimate_tts_prompt_len_from_token_ids(assistant_token_ids)
+        prompt_len = _estimate_tts_prompt_len_from_token_ids(
+            assistant_token_ids,
+            task_type=str(task_type),
+            language=str(language),
+            instruct=str(instruct),
+        )
     else:
+        text = _clean_tts_text(text)
         tts_info["text"] = [text]
         text_token_count_proxy = max(1, len(text)) if isinstance(text, str) else 1
-        prompt_len = _estimate_tts_prompt_len_from_token_ids([0] * text_token_count_proxy)
+        token_ids_for_len = (
+            prompt_len_token_ids
+            if prompt_len_token_ids
+            else [0] * (text_token_count_proxy + len(QWEN_ASSISTANT_PREFIX_IDS) + len(QWEN_ASSISTANT_SUFFIX_IDS))
+        )
+        prompt_len = _estimate_tts_prompt_len_from_token_ids(
+            token_ids_for_len,
+            task_type=str(task_type),
+            language=str(language),
+            instruct=str(instruct),
+        )
 
     if task_type == "Base":
         ref_audio_raw = additional_info.get("tts_ref_audio")
@@ -302,26 +346,12 @@ def _tts_info_and_prompt_len(
         if ref_text:
             tts_info["ref_text"] = [ref_text]
         tts_info["x_vector_only_mode"] = [x_vector_only_mode]
-        logger.info(
-            "[aura_tts_info] task=Base prompt_len=%d has_ref_audio=%s ref_audio=%s ref_text_len=%d "
-            "x_vector_only_mode=%s text_ids=%s",
-            prompt_len,
-            bool(ref_audio),
-            ref_audio,
-            len(str(ref_text or "")),
-            x_vector_only_mode,
-            bool(assistant_token_ids),
-        )
+
     elif task_type == "CustomVoice":
         speaker_raw = additional_info.get("tts_speaker")
         speaker = speaker_raw[0] if isinstance(speaker_raw, list) and speaker_raw else speaker_raw or "Vivian"
         tts_info["speaker"] = [_normalize_qwen3_tts_speaker(speaker)]
-        logger.info(
-            "[aura_tts_info] task=CustomVoice prompt_len=%d speaker=%s text_ids=%s",
-            prompt_len,
-            tts_info["speaker"][0],
-            bool(assistant_token_ids),
-        )
+
     return tts_info, prompt_len
 
 
@@ -349,11 +379,9 @@ def _aura_prompt(system_prompt: str, transcript: str, multi_modal_data: dict[str
     vision = _vision_placeholder(multi_modal_data)
     query = transcript.strip()
     user_body = f"{vision}{query}" if query else vision
-    logger.info("[aura_prompt] user_body=%s has_vision=%s", user_body, bool(vision))
+
     return (
-        f"<|im_start|>system{system_prompt}<|im_end|>"
-        f"<|im_start|>user{user_body}<|im_end|>"
-        "<|im_start|>assistant"
+        f"<|im_start|>system\n{system_prompt}<|im_end|><|im_start|>user\n{user_body}<|im_end|><|im_start|>assistant\n"
     )
 
 
@@ -392,7 +420,7 @@ def asr2aura(
         tts_additional_info = {
             key: value
             for key, value in additional_info.items()
-            if isinstance(key, str) and (key.startswith("tts_") or key == "aura_tts_chunk_tokens")
+            if isinstance(key, str) and (key.startswith("tts_") or key.startswith("aura_tts_"))
         }
         if tts_additional_info:
             next_input["additional_information"] = tts_additional_info
@@ -437,7 +465,6 @@ def asr2aura_async_chunk(
         return None
 
     tokenizer = cached_tokenizer_from_config(transfer_manager.config)
-    logger.info("[asr2aura_async_chunk] tokenizer=%s", type(tokenizer).__name__)
     if not state.get("asr_text"):
         token_ids = _ensure_int_list(getattr(request, "output_token_ids", []) or [])
         if token_ids:
@@ -473,16 +500,11 @@ def asr2aura_async_chunk(
     tts_additional_info = {
         key: value
         for key, value in additional_info.items()
-        if isinstance(key, str) and (key.startswith("tts_") or key == "aura_tts_chunk_tokens")
+        if isinstance(key, str) and (key.startswith("tts_") or key.startswith("aura_tts_"))
     }
     if tts_additional_info:
         payload["additional_information"] = tts_additional_info
-    logger.info(
-        "[asr2aura_async_chunk] req=%s emitted AURA input payload=%s mm_keys=%s",
-        request_id,
-        payload,
-        sorted(multi_modal_data.keys()),
-    )
+
     return payload
 
 
@@ -704,23 +726,13 @@ def aura2tts_async_chunk(
     content_ids = _trim_aura_response_token_ids(_ensure_int_list(getattr(request, "output_token_ids", []) or []))
     finished = bool(is_finished or request.is_finished())
     if not content_ids:
-        logger.info(
-            "[aura2tts_async_chunk] req=%s no content ids yet finished=%s",
-            getattr(request, "request_id", None),
-            finished,
-        )
         return None
     if _is_silent_token_prefix(content_ids):
-        logger.info(
-            "[aura2tts_async_chunk] req=%s holding silent token prefix: token_count=%d finished=%s",
-            getattr(request, "request_id", None),
-            len(content_ids),
-            finished,
-        )
         return None
 
     additional_info = _request_additional_info(request)
     pass_token_ids = _first_bool(additional_info.get("tts_pass_token_ids"), False)
+    full_response = _aura_tts_full_response(transfer_manager, additional_info)
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     request_payload = getattr(transfer_manager, "request_payload", None)
     if request_payload is None:
@@ -733,13 +745,30 @@ def aura2tts_async_chunk(
 
     chunk_tokens = _aura_tts_chunk_tokens(transfer_manager, additional_info)
     last_token_count = int(state.get("aura_tts_last_token_count", 0) or 0)
+    if full_response and not finished:
+        return None
+    if full_response:
+        last_token_count = 0
+        state["aura_tts_last_token_count"] = 0
+        state["aura_tts_last_text_len"] = 0
+        state["aura_tts_static_info_sent"] = False
     delta_content_ids = content_ids[last_token_count:]
     if not finished and len(delta_content_ids) < chunk_tokens:
         return None
 
-    request_text = _request_output_text(request).strip()
+    request_text = _clean_tts_text(_request_output_text(request))
+    if not request_text and not pass_token_ids:
+        try:
+            tokenizer = cached_tokenizer_from_config(transfer_manager.config)
+            request_text = _clean_tts_text(tokenizer.decode(content_ids))
+
+        except Exception:
+            logger.exception(
+                "[aura2tts_async_chunk] req=%s failed to decode AURA token ids; falling back to token ids",
+                getattr(request, "request_id", None),
+            )
     last_text_len = int(state.get("aura_tts_last_text_len", 0) or 0)
-    delta_text = request_text[last_text_len:] if request_text else ""
+    delta_text = _clean_tts_text(request_text[last_text_len:]) if request_text else ""
 
     if not delta_content_ids and not delta_text:
         return None
@@ -752,6 +781,7 @@ def aura2tts_async_chunk(
         additional_info,
         assistant_token_ids=assistant_token_ids if use_token_ids else [],
         text=delta_text,
+        prompt_len_token_ids=assistant_token_ids if not use_token_ids else None,
     )
     dynamic_key = PRECOMPUTED_TEXT_IDS_KEY if use_token_ids else "text"
     static_tts_info = {key: value for key, value in tts_info.items() if key != dynamic_key}
@@ -772,16 +802,8 @@ def aura2tts_async_chunk(
     state["aura_tts_last_token_count"] = len(content_ids)
     if request_text:
         state["aura_tts_last_text_len"] = len(request_text)
-    logger.info(
-        "[aura2tts_async_chunk] req=%s ext_req=%s finished=%s token_count=%d prompt_len=%d "
-        "chunk_tokens=%d mode=%s payload=%s",
-        getattr(request, "request_id", None),
-        request_id,
-        finished,
-        len(delta_content_ids),
-        prompt_len,
-        chunk_tokens,
-        "token_ids" if use_token_ids else "text",
-        payload,
-    )
+    mode = "token_ids" if use_token_ids else "text"
+    if full_response:
+        mode = f"full_{mode}"
+
     return payload

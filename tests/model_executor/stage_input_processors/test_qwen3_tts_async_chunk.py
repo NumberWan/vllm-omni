@@ -99,6 +99,29 @@ def test_flush_on_finish():
     assert len(p.codes.audio) == _Q * 24
 
 
+def test_finished_flush_advances_frame_cursor_to_avoid_repeated_audio():
+    tm = _tm(chunk_frames=25, left_context=72, initial_chunk_frames=1)
+
+    first = _call(tm, "r", n_frames=1)
+    assert first is not None
+    assert first.meta.left_context_size == 0
+    assert len(first.codes.audio) == _Q * 1
+
+    flushed = _call(tm, "r", n_frames=21, finished=True)
+    assert flushed is not None
+    assert flushed.meta.left_context_size == 1
+    assert len(flushed.codes.audio) == _Q * 21
+
+    # Regression: the old modulo-based scheduler emitted frames 2..26 here,
+    # repeating the 20 frames already flushed above.
+    assert _call(tm, "r", n_frames=26) is None
+
+    next_full = _call(tm, "r", n_frames=46)
+    assert next_full is not None
+    assert next_full.meta.left_context_size == 21
+    assert len(next_full.codes.audio) == _Q * 46
+
+
 _CASES = [
     # ── IC boundary rule ──────────────────────────────────────────────
     # initial_codec_chunk_frames only controls the first emitted chunk.
