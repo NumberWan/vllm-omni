@@ -677,15 +677,6 @@ def test_resolve_pipeline_name_from_aura_deploy_yaml():
 
 
 def test_create_streaming_video_handler_defaults_to_qwen():
-    from pathlib import Path
-
-    from vllm_omni.config.stage_config import resolve_pipeline_name_from_config_path
-
-    deploy_path = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "aura_omni.yaml"
-    assert resolve_pipeline_name_from_config_path(deploy_path) == "aura_omni"
-
-
-def test_create_streaming_video_handler_defaults_to_qwen():
     from unittest.mock import MagicMock
 
     from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
