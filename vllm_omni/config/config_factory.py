@@ -63,6 +63,11 @@ class StageConfigFactory:
         if cli_overrides is None:
             cli_overrides = {}
 
+        # When the caller passes --deploy-config, honor its ``pipeline:`` field
+        # before HF model_type auto-detection. AURA's stage-1 checkpoint reports
+        # ``qwen3_vl``, which is not a pipeline registry key; without this path
+        # create_from_model returns None and the server falls back to a single
+        # diffusion stage.
         if deploy_config_path is not None:
             deploy_path = Path(deploy_config_path)
             if deploy_path.exists():

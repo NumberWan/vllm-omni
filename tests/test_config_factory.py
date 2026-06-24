@@ -1547,6 +1547,23 @@ class TestAuraOmniDeploy:
         assert deploy.pipeline == "aura_omni"
         assert deploy.async_chunk is True
 
+    def test_create_from_model_aura_checkpoint_with_explicit_deploy(self):
+        """``/models/AURA`` reports qwen3_vl; explicit deploy must still load aura_omni."""
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni.yaml"
+        stages = StageConfigFactory.create_from_model(
+            "/models/AURA",
+            cli_overrides={"trust_remote_code": True},
+            deploy_config_path=str(deploy_path),
+        )
+        assert stages is not None
+        assert len(stages) == 4
+        assert [stage.model_stage for stage in stages] == [
+            "asr",
+            "aura",
+            "qwen3_tts",
+            "code2wav",
+        ]
+
     def test_aura_omni_deploy_resolves_four_native_stages(self):
         pipeline_cfg = StageConfigFactory.resolve_pipeline_config("aura_omni")
 
