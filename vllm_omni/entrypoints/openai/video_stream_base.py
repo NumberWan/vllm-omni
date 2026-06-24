@@ -365,9 +365,7 @@ class OmniStreamingVideoHandler:
                 if self.releases_turn_after_text_done():
                     turn_busy = is_turn_locked
                 else:
-                    turn_busy = active_request_id is not None or (
-                        query_task is not None and not query_task.done()
-                    )
+                    turn_busy = active_request_id is not None or (query_task is not None and not query_task.done())
                 if turn_busy:
                     if self.supports_query_interrupt():
                         await _cancel_active_query()
@@ -495,11 +493,7 @@ class OmniStreamingVideoHandler:
                         is_generating = active_request_id is not None or (
                             query_task is not None and not query_task.done()
                         )
-                        trigger_turn_locked = (
-                            is_turn_locked
-                            if self.releases_turn_after_text_done()
-                            else is_generating
-                        )
+                        trigger_turn_locked = is_turn_locked if self.releases_turn_after_text_done() else is_generating
                         if self.should_trigger_turn(
                             VideoStreamTurnTrigger(
                                 frame_count=self.auto_trigger_frame_count(

@@ -19,9 +19,7 @@ DEFAULT_AURA_SYSTEM_PROMPT = (
 
 # Same set used by CrossTurnPenalty to skip non-content tokens; extended with
 # common CJK filler glyphs (e.g. ﹑) that models emit instead of <|silent|>.
-AURA_PUNCT_CHARS = frozenset(
-    ".,!?;:，。！？；：、'\"()[]{}""''…—–\n\t\r /-_@#$%^&*+=<>~`|\\（）【】《》﹑·"
-)
+AURA_PUNCT_CHARS = frozenset(".,!?;:，。！？；：、'\"()[]{}''…—–\n\t\r /-_@#$%^&*+=<>~`|\\（）【】《》﹑·")
 
 __all__ = [
     "AURA_PUNCT_CHARS",
@@ -486,9 +484,7 @@ class SessionHistory:
             system_prompt=data.get("system_prompt"),
         )
         history.current_rounds = int(data.get("current_rounds", 0))
-        history._context_history = [
-            history._deserialize_messages(qa) for qa in data.get("context_history", [])
-        ]
+        history._context_history = [history._deserialize_messages(qa) for qa in data.get("context_history", [])]
         history._sliding_window = history._deserialize_messages(data.get("sliding_window", []))
         history._system_msg = {"role": "system", "content": history.system_prompt}
         history._rebuild_history()

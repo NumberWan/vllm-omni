@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory, clear_all_sessions, register_session
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
@@ -17,7 +18,6 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     pop_turn_transcript,
     record_turn_transcript,
 )
-from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory, clear_all_sessions, register_session
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -137,20 +137,23 @@ def test_asr2aura_session_uses_server_side_store():
     history = SessionHistory(pruning_enabled=False)
     session_id = "aura-store-test"
     register_session(session_id, history)
-    history.add_user_message("prior round", video_tuple=(
-        [
-            [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
-            [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
-        ],
-        {
-            "fps": 2.0,
-            "duration": 1.0,
-            "total_num_frames": 2,
-            "frames_indices": [0, 1],
-            "video_backend": "opencv",
-            "do_sample_frames": False,
-        },
-    ))
+    history.add_user_message(
+        "prior round",
+        video_tuple=(
+            [
+                [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
+                [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
+            ],
+            {
+                "fps": 2.0,
+                "duration": 1.0,
+                "total_num_frames": 2,
+                "frames_indices": [0, 1],
+                "video_backend": "opencv",
+                "do_sample_frames": False,
+            },
+        ),
+    )
     history.add_assistant_message("ack")
 
     prompt = {

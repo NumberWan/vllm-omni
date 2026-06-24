@@ -201,7 +201,7 @@ def _write_final_report(log_dir: Path, state: SoakState, deadline_hit: bool) -> 
     lines = [
         "# AURA Streaming Soak — Final Report",
         "",
-        f"- Started: see soak.log",
+        "- Started: see soak.log",
         f"- Status: **{state.status}**",
         f"- Consecutive passes: **{state.consecutive_pass}**",
         f"- Total full runs: {state.total_full_runs}",
@@ -217,8 +217,7 @@ def _write_final_report(log_dir: Path, state: SoakState, deadline_hit: bool) -> 
         lines.append("")
         for rec in state.runs[-15:]:
             lines.append(
-                f"- {rec.kind} #{rec.run_id}: {'PASS' if rec.passed else 'FAIL'} "
-                f"({rec.duration_s:.0f}s) {rec.reasons}"
+                f"- {rec.kind} #{rec.run_id}: {'PASS' if rec.passed else 'FAIL'} ({rec.duration_s:.0f}s) {rec.reasons}"
             )
     lines.extend(
         [
@@ -370,8 +369,7 @@ def run_soak(target_consecutive: int, max_hours: float, health_timeout_s: float)
                 if full_result.passed:
                     state.consecutive_pass += 1
                     _log(
-                        f"full demo #{run_id} PASSED "
-                        f"(consecutive={state.consecutive_pass}/{target_consecutive})",
+                        f"full demo #{run_id} PASSED (consecutive={state.consecutive_pass}/{target_consecutive})",
                         log_dir,
                     )
                 else:

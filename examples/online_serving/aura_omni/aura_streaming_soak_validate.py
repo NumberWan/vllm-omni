@@ -140,9 +140,7 @@ def validate_aura_prompt_logs(server_log: str) -> ValidationResult:
             videos = entry.get("videos") or []
             min_videos = min(idx - 1, 2)
             if len(videos) < min_videos:
-                result.fail(
-                    f"turn {idx}: videos length {len(videos)} < expected {min_videos}"
-                )
+                result.fail(f"turn {idx}: videos length {len(videos)} < expected {min_videos}")
 
     return result
 

@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 from vllm_omni.entrypoints.openai.aura_cross_turn_penalty import CrossTurnPenalty
