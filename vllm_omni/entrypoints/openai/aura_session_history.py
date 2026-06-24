@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import threading
+import uuid
 from typing import Any
 
 import numpy as np
@@ -23,6 +25,11 @@ __all__ = [
     "SILENT_TEXT",
     "is_effectively_silent",
     "normalize_assistant_text",
+    "create_session_id",
+    "register_session",
+    "get_session_history",
+    "unregister_session",
+    "clear_all_sessions",
 ]
 
 
@@ -470,3 +477,33 @@ class SessionHistory:
         history._system_msg = {"role": "system", "content": history.system_prompt}
         history._rebuild_history()
         return history
+
+
+# In-process registry: aura_session_id -> SessionHistory (per WebSocket session).
+_SESSION_LOCK = threading.Lock()
+_SESSIONS: dict[str, SessionHistory] = {}
+
+
+def create_session_id() -> str:
+    return f"aura-{uuid.uuid4().hex}"
+
+
+def register_session(session_id: str, history: SessionHistory) -> None:
+    with _SESSION_LOCK:
+        _SESSIONS[session_id] = history
+
+
+def get_session_history(session_id: str) -> SessionHistory | None:
+    with _SESSION_LOCK:
+        return _SESSIONS.get(session_id)
+
+
+def unregister_session(session_id: str) -> None:
+    with _SESSION_LOCK:
+        _SESSIONS.pop(session_id, None)
+
+
+def clear_all_sessions() -> None:
+    """Clear all registered sessions (for tests)."""
+    with _SESSION_LOCK:
+        _SESSIONS.clear()

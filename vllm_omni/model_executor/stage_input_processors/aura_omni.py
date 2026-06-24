@@ -291,7 +291,7 @@ def asr2aura_session(
     requires_multimodal_data: bool = True,
 ) -> list[dict[str, Any]]:
     """Build AURA prompts from ASR transcripts and server-side or serialized SessionHistory."""
-    from vllm_omni.entrypoints.openai.aura_session_store import get_session_history
+    from vllm_omni.entrypoints.openai.aura_session_history import get_session_history
 
     prompt_by_request_id = _source_prompt_by_request_id(source_outputs, prompt)
     next_inputs: list[dict[str, Any]] = []

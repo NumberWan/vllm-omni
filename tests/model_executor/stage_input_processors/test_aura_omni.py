@@ -17,7 +17,7 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     pop_turn_transcript,
     record_turn_transcript,
 )
-from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory
+from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory, clear_all_sessions, register_session
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -133,8 +133,6 @@ def test_asr2aura_session_restores_history_and_turn_video():
 
 
 def test_asr2aura_session_uses_server_side_store():
-    from vllm_omni.entrypoints.openai.aura_session_store import clear_all_sessions, register_session
-
     clear_all_sessions()
     history = SessionHistory(pruning_enabled=False)
     session_id = "aura-store-test"

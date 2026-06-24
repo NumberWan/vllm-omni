@@ -13,8 +13,12 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory
-from vllm_omni.entrypoints.openai.aura_session_store import clear_all_sessions, register_session
+from vllm_omni.entrypoints.openai.aura_session_history import (
+    SessionHistory,
+    clear_all_sessions,
+    get_session_history,
+    register_session,
+)
 from vllm_omni.entrypoints.openai.serving_video_stream import (
     AuraSessionState,
     AuraStreamingVideoHandler,
@@ -280,8 +284,6 @@ def test_create_message_history_registers_server_side_store():
     state = handler.create_message_history(config)
 
     assert state.session_id
-    from vllm_omni.entrypoints.openai.aura_session_store import get_session_history
-
     assert get_session_history(state.session_id) is state.history
 
 
@@ -290,8 +292,6 @@ def test_on_session_end_unregisters_server_side_store():
     state = _session_state()
 
     handler.on_session_end(state)
-
-    from vllm_omni.entrypoints.openai.aura_session_store import get_session_history
 
     assert get_session_history(state.session_id) is None
 
