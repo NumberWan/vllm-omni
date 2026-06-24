@@ -10,8 +10,6 @@ from typing import Any
 
 import numpy as np
 
-from vllm_omni.entrypoints.openai.aura_text_utils import is_punctuation_only_text
-
 SILENT_TEXT = "<|silent|>"
 DEFAULT_AURA_SYSTEM_PROMPT = (
     "You are receiving a live video stream where the final frame is the present moment. "
@@ -19,10 +17,18 @@ DEFAULT_AURA_SYSTEM_PROMPT = (
     "Otherwise, output '<|silent|>' to signify silence. Respond in Chinese."
 )
 
+# Same set used by CrossTurnPenalty to skip non-content tokens; extended with
+# common CJK filler glyphs (e.g. ﹑) that models emit instead of <|silent|>.
+AURA_PUNCT_CHARS = frozenset(
+    ".,!?;:，。！？；：、'\"()[]{}""''…—–\n\t\r /-_@#$%^&*+=<>~`|\\（）【】《》﹑·"
+)
+
 __all__ = [
+    "AURA_PUNCT_CHARS",
     "SessionHistory",
     "DEFAULT_AURA_SYSTEM_PROMPT",
     "SILENT_TEXT",
+    "is_punctuation_only_text",
     "is_effectively_silent",
     "normalize_assistant_text",
     "create_session_id",
@@ -31,6 +37,16 @@ __all__ = [
     "unregister_session",
     "clear_all_sessions",
 ]
+
+
+def is_punctuation_only_text(text: str) -> bool:
+    """True when stripped text is empty or only whitespace / AURA punctuation."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return all(ch.isspace() or ch in AURA_PUNCT_CHARS for ch in stripped)
 
 
 def is_effectively_silent(text: str) -> bool:

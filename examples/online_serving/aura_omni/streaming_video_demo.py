@@ -41,7 +41,7 @@ except ImportError:
 
 
 SILENT_TEXT = "<|silent|>"
-# Keep in sync with vllm_omni.entrypoints.openai.aura_text_utils (avoid importing vllm_omni here).
+# Keep in sync with vllm_omni.entrypoints.openai.aura_session_history (avoid importing vllm_omni here).
 _AURA_PUNCT_CHARS = frozenset(
     ".,!?;:，。！？；：、'\"()[]{}""''…—–\n\t\r /-_@#$%^&*+=<>~`|\\（）【】《》﹑·"
 )
