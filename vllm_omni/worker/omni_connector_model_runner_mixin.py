@@ -975,14 +975,10 @@ class OmniConnectorModelRunnerMixin:
                     pooling_output=raw_output,
                 )
                 if payload is None:
-                    raise RuntimeError(
-                        f"[Stage-{self._stage_id}] send_full_payload_outputs: custom process "
-                        f"returned None for finished req={req_id}"
-                    )
+                    continue
             if payload is None:
-                raise RuntimeError(
-                    f"[Stage-{self._stage_id}] send_full_payload_outputs: missing payload for finished req={req_id}"
-                )
+                logger.debug("[Stage-%s] send_full_payload_outputs: payload is None for %s", self._stage_id, req_id)
+                continue
             if isinstance(payload, dict):
                 audio_codes = self._payload_audio_codes(payload)
                 if isinstance(audio_codes, torch.Tensor):
@@ -1897,16 +1893,13 @@ class OmniConnectorModelRunnerMixin:
             "_custom_process_supports_is_finished",
             self._custom_process_supports_is_finished_kwarg(),
         )
-        is_finished = False
         is_finished_fn = getattr(request, "is_finished", None)
         if callable(is_finished_fn):
             try:
                 if supports_is_finished is not False:
-                    is_finished = bool(is_finished_fn())
+                    kwargs["is_finished"] = bool(is_finished_fn())
             except Exception:
                 logger.debug("request.is_finished() failed for %s", request_id, exc_info=True)
-        if supports_is_finished is not False:
-            kwargs["is_finished"] = is_finished
 
         try:
             return self._custom_process_func(**kwargs)

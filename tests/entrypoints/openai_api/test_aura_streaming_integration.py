@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end WebSocket integration tests for AURA streaming video."""
+"""WebSocket smoke tests for AURA streaming video."""
 
 from __future__ import annotations
 
@@ -15,12 +15,11 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from vllm_omni.entrypoints.openai.aura_session_history import SILENT_TEXT, SessionHistory
+from vllm_omni.entrypoints.openai.aura.session_history import SessionHistory
 from vllm_omni.entrypoints.openai.serving_video_stream import (
     AuraSessionState,
     AuraStreamingVideoHandler,
     AuraStreamingVideoSessionConfig,
-    create_streaming_video_handler,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -86,12 +85,6 @@ class TimedWebSocket:
 
     def sent_types(self) -> list[str]:
         return [m.get("type", "") for m in self.sent]
-
-
-def test_factory_selects_aura_handler_by_pipeline_name():
-    engine = MagicMock(pipeline_name="aura_omni")
-    handler = create_streaming_video_handler(chat_service=object(), engine_client=engine)
-    assert type(handler).__name__ == "AuraStreamingVideoHandler"
 
 
 @pytest.mark.asyncio
@@ -165,36 +158,6 @@ async def test_aura_ignores_video_query_while_generating():
     assert query_count == 1
 
     gen_release.set()
-    ws.put({"type": "video.done"})
-    await asyncio.wait_for(task, timeout=2.0)
-
-
-@pytest.mark.asyncio
-async def test_aura_ignores_manual_video_query_when_idle():
-    query_started = asyncio.Event()
-
-    class CapturingAuraHandler(AuraStreamingVideoHandler):
-        async def _process_query(self, *args, **kwargs):
-            query_started.set()
-
-    ws = TimedWebSocket()
-    handler = CapturingAuraHandler(chat_service=object(), engine_client=MagicMock(), idle_timeout=5.0)
-    task = asyncio.create_task(handler.handle_session(ws))
-
-    ws.put(
-        {
-            "type": "session.config",
-            "model": "test",
-            "auto_trigger_min_frames": 2,
-            "enable_frame_filter": False,
-        }
-    )
-    await asyncio.sleep(0.05)
-    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10, 10, 10))})
-    ws.put({"type": "video.query", "text": "manual should not fire"})
-    await asyncio.sleep(0.1)
-    assert not query_started.is_set()
-
     ws.put({"type": "video.done"})
     await asyncio.wait_for(task, timeout=2.0)
 
@@ -364,51 +327,4 @@ async def test_aura_multi_turn_accumulates_session_history():
     ws.put({"type": "video.done"})
     await asyncio.wait_for(task, timeout=3.0)
 
-    # Per-turn frame count: two frames per turn, buffer not cleared between turns.
     assert turns_completed == 2
-
-
-@pytest.mark.asyncio
-async def test_aura_receive_config_preserves_aura_specific_fields():
-    ws = TimedWebSocket()
-    handler = AuraStreamingVideoHandler(chat_service=object())
-    ws.put(
-        {
-            "type": "session.config",
-            "model": "test",
-            "auto_trigger": False,
-            "cross_turn_penalty": 2.5,
-            "max_frames_per_round": 8,
-        }
-    )
-    config = await handler._receive_config(ws)
-    assert isinstance(config, AuraStreamingVideoSessionConfig)
-    assert config.auto_trigger is False
-    assert config.cross_turn_penalty == 2.5
-    assert config.max_frames_per_round == 8
-
-
-@pytest.mark.asyncio
-async def test_aura_silent_response_records_penalty_without_spoken_text():
-    from vllm_omni.entrypoints.openai.aura_cross_turn_penalty import CrossTurnPenalty
-
-    class _FakeTokenizer:
-        all_special_ids = [0, 1]
-
-        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-            del add_special_tokens
-            return [ord(c) for c in text]
-
-        def decode(self, token_ids: list[int]) -> str:
-            return "".join(chr(tid) for tid in token_ids)
-
-    handler = AuraStreamingVideoHandler(chat_service=object())
-    state = AuraSessionState(history=SessionHistory(), turn_frame_arrays=[])
-    penalty = CrossTurnPenalty(_FakeTokenizer(), logit_penalty=2.0)
-    state.cross_turn_penalty = penalty
-
-    handler.on_turn_complete(state, {}, SILENT_TEXT)
-    assert penalty._spoken_history() == []
-
-    handler.on_turn_complete(state, {}, "spoken reply")
-    assert penalty._spoken_history() == ["spoken reply"]

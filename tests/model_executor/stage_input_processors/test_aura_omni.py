@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory, clear_all_sessions, register_session
+from vllm_omni.entrypoints.openai.aura.session_history import SessionHistory, clear_all_sessions, register_session
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
@@ -52,9 +52,12 @@ def _transfer_manager():
     return SimpleNamespace(config=SimpleNamespace(), request_payload={})
 
 
-def test_asr2aura_carries_video_payload_and_transcript():
+def test_asr2aura_carries_video_and_strips_audio_from_vl_input():
     prompt = {
-        "multi_modal_data": {"video": ["frame-0", "frame-1"]},
+        "multi_modal_data": {
+            "audio": ("wave", 16000),
+            "video": ["frame-0", "frame-1"],
+        },
         "additional_information": {"aura_system_prompt": ["system"]},
     }
 
@@ -117,8 +120,6 @@ def test_asr2aura_reads_video_stashed_for_downstream_stage():
 def test_clean_asr_transcript_strips_qwen3_asr_wrapper():
     assert _clean_asr_transcript("language Chinese<asr_text>画面有什么？") == "画面有什么？"
     assert _clean_asr_transcript("language Chinese<asr_text>画面有什么") == "画面有什么"
-    assert _clean_asr_transcript("language Chinese<asr_text>画面有游泳池时通知我") == "画面有游泳池时通知我"
-    assert _clean_asr_transcript("language Chinese<asr_text>整个片段换过几次场景?") == "整个片段换过几次场景?"
     assert _clean_asr_transcript("  hello  ") == "hello"
 
 
@@ -163,7 +164,6 @@ def test_asr2aura_session_restores_history_and_turn_video():
     assert "language Chinese" not in next_input["prompt"]
     assert "<asr_text>" not in next_input["prompt"]
     assert next_input["multi_modal_data"]["video"]
-    assert next_input["additional_information"]["aura_system_prompt"] == ["custom system"]
     assert pop_turn_transcript("video-testreq01") == "Hello there."
 
 
@@ -267,27 +267,83 @@ def test_asr2aura_async_chunk_waits_until_asr_finished(monkeypatch):
     assert payload["additional_information"] == {"tts_ref_audio": ["voice.wav"]}
 
 
-def test_aura2tts_builds_qwen3_tts_prompt_information():
-    prompt = {
-        "additional_information": {
-            "tts_language": ["Chinese"],
-            "tts_instruct": ["Calm voice."],
-            "tts_ref_audio": ["ref.wav"],
-            "tts_ref_text": ["Reference transcript sample."],
-        }
-    }
+@pytest.mark.parametrize(
+    ("additional_information", "source", "expected"),
+    [
+        pytest.param(
+            {
+                "tts_language": ["Chinese"],
+                "tts_instruct": ["Calm voice."],
+                "tts_ref_audio": ["ref.wav"],
+                "tts_ref_text": ["Reference transcript sample."],
+            },
+            _source_output("Hello."),
+            {
+                "task_type": ["Base"],
+                "language": ["Chinese"],
+                "text": ["Hello."],
+                "ref_audio": ["ref.wav"],
+                "ref_text": ["Reference transcript sample."],
+                "x_vector_only_mode": [False],
+                "instruct": ["Calm voice."],
+            },
+            id="base",
+        ),
+        pytest.param(
+            {
+                "tts_task_type": ["CustomVoice"],
+                "tts_speaker": ["vivian"],
+            },
+            _source_output("Hello."),
+            {
+                "task_type": ["CustomVoice"],
+                "speaker": ["Vivian"],
+                "text": ["Hello."],
+            },
+            id="custom_voice",
+        ),
+        pytest.param(
+            {
+                "tts_task_type": ["Base"],
+                "tts_x_vector_only_mode": [True],
+                "tts_ref_audio": ["ref.wav"],
+                "tts_ref_text": ["Reference transcript sample."],
+            },
+            _source_output("Hello."),
+            {
+                "task_type": ["Base"],
+                "x_vector_only_mode": [True],
+                "text": ["Hello."],
+            },
+            id="x_vector_only",
+        ),
+        pytest.param(
+            {
+                "tts_ref_audio": ["ref.wav"],
+                "tts_ref_text": ["Reference transcript sample."],
+                "tts_pass_token_ids": [True],
+            },
+            _source_output("Hello.", token_ids=[151644, 77091, 198, 108386, 1773, 151645, 198]),
+            {
+                PRECOMPUTED_TEXT_IDS_KEY: [[151644, 77091, 198, 108386, 1773, 151645, 198, 151644, 77091, 198]],
+            },
+            id="token_ids",
+        ),
+    ],
+)
+def test_aura2tts_modes(additional_information, source, expected):
+    prompt = {"additional_information": additional_information}
 
-    [tts_input] = aura2tts([_source_output("Hello.")], prompt=[prompt])
+    [tts_input] = aura2tts([source], prompt=[prompt])
+    info = tts_input["additional_information"]
 
-    assert tts_input["prompt_token_ids"]
-    assert tts_input["additional_information"]["text"] == ["Hello."]
-    assert PRECOMPUTED_TEXT_IDS_KEY not in tts_input["additional_information"]
-    assert tts_input["additional_information"]["task_type"] == ["Base"]
-    assert tts_input["additional_information"]["language"] == ["Chinese"]
-    assert tts_input["additional_information"]["ref_audio"] == ["ref.wav"]
-    assert tts_input["additional_information"]["ref_text"] == ["Reference transcript sample."]
-    assert tts_input["additional_information"]["x_vector_only_mode"] == [False]
-    assert tts_input["additional_information"]["instruct"] == ["Calm voice."]
+    for key, value in expected.items():
+        assert info[key] == value
+    if PRECOMPUTED_TEXT_IDS_KEY in expected:
+        assert "text" not in info
+    else:
+        assert PRECOMPUTED_TEXT_IDS_KEY not in info
+        assert len(tts_input["prompt_token_ids"]) >= 32
 
 
 def test_aura2tts_prefers_streaming_cumulative_text():

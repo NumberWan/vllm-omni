@@ -1579,7 +1579,7 @@ class TestAuraOmniDeploy:
 
     def test_streaming_session_dispatches_aura_processors(self):
         """``deploy.streaming_session`` picks asr2aura_session vs asr2aura on stage 1."""
-        pipeline = _PIPELINE_REGISTRY["aura_omni"]
+        pipeline = OMNI_PIPELINES["aura_omni"]
 
         session_stages = merge_pipeline_deploy(pipeline, DeployConfig(streaming_session=True))
         assert session_stages[1].custom_process_input_func.endswith("asr2aura_session")

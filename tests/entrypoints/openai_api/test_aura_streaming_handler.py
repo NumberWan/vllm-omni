@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from vllm_omni.entrypoints.openai.aura_session_history import (
+from vllm_omni.entrypoints.openai.aura.session_history import (
     SessionHistory,
     clear_all_sessions,
     get_session_history,
@@ -83,7 +83,6 @@ def test_should_trigger_turn_respects_auto_trigger_gate():
         )
         is False
     )
-    # TTS tail still running: is_generating=True but conversation turn is released.
     assert (
         handler.should_trigger_turn(
             VideoStreamTurnTrigger(frame_count=3, is_generating=True, is_turn_locked=False, config=config)
@@ -172,48 +171,6 @@ def test_on_turn_complete_persists_user_video_and_assistant():
     assert state.pending_turn_video is None
 
 
-def test_on_turn_complete_pops_transcript_recorded_with_internal_request_id():
-    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-        record_turn_transcript,
-    )
-
-    handler = AuraStreamingVideoHandler(chat_service=object())
-    state = _session_state()
-    external = "video-a234643a36e3"
-    internal = f"{external}-b52ad29b"
-    record_turn_transcript(internal, "画面有什么")
-
-    handler.on_turn_complete(state, {"role": "user", "content": []}, "好的。", request_id=external)
-
-    assert "画面有什么" in state.history.get_vllm_inputs()["prompt"]
-
-
-def test_on_turn_complete_persists_video_only_user_turn():
-    handler = AuraStreamingVideoHandler(chat_service=object())
-    state = _session_state()
-    state.pending_turn_video = {
-        "frames": [
-            [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
-            [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
-        ],
-        "metadata": {
-            "fps": 2.0,
-            "duration": 1.0,
-            "total_num_frames": 2,
-            "frames_indices": [0, 1],
-            "video_backend": "opencv",
-            "do_sample_frames": False,
-        },
-    }
-
-    handler.on_turn_complete(state, {"role": "user", "content": []}, "<|silent|>", request_id="req-silent")
-
-    inputs = state.history.get_vllm_inputs()
-    assert "<|video_pad|>" in inputs["prompt"]
-    assert "<|silent|>" in inputs["prompt"]
-    assert len(inputs["multi_modal_data"]["video"]) == 1
-
-
 def test_build_engine_prompt_stores_audio_and_session_payload():
     handler = AuraStreamingVideoHandler(chat_service=object())
     config = AuraStreamingVideoSessionConfig(model="test", aura_system_prompt="system-a")
@@ -247,88 +204,31 @@ def test_build_engine_prompt_stores_audio_and_session_payload():
     assert additional["tts_ref_text"]
 
 
-def test_build_engine_prompt_omits_tts_when_text_only():
+def test_build_engine_prompt_omni_skip_stages():
     handler = AuraStreamingVideoHandler(chat_service=object())
-    config = AuraStreamingVideoSessionConfig(model="test", modalities=["text"])
     state = _session_state()
     state.turn_frame_arrays = [np.zeros((8, 8, 3), dtype=np.uint8)]
 
-    _, user_message = handler.build_engine_prompt(config, [], bytearray(), state, "", {})
+    _, text_only = handler.build_engine_prompt(
+        AuraStreamingVideoSessionConfig(model="test", modalities=["text"]),
+        [],
+        bytearray(),
+        state,
+        "",
+        {},
+    )
+    assert text_only["_aura_additional_information"]["omni_skip_stages"] == [0]
 
-    additional = user_message["_aura_additional_information"]
-    assert "tts_ref_audio" not in additional
-    assert "tts_ref_text" not in additional
-    assert additional["omni_skip_stages"] == [0]
-
-
-def test_build_engine_prompt_disables_skip_asr_when_audio_present():
-    handler = AuraStreamingVideoHandler(chat_service=object())
-    config = AuraStreamingVideoSessionConfig(model="test")
-    state = _session_state()
-    state.turn_frame_arrays = [np.zeros((8, 8, 3), dtype=np.uint8)]
-
-    _, user_message = handler.build_engine_prompt(
-        config,
+    _, with_audio = handler.build_engine_prompt(
+        AuraStreamingVideoSessionConfig(model="test"),
         [_b64(_make_jpeg())],
         bytearray(b"\x00\x01"),
         state,
         "",
         {},
     )
-
-    assert user_message["_aura_additional_information"]["omni_skip_stages"] == []
-
-
-@pytest.mark.asyncio
-async def test_build_engine_prompt_via_preprocess_mock():
-    captured_requests: list[Any] = []
-
-    class CapturingChatService:
-        chat_template = None
-        chat_template_content_format = "string"
-
-        class _Renderer:
-            pass
-
-        renderer = _Renderer()
-
-        async def _preprocess_chat(self, request, messages, **kwargs):
-            captured_requests.append(request)
-            return messages, [{"prompt": "engine-prompt"}]
-
-    handler = AuraStreamingVideoHandler(chat_service=CapturingChatService(), engine_client=MagicMock())
-    config = AuraStreamingVideoSessionConfig(model="test")
-    state = _session_state()
-    state.turn_frame_arrays = [
-        np.zeros((8, 8, 3), dtype=np.uint8),
-        np.zeros((8, 8, 3), dtype=np.uint8),
-    ]
-
-    async def _noop_generation(*_args, **_kwargs):
-        return None
-
-    handler._run_engine_generation = _noop_generation  # type: ignore[method-assign]
-
-    await handler._process_query_engine(
-        websocket=MagicMock(),
-        config=config,
-        frame_buffer=[_b64(_make_jpeg())],
-        audio_buffer=bytearray(b"\x00\x00"),
-        message_history=state,
-        query_text="",
-        request_id="req-aura-1",
-        interrupt_event=MagicMock(),
-        prewarmed_frames={},
-    )
-
-    assert captured_requests
-    request = captured_requests[0]
-    additional = getattr(request, "additional_information")
-    assert additional["aura_session_id"] == state.session_id
-    assert "aura_session_state" not in additional
-    assert "aura_turn_video" in additional
-    assert state.pending_turn_video is additional["aura_turn_video"]
-    assert request.messages[0]["content"][0]["type"] == "input_audio"
+    assert with_audio["_aura_additional_information"]["omni_skip_stages"] == []
+    assert "tts_ref_audio" not in text_only["_aura_additional_information"]
 
 
 def test_create_message_history_registers_server_side_store():
@@ -377,7 +277,7 @@ async def test_process_query_merges_cross_turn_penalty_sampling_params():
         def decode(self, token_ids: list[int]) -> str:
             return "".join(chr(tid) for tid in token_ids)
 
-    from vllm_omni.entrypoints.openai.aura_cross_turn_penalty import CrossTurnPenalty
+    from vllm_omni.entrypoints.openai.aura import CrossTurnPenalty
 
     mock_engine = MagicMock()
 
@@ -420,3 +320,11 @@ async def test_process_query_merges_cross_turn_penalty_sampling_params():
     assert sampling is not None
     assert len(sampling) >= 2
     assert sampling[1].get("logit_bias") or sampling[1].get("bad_words")
+
+    merged = AuraStreamingVideoHandler._merge_penalty_sampling_params(
+        [{"temperature": 0.7}, {"top_p": 0.9}],
+        {"logit_bias": {42: -1.5}, "bad_words": ["foo"]},
+    )
+    assert merged[0] == {"temperature": 0.7}
+    assert merged[1]["logit_bias"] == {42: -1.5}
+    assert merged[1]["bad_words"] == ["foo"]

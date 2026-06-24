@@ -34,8 +34,8 @@ from typing import Any
 import numpy as np
 from pydantic import Field
 
-from vllm_omni.entrypoints.openai.aura_cross_turn_penalty import CrossTurnPenalty
-from vllm_omni.entrypoints.openai.aura_session_history import (
+from vllm_omni.entrypoints.openai.aura import CrossTurnPenalty
+from vllm_omni.entrypoints.openai.aura.session_history import (
     DEFAULT_AURA_SYSTEM_PROMPT,
     SessionHistory,
     create_session_id,
