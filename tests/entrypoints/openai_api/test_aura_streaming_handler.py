@@ -85,6 +85,45 @@ def test_should_trigger_turn_respects_auto_trigger_gate():
     ) is False
 
 
+def test_auto_trigger_frame_count_uses_turn_frame_arrays():
+    handler = AuraStreamingVideoHandler(chat_service=object())
+    state = _session_state()
+    session_buffer = [_b64(_make_jpeg()) for _ in range(5)]
+    state.turn_frame_arrays = [
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        np.zeros((8, 8, 3), dtype=np.uint8),
+    ]
+    assert handler.auto_trigger_frame_count(session_buffer, state) == 2
+
+
+def test_per_turn_auto_trigger_not_cumulative_session_buffer():
+    """13 frames @ min=2 should yield 6 turns, not 12 from uncleared frame_buffer."""
+    handler = AuraStreamingVideoHandler(chat_service=object())
+    config = AuraStreamingVideoSessionConfig(model="test", auto_trigger=True, auto_trigger_min_frames=2)
+    state = _session_state()
+    session_buffer: list[str] = []
+    triggers = 0
+
+    for i in range(13):
+        raw = _make_jpeg(i, i, i)
+        b64 = _b64(raw)
+        session_buffer.append(b64)
+        handler.on_frame_buffered(raw, b64, state, config)
+        if handler.should_trigger_turn(
+            VideoStreamTurnTrigger(
+                frame_count=handler.auto_trigger_frame_count(session_buffer, state),
+                is_generating=False,
+                is_turn_locked=False,
+                config=config,
+            )
+        ):
+            triggers += 1
+            state.turn_frame_arrays.clear()
+
+    assert triggers == 6
+    assert len(session_buffer) == 13
+
+
 def test_on_turn_complete_persists_user_video_and_assistant():
     from vllm_omni.model_executor.stage_input_processors.aura_omni import (
         record_turn_transcript,

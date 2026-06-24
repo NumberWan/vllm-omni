@@ -368,6 +368,9 @@ class DeployConfig:
     """
 
     async_chunk: bool = True
+    # Multi-turn streaming: for stages whose ``custom_process_input_func`` is a
+    # processor module (see ``STREAMING_INPUT_FUNCS``), pick the session entry.
+    streaming_session: bool = False
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
     connectors: dict[str, Any] | None = None
@@ -547,6 +550,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
+        "streaming_session": raw_dict.get("streaming_session", False),
         "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
@@ -680,17 +684,41 @@ def _resolve_execution_mode(
     return _EXECUTION_TYPE_TO_STAGE_WORKER.get(execution_type, (StageType.LLM, None))
 
 
+_STREAMING_INPUT_PROC_VARIANTS: dict[str, tuple[str, str]] = {
+    "vllm_omni.model_executor.stage_input_processors.aura_omni": (
+        "asr2aura",
+        "asr2aura_session",
+    ),
+}
+
+
+def _resolve_streaming_input_proc(
+    proc: str | None,
+    streaming_session: bool,
+) -> str | None:
+    """Expand a processor-module path when deploy ``streaming_session`` is set."""
+    if proc is None:
+        return None
+    module_path = proc.rstrip(".")
+    variants = _STREAMING_INPUT_PROC_VARIANTS.get(module_path)
+    if variants is None:
+        return proc
+    func = variants[1] if streaming_session else variants[0]
+    return f"{module_path}.{func}"
+
+
 def _select_processor_funcs(
     ps: StagePipelineConfig,
     async_chunk: bool,
+    streaming_session: bool = False,
 ) -> tuple[str | None, str | None]:
-    """Pick ``(input_proc, next_stage_proc)`` based on the async_chunk mode."""
+    """Pick ``(input_proc, next_stage_proc)`` based on deploy mode."""
     next_stage_proc = ps.custom_process_next_stage_input_func
-    input_proc = ps.custom_process_input_func
+    input_proc = _resolve_streaming_input_proc(ps.custom_process_input_func, streaming_session)
+    if not async_chunk and ps.sync_process_input_func:
+        input_proc = ps.sync_process_input_func
     if async_chunk and ps.async_chunk_process_next_stage_input_func:
         next_stage_proc = ps.async_chunk_process_next_stage_input_func
-    elif not async_chunk and ps.sync_process_input_func:
-        input_proc = ps.sync_process_input_func
     return input_proc, next_stage_proc
 
 
@@ -821,7 +849,11 @@ def merge_pipeline_deploy(
     for ps in pipeline.stages:
         ds = deploy_by_id.get(ps.stage_id)
         stage_type, worker_type = _resolve_execution_mode(ps.execution_type)
-        input_proc, next_stage_proc = _select_processor_funcs(ps, deploy.async_chunk)
+        input_proc, next_stage_proc = _select_processor_funcs(
+            ps,
+            deploy.async_chunk,
+            deploy.streaming_session,
+        )
         engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
         sched_cls = _resolve_scheduler(
             ps.execution_type,

@@ -4,9 +4,9 @@ vLLM-Omni exposes the same WebSocket endpoint as Qwen-Omni streaming video, but 
 
 - **ASR → AURA → TTS → Code2Wav** four-stage pipeline
 - **Automatic turn trigger** after `auto_trigger_min_frames` buffered frames (default `2`)
-- **SessionHistory** across turns via `asr2aura_session`
+- **SessionHistory** across turns via `asr2aura_session` (`streaming_session: true` in deploy YAML selects it from the `aura_omni` processor module)
 - **`modalities: ["text", "audio"]`** for TTS output via `response.audio.delta` / `response.audio.done`
-- **Frame-only auto trigger** — `frames >= auto_trigger_min_frames` and **`not is_turn_locked`**
+- **Frame-only auto trigger** — per-turn `turn_frame_arrays` count `>= auto_trigger_min_frames` and **`not is_turn_locked`** (not cumulative `frame_buffer`)
 - **Early turn release** — after assistant text (`response.text.done`), SessionHistory updates and the next frame may trigger while TTS audio still streams
 - **`video.query` is ignored** — no manual trigger, no interrupt
 
@@ -56,14 +56,21 @@ python examples/online_serving/aura_omni/streaming_video_client.py \
 | `num_rounds_keep` | int | `30` | Rounds kept in the sliding window after pruning. |
 | `aura_system_prompt` | string | AURA default | Override the AURA system prompt. |
 | `video_fps` | float | `2.0` | FPS metadata attached to each `video_tuple`. |
+| `stream_text_deltas` | bool | `false` | When `false`, the server buffers assistant text and only sends `response.text.done` (no per-token `response.text.delta`). Set `true` for incremental text streaming. |
 
 All standard fields from [video_stream_api.md](video_stream_api.md) (`max_frames`, EVS, `sampling_params_list`, etc.) still apply.
+
+## Text Output
+
+By default AURA does **not** stream `response.text.delta` to clients. Assistant tokens are accumulated server-side; the client receives a single `response.text.done` with the full reply (sent early when TTS audio starts if `VLLM_VIDEO_ASYNC_CHUNK=on`, so the next turn can begin while audio still streams).
+
+Set `stream_text_deltas: true` in `session.config` if you need incremental text events (e.g. for a live caption UI).
 
 ## Trigger Semantics
 
 | Event | Behavior |
 |-------|----------|
-| `video.frame` with `frames >= auto_trigger_min_frames` and `not is_turn_locked` | Start a turn (ASR fills transcript from buffered audio) |
+| `video.frame` with per-turn frames `>= auto_trigger_min_frames` and `not is_turn_locked` | Start a turn (ASR fills transcript from buffered audio) |
 | `video.frame` while `is_turn_locked` | Frame buffered only (ASR→AURA text in flight) |
 | `video.frame` during TTS tail only (`is_generating` but `not is_turn_locked`) | **May trigger** the next turn |
 | `audio.chunk` | Appended to session buffer; snapshot at turn start (send full utterance before trigger for push-to-talk) |

@@ -32,6 +32,8 @@ DEFAULT_AURA_SYSTEM_PROMPT = (
 )
 
 SILENT_TEXT = "<|silent|>"
+# Stage-1 ``custom_process_input_func`` is the module path ``...aura_omni``;
+# deploy ``streaming_session`` picks ``asr2aura`` vs ``asr2aura_session``.
 QWEN_IM_START_ID = 151644
 QWEN_IM_END_ID = 151645
 QWEN_ASSISTANT_ID = 77091

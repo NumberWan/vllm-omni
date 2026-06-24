@@ -222,6 +222,13 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
         default=False,
         description="Pass AURA assistant token ids to Qwen3-TTS instead of decoded text.",
     )
+    stream_text_deltas: bool = Field(
+        default=False,
+        description=(
+            "When false (default), accumulate assistant text server-side and only "
+            "emit response.text.done to the client. Audio streaming is unaffected."
+        ),
+    )
 
 
 @dataclass
@@ -288,6 +295,16 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         if not config.auto_trigger:
             return False
         return trigger.frame_count >= config.auto_trigger_min_frames and not trigger.is_turn_locked
+
+    def auto_trigger_frame_count(
+        self,
+        frame_buffer: list[str],
+        message_history: Any,
+    ) -> int:
+        del frame_buffer
+        if isinstance(message_history, AuraSessionState):
+            return len(message_history.turn_frame_arrays)
+        return 0
 
     def on_frame_buffered(
         self,
@@ -592,6 +609,8 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
         async_chunk_mode = video_stream_envs.VLLM_VIDEO_ASYNC_CHUNK
         streaming = async_chunk_mode == "on"
+        aura_config = self._as_aura_config(config)
+        stream_text_deltas = aura_config.stream_text_deltas
         audio_tail_tensors: list[Any] = []
 
         async def _try_release_turn_lock(full_text: str) -> None:
@@ -657,7 +676,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                         if t_first_text is None:
                             t_first_text = _time.monotonic()
                         text_parts.append(delta_text)
-                        if streaming:
+                        if streaming and stream_text_deltas:
                             await websocket.send_json({"type": "response.text.delta", "delta": delta_text})
 
             if not text_done_sent:

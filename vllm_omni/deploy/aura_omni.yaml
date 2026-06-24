@@ -4,16 +4,13 @@
 # `--model` at any local placeholder repo if needed; each stage overrides its
 # own model below.
 pipeline: aura_omni
-# AURA has a semantic ASR -> AURA -> TTS dependency.
-# async_chunk: false
-
 # ASR and AURA run in semantic order; the orchestrator prewarms downstream
 # stages and the connector moves async payloads between stages. Stage 1 buffers
 # each AURA request and sends one complete payload to TTS when AURA finishes.
-
-# TODO: Enable the feature for AURA to send chunks to TTS. This requires qwen3-tts to support streaming input first;
-# otherwise, in the absence of historical context, the speech quality of individual chunks will be inconsistent.
 async_chunk: true
+# Multi-turn WebSocket streaming: stage-1 uses asr2aura_session (SessionHistory).
+# Single-turn /chat/completions paths can omit this or set false for asr2aura.
+streaming_session: true
 
 connectors:
   connector_of_shared_memory:
