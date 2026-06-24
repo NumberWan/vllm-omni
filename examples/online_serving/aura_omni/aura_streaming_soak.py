@@ -23,7 +23,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from examples.online_serving.aura_omni.aura_streaming_soak_validate import validate_run
+from examples.online_serving.aura_omni.aura_streaming_soak_validate import validate_run  # noqa: E402
 
 PYTHON = Path(os.environ.get("AURA_SOAK_PYTHON", "/public/wtk/.venv/bin/python"))
 DEMO = _REPO_ROOT / "examples/online_serving/aura_omni/streaming_video_demo.py"
