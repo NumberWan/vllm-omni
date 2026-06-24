@@ -48,7 +48,7 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             engine_output_type="text",
             model_arch="AuraQwen3VLForConditionalGeneration",
-            custom_process_input_func=f"{_AURA_PROC}.asr2aura_session",
+            custom_process_input_func=_AURA_PROC,
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(

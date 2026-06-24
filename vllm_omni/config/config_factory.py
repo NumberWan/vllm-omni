@@ -170,6 +170,10 @@ class StageConfigFactory:
         if cli_async_chunk is not None:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
 
+        cli_streaming_session = cli_overrides.get("streaming_session")
+        if cli_streaming_session is not None:
+            deploy_cfg.streaming_session = bool(cli_streaming_session)
+
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
         explicit_overrides = {k: v for k, v in cli_overrides.items() if v is not None}

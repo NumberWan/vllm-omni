@@ -307,7 +307,7 @@ async def test_aura_websocket_streams_text_and_audio(monkeypatch):
 
     types = ws.sent_types()
     assert "response.start" in types
-    assert "response.text.delta" in types
+    assert "response.text.delta" not in types
     assert "response.text.done" in types
     assert "response.audio.delta" in types
     assert "response.audio.done" in types
@@ -364,8 +364,8 @@ async def test_aura_multi_turn_accumulates_session_history():
     ws.put({"type": "video.done"})
     await asyncio.wait_for(task, timeout=3.0)
 
-    # Buffer is not cleared between turns; extra auto-triggers are expected once count >= min_frames.
-    assert turns_completed >= 2
+    # Per-turn frame count: two frames per turn, buffer not cleared between turns.
+    assert turns_completed == 2
 
 
 @pytest.mark.asyncio

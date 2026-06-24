@@ -1568,6 +1568,18 @@ class TestAuraOmniDeploy:
         assert stages[1].yaml_engine_args["model_arch"] == "AuraQwen3VLForConditionalGeneration"
         assert stages[2].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
+        assert stages[1].custom_process_input_func.endswith("asr2aura_session")
+
+    def test_streaming_session_dispatches_aura_processors(self):
+        """``deploy.streaming_session`` picks asr2aura_session vs asr2aura on stage 1."""
+        pipeline = _PIPELINE_REGISTRY["aura_omni"]
+
+        session_stages = merge_pipeline_deploy(pipeline, DeployConfig(streaming_session=True))
+        assert session_stages[1].custom_process_input_func.endswith("asr2aura_session")
+
+        single_turn_stages = merge_pipeline_deploy(pipeline, DeployConfig(streaming_session=False))
+        assert single_turn_stages[1].custom_process_input_func.endswith("asr2aura")
+        assert not single_turn_stages[1].custom_process_input_func.endswith("asr2aura_session")
 
 
 class TestSentinelDefaultPrecedence:

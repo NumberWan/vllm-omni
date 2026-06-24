@@ -7,6 +7,9 @@ pipeline: aura_omni
 # AURA has a semantic ASR -> AURA -> TTS dependency. Do not prewarm downstream
 # stages before AURA text is converted into Qwen3-TTS metadata by aura2tts.
 async_chunk: false
+# Multi-turn WebSocket streaming: stage-1 uses asr2aura_session (SessionHistory).
+# Single-turn /chat/completions paths can omit this or set false for asr2aura.
+streaming_session: true
 
 connectors:
   connector_of_shared_memory:

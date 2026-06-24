@@ -76,6 +76,14 @@ class VideoStreamPipelineHooks(Protocol):
         """Return True to auto-start a turn after a new frame (no ``video.query``)."""
         ...
 
+    def auto_trigger_frame_count(
+        self,
+        frame_buffer: list[str],
+        message_history: Any,
+    ) -> int:
+        """Frames to compare against ``auto_trigger_min_frames`` (default: session buffer)."""
+        ...
+
     def build_engine_prompt(
         self,
         config: "StreamingVideoSessionConfig",
@@ -163,6 +171,15 @@ class OmniStreamingVideoHandler:
     def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
         """Auto-trigger after ``video.frame`` when True (default: never)."""
         return False
+
+    def auto_trigger_frame_count(
+        self,
+        frame_buffer: list[str],
+        message_history: Any,
+    ) -> int:
+        """Frames counted for auto-trigger (default: cumulative session ``frame_buffer``)."""
+        del message_history
+        return len(frame_buffer)
 
     def build_engine_prompt(
         self,
@@ -485,7 +502,10 @@ class OmniStreamingVideoHandler:
                         )
                         if self.should_trigger_turn(
                             VideoStreamTurnTrigger(
-                                frame_count=len(frame_buffer),
+                                frame_count=self.auto_trigger_frame_count(
+                                    frame_buffer,
+                                    message_history,
+                                ),
                                 is_generating=is_generating,
                                 is_turn_locked=trigger_turn_locked,
                                 config=config,
