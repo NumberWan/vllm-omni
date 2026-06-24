@@ -362,6 +362,22 @@ def test_aura2tts_prefers_streaming_cumulative_text():
     assert tts_input["additional_information"]["text"] == ["The complete AURA reply."]
 
 
+def test_aura2tts_supports_base_ref_audio_override():
+    prompt = {
+        "additional_information": {
+            "tts_ref_audio": ["custom.wav"],
+            "tts_ref_text": ["custom transcript"],
+        }
+    }
+
+    [tts_input] = aura2tts([_source_output("Hello.")], prompt=[prompt])
+
+    assert tts_input["additional_information"]["task_type"] == ["Base"]
+    assert tts_input["additional_information"]["ref_audio"] == ["custom.wav"]
+    assert tts_input["additional_information"]["ref_text"] == ["custom transcript"]
+    assert tts_input["additional_information"]["x_vector_only_mode"] == [False]
+
+
 def test_aura2tts_supports_x_vector_only_mode_for_base():
     prompt = {
         "additional_information": {
