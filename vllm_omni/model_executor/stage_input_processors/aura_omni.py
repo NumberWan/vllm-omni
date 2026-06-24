@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import re
@@ -648,29 +647,6 @@ def _copy_aura_tts_fields(additional_info: dict[str, Any]) -> dict[str, Any]:
     return copied
 
 
-def _summarize_vllm_inputs(vllm_inputs: dict[str, Any]) -> str:
-    videos = vllm_inputs.get("multi_modal_data", {}).get("video", [])
-    video_info = []
-    for vt in videos:
-        arr, meta = vt
-        arr = np.asarray(arr)
-        video_info.append(
-            {
-                "frames": int(arr.shape[0]),
-                "shape": list(arr.shape),
-                "fps": meta.get("fps"),
-                "duration": meta.get("duration"),
-            }
-        )
-    return json.dumps(
-        {
-            "prompt_text": vllm_inputs.get("prompt", ""),
-            "videos": video_info,
-        },
-        ensure_ascii=False,
-    )
-
-
 def asr2aura_session(
     source_outputs: list[Any],
     prompt: Any = None,
@@ -712,12 +688,6 @@ def asr2aura_session(
             vllm_inputs = history.get_vllm_inputs()
         else:
             vllm_inputs = history.preview_vllm_inputs(transcript, video_tuple=video_tuple)
-        logger.info(
-            "AURA turn prompt request_id=%s transcript=%r: %s",
-            getattr(source_output, "request_id", idx),
-            transcript,
-            _summarize_vllm_inputs(vllm_inputs),
-        )
 
         next_input = {
             "prompt": vllm_inputs["prompt"],

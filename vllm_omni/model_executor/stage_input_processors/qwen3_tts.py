@@ -454,9 +454,6 @@ def talker2code2wav_token_only(
         # Codebook-major flat: Q * (ref_frames + audio_frames)
         prompt_len = num_quantizers * (ref_frames + num_audio_frames)
         if prompt_len <= 0:
-            logger.debug(
-                "qwen3_tts.talker2code2wav_token_only: skip req with zero codec tokens (finished empty talker output)"
-            )
             continue
 
         additional_info = to_dict(

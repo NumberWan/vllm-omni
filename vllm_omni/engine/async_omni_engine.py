@@ -351,7 +351,7 @@ class AsyncOmniEngine:
             single_stage_mode=self.single_stage_mode,
             stage_init_timeout=stage_init_timeout,
             diffusion_batch_size=self.diffusion_batch_size,
-                async_chunk=self.async_chunk,
+            async_chunk=self.async_chunk,
             tokenizer=self.tokenizer,
             single_stage_id_filter=self._single_stage_id_filter,
             omni_master_address=self._omni_master_address,
@@ -373,8 +373,8 @@ class AsyncOmniEngine:
         self.input_processor = (
             build_stage0_input_processor(self.stage_vllm_configs[0])
             if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
-                                        else None
-                                    )
+            else None
+        )
         self.prompt_expand_func = next(
             (
                 getattr(client, "prompt_expand_func", None)
@@ -385,7 +385,7 @@ class AsyncOmniEngine:
         )
         self.default_sampling_params_list = [client.default_sampling_params for client in self.stage_clients]
         self.stage_metadata = [
-                StageRuntimeInfo(
+            StageRuntimeInfo(
                 final_output=client.final_output,
                 final_output_type=client.final_output_type,
                 stage_type=client.stage_type,
