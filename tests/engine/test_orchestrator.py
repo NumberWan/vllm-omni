@@ -1148,7 +1148,7 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
 
 
 @pytest.mark.asyncio
-async def test_aura_skip_asr_bypasses_stage0(orchestrator_factory) -> None:
+async def test_omni_skip_stages_bypasses_stage0(orchestrator_factory) -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(
         stage_type="llm",
@@ -1170,7 +1170,7 @@ async def test_aura_skip_asr_bypasses_stage0(orchestrator_factory) -> None:
             prompt=request,
             original_prompt={
                 "prompt": "video-only",
-                "additional_information": {"aura_skip_asr": True},
+                "additional_information": {"omni_skip_stages": [0]},
             },
             sampling_params_list=[_sampling_params(), _sampling_params()],
             final_stage_id=1,
