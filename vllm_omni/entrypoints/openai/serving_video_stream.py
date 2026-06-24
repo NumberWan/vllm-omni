@@ -33,17 +33,15 @@ import numpy as np
 from pydantic import Field
 
 from vllm_omni.entrypoints.openai.aura_cross_turn_penalty import CrossTurnPenalty
-from vllm_omni.entrypoints.openai.aura_session_store import (
-    create_session_id,
-    register_session,
-    unregister_session,
-)
 from vllm_omni.entrypoints.openai.aura_session_history import (
     DEFAULT_AURA_SYSTEM_PROMPT,
     SILENT_TEXT,
     SessionHistory,
+    create_session_id,
     is_effectively_silent,
     normalize_assistant_text,
+    register_session,
+    unregister_session,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
     _BAD_FRAME,
