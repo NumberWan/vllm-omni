@@ -54,6 +54,20 @@ def test_asr2aura_carries_video_and_strips_audio_from_vl_input():
     assert next_input["prompt"].startswith("<|im_start|>system\nsystem")
 
 
+def test_asr2aura_reads_video_stashed_for_downstream_stage():
+    prompt = {
+        "multi_modal_data": {"audio": ("wave", 16000)},
+        "additional_information": {
+            "deferred_multi_modal_data": {"video": ["frame-0", "frame-1"]},
+        },
+    }
+
+    [next_input] = asr2aura([_source_output("Check the video")], prompt=[prompt])
+
+    assert next_input["multi_modal_data"] == {"video": ["frame-0", "frame-1"]}
+    assert "<|video_pad|>" in next_input["prompt"]
+
+
 def test_clean_asr_transcript_strips_qwen3_asr_wrapper():
     assert _clean_asr_transcript("language Chinese<asr_text>画面有什么？") == "画面有什么？"
     assert _clean_asr_transcript("language Chinese<asr_text>画面有什么") == "画面有什么"
@@ -246,7 +260,11 @@ def test_aura2tts_modes(additional_information, source, expected):
         assert "text" not in info
     else:
         assert PRECOMPUTED_TEXT_IDS_KEY not in info
-        assert len(tts_input["prompt_token_ids"]) >= 32
+        if expected.get("task_type") == ["CustomVoice"]:
+            assert "ref_audio" not in info
+            assert len(tts_input["prompt_token_ids"]) == 14
+        else:
+            assert len(tts_input["prompt_token_ids"]) >= 32
 
 
 def test_aura2tts_prefers_streaming_cumulative_text():
@@ -263,6 +281,22 @@ def test_aura2tts_prefers_streaming_cumulative_text():
     )
 
     assert tts_input["additional_information"]["text"] == ["The complete AURA reply."]
+
+
+def test_aura2tts_supports_base_ref_audio_override():
+    prompt = {
+        "additional_information": {
+            "tts_ref_audio": ["custom.wav"],
+            "tts_ref_text": ["custom transcript"],
+        }
+    }
+
+    [tts_input] = aura2tts([_source_output("Hello.")], prompt=[prompt])
+
+    assert tts_input["additional_information"]["task_type"] == ["Base"]
+    assert tts_input["additional_information"]["ref_audio"] == ["custom.wav"]
+    assert tts_input["additional_information"]["ref_text"] == ["custom transcript"]
+    assert tts_input["additional_information"]["x_vector_only_mode"] == [False]
 
 
 @pytest.mark.parametrize(
