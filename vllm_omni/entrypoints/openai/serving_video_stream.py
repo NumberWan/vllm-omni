@@ -37,7 +37,6 @@ from pydantic import Field
 from vllm_omni.entrypoints.openai.aura_cross_turn_penalty import CrossTurnPenalty
 from vllm_omni.entrypoints.openai.aura_session_history import (
     DEFAULT_AURA_SYSTEM_PROMPT,
-    SILENT_TEXT,
     SessionHistory,
     create_session_id,
     is_effectively_silent,
@@ -690,9 +689,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
                 try:
                     coalesced = (
-                        audio_tail_tensors[0]
-                        if len(audio_tail_tensors) == 1
-                        else torch.cat(audio_tail_tensors, dim=-1)
+                        audio_tail_tensors[0] if len(audio_tail_tensors) == 1 else torch.cat(audio_tail_tensors, dim=-1)
                     )
                     tail_np = self._tensor_to_1d_np(coalesced)
                     b64, _ = self._encode_tail(tail_np, 0, new_drained=len(audio_tail_tensors), is_first=True)

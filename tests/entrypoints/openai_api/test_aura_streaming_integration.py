@@ -20,8 +20,8 @@ from vllm_omni.entrypoints.openai.serving_video_stream import (
     AuraSessionState,
     AuraStreamingVideoHandler,
     AuraStreamingVideoSessionConfig,
+    create_streaming_video_handler,
 )
-from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

@@ -656,8 +656,10 @@ def test_build_messages_keeps_recent_history_text_only():
 def test_create_streaming_video_handler_routes_aura_pipeline():
     from unittest.mock import MagicMock
 
-    from vllm_omni.entrypoints.openai.serving_video_stream import AuraStreamingVideoHandler
-    from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
+    from vllm_omni.entrypoints.openai.serving_video_stream import (
+        AuraStreamingVideoHandler,
+        create_streaming_video_handler,
+    )
 
     engine = MagicMock(pipeline_name="aura_omni", stage_configs=[])
 

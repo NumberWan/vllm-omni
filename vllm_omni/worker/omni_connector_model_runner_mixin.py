@@ -981,8 +981,7 @@ class OmniConnectorModelRunnerMixin:
                     )
             if payload is None:
                 raise RuntimeError(
-                    f"[Stage-{self._stage_id}] send_full_payload_outputs: missing payload "
-                    f"for finished req={req_id}"
+                    f"[Stage-{self._stage_id}] send_full_payload_outputs: missing payload for finished req={req_id}"
                 )
             if isinstance(payload, dict):
                 audio_codes = self._payload_audio_codes(payload)

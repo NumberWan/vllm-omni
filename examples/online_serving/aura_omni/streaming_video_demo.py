@@ -42,9 +42,7 @@ except ImportError:
 
 SILENT_TEXT = "<|silent|>"
 # Keep in sync with vllm_omni.entrypoints.openai.aura_session_history (avoid importing vllm_omni here).
-_AURA_PUNCT_CHARS = frozenset(
-    ".,!?;:，。！？；：、'\"()[]{}""''…—–\n\t\r /-_@#$%^&*+=<>~`|\\（）【】《》﹑·"
-)
+_AURA_PUNCT_CHARS = frozenset(".,!?;:，。！？；：、'\"()[]{}''…—–\n\t\r /-_@#$%^&*+=<>~`|\\（）【】《》﹑·")
 
 
 def is_effectively_silent(text: str) -> bool:
@@ -99,7 +97,9 @@ def _load_pcm16_16k(path: str) -> bytes:
 def _summarize_outbound(msg: dict[str, Any]) -> str:
     t = msg.get("type", "?")
     if t == "session.config":
-        return f"session.config modalities={msg.get('modalities')} auto_trigger_min={msg.get('auto_trigger_min_frames')}"
+        return (
+            f"session.config modalities={msg.get('modalities')} auto_trigger_min={msg.get('auto_trigger_min_frames')}"
+        )
     if t == "video.frame":
         data = msg.get("data", "")
         return f"video.frame b64_len={len(data)}"
@@ -151,22 +151,24 @@ async def _receiver(ws: Any, log: SessionLog, done: asyncio.Event) -> None:
         if msg_type == "response.start":
             log.turn += 1
             turn_text = []
-            log.note(f"\n{'='*60}\n[{ts}] <<< TURN {log.turn} response.start")
+            log.note(f"\n{'=' * 60}\n[{ts}] <<< TURN {log.turn} response.start")
         elif msg_type == "response.text.delta":
             delta = data.get("delta", "")
             turn_text.append(delta)
-            log.note(f"[{ts}] <<< { _summarize_inbound(data) }")
+            log.note(f"[{ts}] <<< {_summarize_inbound(data)}")
         elif msg_type == "response.text.done":
             full = data.get("text", "")
-            log.note(f"[{ts}] <<< { _summarize_inbound(data) }")
+            log.note(f"[{ts}] <<< {_summarize_inbound(data)}")
             log.note(f"         turn {log.turn} full_text={json.dumps(full, ensure_ascii=False)}")
         elif msg_type == "response.audio.delta":
-            log.note(f"[{ts}] <<< { _summarize_inbound(data) }")
+            log.note(f"[{ts}] <<< {_summarize_inbound(data)}")
         elif msg_type == "response.audio.done":
             log.note(f"[{ts}] <<< response.audio.done")
         elif msg_type == "session.done":
             log.note(f"\n[{ts}] <<< session.done")
-            log.note(f"Session summary: {log.turn} turn(s), {log.frames_sent} frame(s) sent, audio_sent={log.audio_sent}")
+            log.note(
+                f"Session summary: {log.turn} turn(s), {log.frames_sent} frame(s) sent, audio_sent={log.audio_sent}"
+            )
             done.set()
             break
         elif msg_type == "error":
@@ -174,7 +176,7 @@ async def _receiver(ws: Any, log: SessionLog, done: asyncio.Event) -> None:
             done.set()
             break
         else:
-            log.note(f"[{ts}] <<< { _summarize_inbound(data) }")
+            log.note(f"[{ts}] <<< {_summarize_inbound(data)}")
 
 
 async def _send_json(ws: Any, msg: dict[str, Any], log: SessionLog) -> None:
@@ -514,8 +516,7 @@ def main() -> None:
         "--sample-fps",
         type=float,
         default=None,
-        help="Frames extracted per second of source video (decoupled from send rate). "
-        "Default: same as send fps.",
+        help="Frames extracted per second of source video (decoupled from send rate). Default: same as send fps.",
     )
     p.add_argument("--max-duration", type=float, default=0, help="Stop sending after N seconds (0=all)")
     p.add_argument("--max-frames", type=int, default=256)

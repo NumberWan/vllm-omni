@@ -65,24 +65,39 @@ def test_should_trigger_turn_respects_auto_trigger_gate():
     handler = AuraStreamingVideoHandler(chat_service=object())
     config = AuraStreamingVideoSessionConfig(model="test", auto_trigger=True, auto_trigger_min_frames=2)
 
-    assert handler.should_trigger_turn(
-        VideoStreamTurnTrigger(frame_count=1, is_generating=False, is_turn_locked=False, config=config)
-    ) is False
-    assert handler.should_trigger_turn(
-        VideoStreamTurnTrigger(frame_count=2, is_generating=False, is_turn_locked=False, config=config)
-    ) is True
-    assert handler.should_trigger_turn(
-        VideoStreamTurnTrigger(frame_count=3, is_generating=True, is_turn_locked=True, config=config)
-    ) is False
+    assert (
+        handler.should_trigger_turn(
+            VideoStreamTurnTrigger(frame_count=1, is_generating=False, is_turn_locked=False, config=config)
+        )
+        is False
+    )
+    assert (
+        handler.should_trigger_turn(
+            VideoStreamTurnTrigger(frame_count=2, is_generating=False, is_turn_locked=False, config=config)
+        )
+        is True
+    )
+    assert (
+        handler.should_trigger_turn(
+            VideoStreamTurnTrigger(frame_count=3, is_generating=True, is_turn_locked=True, config=config)
+        )
+        is False
+    )
     # TTS tail still running: is_generating=True but conversation turn is released.
-    assert handler.should_trigger_turn(
-        VideoStreamTurnTrigger(frame_count=3, is_generating=True, is_turn_locked=False, config=config)
-    ) is True
+    assert (
+        handler.should_trigger_turn(
+            VideoStreamTurnTrigger(frame_count=3, is_generating=True, is_turn_locked=False, config=config)
+        )
+        is True
+    )
 
     disabled = AuraStreamingVideoSessionConfig(model="test", auto_trigger=False)
-    assert handler.should_trigger_turn(
-        VideoStreamTurnTrigger(frame_count=5, is_generating=False, is_turn_locked=False, config=disabled)
-    ) is False
+    assert (
+        handler.should_trigger_turn(
+            VideoStreamTurnTrigger(frame_count=5, is_generating=False, is_turn_locked=False, config=disabled)
+        )
+        is False
+    )
 
 
 def test_auto_trigger_frame_count_uses_turn_frame_arrays():
