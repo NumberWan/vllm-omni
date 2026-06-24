@@ -10,8 +10,7 @@ vLLM-Omni exposes the same WebSocket endpoint as Qwen-Omni streaming video, but 
 - **Early turn release** — after assistant text (`response.text.done`), SessionHistory updates and the next frame may trigger while TTS audio still streams
 - **`video.query` is ignored** — no manual trigger, no interrupt
 
-See also: [video_stream_api.md](video_stream_api.md) for shared protocol fields.  
-**Troubleshooting / bug tracker:** [aura_streaming_bug_tracker.md](aura_streaming_bug_tracker.md)
+See also: [video_stream_api.md](video_stream_api.md) for shared protocol fields.
 
 ## Quick Start
 

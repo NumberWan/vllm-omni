@@ -471,10 +471,6 @@ class Orchestrator:
         )
 
         if should_skip_aura_asr(original_prompt) and final_stage_id >= 1:
-            logger.info(
-                "[Orchestrator] req=%s skipping stage-0 ASR for video-only AURA turn",
-                request_id,
-            )
             await self._forward_to_next_stage(
                 request_id,
                 stage_id,
