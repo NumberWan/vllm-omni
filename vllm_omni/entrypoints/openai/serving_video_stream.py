@@ -4,11 +4,11 @@
 
 Shared protocol (see :mod:`video_stream_base`):
     Client -> Server:
-        {"type": "session.config", ...}
-        {"type": "video.frame", "data": "..."}
-        {"type": "audio.chunk", "data": "..."}
-        {"type": "video.query", "text": "..."}
-        {"type": "video.done"}
+        {"type": "session.config", ...}         # Session config (sent once)
+        {"type": "video.frame", "data": "..."}  # base64 JPEG/PNG frame
+        {"type": "audio.chunk", "data": "..."}  # base64 PCM16 16kHz mono
+        {"type": "video.query", "text": "..."}  # Submit query about buffered frames
+        {"type": "video.done"}                  # End of session
 
     Server -> Client:
         {"type": "response.start"}
@@ -20,8 +20,10 @@ Shared protocol (see :mod:`video_stream_base`):
         {"type": "error", "message": "..."}
 
 Model-specific handlers:
-    :class:`QwenOmniStreamingVideoHandler` — Qwen3-Omni (thinker -> talker -> code2wav)
-    :class:`AuraStreamingVideoHandler` — AURA Omni (ASR -> AURA -> TTS -> code2wav)
+    :class:`QwenOmniStreamingVideoHandler` — Qwen3-Omni (thinker -> talker -> code2wav);
+        turns start on ``video.query`` only.
+    :class:`AuraStreamingVideoHandler` — AURA Omni (ASR -> AURA -> TTS -> code2wav);
+        auto-trigger on buffered frames; ``video.query`` is ignored.
 """
 
 from __future__ import annotations
