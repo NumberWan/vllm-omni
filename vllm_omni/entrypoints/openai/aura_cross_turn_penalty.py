@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from vllm_omni.entrypoints.openai.aura_text_utils import is_punctuation_only_text
+from vllm_omni.entrypoints.openai.aura_session_history import is_punctuation_only_text
 
 
 class CrossTurnPenalty:
