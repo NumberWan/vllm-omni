@@ -14,6 +14,7 @@ import pytest
 from PIL import Image
 
 from vllm_omni.entrypoints.openai.aura_session_history import SessionHistory
+from vllm_omni.entrypoints.openai.aura_session_store import clear_all_sessions, register_session
 from vllm_omni.entrypoints.openai.serving_video_stream import (
     AuraSessionState,
     AuraStreamingVideoHandler,
@@ -22,6 +23,13 @@ from vllm_omni.entrypoints.openai.serving_video_stream import (
 from vllm_omni.entrypoints.openai.video_stream_base import VideoStreamTurnTrigger
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _clear_aura_session_store():
+    clear_all_sessions()
+    yield
+    clear_all_sessions()
 
 
 def _make_jpeg(r: int = 128, g: int = 128, b: int = 128) -> bytes:
@@ -36,7 +44,10 @@ def _b64(data: bytes) -> str:
 
 
 def _session_state() -> AuraSessionState:
-    return AuraSessionState(history=SessionHistory(), turn_frame_arrays=[])
+    history = SessionHistory()
+    session_id = "aura-test-session"
+    register_session(session_id, history)
+    return AuraSessionState(history=history, turn_frame_arrays=[], session_id=session_id)
 
 
 def test_aura_disables_manual_query_and_interrupt():
@@ -103,6 +114,22 @@ def test_on_turn_complete_persists_user_video_and_assistant():
     assert state.pending_turn_video is None
 
 
+def test_on_turn_complete_pops_transcript_recorded_with_internal_request_id():
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        record_turn_transcript,
+    )
+
+    handler = AuraStreamingVideoHandler(chat_service=object())
+    state = _session_state()
+    external = "video-a234643a36e3"
+    internal = f"{external}-b52ad29b"
+    record_turn_transcript(internal, "画面有什么")
+
+    handler.on_turn_complete(state, {"role": "user", "content": []}, "好的。", request_id=external)
+
+    assert "画面有什么" in state.history.get_vllm_inputs()["prompt"]
+
+
 def test_on_turn_complete_persists_video_only_user_turn():
     handler = AuraStreamingVideoHandler(chat_service=object())
     state = _session_state()
@@ -153,7 +180,8 @@ def test_build_engine_prompt_stores_audio_and_session_payload():
     assert content_types == ["input_audio"]
 
     additional = user_message["_aura_additional_information"]
-    assert "aura_session_state" in additional
+    assert additional["aura_session_id"] == state.session_id
+    assert "aura_session_state" not in additional
     assert additional["aura_system_prompt"] == ["system-a"]
     assert additional["aura_turn_video"]["metadata"]["total_num_frames"] == 2
     assert len(additional["aura_turn_video"]["frames"]) == 2
@@ -172,6 +200,25 @@ def test_build_engine_prompt_omits_tts_when_text_only():
     additional = user_message["_aura_additional_information"]
     assert "tts_ref_audio" not in additional
     assert "tts_ref_text" not in additional
+    assert additional["aura_skip_asr"] is True
+
+
+def test_build_engine_prompt_disables_skip_asr_when_audio_present():
+    handler = AuraStreamingVideoHandler(chat_service=object())
+    config = AuraStreamingVideoSessionConfig(model="test")
+    state = _session_state()
+    state.turn_frame_arrays = [np.zeros((8, 8, 3), dtype=np.uint8)]
+
+    _, user_message = handler.build_engine_prompt(
+        config,
+        [_b64(_make_jpeg())],
+        bytearray(b"\x00\x01"),
+        state,
+        "",
+        {},
+    )
+
+    assert user_message["_aura_additional_information"]["aura_skip_asr"] is False
 
 
 @pytest.mark.asyncio
@@ -219,10 +266,34 @@ async def test_build_engine_prompt_via_preprocess_mock():
     assert captured_requests
     request = captured_requests[0]
     additional = getattr(request, "additional_information")
-    assert "aura_session_state" in additional
+    assert additional["aura_session_id"] == state.session_id
+    assert "aura_session_state" not in additional
     assert "aura_turn_video" in additional
     assert state.pending_turn_video is additional["aura_turn_video"]
     assert request.messages[0]["content"][0]["type"] == "input_audio"
+
+
+def test_create_message_history_registers_server_side_store():
+    handler = AuraStreamingVideoHandler(chat_service=object())
+    config = AuraStreamingVideoSessionConfig(model="test")
+
+    state = handler.create_message_history(config)
+
+    assert state.session_id
+    from vllm_omni.entrypoints.openai.aura_session_store import get_session_history
+
+    assert get_session_history(state.session_id) is state.history
+
+
+def test_on_session_end_unregisters_server_side_store():
+    handler = AuraStreamingVideoHandler(chat_service=object())
+    state = _session_state()
+
+    handler.on_session_end(state)
+
+    from vllm_omni.entrypoints.openai.aura_session_store import get_session_history
+
+    assert get_session_history(state.session_id) is None
 
 
 @pytest.mark.asyncio

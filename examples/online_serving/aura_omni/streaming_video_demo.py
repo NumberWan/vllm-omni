@@ -4,16 +4,20 @@
 """AURA streaming video demo — real-time frames, timed audio, verbose WS log.
 
 Two send modes:
-  1. Steady fps (``--fps 2``): one frame every 0.5s.
+  1. Steady (``--burst-interval 0``): ``--send-fps`` frames per wall-clock second.
   2. Burst (``--burst-interval 5 --burst-frames 2``): every 5s send 2 frames.
 
+Sampling vs sending (decoupled):
+  ``--sample-fps`` controls how many frames are *extracted* per second of source video.
+  ``--send-fps`` / ``--fps`` controls how fast frames are *sent* over the WebSocket.
+  When omitted, ``--sample-fps`` defaults to the send rate (legacy behaviour).
+
 Usage:
-    # Steady 2 fps + two timed audio clips
+    # Sample 8 frames/s from video, send 2 frames/s (49s clip -> ~392 frames, ~196s wall)
     python examples/online_serving/aura_omni/streaming_video_demo.py \\
         --video /public/wtk/aura_prompts/aura_test.mp4 \\
-        --burst-interval 0 --fps 2 \\
-        --audio-schedule 3:/public/wtk/aura_prompts/01_frame_what.wav \\
-        --audio-schedule 10:/public/wtk/aura_prompts/02_pool_notify.wav \\
+        --burst-interval 0 --sample-fps 8 --send-fps 2 \\
+        --audio-schedule 4:/public/wtk/aura_prompts/01_frame_what.wav \\
         --no-evs
 """
 
@@ -187,6 +191,13 @@ class AudioScheduleItem:
     injected: bool = False
 
 
+def _resolve_sample_send_fps(args: argparse.Namespace) -> tuple[float, float]:
+    """Return (sample_fps, send_fps). Sample = extract from file; send = wall-clock wire rate."""
+    send_fps = args.send_fps if args.send_fps is not None else args.fps
+    sample_fps = args.sample_fps if args.sample_fps is not None else send_fps
+    return sample_fps, send_fps
+
+
 def _parse_audio_schedule(
     audio: str | None,
     audio_at_sec: float,
@@ -332,8 +343,10 @@ async def _stream_video_steady(
     src_fps: float,
 ) -> None:
     audio_desc = ", ".join(f"{x.at_sec}s:{x.label}" for x in audio_schedule) or "none"
+    sample_fps, send_fps = _resolve_sample_send_fps(args)
     log.note(
-        f"Send mode: steady — {args.fps} fps (every {interval_s:.3f}s), audio: {audio_desc}"
+        f"Send mode: steady — sample {sample_fps} fps, send {send_fps} fps "
+        f"(every {interval_s:.3f}s), audio: {audio_desc}"
     )
     t0 = time.monotonic()
     src_idx = 0
@@ -388,10 +401,17 @@ async def _stream_video(
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duration = total_frames / src_fps if total_frames > 0 else 0.0
-    step = max(1, int(round(src_fps / max(args.fps, 0.1))))
-    interval_s = 1.0 / max(args.fps, 0.1)
+    sample_fps, send_fps = _resolve_sample_send_fps(args)
+    step = max(1, int(round(src_fps / max(sample_fps, 0.1))))
+    interval_s = 1.0 / max(send_fps, 0.1)
+    est_frames = int(total_frames / step) if total_frames > 0 else 0
+    est_wall_s = est_frames / send_fps if send_fps > 0 else 0.0
 
-    log.note(f"Video: {args.video} src_fps={src_fps:.2f} duration≈{duration:.1f}s")
+    log.note(
+        f"Video: {args.video} src_fps={src_fps:.2f} duration≈{duration:.1f}s "
+        f"sample_fps={sample_fps} send_fps={send_fps} step={step} "
+        f"est_frames≈{est_frames} est_wall≈{est_wall_s:.1f}s"
+    )
 
     modalities = ["text"] if args.text_only else ["text", "audio"]
     config: dict[str, Any] = {
@@ -478,7 +498,25 @@ def main() -> None:
         help="Gap between frames inside one burst (ms)",
     )
     p.add_argument("--max-bursts", type=int, default=0, help="Stop after N bursts (0=unlimited)")
-    p.add_argument("--fps", type=float, default=2.0, help="Steady mode only (--burst-interval 0): frames per second")
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=2.0,
+        help="Steady mode send rate (frames/s on wire). Alias for --send-fps when that is unset.",
+    )
+    p.add_argument(
+        "--send-fps",
+        type=float,
+        default=None,
+        help="Wall-clock send rate in steady mode. Overrides --fps when set.",
+    )
+    p.add_argument(
+        "--sample-fps",
+        type=float,
+        default=None,
+        help="Frames extracted per second of source video (decoupled from send rate). "
+        "Default: same as send fps.",
+    )
     p.add_argument("--max-duration", type=float, default=0, help="Stop sending after N seconds (0=all)")
     p.add_argument("--max-frames", type=int, default=256)
     p.add_argument("--max-frames-per-round", type=int, default=16)

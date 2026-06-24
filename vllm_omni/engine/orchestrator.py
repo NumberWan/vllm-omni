@@ -458,13 +458,33 @@ class Orchestrator:
         if self._running_counter is not None:
             self._running_counter.increment()
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
-        req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+
+        from vllm_omni.model_executor.stage_input_processors.aura_omni_skip import (
+            make_mock_asr_source_output,
+            should_skip_aura_asr,
+        )
+
+        if should_skip_aura_asr(original_prompt) and final_stage_id >= 1:
+            logger.info(
+                "[Orchestrator] req=%s skipping stage-0 ASR for video-only AURA turn",
+                request_id,
+            )
+            await self._forward_to_next_stage(
+                request_id,
+                stage_id,
+                make_mock_asr_source_output(request_id),
+                req_state,
+                src_replica_id=0,
+            )
+            return
+
+        req_state.stage_submit_ts[stage_id] = _time.time()
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
