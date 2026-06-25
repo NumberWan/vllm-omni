@@ -1,10 +1,10 @@
 # AURA Streaming Video API
 
-vLLM-Omni exposes the same WebSocket endpoint as Qwen-Omni streaming video, but when the server is started with the `aura_omni_streaming` deploy profile it uses `AuraStreamingVideoHandler`:
+vLLM-Omni exposes the same WebSocket endpoint as Qwen-Omni streaming video, but when the server is started with the `aura_omni` deploy profile it uses `AuraStreamingVideoHandler`:
 
 - **ASR → AURA → TTS → Code2Wav** four-stage pipeline
 - **Automatic turn trigger** after `auto_trigger_min_frames` buffered frames (default `2`)
-- **SessionHistory** across turns via `asr2aura_session` (selected by deploy `pipeline: aura_omni_streaming`)
+- **SessionHistory** across WebSocket turns via stage-1 `asr2aura` when `aura_session_id` is present
 - **`modalities: ["text", "audio"]`** for TTS output via `response.audio.delta` / `response.audio.done`
 - **Frame-only auto trigger** — per-turn `turn_frame_arrays` count `>= auto_trigger_min_frames` and **`not is_turn_locked`** (not cumulative `frame_buffer`)
 - **Early turn release** — after assistant text (`response.text.done`), SessionHistory updates and the next frame may trigger while TTS audio still streams
@@ -12,23 +12,21 @@ vLLM-Omni exposes the same WebSocket endpoint as Qwen-Omni streaming video, but 
 
 See also: [video_stream_api.md](video_stream_api.md) for shared protocol fields.
 
-## Required: `pipeline: aura_omni_streaming` (multi-turn WebSocket)
+## Deploy: `pipeline: aura_omni`
 
-The WebSocket handler always registers an `aura_session_id` and updates `SessionHistory` in-process. **Cross-turn prompts only work when stage-1 is wired to `asr2aura_session`**, which the registry pipeline `aura_omni_streaming` selects:
+Use a single deploy profile for HTTP single-turn and WebSocket multi-turn:
 
 ```yaml
-# vllm_omni/deploy/aura_omni_streaming.yaml
-pipeline: aura_omni_streaming
+# vllm_omni/deploy/aura_omni.yaml
+pipeline: aura_omni
 ```
 
-| Deploy `pipeline` | Stage-1 processor | WebSocket multi-turn |
-|-------------------|-------------------|----------------------|
-| `aura_omni_streaming` | `asr2aura_session` | SessionHistory across turns |
-| `aura_omni` | `asr2aura` | Single-turn only — `aura_session_id` ignored for history |
+Stage-1 `asr2aura` is session-aware at runtime:
 
-If you use `pipeline: aura_omni` with the AURA streaming handler, stage-1 logs a **one-time WARNING** when it sees `aura_session_id`.
-
-Single-turn `/chat/completions` or Gradio can use `pipeline: aura_omni`.
+| Request context | Stage-1 behavior |
+|-----------------|------------------|
+| WebSocket with `aura_session_id` | `SessionHistory` across turns |
+| `/chat/completions`, Gradio, offline (no session fields) | Stateless single-turn prompt |
 
 ## Quick Start
 
@@ -36,7 +34,7 @@ Single-turn `/chat/completions` or Gradio can use `pipeline: aura_omni`.
 
 ```bash
 vllm serve aurateam/AURA \
-    --deploy-config vllm_omni/deploy/aura_omni_streaming.yaml \
+    --deploy-config vllm_omni/deploy/aura_omni.yaml \
     --omni \
     --port 8000 \
     --trust-remote-code
@@ -114,6 +112,5 @@ The example client saves concatenated PCM to `--output-wav` (default `aura_strea
 
 | Deploy profile | `pipeline` | Handler |
 |----------------|------------|---------|
-| `aura_omni_streaming.yaml` | `aura_omni_streaming` | `AuraStreamingVideoHandler` |
 | `aura_omni.yaml` | `aura_omni` | `AuraStreamingVideoHandler` |
 | `qwen3_omni.yaml` (default omni video) | *(other)* | `QwenOmniStreamingVideoHandler` |

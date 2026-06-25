@@ -1148,8 +1148,13 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
 
 
 @pytest.mark.asyncio
-async def test_omni_skip_stages_bypasses_stage0(orchestrator_factory) -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+async def test_omni_skip_stages_still_submits_stage0(orchestrator_factory) -> None:
+    """Skip metadata is consumed by the ASR model; orchestrator still schedules stage-0."""
+    stage0 = FakeStageClient(
+        stage_type="llm",
+        final_output=False,
+        next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
+    )
     stage1 = FakeStageClient(
         stage_type="llm",
         final_output=True,
@@ -1157,7 +1162,7 @@ async def test_omni_skip_stages_bypasses_stage0(orchestrator_factory) -> None:
         next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
     )
     processors = [
-        FakeOutputProcessor(),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-skip-asr", token_ids=[1, 2], finished=True)]),
         FakeOutputProcessor(request_outputs=[_build_request_output("req-skip-asr", token_ids=[3, 4], finished=True)]),
     ]
     orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
@@ -1176,8 +1181,11 @@ async def test_omni_skip_stages_bypasses_stage0(orchestrator_factory) -> None:
             final_stage_id=1,
         )
 
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        assert stage0.add_request_calls[0][0].request_id == "req-skip-asr"
+
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
-        assert len(stage0.add_request_calls) == 0
         assert stage1.add_request_calls[0][0].request_id == "req-skip-asr"
         assert stage1.add_request_calls[0][0].prompt_token_ids == [7, 8, 9]
 

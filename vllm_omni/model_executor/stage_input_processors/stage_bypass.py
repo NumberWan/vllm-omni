@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Generic optional stage-bypass helpers (import-light for orchestrator use)."""
+"""Generic optional stage-skip metadata helpers."""
 
 from __future__ import annotations
 
@@ -31,6 +31,11 @@ def should_skip_stage(prompt: Any, stage_id: int) -> bool:
     if not isinstance(prompt, dict):
         return False
     additional_info = prompt.get("additional_information")
+    return should_skip_stage_from_info(additional_info, stage_id)
+
+
+def should_skip_stage_from_info(additional_info: Any, stage_id: int) -> bool:
+    """Return True when a per-request ``additional_information`` dict requests stage skip."""
     if not isinstance(additional_info, dict):
         return False
     return stage_id in _parse_skip_stage_ids(additional_info.get(OMNI_SKIP_STAGES_KEY))

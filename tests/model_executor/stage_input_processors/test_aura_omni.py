@@ -18,7 +18,6 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
     _clean_asr_transcript,
     asr2aura,
-    asr2aura_session,
     aura2tts,
     pop_turn_transcript,
     record_turn_transcript,
@@ -88,7 +87,7 @@ def test_transcript_storage_normalizes_internal_request_id():
     assert pop_turn_transcript(internal) == ""
 
 
-def test_asr2aura_session_restores_history_and_turn_video():
+def test_asr2aura_restores_history_and_turn_video():
     history = SessionHistory(pruning_enabled=False)
     frames = np.array(
         [
@@ -113,7 +112,7 @@ def test_asr2aura_session_restores_history_and_turn_video():
         }
     }
 
-    [next_input] = asr2aura_session(
+    [next_input] = asr2aura(
         [_source_output("language Chinese<asr_text>Hello there.", request_id="video-testreq01-abcd1234")],
         prompt=[prompt],
     )
@@ -145,7 +144,7 @@ def test_video_tuple_from_additional_info_legacy_aura_turn_video():
     assert meta["fps"] == 2.0
 
 
-def test_asr2aura_session_uses_server_side_store():
+def test_asr2aura_uses_server_side_store():
     clear_all_sessions()
     history = SessionHistory(pruning_enabled=False)
     session_id = "aura-store-test"
@@ -197,7 +196,7 @@ def test_asr2aura_session_uses_server_side_store():
         }
     }
 
-    [next_input] = asr2aura_session(
+    [next_input] = asr2aura(
         [_source_output("language Chinese<asr_text>Hello there.", request_id="video-testreq02-abcd1234")],
         prompt=[prompt],
     )

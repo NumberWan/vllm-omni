@@ -359,6 +359,11 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
+    "Qwen3ASRForConditionalGeneration": (
+        "aura_omni",
+        "qwen3_asr",
+        "AuraQwen3ASRForConditionalGeneration",
+    ),
 }
 
 

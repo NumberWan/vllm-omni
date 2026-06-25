@@ -465,21 +465,6 @@ class Orchestrator:
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
 
-        from vllm_omni.model_executor.stage_input_processors.stage_bypass import (
-            make_mock_text_stage_output,
-            should_skip_stage,
-        )
-
-        if should_skip_stage(original_prompt, stage_id=0) and final_stage_id >= 1:
-            await self._forward_to_next_stage(
-                request_id,
-                stage_id,
-                make_mock_text_stage_output(request_id),
-                req_state,
-                src_replica_id=0,
-            )
-            return
-
         req_state.stage_submit_ts[stage_id] = _time.time()
         await self.stage_pools[stage_id].submit_initial(
             request_id,
