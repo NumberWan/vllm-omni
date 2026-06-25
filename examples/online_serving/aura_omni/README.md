@@ -46,7 +46,6 @@ Expected request shape:
   - `tts_ref_text`
   - `tts_x_vector_only_mode`
   - `tts_pass_token_ids`
-  - `aura_tts_full_response`
 
 If AURA emits `<|silent|>`, the `aura2tts` processor returns no TTS request, so
 the TTS stages are skipped for that turn.
@@ -81,8 +80,8 @@ sequenceDiagram
     stage0->>adapter: ASR chunks accumulate
     adapter->>stage1: ASR finish emits AURA prompt and deferred video
     stage1-->>client: Text final output stream
-    stage1->>adapter: AURA tokens buffered or full response
-    adapter->>stage2: TTS text or token payload
+    stage1->>adapter: AURA response accumulates until request finish
+    adapter->>stage2: One complete TTS text or token payload
     stage2->>adapter: Codec chunks
     adapter->>stage3: Code2Wav audio-code payloads
     stage3-->>client: Audio final output stream
@@ -103,7 +102,7 @@ flowchart LR
     aura --> textOut["Final text output"]
     aura --> silentGate{"Silent marker"}
     silentGate -->|"silent"| noTts["No TTS payload"]
-    silentGate -->|"non-silent"| auraBridge["aura2tts_async_chunk buffer or full response"]
+    silentGate -->|"non-silent"| auraBridge["aura2tts_async_chunk on AURA finish"]
     auraBridge --> talker["Stage2 Qwen3-TTS Talker: text to codec tokens"]
     talker --> codecBridge["talker2code2wav_async_chunk"]
     codecBridge --> code2wav["Stage3 Code2Wav: codec tokens to audio"]
@@ -155,14 +154,6 @@ python examples/online_serving/aura_omni/openai_chat_completion_client.py \
   --tts-pass-token-ids
 ```
 
-Wait until AURA finishes the current answer before sending one complete text
-payload to TTS:
-
-```bash
-python examples/online_serving/aura_omni/openai_chat_completion_client.py \
-  --aura-tts-full-response
-```
-
 CustomVoice mode requires stages 2 and 3 in `aura_omni.yaml` to point at a
 Qwen3-TTS CustomVoice checkpoint:
 
@@ -176,11 +167,6 @@ By default, AURA responses are passed to Qwen3-TTS as text. Set
 `tts_pass_token_ids=true` to pass AURA-generated assistant token ids directly
 to Qwen3-TTS instead. The processor still uses AURA token ids, when available,
 to estimate the Talker prompt length in the default text path.
-
-Set `aura_tts_full_response=true` to buffer AURA output until the current answer
-is finished, then send a single full-text TTS request. This is useful for
-CustomVoice and other non-streaming TTS modes that expect complete text
-conditioning in the Talker prefill.
 
 ## Curl
 
