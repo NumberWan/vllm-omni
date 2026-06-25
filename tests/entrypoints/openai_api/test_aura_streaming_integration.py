@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from vllm_omni.entrypoints.openai.aura.session_history import SessionHistory
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import SessionHistory
 from vllm_omni.entrypoints.openai.serving_video_stream import (
     AuraSessionState,
     AuraStreamingVideoHandler,

@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from vllm_omni.entrypoints.openai.aura.session_history import (
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
     SessionHistory,
     clear_all_sessions,
     get_session_history,
@@ -145,20 +145,22 @@ def test_on_turn_complete_persists_user_video_and_assistant():
 
     handler = AuraStreamingVideoHandler(chat_service=object())
     state = _session_state()
-    state.pending_turn_video = {
-        "frames": [
+    frames = np.array(
+        [
             [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
             [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
         ],
-        "metadata": {
-            "fps": 2.0,
-            "duration": 1.0,
-            "total_num_frames": 2,
-            "frames_indices": [0, 1],
-            "video_backend": "opencv",
-            "do_sample_frames": False,
-        },
+        dtype=np.uint8,
+    )
+    metadata = {
+        "fps": 2.0,
+        "duration": 1.0,
+        "total_num_frames": 2,
+        "frames_indices": [0, 1],
+        "video_backend": "opencv",
+        "do_sample_frames": False,
     }
+    state.pending_turn_video = {"video": [(frames, metadata)]}
     record_turn_transcript("req-1", "画面有什么？")
 
     handler.on_turn_complete(state, {"role": "user", "content": []}, "好的。", request_id="req-1")
@@ -198,8 +200,9 @@ def test_build_engine_prompt_stores_audio_and_session_payload():
     assert additional["aura_session_id"] == state.session_id
     assert "aura_session_state" not in additional
     assert additional["aura_system_prompt"] == ["system-a"]
-    assert additional["aura_turn_video"]["metadata"]["total_num_frames"] == 2
-    assert len(additional["aura_turn_video"]["frames"]) == 2
+    deferred = additional["deferred_multi_modal_data"]
+    assert deferred["video"][0][1]["total_num_frames"] == 2
+    assert deferred["video"][0][0].shape == (2, 8, 8, 3)
     assert additional["tts_ref_audio"]
     assert additional["tts_ref_text"]
 
@@ -277,7 +280,7 @@ async def test_process_query_merges_cross_turn_penalty_sampling_params():
         def decode(self, token_ids: list[int]) -> str:
             return "".join(chr(tid) for tid in token_ids)
 
-    from vllm_omni.entrypoints.openai.aura import CrossTurnPenalty
+    from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import CrossTurnPenalty
 
     mock_engine = MagicMock()
 

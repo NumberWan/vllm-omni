@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -14,21 +15,17 @@ import numpy as np
 import soundfile as sf
 from vllm.logger import init_logger
 
-from vllm_omni.entrypoints.openai.aura.session_history import SessionHistory, is_effectively_silent
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
-
-DEFAULT_AURA_SYSTEM_PROMPT = (
-    "You are receiving a live video stream where the final frame is the present moment. "
-    "Respond only when a response is needed based on the user's message or the visual context. "
-    "Otherwise, output '<|silent|>' to signify silence. Respond in Chinese."
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    DEFAULT_AURA_SYSTEM_PROMPT,
+    SILENT_TEXT,
+    SessionHistory,
+    is_effectively_silent,
 )
-
-SILENT_TEXT = "<|silent|>"
-# Stage-1 ``custom_process_input_func`` is the module path ``...aura_omni``;
-# deploy ``streaming_session`` picks ``asr2aura`` vs ``asr2aura_session``.
+# Stage-1 processor is chosen by deploy ``pipeline`` (``aura_omni`` vs ``aura_omni_streaming``).
 QWEN_IM_START_ID = 151644
 QWEN_IM_END_ID = 151645
 QWEN_ASSISTANT_ID = 77091
@@ -36,6 +33,32 @@ QWEN_ASSISTANT_ID = 77091
 logger = init_logger(__name__)
 
 _TURN_TRANSCRIPTS_BY_REQUEST: dict[str, str] = {}
+
+_STREAMING_SESSION_DISABLED_WARNED = False
+
+
+def _aura_log_turn_prompt_enabled() -> bool:
+    return os.environ.get("VLLM_AURA_LOG_TURN_PROMPT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _warn_single_turn_processor_with_session_id(additional_info: dict[str, Any]) -> None:
+    """Warn once when WebSocket sends session ids but deploy uses single-turn asr2aura."""
+    global _STREAMING_SESSION_DISABLED_WARNED
+    if _STREAMING_SESSION_DISABLED_WARNED:
+        return
+    if not (additional_info.get("aura_session_id") or additional_info.get("aura_session_state")):
+        return
+    _STREAMING_SESSION_DISABLED_WARNED = True
+    logger.warning(
+        "AURA WebSocket session fields (aura_session_id) were received but stage-1 is "
+        "wired to single-turn asr2aura. Multi-turn SessionHistory requires deploy "
+        "pipeline: aura_omni_streaming (or stage-1 processor asr2aura_session)."
+    )
 
 QWEN_NEWLINE_ID = 198
 QWEN_ASSISTANT_PREFIX_IDS = [QWEN_IM_START_ID, QWEN_ASSISTANT_ID, QWEN_NEWLINE_ID]
@@ -239,6 +262,7 @@ def asr2aura(
     for idx, source_output in enumerate(source_outputs):
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
+        _warn_single_turn_processor_with_session_id(additional_info)
         system_prompt = _first_value(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT)
         transcript = _clean_asr_transcript(_extract_text(source_output))
         multi_modal_data = {}
@@ -261,22 +285,51 @@ def asr2aura(
     return next_inputs
 
 
-def video_tuple_from_aura_turn_video(aura_turn_video: Any) -> tuple[np.ndarray, dict[str, Any]] | None:
-    if not isinstance(aura_turn_video, dict):
-        return None
-    frames = aura_turn_video.get("frames")
+def _normalize_video_tuple(
+    frames: Any,
+    metadata: dict[str, Any] | None,
+) -> tuple[np.ndarray, dict[str, Any]] | None:
+    """Return (uint8 ndarray [T,H,W,C], metadata) with at least two frames."""
     if frames is None:
         return None
-    metadata = dict(aura_turn_video.get("metadata") or {})
     video_array = np.asarray(frames, dtype=np.uint8)
     if video_array.ndim != 4:
         return None
+    meta = dict(metadata or {})
     if video_array.shape[0] < 2:
         video_array = np.concatenate([video_array, video_array], axis=0)[:2]
-        metadata = dict(metadata)
-        metadata["total_num_frames"] = 2
-        metadata["duration"] = 2 / float(metadata.get("fps", 2.0))
-    return video_array, metadata
+        meta = dict(meta)
+        meta["total_num_frames"] = 2
+        meta["duration"] = 2 / float(meta.get("fps", 2.0))
+    return video_array, meta
+
+
+def video_tuple_from_aura_turn_video(aura_turn_video: Any) -> tuple[np.ndarray, dict[str, Any]] | None:
+    """Legacy JSON-serializable turn video: ``{frames: list, metadata: dict}``."""
+    if not isinstance(aura_turn_video, dict):
+        return None
+    return _normalize_video_tuple(aura_turn_video.get("frames"), aura_turn_video.get("metadata"))
+
+
+def video_tuple_from_deferred_multi_modal(deferred: Any) -> tuple[np.ndarray, dict[str, Any]] | None:
+    """Read the first ``(ndarray, metadata)`` video entry from deferred multimodal data."""
+    if not isinstance(deferred, dict):
+        return None
+    videos = deferred.get("video")
+    if not videos:
+        return None
+    first = videos[0] if isinstance(videos, list) else videos
+    if isinstance(first, (tuple, list)) and len(first) == 2:
+        return _normalize_video_tuple(first[0], first[1] if isinstance(first[1], dict) else {})
+    return None
+
+
+def video_tuple_from_additional_info(additional_info: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]] | None:
+    """Resolve per-turn video from ``deferred_multi_modal_data`` or legacy ``aura_turn_video``."""
+    video_tuple = video_tuple_from_deferred_multi_modal(additional_info.get("deferred_multi_modal_data"))
+    if video_tuple is not None:
+        return video_tuple
+    return video_tuple_from_aura_turn_video(additional_info.get("aura_turn_video"))
 
 
 def _copy_aura_tts_fields(additional_info: dict[str, Any]) -> dict[str, Any]:
@@ -287,13 +340,36 @@ def _copy_aura_tts_fields(additional_info: dict[str, Any]) -> dict[str, Any]:
     return copied
 
 
+def _summarize_vllm_inputs(vllm_inputs: dict[str, Any]) -> str:
+    """JSON summary of AURA stage-1 prompt (text skeleton + video metadata, no pixels)."""
+    videos = vllm_inputs.get("multi_modal_data", {}).get("video", [])
+    video_info: list[dict[str, Any]] = []
+    for vt in videos:
+        arr, meta = vt
+        video_info.append(
+            {
+                "frames": int(arr.shape[0]),
+                "shape": list(arr.shape),
+                "fps": meta.get("fps"),
+                "duration": meta.get("duration"),
+            }
+        )
+    return json.dumps(
+        {
+            "prompt_text": vllm_inputs.get("prompt", ""),
+            "videos": video_info,
+        },
+        ensure_ascii=False,
+    )
+
+
 def asr2aura_session(
     source_outputs: list[Any],
     prompt: Any = None,
     requires_multimodal_data: bool = True,
 ) -> list[dict[str, Any]]:
     """Build AURA prompts from ASR transcripts and server-side or serialized SessionHistory."""
-    from vllm_omni.entrypoints.openai.aura.session_history import get_session_history
+    from vllm_omni.model_executor.stage_input_processors.aura_session_history import get_session_history
 
     prompt_by_request_id = _source_prompt_by_request_id(source_outputs, prompt)
     next_inputs: list[dict[str, Any]] = []
@@ -321,13 +397,21 @@ def asr2aura_session(
         request_id = str(getattr(source_output, "request_id", idx))
         transcript = _clean_asr_transcript(_extract_text(source_output))
         record_turn_transcript(request_id, transcript)
-        video_tuple = video_tuple_from_aura_turn_video(additional_info.get("aura_turn_video"))
+        video_tuple = video_tuple_from_additional_info(additional_info)
         if history is None:
             history = SessionHistory.from_dict(additional_info["aura_session_state"])
             history.add_user_message(transcript, video_tuple=video_tuple)
             vllm_inputs = history.get_vllm_inputs()
         else:
             vllm_inputs = history.preview_vllm_inputs(transcript, video_tuple=video_tuple)
+
+        if _aura_log_turn_prompt_enabled():
+            logger.info(
+                "AURA turn prompt request_id=%s transcript=%r: %s",
+                request_id,
+                transcript,
+                _summarize_vllm_inputs(vllm_inputs),
+            )
 
         next_input = {
             "prompt": vllm_inputs["prompt"],

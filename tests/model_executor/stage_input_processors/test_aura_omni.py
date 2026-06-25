@@ -3,9 +3,14 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
-from vllm_omni.entrypoints.openai.aura.session_history import SessionHistory, clear_all_sessions, register_session
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    SessionHistory,
+    clear_all_sessions,
+    register_session,
+)
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
@@ -17,6 +22,7 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     aura2tts,
     pop_turn_transcript,
     record_turn_transcript,
+    video_tuple_from_additional_info,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -84,23 +90,25 @@ def test_transcript_storage_normalizes_internal_request_id():
 
 def test_asr2aura_session_restores_history_and_turn_video():
     history = SessionHistory(pruning_enabled=False)
+    frames = np.array(
+        [
+            [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
+            [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
+        ],
+        dtype=np.uint8,
+    )
+    metadata = {
+        "fps": 2.0,
+        "duration": 1.0,
+        "total_num_frames": 2,
+        "frames_indices": [0, 1],
+        "video_backend": "opencv",
+        "do_sample_frames": False,
+    }
     prompt = {
         "additional_information": {
             "aura_session_state": history.to_dict(),
-            "aura_turn_video": {
-                "frames": [
-                    [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
-                    [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
-                ],
-                "metadata": {
-                    "fps": 2.0,
-                    "duration": 1.0,
-                    "total_num_frames": 2,
-                    "frames_indices": [0, 1],
-                    "video_backend": "opencv",
-                    "do_sample_frames": False,
-                },
-            },
+            "deferred_multi_modal_data": {"video": [(frames, metadata)]},
             "aura_system_prompt": ["custom system"],
         }
     }
@@ -116,6 +124,25 @@ def test_asr2aura_session_restores_history_and_turn_video():
     assert "<asr_text>" not in next_input["prompt"]
     assert next_input["multi_modal_data"]["video"]
     assert pop_turn_transcript("video-testreq01") == "Hello there."
+
+
+def test_video_tuple_from_additional_info_legacy_aura_turn_video():
+    frames = [
+        [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
+        [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
+    ]
+    video_tuple = video_tuple_from_additional_info(
+        {
+            "aura_turn_video": {
+                "frames": frames,
+                "metadata": {"fps": 2.0},
+            }
+        }
+    )
+    assert video_tuple is not None
+    arr, meta = video_tuple
+    assert arr.shape[0] == 2
+    assert meta["fps"] == 2.0
 
 
 def test_asr2aura_session_uses_server_side_store():
@@ -145,19 +172,26 @@ def test_asr2aura_session_uses_server_side_store():
     prompt = {
         "additional_information": {
             "aura_session_id": session_id,
-            "aura_turn_video": {
-                "frames": [
-                    [[[3, 0, 0], [0, 3, 0]], [[0, 0, 3], [3, 3, 0]]],
-                    [[[4, 0, 0], [0, 4, 0]], [[0, 0, 4], [4, 4, 0]]],
+            "deferred_multi_modal_data": {
+                "video": [
+                    (
+                        np.array(
+                            [
+                                [[[3, 0, 0], [0, 3, 0]], [[0, 0, 3], [3, 3, 0]]],
+                                [[[4, 0, 0], [0, 4, 0]], [[0, 0, 4], [4, 4, 0]]],
+                            ],
+                            dtype=np.uint8,
+                        ),
+                        {
+                            "fps": 2.0,
+                            "duration": 1.0,
+                            "total_num_frames": 2,
+                            "frames_indices": [0, 1],
+                            "video_backend": "opencv",
+                            "do_sample_frames": False,
+                        },
+                    )
                 ],
-                "metadata": {
-                    "fps": 2.0,
-                    "duration": 1.0,
-                    "total_num_frames": 2,
-                    "frames_indices": [0, 1],
-                    "video_backend": "opencv",
-                    "do_sample_frames": False,
-                },
             },
             "aura_system_prompt": ["custom system"],
         }

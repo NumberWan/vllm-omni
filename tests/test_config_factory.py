@@ -1544,7 +1544,7 @@ class TestAuraOmniDeploy:
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni.yaml"
         deploy = load_deploy_config(deploy_path)
 
-        assert deploy.pipeline == "aura_omni"
+        assert deploy.pipeline == "aura_omni_streaming"
 
     def test_aura_omni_deploy_resolves_four_native_stages(self):
         pipeline_cfg = StageConfigFactory.resolve_pipeline_config("aura_omni")
@@ -1570,14 +1570,12 @@ class TestAuraOmniDeploy:
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
         assert stages[1].custom_process_input_func.endswith("asr2aura_session")
 
-    def test_streaming_session_dispatches_aura_processors(self):
-        """``deploy.streaming_session`` picks asr2aura_session vs asr2aura on stage 1."""
-        pipeline = OMNI_PIPELINES["aura_omni"]
+    def test_aura_omni_pipelines_dispatch_stage1_processors(self):
+        """Registry pipelines pick explicit stage-1 processors (no deploy knob)."""
+        streaming_stages = merge_pipeline_deploy(OMNI_PIPELINES["aura_omni_streaming"], DeployConfig())
+        assert streaming_stages[1].custom_process_input_func.endswith("asr2aura_session")
 
-        session_stages = merge_pipeline_deploy(pipeline, DeployConfig(streaming_session=True))
-        assert session_stages[1].custom_process_input_func.endswith("asr2aura_session")
-
-        single_turn_stages = merge_pipeline_deploy(pipeline, DeployConfig(streaming_session=False))
+        single_turn_stages = merge_pipeline_deploy(OMNI_PIPELINES["aura_omni"], DeployConfig())
         assert single_turn_stages[1].custom_process_input_func.endswith("asr2aura")
         assert not single_turn_stages[1].custom_process_input_func.endswith("asr2aura_session")
 

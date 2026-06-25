@@ -1,16 +1,34 @@
 # AURA Streaming Video API
 
-vLLM-Omni exposes the same WebSocket endpoint as Qwen-Omni streaming video, but when the server is started with the `aura_omni` deploy profile it uses `AuraStreamingVideoHandler`:
+vLLM-Omni exposes the same WebSocket endpoint as Qwen-Omni streaming video, but when the server is started with the `aura_omni_streaming` deploy profile it uses `AuraStreamingVideoHandler`:
 
 - **ASR → AURA → TTS → Code2Wav** four-stage pipeline
 - **Automatic turn trigger** after `auto_trigger_min_frames` buffered frames (default `2`)
-- **SessionHistory** across turns via `asr2aura_session` (`streaming_session: true` in deploy YAML selects it from the `aura_omni` processor module)
+- **SessionHistory** across turns via `asr2aura_session` (selected by deploy `pipeline: aura_omni_streaming`)
 - **`modalities: ["text", "audio"]`** for TTS output via `response.audio.delta` / `response.audio.done`
 - **Frame-only auto trigger** — per-turn `turn_frame_arrays` count `>= auto_trigger_min_frames` and **`not is_turn_locked`** (not cumulative `frame_buffer`)
 - **Early turn release** — after assistant text (`response.text.done`), SessionHistory updates and the next frame may trigger while TTS audio still streams
 - **`video.query` is ignored** — no manual trigger, no interrupt
 
 See also: [video_stream_api.md](video_stream_api.md) for shared protocol fields.
+
+## Required: `pipeline: aura_omni_streaming` (multi-turn WebSocket)
+
+The WebSocket handler always registers an `aura_session_id` and updates `SessionHistory` in-process. **Cross-turn prompts only work when stage-1 is wired to `asr2aura_session`**, which the registry pipeline `aura_omni_streaming` selects:
+
+```yaml
+# vllm_omni/deploy/aura_omni.yaml
+pipeline: aura_omni_streaming
+```
+
+| Deploy `pipeline` | Stage-1 processor | WebSocket multi-turn |
+|-------------------|-------------------|----------------------|
+| `aura_omni_streaming` | `asr2aura_session` | SessionHistory across turns |
+| `aura_omni` | `asr2aura` | Single-turn only — `aura_session_id` ignored for history |
+
+If you use `pipeline: aura_omni` with the AURA streaming handler, stage-1 logs a **one-time WARNING** when it sees `aura_session_id`.
+
+Single-turn `/chat/completions` or Gradio can use `pipeline: aura_omni`.
 
 ## Quick Start
 
@@ -54,6 +72,7 @@ python examples/online_serving/aura_omni/streaming_video_client.py \
 | `pruning_enabled` | bool | `true` | Enable SessionHistory sliding-window pruning. |
 | `max_rounds` | int | `45` | Sliding-window round limit before pruning. |
 | `num_rounds_keep` | int | `30` | Rounds kept in the sliding window after pruning. |
+| `max_context_qas` | int | `10` | Max Q&A blocks in compressed context history after prune. |
 | `aura_system_prompt` | string | AURA default | Override the AURA system prompt. |
 | `video_fps` | float | `2.0` | FPS metadata attached to each `video_tuple`. |
 | `stream_text_deltas` | bool | `false` | When `false`, the server buffers assistant text and only sends `response.text.done` (no per-token `response.text.delta`). Set `true` for incremental text streaming. |
@@ -89,12 +108,33 @@ Set `VLLM_VIDEO_ASYNC_CHUNK=on` for incremental audio deltas during generation (
 
 The example client saves concatenated PCM to `--output-wav` (default `aura_stream_output.wav`). Pass `--text-only` to request text-only modalities.
 
+### Timed replay demo (`streaming_video_demo.py`)
+
+`--audio-schedule SEC:PATH` injects WAV at stream wall-clock seconds (not clip length).
+
+Pruning defaults (`max_rounds=45`) are **not** reached on short clips (~43 turns for `aura_test.mp4` @ 2 fps). To exercise prune:
+
+```bash
+python examples/online_serving/aura_omni/streaming_video_demo.py \
+  ... --max-rounds 30 --num-rounds-keep 20
+```
+
+### Debug: log assembled AURA prompts
+
+Set before `vllm serve` (logs appear on **Stage-1 worker**, not always the API process):
+
+```bash
+export VLLM_AURA_LOG_TURN_PROMPT=1
+```
+
+Each turn prints `AURA turn prompt request_id=...` with `prompt_text` and video metadata (no pixels).
+
 ## Handler Selection
 
-`create_streaming_video_handler()` picks the handler from the deploy profile
-``pipeline`` name (``engine_client.pipeline_name``):
+`create_streaming_video_handler()` reads the deploy YAML ``pipeline`` from ``engine_client.config_path``:
 
 | Deploy profile | `pipeline` | Handler |
 |----------------|------------|---------|
-| `aura_omni.yaml` | `aura_omni` | `AuraStreamingVideoHandler` |
+| `aura_omni.yaml` | `aura_omni_streaming` | `AuraStreamingVideoHandler` |
+| single-turn AURA | `aura_omni` | `AuraStreamingVideoHandler` |
 | `qwen3_omni.yaml` (default omni video) | *(other)* | `QwenOmniStreamingVideoHandler` |

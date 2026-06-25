@@ -654,6 +654,7 @@ def test_build_messages_keeps_recent_history_text_only():
 
 
 def test_create_streaming_video_handler_routes_aura_pipeline():
+    from pathlib import Path
     from unittest.mock import MagicMock
 
     from vllm_omni.entrypoints.openai.serving_video_stream import (
@@ -661,19 +662,22 @@ def test_create_streaming_video_handler_routes_aura_pipeline():
         create_streaming_video_handler,
     )
 
-    engine = MagicMock(pipeline_name="aura_omni", stage_configs=[])
+    deploy_path = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "aura_omni.yaml"
+    engine = MagicMock(config_path=str(deploy_path), stage_configs=[])
 
     handler = create_streaming_video_handler(chat_service=object(), engine_client=engine)
     assert isinstance(handler, AuraStreamingVideoHandler)
 
 
-def test_resolve_pipeline_name_from_aura_deploy_yaml():
+def test_resolve_deploy_pipeline_from_aura_deploy_yaml():
     from pathlib import Path
+    from unittest.mock import MagicMock
 
-    from vllm_omni.config.stage_config import resolve_pipeline_name_from_config_path
+    from vllm_omni.entrypoints.openai.serving_video_stream import _resolve_deploy_pipeline
 
     deploy_path = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "aura_omni.yaml"
-    assert resolve_pipeline_name_from_config_path(deploy_path) == "aura_omni"
+    engine = MagicMock(config_path=str(deploy_path))
+    assert _resolve_deploy_pipeline(engine) == "aura_omni_streaming"
 
 
 def test_create_streaming_video_handler_defaults_to_qwen():
@@ -681,6 +685,6 @@ def test_create_streaming_video_handler_defaults_to_qwen():
 
     from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
 
-    engine = MagicMock(pipeline_name=None, stage_configs=[MagicMock(model_stage="thinker")])
+    engine = MagicMock(config_path=None, stage_configs=[MagicMock(model_stage="thinker")])
     handler = create_streaming_video_handler(chat_service=object(), engine_client=engine)
     assert isinstance(handler, QwenOmniStreamingVideoHandler)

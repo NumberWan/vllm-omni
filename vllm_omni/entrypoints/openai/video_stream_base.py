@@ -352,9 +352,6 @@ class OmniStreamingVideoHandler:
                     if query_task is not None and not query_task.done():
                         query_task.cancel()
                         await asyncio.gather(query_task, return_exceptions=True)
-                    if query_task is not None and not query_task.done():
-                        query_task.cancel()
-                        await asyncio.gather(query_task, return_exceptions=True)
                     query_task = None
                     is_turn_locked = False
 

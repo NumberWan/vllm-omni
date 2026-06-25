@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_omni.entrypoints.openai.aura import CrossTurnPenalty
+from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import CrossTurnPenalty
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

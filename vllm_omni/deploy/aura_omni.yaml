@@ -3,13 +3,12 @@
 # Pass `--deploy-config vllm_omni/deploy/aura_omni.yaml` and point the parent
 # `--model` at any local placeholder repo if needed; each stage overrides its
 # own model below.
-pipeline: aura_omni
+pipeline: aura_omni_streaming
 # AURA has a semantic ASR -> AURA -> TTS dependency. Do not prewarm downstream
 # stages before AURA text is converted into Qwen3-TTS metadata by aura2tts.
 async_chunk: false
-# Multi-turn WebSocket streaming: stage-1 uses asr2aura_session (SessionHistory).
-# Single-turn /chat/completions paths can omit this or set false for asr2aura.
-streaming_session: true
+# Multi-turn WebSocket: ``aura_omni_streaming`` wires stage-1 to asr2aura_session.
+# Single-turn /chat/completions: use pipeline ``aura_omni`` (asr2aura) instead.
 
 connectors:
   connector_of_shared_memory:
