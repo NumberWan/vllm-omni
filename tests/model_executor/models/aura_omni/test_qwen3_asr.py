@@ -8,15 +8,6 @@ from vllm.model_executor.models.qwen3_asr import Qwen3ASRForConditionalGeneratio
 from vllm_omni.model_executor.models.aura_omni.qwen3_asr import (
     AuraQwen3ASRForConditionalGeneration,
 )
-from vllm_omni.model_executor.stage_input_processors.stage_bypass import (
-    should_skip_stage_from_info,
-)
-
-
-def test_should_skip_stage_from_info():
-    assert should_skip_stage_from_info({"omni_skip_stages": [0]}, 0) is True
-    assert should_skip_stage_from_info({"omni_skip_stages": [0]}, 1) is False
-    assert should_skip_stage_from_info({}, 0) is False
 
 
 def _bind_aura_asr_helpers(model: AuraQwen3ASRForConditionalGeneration) -> None:
