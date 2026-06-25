@@ -97,6 +97,11 @@ def _first_int(value: Any, default: int) -> int:
         return default
 
 
+def _first_str(value: Any, default: str = "") -> str:
+    value = _first_value(value, default)
+    return value if isinstance(value, str) else default
+
+
 def _connector_extra_config(transfer_manager: Any) -> dict[str, Any]:
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
@@ -265,25 +270,65 @@ def _clean_tts_text(text: Any) -> str:
     return " ".join(text.split()).strip()
 
 
+def _aura_system_prompt(additional_info: dict[str, Any]) -> str:
+    return _first_str(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT) or DEFAULT_AURA_SYSTEM_PROMPT
+
+
+def _merged_vision_multimodal_data(*sources: Any) -> dict[str, Any]:
+    multi_modal_data: dict[str, Any] = {}
+    for source in sources:
+        if isinstance(source, dict):
+            multi_modal_data.update(source)
+    return _vision_multimodal_data(multi_modal_data)
+
+
+def _tts_additional_info(additional_info: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in additional_info.items()
+        if isinstance(key, str) and (key.startswith("tts_") or key.startswith("aura_tts_"))
+    }
+
+
+def _build_aura_input_payload(
+    *,
+    transcript: str,
+    additional_info: dict[str, Any],
+    multi_modal_data: dict[str, Any],
+    requires_multimodal_data: bool,
+    mm_processor_kwargs: Any = None,
+    tokenizer: Any | None = None,
+    include_empty_multimodal_data: bool = False,
+) -> dict[str, Any]:
+    prompt = _aura_prompt(_aura_system_prompt(additional_info), transcript, multi_modal_data)
+    next_input: dict[str, Any] = {"prompt": prompt}
+    if tokenizer is not None:
+        prompt_token_ids = tokenizer.encode(prompt)
+        next_input["prompt_token_ids"] = prompt_token_ids
+        next_input["ids"] = {"prompt": prompt_token_ids}
+    if requires_multimodal_data and (multi_modal_data or include_empty_multimodal_data):
+        next_input["multi_modal_data"] = multi_modal_data
+    if mm_processor_kwargs is not None:
+        next_input["mm_processor_kwargs"] = mm_processor_kwargs
+    tts_info = _tts_additional_info(additional_info)
+    if tts_info:
+        next_input["additional_information"] = tts_info
+    return next_input
+
+
 def _tts_info_and_prompt_len(
     additional_info: dict[str, Any],
     *,
     assistant_token_ids: list[int],
     text: str,
     prompt_len_token_ids: list[int] | None = None,
+    default_language: str = "Chinese",
+    allow_default_base_refs: bool = True,
 ) -> tuple[dict[str, Any], int]:
-    task_type_raw = additional_info.get("tts_task_type")
-    task_type = task_type_raw[0] if isinstance(task_type_raw, list) and task_type_raw else task_type_raw or "Base"
-    language_raw = additional_info.get("tts_language")
-    language = language_raw[0] if isinstance(language_raw, list) and language_raw else language_raw or "Chinese"
-    instruct_raw = additional_info.get("tts_instruct")
-    instruct = instruct_raw[0] if isinstance(instruct_raw, list) and instruct_raw else instruct_raw or ""
-    max_new_tokens_raw = additional_info.get("tts_max_new_tokens")
-    max_new_tokens = (
-        max_new_tokens_raw[0]
-        if isinstance(max_new_tokens_raw, list) and max_new_tokens_raw
-        else max_new_tokens_raw or 2048
-    )
+    task_type = _first_value(additional_info.get("tts_task_type"), "Base")
+    language = _first_value(additional_info.get("tts_language"), default_language)
+    instruct = _first_value(additional_info.get("tts_instruct"), "")
+    max_new_tokens = _first_value(additional_info.get("tts_max_new_tokens"), 2048)
     tts_info: dict[str, Any] = {
         "task_type": [task_type],
         "language": [language],
@@ -315,19 +360,13 @@ def _tts_info_and_prompt_len(
         )
 
     if task_type == "Base":
-        ref_audio_raw = additional_info.get("tts_ref_audio")
-        ref_audio = (
-            ref_audio_raw[0] if isinstance(ref_audio_raw, list) and ref_audio_raw else ref_audio_raw
-        ) or default_qwen3_tts_ref_audio_path()
-        ref_text_raw = additional_info.get("tts_ref_text")
-        ref_text = (
-            ref_text_raw[0] if isinstance(ref_text_raw, list) and ref_text_raw else ref_text_raw
-        ) or DEFAULT_QWEN3_TTS_REF_TEXT
+        ref_audio = _first_value(additional_info.get("tts_ref_audio"), None)
+        ref_text = _first_value(additional_info.get("tts_ref_text"), None)
+        if allow_default_base_refs:
+            ref_audio = ref_audio or default_qwen3_tts_ref_audio_path()
+            ref_text = ref_text or DEFAULT_QWEN3_TTS_REF_TEXT
         x_vector_only_mode = _first_bool(additional_info.get("tts_x_vector_only_mode"), False)
-        ref_code_len_raw = additional_info.get("tts_ref_code_length")
-        ref_code_len_value = (
-            ref_code_len_raw[0] if isinstance(ref_code_len_raw, list) and ref_code_len_raw else ref_code_len_raw
-        )
+        ref_code_len_value = _first_value(additional_info.get("tts_ref_code_length"), None)
         ref_code_len = int(ref_code_len_value) if isinstance(ref_code_len_value, int) else None
         if not x_vector_only_mode and ref_code_len is None:
             ref_code_len = _estimate_ref_code_len_from_ref_audio(ref_audio)
@@ -348,8 +387,7 @@ def _tts_info_and_prompt_len(
         tts_info["x_vector_only_mode"] = [x_vector_only_mode]
 
     elif task_type == "CustomVoice":
-        speaker_raw = additional_info.get("tts_speaker")
-        speaker = speaker_raw[0] if isinstance(speaker_raw, list) and speaker_raw else speaker_raw or "Vivian"
+        speaker = _first_value(additional_info.get("tts_speaker"), "Vivian")
         tts_info["speaker"] = [_normalize_qwen3_tts_speaker(speaker)]
 
     return tts_info, prompt_len
@@ -396,35 +434,22 @@ def asr2aura(
     for idx, source_output in enumerate(source_outputs):
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
-        system_prompt_raw = additional_info.get("aura_system_prompt")
-        system_prompt = (
-            system_prompt_raw[0] if isinstance(system_prompt_raw, list) and system_prompt_raw else system_prompt_raw
-        ) or DEFAULT_AURA_SYSTEM_PROMPT
         transcript = _extract_text(source_output)
-        multi_modal_data = {}
-        source_multi_modal_data = src_prompt.get("multi_modal_data") or {}
-        if isinstance(source_multi_modal_data, dict):
-            multi_modal_data.update(source_multi_modal_data)
-        deferred_multi_modal_data = additional_info.get("deferred_multi_modal_data") or {}
-        if isinstance(deferred_multi_modal_data, dict):
-            multi_modal_data.update(deferred_multi_modal_data)
-        multi_modal_data = _vision_multimodal_data(multi_modal_data)
+        multi_modal_data = _merged_vision_multimodal_data(
+            src_prompt.get("multi_modal_data") or {},
+            additional_info.get("deferred_multi_modal_data") or {},
+        )
 
-        next_input: dict[str, Any] = {
-            "prompt": _aura_prompt(str(system_prompt), transcript, multi_modal_data),
-        }
-        if requires_multimodal_data:
-            next_input["multi_modal_data"] = multi_modal_data
-        if src_prompt.get("mm_processor_kwargs") is not None:
-            next_input["mm_processor_kwargs"] = src_prompt.get("mm_processor_kwargs")
-        tts_additional_info = {
-            key: value
-            for key, value in additional_info.items()
-            if isinstance(key, str) and (key.startswith("tts_") or key.startswith("aura_tts_"))
-        }
-        if tts_additional_info:
-            next_input["additional_information"] = tts_additional_info
-        next_inputs.append(next_input)
+        next_inputs.append(
+            _build_aura_input_payload(
+                transcript=transcript,
+                additional_info=additional_info,
+                multi_modal_data=multi_modal_data,
+                requires_multimodal_data=requires_multimodal_data,
+                mm_processor_kwargs=src_prompt.get("mm_processor_kwargs"),
+                include_empty_multimodal_data=True,
+            )
+        )
     return next_inputs
 
 
@@ -471,41 +496,20 @@ def asr2aura_async_chunk(
             state["asr_text"] = _clean_asr_text(tokenizer.decode(token_ids))
 
     additional_info = _request_additional_info(request)
-    system_prompt_raw = additional_info.get("aura_system_prompt")
-    system_prompt = (
-        system_prompt_raw[0] if isinstance(system_prompt_raw, list) and system_prompt_raw else system_prompt_raw
-    ) or DEFAULT_AURA_SYSTEM_PROMPT
-
-    multi_modal_data = {}
-    source_multi_modal_data = getattr(request, "multi_modal_data", None) or {}
-    if isinstance(source_multi_modal_data, dict):
-        multi_modal_data.update(source_multi_modal_data)
-    deferred_multi_modal_data = additional_info.get("deferred_multi_modal_data") or {}
-    if isinstance(deferred_multi_modal_data, dict):
-        multi_modal_data.update(deferred_multi_modal_data)
-    multi_modal_data = _vision_multimodal_data(multi_modal_data)
-
-    prompt = _aura_prompt(str(system_prompt), str(state.get("asr_text", "")), multi_modal_data)
-    prompt_token_ids = tokenizer.encode(prompt)
-    payload: dict[str, Any] = {
-        "prompt": prompt,
-        "prompt_token_ids": prompt_token_ids,
-        "ids": {"prompt": prompt_token_ids},
-    }
-    if multi_modal_data:
-        payload["multi_modal_data"] = multi_modal_data
+    multi_modal_data = _merged_vision_multimodal_data(
+        getattr(request, "multi_modal_data", None) or {},
+        additional_info.get("deferred_multi_modal_data") or {},
+    )
     mm_processor_kwargs = getattr(request, "mm_processor_kwargs", None)
-    if mm_processor_kwargs is not None:
-        payload["mm_processor_kwargs"] = mm_processor_kwargs
-    tts_additional_info = {
-        key: value
-        for key, value in additional_info.items()
-        if isinstance(key, str) and (key.startswith("tts_") or key.startswith("aura_tts_"))
-    }
-    if tts_additional_info:
-        payload["additional_information"] = tts_additional_info
 
-    return payload
+    return _build_aura_input_payload(
+        transcript=str(state.get("asr_text", "")),
+        additional_info=additional_info,
+        multi_modal_data=multi_modal_data,
+        requires_multimodal_data=True,
+        mm_processor_kwargs=mm_processor_kwargs,
+        tokenizer=tokenizer,
+    )
 
 
 def _estimate_ref_code_len_from_ref_audio(ref_audio: Any) -> int | None:
@@ -643,57 +647,22 @@ def aura2tts(
 
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
-        task_type = _first_value(additional_info.get("tts_task_type"), "Base")
-        language = _first_value(additional_info.get("tts_language"), "English")
-        instruct = _first_value(additional_info.get("tts_instruct"), "")
-        x_vector_only_mode = _first_bool(additional_info.get("tts_x_vector_only_mode"), False)
-        non_streaming_mode_raw = _first_value(additional_info.get("tts_non_streaming_mode"), None)
-        non_streaming_mode = non_streaming_mode_raw if isinstance(non_streaming_mode_raw, bool) else None
-        ref_code_len_raw = _first_value(additional_info.get("tts_ref_code_length"), None)
-        ref_code_len = int(ref_code_len_raw) if isinstance(ref_code_len_raw, int) else None
-        ref_audio = None
-        ref_text = None
-        if task_type == "Base" and not x_vector_only_mode and ref_code_len is None:
-            ref_audio = _first_value(additional_info.get("tts_ref_audio"), None)
-            ref_code_len = _estimate_ref_code_len_from_ref_audio(ref_audio)
-
         assistant_token_ids_for_len = _qwen3_tts_assistant_token_ids_from_aura(source_output)
         pass_token_ids = _first_bool(additional_info.get("tts_pass_token_ids"), False)
-        tts_info = {
-            "task_type": [task_type],
-            "language": [language],
-            "instruct": [instruct],
-            "max_new_tokens": [int(_first_value(additional_info.get("tts_max_new_tokens"), 2048))],
-        }
-        if pass_token_ids and assistant_token_ids_for_len:
-            tts_info[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids_for_len]
-        else:
-            tts_info["text"] = [text]
-        if ref_code_len is not None:
-            tts_info["ref_code_length"] = [int(ref_code_len)]
-        prompt_len = _estimate_tts_prompt_len_from_token_ids(
-            assistant_token_ids_for_len if assistant_token_ids_for_len else [0] * max(0, len(text)),
-            task_type=str(task_type),
-            language=str(language),
-            instruct=str(instruct),
-            x_vector_only_mode=x_vector_only_mode,
-            non_streaming_mode=non_streaming_mode,
-            ref_code_len=ref_code_len,
+        use_token_ids = pass_token_ids and bool(assistant_token_ids_for_len)
+        tts_info, prompt_len = _tts_info_and_prompt_len(
+            additional_info,
+            assistant_token_ids=assistant_token_ids_for_len if use_token_ids else [],
+            text=text,
+            prompt_len_token_ids=assistant_token_ids_for_len if not use_token_ids else None,
+            default_language="English",
+            allow_default_base_refs=False,
         )
 
+        task_type = _first_value(additional_info.get("tts_task_type"), "Base")
         if task_type == "Base":
-            ref_audio = ref_audio or _first_value(additional_info.get("tts_ref_audio"), None)
-            ref_text = _first_value(additional_info.get("tts_ref_text"), None)
-            if not ref_audio or not ref_text:
+            if not tts_info.get("ref_audio") or not tts_info.get("ref_text"):
                 raise ValueError("AURA Base TTS requires tts_ref_audio and tts_ref_text.")
-            x_vector_only_mode = _first_bool(additional_info.get("tts_x_vector_only_mode"), False)
-            tts_info["ref_audio"] = [ref_audio]
-            tts_info["ref_text"] = [ref_text]
-            tts_info["x_vector_only_mode"] = [x_vector_only_mode]
-        elif task_type == "CustomVoice":
-            tts_info["speaker"] = [
-                _normalize_qwen3_tts_speaker(_first_value(additional_info.get("tts_speaker"), "Vivian"))
-            ]
         next_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * prompt_len,
@@ -701,12 +670,6 @@ def aura2tts(
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )
-        )
-        logger.debug(
-            "[aura2tts] req=%s built TTS input: keys=%s prompt_len=%d",
-            getattr(source_output, "request_id", idx),
-            sorted(tts_info.keys()),
-            prompt_len,
         )
     return next_inputs
 

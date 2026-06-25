@@ -1,4 +1,4 @@
-# AURA Omni Native Pipeline
+# AURA Omni Pipeline
 
 `aura_omni` serves AURA as a native multi-stage vLLM-Omni pipeline:
 
@@ -50,6 +50,65 @@ Expected request shape:
 
 If AURA emits `<|silent|>`, the `aura2tts` processor returns no TTS request, so
 the TTS stages are skipped for that turn.
+
+## Async Chunk Flow
+
+`vllm_omni/deploy/aura_omni.yaml` enables `async_chunk` by default. In this
+mode, the orchestrator admits the ASR request and prewarms downstream stages
+with placeholder prompts. The scheduler-owned `OmniChunkTransferAdapter` then
+drives inter-stage payloads through the shared-memory connector.
+
+```mermaid
+sequenceDiagram
+    participant client as Client
+    participant servingChat as ServingChat
+    participant asyncOmni as AsyncOmni
+    participant orchestrator as Orchestrator
+    participant stage0 as Stage0_ASR
+    participant adapter as ChunkAdapter
+    participant stage1 as Stage1_AURA
+    participant stage2 as Stage2_Talker
+    participant stage3 as Stage3_Code2Wav
+
+    client->>servingChat: Chat request with audio and video
+    servingChat->>servingChat: Keep audio for ASR and defer video for AURA
+    servingChat->>asyncOmni: generate with four stage sampling params
+    asyncOmni->>orchestrator: add_request
+    orchestrator->>stage0: submit_initial ASR request
+    orchestrator->>stage1: prewarm placeholder request
+    orchestrator->>stage2: prewarm placeholder request
+    orchestrator->>stage3: prewarm placeholder request
+    stage0->>adapter: ASR chunks accumulate
+    adapter->>stage1: ASR finish emits AURA prompt and deferred video
+    stage1-->>client: Text final output stream
+    stage1->>adapter: AURA tokens buffered or full response
+    adapter->>stage2: TTS text or token payload
+    stage2->>adapter: Codec chunks
+    adapter->>stage3: Code2Wav audio-code payloads
+    stage3-->>client: Audio final output stream
+```
+
+The same topology can run with `--no-async-chunk`, but that path waits for each
+stage to finish before the orchestrator calls the next stage's sync processor.
+Async chunk moves those handoffs into connector payload processors:
+
+```mermaid
+flowchart LR
+    userReq["OpenAI Chat Request: audio, video"] --> split["ServingChat multimodal split"]
+    split --> asr["Stage0 ASR: audio to transcript"]
+    split --> deferred["Deferred video or image payload"]
+    asr --> asrBridge["asr2aura_async_chunk on ASR finish"]
+    deferred --> asrBridge
+    asrBridge --> aura["Stage1 AURA: transcript plus vision to text"]
+    aura --> textOut["Final text output"]
+    aura --> silentGate{"Silent marker"}
+    silentGate -->|"silent"| noTts["No TTS payload"]
+    silentGate -->|"non-silent"| auraBridge["aura2tts_async_chunk buffer or full response"]
+    auraBridge --> talker["Stage2 Qwen3-TTS Talker: text to codec tokens"]
+    talker --> codecBridge["talker2code2wav_async_chunk"]
+    codecBridge --> code2wav["Stage3 Code2Wav: codec tokens to audio"]
+    code2wav --> audioOut["Final audio output"]
+```
 
 ## GPU Utilization Recommendation
 
