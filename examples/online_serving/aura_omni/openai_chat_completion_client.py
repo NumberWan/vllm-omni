@@ -141,7 +141,6 @@ def main(args) -> None:
                 "tts_ref_text": args.tts_ref_text,
                 "tts_x_vector_only_mode": args.tts_x_vector_only_mode,
                 "tts_pass_token_ids": args.tts_pass_token_ids,
-                "aura_tts_full_response": args.aura_tts_full_response,
             },
         },
         timeout=args.timeout,
@@ -166,7 +165,7 @@ def parse_args():
         "--aura-system-prompt",
         default=(
             "You are receiving a live video stream where the final frame is the present moment. "
-            "Respond only when a response is needed. Otherwise output '<|silent|>'."
+            "Respond only when a response is needed. Otherwise output '<|silent|>'. Respond in Chinese."
         ),
     )
     parser.add_argument("--tts-task-type", default="Base", choices=["Base", "CustomVoice"])
@@ -192,11 +191,6 @@ def parse_args():
         "--tts-pass-token-ids",
         action="store_true",
         help="Pass AURA-generated assistant token ids directly to Qwen3-TTS. Defaults to sending text.",
-    )
-    parser.add_argument(
-        "--aura-tts-full-response",
-        action="store_true",
-        help="Wait for the full AURA answer before sending one complete payload to TTS.",
     )
     parser.add_argument("--timeout", type=float, default=600.0)
     return parser.parse_args()

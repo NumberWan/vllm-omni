@@ -107,8 +107,8 @@ VRAM each stage can reserve. Start with this split for a single GPU:
   `tts_task_type=CustomVoice` and `tts_speaker`.
 
 The checked-in deploy profile currently points stages 2 and 3 at CustomVoice
-checkpoint paths and sets `aura_tts_full_response: true`. Switch both TTS stage
-models to Base checkpoints before using Base voice-clone mode.
+checkpoint paths. Switch both TTS stage models to Base checkpoints before using
+Base voice-clone mode.
 
 By default, AURA responses are passed to Qwen3-TTS as text. Set
 `additional_information.tts_pass_token_ids=true` to pass AURA-generated

@@ -39,17 +39,8 @@ def _source_delta_final_output(cumulative_text: str, request_id: str = "req-1", 
     return SimpleNamespace(request_id=request_id, outputs=[output], finished=True)
 
 
-def _transfer_manager(aura_tts_chunk_tokens: int = 1, aura_tts_full_response: bool = False):
-    return SimpleNamespace(
-        connector=SimpleNamespace(
-            config={
-                "extra": {
-                    "aura_tts_chunk_tokens": aura_tts_chunk_tokens,
-                    "aura_tts_full_response": aura_tts_full_response,
-                }
-            }
-        ),
-    )
+def _transfer_manager():
+    return SimpleNamespace(config=SimpleNamespace(), request_payload={})
 
 
 def test_asr2aura_carries_video_payload_and_transcript():
@@ -73,7 +64,6 @@ def test_asr2aura_forwards_tts_options_to_aura_worker():
             "tts_task_type": ["Base"],
             "tts_ref_audio": ["voice.wav"],
             "tts_ref_text": ["hello"],
-            "aura_tts_full_response": [True],
             "aura_system_prompt": ["system"],
         },
     }
@@ -84,7 +74,6 @@ def test_asr2aura_forwards_tts_options_to_aura_worker():
         "tts_task_type": ["Base"],
         "tts_ref_audio": ["voice.wav"],
         "tts_ref_text": ["hello"],
-        "aura_tts_full_response": [True],
     }
 
 
@@ -256,7 +245,7 @@ def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
     assert "text" not in tts_input["additional_information"]
 
 
-def test_aura2tts_async_chunk_packs_tts_conditioning_in_connector_payload():
+def test_aura2tts_async_chunk_waits_until_aura_finished():
     transfer_manager = _transfer_manager()
     request = SimpleNamespace(
         request_id="req-1",
@@ -269,7 +258,8 @@ def test_aura2tts_async_chunk_packs_tts_conditioning_in_connector_payload():
         is_finished=lambda: False,
     )
 
-    payload = aura2tts_async_chunk(transfer_manager, None, request)
+    assert aura2tts_async_chunk(transfer_manager, None, request) is None
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
 
     text_ids = payload[PRECOMPUTED_TEXT_IDS_KEY][0]
     assert 108386 in text_ids
@@ -297,7 +287,8 @@ def test_aura2tts_async_chunk_reads_nested_request_additional_information():
         is_finished=lambda: False,
     )
 
-    payload = aura2tts_async_chunk(transfer_manager, None, request)
+    assert aura2tts_async_chunk(transfer_manager, None, request) is None
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
 
     assert payload["task_type"] == ["CustomVoice"]
     assert payload["speaker"] == ["Vivian"]
@@ -307,33 +298,54 @@ def test_aura2tts_async_chunk_reads_nested_request_additional_information():
     assert "ref_text" not in payload
 
 
-def test_aura2tts_async_chunk_emits_updated_text_ids_for_non_final_chunks():
+def test_aura2tts_async_chunk_uses_cached_tts_metadata_when_request_info_is_cleared():
+    transfer_manager = _transfer_manager()
+    transfer_manager.request_payload["req-1"] = {
+        "_request_tts_metadata": {
+            "tts_task_type": ["CustomVoice"],
+            "tts_speaker": ["vivian"],
+            "tts_language": ["Chinese"],
+        }
+    }
+    request = SimpleNamespace(
+        request_id="req-1",
+        external_req_id="req-1",
+        output_token_ids=[108386, 1773],
+        additional_information={},
+        is_finished=lambda: False,
+    )
+
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+
+    assert payload["task_type"] == ["CustomVoice"]
+    assert payload["speaker"] == ["Vivian"]
+    assert payload["language"] == ["Chinese"]
+    assert "ref_audio" not in payload
+
+
+def test_aura2tts_async_chunk_accumulates_and_sends_full_text_once_finished():
     transfer_manager = _transfer_manager()
     request = SimpleNamespace(
         request_id="req-1",
         external_req_id="req-1",
         output_token_ids=[108386, 1773],
-        output_text="第一句",
-        additional_information={"tts_ref_audio": ["custom.wav"], "tts_ref_text": ["custom transcript"]},
+        output_text="你好",
+        additional_information={
+            "tts_ref_audio": ["custom.wav"],
+            "tts_ref_text": ["custom transcript"],
+        },
         is_finished=lambda: False,
     )
 
-    first_payload = aura2tts_async_chunk(transfer_manager, None, request)
+    assert aura2tts_async_chunk(transfer_manager, None, request) is None
     request.output_token_ids = [108386, 1773, 104139]
-    request.output_text = "第一句，第二句"
-    second_payload = aura2tts_async_chunk(transfer_manager, None, request)
+    request.output_text = "你好，世界"
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
 
-    assert first_payload["text"] == ["第一句"]
-    assert first_payload["task_type"] == ["Base"]
-    assert first_payload["ref_audio"] == ["custom.wav"]
-    assert first_payload["prompt_token_ids"]
-    assert "_reuse_tts_info" not in first_payload
-    assert second_payload["text"] == ["，第二句"]
-    assert second_payload["_reuse_tts_info"] is True
-    assert second_payload["prompt_token_ids"]
-    assert "task_type" not in second_payload
-    assert "ref_audio" not in second_payload
-    assert "next_stage_prompt_len" not in second_payload
+    assert payload["text"] == ["你好，世界"]
+    assert payload["task_type"] == ["Base"]
+    assert payload["ref_audio"] == ["custom.wav"]
+    assert payload["prompt_token_ids"]
 
 
 def test_aura2tts_async_chunk_passes_token_ids_only_when_enabled():
@@ -351,84 +363,14 @@ def test_aura2tts_async_chunk_passes_token_ids_only_when_enabled():
         is_finished=lambda: False,
     )
 
-    first_payload = aura2tts_async_chunk(transfer_manager, None, request)
+    assert aura2tts_async_chunk(transfer_manager, None, request) is None
     request.output_token_ids = [108386, 1773, 104139]
-    second_payload = aura2tts_async_chunk(transfer_manager, None, request)
-
-    assert PRECOMPUTED_TEXT_IDS_KEY in first_payload
-    assert "text" not in first_payload
-    assert first_payload["task_type"] == ["Base"]
-    assert 104139 in second_payload[PRECOMPUTED_TEXT_IDS_KEY][0]
-    assert second_payload["_reuse_tts_info"] is True
-    assert "task_type" not in second_payload
-
-
-def test_aura2tts_async_chunk_buffers_until_configured_token_count():
-    transfer_manager = _transfer_manager(aura_tts_chunk_tokens=5)
-    request = SimpleNamespace(
-        request_id="req-1",
-        external_req_id="req-1",
-        output_token_ids=[101, 102],
-        output_text="你好",
-        additional_information={"tts_ref_audio": ["custom.wav"], "tts_ref_text": ["custom transcript"]},
-        is_finished=lambda: False,
-    )
-
-    assert aura2tts_async_chunk(transfer_manager, None, request) is None
-    assert transfer_manager.request_payload["req-1"].get("aura_tts_last_token_count", 0) == 0
-
-    request.output_token_ids = [101, 102, 103, 104, 105]
-    request.output_text = "你好世界啦"
-    payload = aura2tts_async_chunk(transfer_manager, None, request)
-
-    assert payload["text"] == ["你好世界啦"]
-    assert payload["task_type"] == ["Base"]
-    assert transfer_manager.request_payload["req-1"]["aura_tts_last_token_count"] == 5
-
-
-def test_aura2tts_async_chunk_flushes_partial_chunk_when_finished():
-    transfer_manager = _transfer_manager(aura_tts_chunk_tokens=5)
-    request = SimpleNamespace(
-        request_id="req-1",
-        external_req_id="req-1",
-        output_token_ids=[101, 102],
-        output_text="你好",
-        additional_information={"tts_ref_audio": ["custom.wav"], "tts_ref_text": ["custom transcript"]},
-        is_finished=lambda: False,
-    )
-
     payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
 
-    assert payload["text"] == ["你好"]
+    assert PRECOMPUTED_TEXT_IDS_KEY in payload
+    assert "text" not in payload
     assert payload["task_type"] == ["Base"]
-
-
-def test_aura2tts_async_chunk_waits_for_full_response_when_enabled():
-    transfer_manager = _transfer_manager(aura_tts_full_response=True)
-    request = SimpleNamespace(
-        request_id="req-1",
-        external_req_id="req-1",
-        output_token_ids=[101, 102],
-        output_text="第一句\n\n\n",
-        additional_information={
-            "tts_task_type": ["CustomVoice"],
-            "tts_speaker": ["Vivian"],
-            "tts_language": ["Chinese"],
-        },
-        is_finished=lambda: False,
-    )
-
-    assert aura2tts_async_chunk(transfer_manager, None, request) is None
-
-    request.output_token_ids = [101, 102, 103, 104]
-    request.output_text = "第一句\n\n\n第二句"
-    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
-
-    assert payload["text"] == ["第一句 第二句"]
-    assert payload["task_type"] == ["CustomVoice"]
-    assert payload["speaker"] == ["Vivian"]
-    assert payload["prompt_token_ids"]
-    assert transfer_manager.request_payload["req-1"]["aura_tts_last_token_count"] == 4
+    assert 104139 in payload[PRECOMPUTED_TEXT_IDS_KEY][0]
 
 
 def test_aura2tts_async_chunk_decodes_text_instead_of_passing_source_token_ids(monkeypatch):
@@ -441,7 +383,7 @@ def test_aura2tts_async_chunk_decodes_text_instead_of_passing_source_token_ids(m
         "vllm_omni.model_executor.stage_input_processors.aura_omni.cached_tokenizer_from_config",
         lambda config: FakeTokenizer(),
     )
-    transfer_manager = _transfer_manager(aura_tts_full_response=True)
+    transfer_manager = _transfer_manager()
     transfer_manager.config = SimpleNamespace()
     request = SimpleNamespace(
         request_id="req-1",
@@ -458,30 +400,9 @@ def test_aura2tts_async_chunk_decodes_text_instead_of_passing_source_token_ids(m
     payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
 
     assert payload["text"] == ["第一句 第二句"]
+    assert payload["task_type"] == ["CustomVoice"]
     assert PRECOMPUTED_TEXT_IDS_KEY not in payload
     assert payload["prompt_token_ids"]
-
-
-def test_aura2tts_async_chunk_full_response_request_override():
-    transfer_manager = _transfer_manager()
-    request = SimpleNamespace(
-        request_id="req-1",
-        external_req_id="req-1",
-        output_token_ids=[101, 102],
-        output_text="你好",
-        additional_information={
-            "tts_ref_audio": ["custom.wav"],
-            "tts_ref_text": ["custom transcript"],
-            "aura_tts_full_response": [True],
-        },
-        is_finished=lambda: False,
-    )
-
-    assert aura2tts_async_chunk(transfer_manager, None, request) is None
-
-    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
-    assert payload["text"] == ["你好"]
-    assert payload["task_type"] == ["Base"]
 
 
 def test_aura2tts_async_chunk_holds_silent_token_prefix():
