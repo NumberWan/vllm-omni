@@ -1540,8 +1540,14 @@ class TestCLIOverrideFlow:
 
 
 class TestAuraOmniDeploy:
-    def test_aura_omni_deploy_forces_pipeline_override(self):
+    def test_aura_omni_deploy_pipeline(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni.yaml"
+        deploy = load_deploy_config(deploy_path)
+
+        assert deploy.pipeline == "aura_omni"
+
+    def test_aura_omni_streaming_deploy_pipeline(self):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni_streaming.yaml"
         deploy = load_deploy_config(deploy_path)
 
         assert deploy.pipeline == "aura_omni_streaming"
@@ -1568,6 +1574,21 @@ class TestAuraOmniDeploy:
         assert stages[1].yaml_engine_args["model_arch"] == "AuraQwen3VLForConditionalGeneration"
         assert stages[2].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
+        assert stages[1].custom_process_input_func.endswith("asr2aura")
+        assert not stages[1].custom_process_input_func.endswith("asr2aura_session")
+
+    def test_aura_omni_streaming_deploy_wires_session_processor(self):
+        pipeline_cfg = StageConfigFactory.resolve_pipeline_config("aura_omni_streaming")
+
+        stages = StageConfigFactory._create_from_registry(
+            "qwen3_tts",
+            pipeline_cfg,
+            cli_overrides={},
+            deploy_config_path=str(
+                Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni_streaming.yaml"
+            ),
+        )
+
         assert stages[1].custom_process_input_func.endswith("asr2aura_session")
 
     def test_aura_omni_pipelines_dispatch_stage1_processors(self):

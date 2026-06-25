@@ -1,14 +1,13 @@
-# AURA Omni deploy profile: Qwen3-ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Code2Wav.
+# AURA Omni streaming deploy profile: same four-stage topology as aura_omni.yaml
+# but wires stage-1 to asr2aura_session for WebSocket multi-turn SessionHistory.
 #
-# Pass `--deploy-config vllm_omni/deploy/aura_omni.yaml` and point the parent
-# `--model` at any local placeholder repo if needed; each stage overrides its
-# own model below.
-pipeline: aura_omni
+# Pass `--deploy-config vllm_omni/deploy/aura_omni_streaming.yaml` for
+# `/v1/video/chat/stream`. Single-turn /chat/completions and Gradio should use
+# `aura_omni.yaml` (`pipeline: aura_omni`).
+pipeline: aura_omni_streaming
 # AURA has a semantic ASR -> AURA -> TTS dependency. Do not prewarm downstream
 # stages before AURA text is converted into Qwen3-TTS metadata by aura2tts.
 async_chunk: false
-# Single-turn: /chat/completions, Gradio, offline inference (stage-1 asr2aura).
-# Multi-turn WebSocket: use vllm_omni/deploy/aura_omni_streaming.yaml instead.
 
 connectors:
   connector_of_shared_memory:

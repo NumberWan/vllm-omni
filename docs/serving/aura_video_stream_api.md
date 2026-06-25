@@ -17,7 +17,7 @@ See also: [video_stream_api.md](video_stream_api.md) for shared protocol fields.
 The WebSocket handler always registers an `aura_session_id` and updates `SessionHistory` in-process. **Cross-turn prompts only work when stage-1 is wired to `asr2aura_session`**, which the registry pipeline `aura_omni_streaming` selects:
 
 ```yaml
-# vllm_omni/deploy/aura_omni.yaml
+# vllm_omni/deploy/aura_omni_streaming.yaml
 pipeline: aura_omni_streaming
 ```
 
@@ -36,7 +36,7 @@ Single-turn `/chat/completions` or Gradio can use `pipeline: aura_omni`.
 
 ```bash
 vllm serve aurateam/AURA \
-    --deploy-config vllm_omni/deploy/aura_omni.yaml \
+    --deploy-config vllm_omni/deploy/aura_omni_streaming.yaml \
     --omni \
     --port 8000 \
     --trust-remote-code
@@ -108,33 +108,12 @@ Set `VLLM_VIDEO_ASYNC_CHUNK=on` for incremental audio deltas during generation (
 
 The example client saves concatenated PCM to `--output-wav` (default `aura_stream_output.wav`). Pass `--text-only` to request text-only modalities.
 
-### Timed replay demo (`streaming_video_demo.py`)
-
-`--audio-schedule SEC:PATH` injects WAV at stream wall-clock seconds (not clip length).
-
-Pruning defaults (`max_rounds=45`) are **not** reached on short clips (~43 turns for `aura_test.mp4` @ 2 fps). To exercise prune:
-
-```bash
-python examples/online_serving/aura_omni/streaming_video_demo.py \
-  ... --max-rounds 30 --num-rounds-keep 20
-```
-
-### Debug: log assembled AURA prompts
-
-Set before `vllm serve` (logs appear on **Stage-1 worker**, not always the API process):
-
-```bash
-export VLLM_AURA_LOG_TURN_PROMPT=1
-```
-
-Each turn prints `AURA turn prompt request_id=...` with `prompt_text` and video metadata (no pixels).
-
 ## Handler Selection
 
 `create_streaming_video_handler()` reads the deploy YAML ``pipeline`` from ``engine_client.config_path``:
 
 | Deploy profile | `pipeline` | Handler |
 |----------------|------------|---------|
-| `aura_omni.yaml` | `aura_omni_streaming` | `AuraStreamingVideoHandler` |
-| single-turn AURA | `aura_omni` | `AuraStreamingVideoHandler` |
+| `aura_omni_streaming.yaml` | `aura_omni_streaming` | `AuraStreamingVideoHandler` |
+| `aura_omni.yaml` | `aura_omni` | `AuraStreamingVideoHandler` |
 | `qwen3_omni.yaml` (default omni video) | *(other)* | `QwenOmniStreamingVideoHandler` |
