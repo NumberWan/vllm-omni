@@ -67,7 +67,7 @@ __all__ = [
     "create_streaming_video_handler",
 ]
 
-_AURA_PIPELINE_NAMES = frozenset({"aura_omni", "aura_omni_streaming"})
+_AURA_PIPELINE_NAMES = frozenset({"aura_omni"})
 _AURA_ADDITIONAL_INFO_KEY = "_aura_additional_information"
 
 
@@ -791,7 +791,7 @@ def create_streaming_video_handler(
     """Create the handler for ``/v1/video/chat/stream``.
 
     Routes to :class:`AuraStreamingVideoHandler` when the deploy YAML
-    ``pipeline`` is ``aura_omni`` or ``aura_omni_streaming``.
+    ``pipeline`` is ``aura_omni``.
     """
     pipeline = _resolve_deploy_pipeline(engine_client) if engine_client is not None else None
     if pipeline in _AURA_PIPELINE_NAMES:

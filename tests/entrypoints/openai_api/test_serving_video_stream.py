@@ -669,20 +669,7 @@ def test_create_streaming_video_handler_routes_aura_pipeline():
     assert isinstance(handler, AuraStreamingVideoHandler)
 
 
-def test_resolve_deploy_pipeline_from_aura_streaming_deploy_yaml():
-    from pathlib import Path
-    from unittest.mock import MagicMock
-
-    from vllm_omni.entrypoints.openai.serving_video_stream import _resolve_deploy_pipeline
-
-    deploy_path = (
-        Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "aura_omni_streaming.yaml"
-    )
-    engine = MagicMock(config_path=str(deploy_path))
-    assert _resolve_deploy_pipeline(engine) == "aura_omni_streaming"
-
-
-def test_resolve_deploy_pipeline_from_aura_single_turn_deploy_yaml():
+def test_resolve_deploy_pipeline_from_aura_deploy_yaml():
     from pathlib import Path
     from unittest.mock import MagicMock
 

@@ -1545,12 +1545,6 @@ class TestAuraOmniDeploy:
         deploy = load_deploy_config(deploy_path)
 
         assert deploy.pipeline == "aura_omni"
-
-    def test_aura_omni_streaming_deploy_pipeline(self):
-        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni_streaming.yaml"
-        deploy = load_deploy_config(deploy_path)
-
-        assert deploy.pipeline == "aura_omni_streaming"
         assert deploy.async_chunk is True
 
     def test_aura_omni_deploy_resolves_four_native_stages(self):
@@ -1576,21 +1570,6 @@ class TestAuraOmniDeploy:
         assert stages[2].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
         assert stages[1].custom_process_input_func.endswith("asr2aura")
-        assert not stages[1].custom_process_input_func.endswith("asr2aura_session")
-
-    def test_aura_omni_streaming_deploy_wires_session_processor(self):
-        pipeline_cfg = StageConfigFactory.resolve_pipeline_config("aura_omni_streaming")
-
-        stages = StageConfigFactory._create_from_registry(
-            "qwen3_tts",
-            pipeline_cfg,
-            cli_overrides={},
-            deploy_config_path=str(
-                Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni_streaming.yaml"
-            ),
-        )
-
-        assert stages[1].custom_process_input_func.endswith("asr2aura_session")
         assert stages[0].yaml_engine_args["custom_process_next_stage_input_func"].endswith("asr2aura_async_chunk")
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith("aura2tts_async_chunk")
         assert (
@@ -1598,14 +1577,9 @@ class TestAuraOmniDeploy:
         )
         assert stages[3].custom_process_input_func is None
 
-    def test_aura_omni_pipelines_dispatch_stage1_processors(self):
-        """Registry pipelines pick explicit stage-1 processors (no deploy knob)."""
-        streaming_stages = merge_pipeline_deploy(OMNI_PIPELINES["aura_omni_streaming"], DeployConfig())
-        assert streaming_stages[1].custom_process_input_func.endswith("asr2aura_session")
-
-        single_turn_stages = merge_pipeline_deploy(OMNI_PIPELINES["aura_omni"], DeployConfig())
-        assert single_turn_stages[1].custom_process_input_func.endswith("asr2aura")
-        assert not single_turn_stages[1].custom_process_input_func.endswith("asr2aura_session")
+    def test_aura_omni_merge_wires_asr2aura_processor(self):
+        stages = merge_pipeline_deploy(OMNI_PIPELINES["aura_omni"], DeployConfig())
+        assert stages[1].custom_process_input_func.endswith("asr2aura")
 
 
 class TestSentinelDefaultPrecedence:

@@ -3,13 +3,13 @@
 # Pass `--deploy-config vllm_omni/deploy/aura_omni.yaml` and point the parent
 # `--model` at any local placeholder repo if needed; each stage overrides its
 # own model below.
-pipeline: aura_omni_streaming
+pipeline: aura_omni
 # ASR and AURA run in semantic order; the orchestrator prewarms downstream
 # stages and the connector moves async payloads between stages. Stage 1 buffers
 # each AURA request and sends one complete payload to TTS when AURA finishes.
 async_chunk: true
-# Multi-turn WebSocket: ``aura_omni_streaming`` wires stage-1 to asr2aura_session.
-# Single-turn /chat/completions: use pipeline ``aura_omni`` (asr2aura) instead.
+# Single deploy profile for HTTP single-turn and WebSocket multi-turn.
+# Stage-1 ``asr2aura`` uses SessionHistory when ``aura_session_id`` is present.
 
 connectors:
   connector_of_shared_memory:
