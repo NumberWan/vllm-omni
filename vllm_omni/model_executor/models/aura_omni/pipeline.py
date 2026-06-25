@@ -22,10 +22,8 @@ _AURA_PROC = "vllm_omni.model_executor.stage_input_processors.aura_omni"
 _QWEN3_TTS_PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
 
 
-AURA_OMNI_PIPELINE = PipelineConfig(
-    model_type="aura_omni",
-    model_arch="Qwen3ASRForConditionalGeneration",
-    stages=(
+def _aura_omni_stages(*, aura_stage1_input_proc: str) -> tuple[StagePipelineConfig, ...]:
+    return (
         StagePipelineConfig(
             stage_id=0,
             model_stage="asr",
@@ -49,7 +47,7 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             engine_output_type="text",
             model_arch="AuraQwen3VLForConditionalGeneration",
-            custom_process_input_func=_AURA_PROC,
+            custom_process_input_func=aura_stage1_input_proc,
             async_chunk_process_next_stage_input_func=f"{_AURA_PROC}.aura2tts_async_chunk",
             sampling_constraints={"detokenize": True},
         ),
@@ -82,5 +80,17 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             sampling_constraints={"detokenize": True},
             extras={"tts_args": {"max_instructions_length": 500}},
         ),
-    ),
+    )
+
+
+AURA_OMNI_PIPELINE = PipelineConfig(
+    model_type="aura_omni",
+    model_arch="Qwen3ASRForConditionalGeneration",
+    stages=_aura_omni_stages(aura_stage1_input_proc=f"{_AURA_PROC}.asr2aura"),
+)
+
+AURA_OMNI_STREAMING_PIPELINE = PipelineConfig(
+    model_type="aura_omni_streaming",
+    model_arch="Qwen3ASRForConditionalGeneration",
+    stages=_aura_omni_stages(aura_stage1_input_proc=f"{_AURA_PROC}.asr2aura_session"),
 )

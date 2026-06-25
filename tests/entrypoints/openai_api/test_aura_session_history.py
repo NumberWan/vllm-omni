@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from vllm_omni.entrypoints.openai.aura.session_history import (
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
     SessionHistory,
     is_effectively_silent,
     normalize_assistant_text,

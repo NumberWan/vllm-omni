@@ -41,7 +41,7 @@ except ImportError:
 
 
 SILENT_TEXT = "<|silent|>"
-# Keep in sync with vllm_omni.entrypoints.openai.aura.session_history (avoid importing vllm_omni here).
+# Keep in sync with vllm_omni.model_executor.stage_input_processors.aura_session_history.
 _AURA_PUNCT_CHARS = frozenset(".,!?;:，。！？；：、'\"()[]{}''…—–\n\t\r /-_@#$%^&*+=<>~`|\\（）【】《》﹑·")
 
 
@@ -427,6 +427,14 @@ async def _stream_video(
         "enable_frame_filter": not args.no_evs,
         "frame_filter_threshold": args.evs_threshold,
     }
+    if args.max_rounds is not None:
+        config["max_rounds"] = args.max_rounds
+    if args.num_rounds_keep is not None:
+        config["num_rounds_keep"] = args.num_rounds_keep
+    if args.max_context_qas is not None:
+        config["max_context_qas"] = args.max_context_qas
+    if args.no_pruning:
+        config["pruning_enabled"] = False
     await _send_json(ws, config, log)
 
     if args.burst_interval > 0:
@@ -522,6 +530,26 @@ def main() -> None:
     p.add_argument("--max-frames", type=int, default=256)
     p.add_argument("--max-frames-per-round", type=int, default=16)
     p.add_argument("--auto-trigger-min-frames", type=int, default=2)
+    p.add_argument(
+        "--max-rounds",
+        type=int,
+        default=None,
+        help="SessionHistory sliding-window limit before prune (server default 45). "
+        "aura_test.mp4 steady 2fps yields ~43 turns — use e.g. 30 to exercise prune.",
+    )
+    p.add_argument(
+        "--num-rounds-keep",
+        type=int,
+        default=None,
+        help="Rounds kept in sliding window after prune (server default 30).",
+    )
+    p.add_argument(
+        "--max-context-qas",
+        type=int,
+        default=None,
+        help="Max QAs in compressed context history after prune (server default 10).",
+    )
+    p.add_argument("--no-pruning", action="store_true", help="Disable SessionHistory pruning.")
     p.add_argument("--text-only", action="store_true")
     p.add_argument("--no-evs", action="store_true")
     p.add_argument("--evs-threshold", type=float, default=0.95)

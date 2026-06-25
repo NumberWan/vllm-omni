@@ -34,8 +34,10 @@ from typing import Any
 import numpy as np
 from pydantic import Field
 
-from vllm_omni.entrypoints.openai.aura import CrossTurnPenalty
-from vllm_omni.entrypoints.openai.aura.session_history import (
+from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import (
+    CrossTurnPenalty,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
     DEFAULT_AURA_SYSTEM_PROMPT,
     SessionHistory,
     create_session_id,
@@ -65,8 +67,30 @@ __all__ = [
     "create_streaming_video_handler",
 ]
 
-_AURA_OMNI_PIPELINE = "aura_omni"
+_AURA_PIPELINE_NAMES = frozenset({"aura_omni", "aura_omni_streaming"})
 _AURA_ADDITIONAL_INFO_KEY = "_aura_additional_information"
+
+
+def _resolve_deploy_pipeline(engine_client: Any) -> str | None:
+    """Read ``pipeline:`` from the engine deploy YAML (entrypoints-only; no engine field)."""
+    config_path = getattr(engine_client, "config_path", None)
+    if config_path is None:
+        return None
+    from pathlib import Path
+
+    from vllm_omni.config.stage_config import _DEPLOY_DIR, load_deploy_config
+
+    path = Path(config_path)
+    if not path.exists():
+        if path.parent != Path("."):
+            return None
+        bare_name = path.name if path.name.endswith(".yaml") else f"{path.name}.yaml"
+        candidate = _DEPLOY_DIR / bare_name
+        if not candidate.exists():
+            return None
+        path = candidate
+    pipeline = load_deploy_config(path).pipeline
+    return str(pipeline) if pipeline else None
 
 
 def _default_qwen3_tts_ref_audio_path() -> str:
@@ -238,7 +262,7 @@ class AuraSessionState:
     turn_frame_arrays: list[np.ndarray]
     session_id: str = ""
     cross_turn_penalty: CrossTurnPenalty | None = None
-    pending_turn_video: dict[str, Any] | None = None
+    pending_turn_video: dict[str, Any] | None = None  # deferred_multi_modal_data for next turn
 
 
 class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
@@ -360,9 +384,8 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         system_prompt = aura_config.aura_system_prompt or DEFAULT_AURA_SYSTEM_PROMPT
         additional_information: dict[str, Any] = {
             "aura_session_id": message_history.session_id,
-            "aura_turn_video": {
-                "frames": video_array.tolist(),
-                "metadata": metadata,
+            "deferred_multi_modal_data": {
+                "video": [(video_array, metadata)],
             },
             "aura_system_prompt": [system_prompt],
             "omni_skip_stages": [0] if len(audio_buffer) == 0 else [],
@@ -385,11 +408,11 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
         from vllm_omni.model_executor.stage_input_processors.aura_omni import (
             pop_turn_transcript,
-            video_tuple_from_aura_turn_video,
+            video_tuple_from_deferred_multi_modal,
         )
 
         transcript = pop_turn_transcript(request_id)
-        video_tuple = video_tuple_from_aura_turn_video(message_history.pending_turn_video)
+        video_tuple = video_tuple_from_deferred_multi_modal(message_history.pending_turn_video)
         if video_tuple is None and message_history.turn_frame_arrays:
             video_tuple = self._frames_to_video_tuple(
                 list(message_history.turn_frame_arrays),
@@ -526,8 +549,8 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         additional_information = user_message.pop(_AURA_ADDITIONAL_INFO_KEY, None)
 
         if isinstance(message_history, AuraSessionState) and isinstance(additional_information, dict):
-            turn_video = additional_information.get("aura_turn_video")
-            message_history.pending_turn_video = turn_video if isinstance(turn_video, dict) else None
+            deferred = additional_information.get("deferred_multi_modal_data")
+            message_history.pending_turn_video = deferred if isinstance(deferred, dict) else None
 
         aura_config = self._as_aura_config(config)
         penalty_kwargs: dict[str, Any] = {}
@@ -767,10 +790,11 @@ def create_streaming_video_handler(
 ) -> OmniStreamingVideoHandlerBase:
     """Create the handler for ``/v1/video/chat/stream``.
 
-    Routes to :class:`AuraStreamingVideoHandler` when
-    ``engine_client.pipeline_name`` is ``aura_omni`` (from deploy YAML).
+    Routes to :class:`AuraStreamingVideoHandler` when the deploy YAML
+    ``pipeline`` is ``aura_omni`` or ``aura_omni_streaming``.
     """
-    if getattr(engine_client, "pipeline_name", None) == _AURA_OMNI_PIPELINE:
+    pipeline = _resolve_deploy_pipeline(engine_client) if engine_client is not None else None
+    if pipeline in _AURA_PIPELINE_NAMES:
         return AuraStreamingVideoHandler(
             chat_service=chat_service,
             idle_timeout=idle_timeout,

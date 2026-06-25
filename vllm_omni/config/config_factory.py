@@ -64,10 +64,11 @@ class StageConfigFactory:
             cli_overrides = {}
 
         # When the caller passes --deploy-config, honor its ``pipeline:`` field
-        # before HF model_type auto-detection. AURA's stage-1 checkpoint reports
-        # ``qwen3_vl``, which is not a pipeline registry key; without this path
-        # create_from_model returns None and the server falls back to a single
-        # diffusion stage.
+        # before HF model_type auto-detection. Some checkpoints report a
+        # ``model_type`` that is not an ``OMNI_PIPELINES`` registry key (e.g. a
+        # stage-specific HF type that differs from the deploy pipeline name).
+        # Without this path, ``create_from_model`` returns None and the server
+        # falls back to a single-stage diffusion default.
         if deploy_config_path is not None:
             deploy_path = Path(deploy_config_path)
             if deploy_path.exists():
@@ -193,10 +194,6 @@ class StageConfigFactory:
         cli_async_chunk = cli_overrides.get("async_chunk")
         if cli_async_chunk is not None:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
-
-        cli_streaming_session = cli_overrides.get("streaming_session")
-        if cli_streaming_session is not None:
-            deploy_cfg.streaming_session = bool(cli_streaming_session)
 
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 

@@ -145,7 +145,6 @@ class AsyncOmni(EngineClient, OmniBase):
         self.final_output_task: asyncio.Task | None = None
         self.event_resolver = AsyncEventResolver(orchestrator=self)
         self.config_path = self.engine.config_path
-        self.pipeline_name = getattr(self.engine, "pipeline_name", None)
         self.tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
         self.input_processor = self.engine.input_processor
 
