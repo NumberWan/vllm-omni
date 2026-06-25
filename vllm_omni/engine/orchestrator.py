@@ -141,9 +141,8 @@ def build_engine_core_request_from_tokens(
         pooling_params = params.clone()
 
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
-    raw_additional_info = prompt.get("additional_information")
     additional_info_payload = serialize_additional_information(
-        raw_additional_info,
+        prompt.get("additional_information"),
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
     )
 
@@ -484,8 +483,8 @@ class Orchestrator:
             prompt_text=msg.output_prompt_text,
         )
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > stage_id:
-            await self._prewarm_async_chunk_stages(request_id, stage_id, prompt, req_state)
+        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
@@ -527,8 +526,8 @@ class Orchestrator:
             prompt_text=msg.output_prompt_text,
         )
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > stage_id:
-            await self._prewarm_async_chunk_stages(request_id, stage_id, request, req_state)
+        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -1393,12 +1392,13 @@ class Orchestrator:
         if not next_inputs:
             if not getattr(output, "finished", False):
                 logger.debug(
-                    "[Orchestrator] req=%s stage-%s produced no inputs for stage-%s; waiting for more chunks",
+                    "[Orchestrator] req=%s stage-%s produced no inputs for stage-%s; waiting for more outputs",
                     req_id,
                     src_stage_id,
                     next_logical,
                 )
                 return
+
             final_stage_id = req_state.final_stage_id
             final_pool = self.stage_pools[final_stage_id]
             final_output_type = getattr(final_pool.stage_client, "final_output_type", None)
@@ -1466,24 +1466,22 @@ class Orchestrator:
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
-        source_stage_id: int,
-        source_stage_request: Any,
+        stage0_request: Any,
         req_state: OrchestratorRequestState,
     ) -> None:
         """Pre-submit downstream stages for async-chunk mode."""
-        if req_state.final_stage_id <= source_stage_id:
+        if req_state.final_stage_id <= 0:
             return
 
-        prompt_token_ids = getattr(source_stage_request, "prompt_token_ids", None)
+        prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
         if prompt_token_ids is None:
             logger.warning(
-                "[Orchestrator] async_chunk prewarm skipped for req=%s: stage-%s prompt_token_ids missing",
+                "[Orchestrator] async_chunk prewarm skipped for req=%s: stage0 prompt_token_ids missing",
                 request_id,
-                source_stage_id,
             )
             return
 
-        for next_stage_id in range(source_stage_id + 1, req_state.final_stage_id + 1):
+        for next_stage_id in range(1, req_state.final_stage_id + 1):
             if next_stage_id in req_state.stage_submit_ts:
                 continue
             next_pool = self.stage_pools[next_stage_id]
@@ -1523,7 +1521,7 @@ class Orchestrator:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                downstream_resumable = bool(getattr(source_stage_request, "resumable", req_state.streaming.enabled))
+                downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
@@ -1540,7 +1538,8 @@ class Orchestrator:
                 )
 
             # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
-            # replica is the previous stage's bound replica; fall back to 0 if unknown.
+            # replica is stage 0's bound replica (single-replica thinker in
+            # all current configs); fall back to 0 if unknown.
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
             src_replica = self.stage_pools[next_stage_id - 1].get_bound_replica_id(request_id)
             self._emit_tx_edge(

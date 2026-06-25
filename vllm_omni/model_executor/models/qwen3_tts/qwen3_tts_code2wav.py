@@ -406,18 +406,6 @@ class Qwen3TTSCode2Wav(nn.Module):
                     cached_ref = cached_ref.to(device=codes_qf.device, dtype=codes_qf.dtype)
                     codes_qf = torch.cat((cached_ref, codes_qf), dim=1)
                     frames = int(codes_qf.shape[1])
-            logger.info(
-                "[Code2Wav] parse req_index=%d input_tokens=%d frames=%d left_context=%d "
-                "ref_context_size=%d ref_context_included=%s ref_req_id=%s finished=%s",
-                i,
-                int(n),
-                frames,
-                ctx_frames,
-                ref_ctx_frames,
-                ref_context_included[i],
-                ref_req_id,
-                finished_flags[i],
-            )
             parsed.append((ctx_frames, frames))
             valid_codes_qf.append(codes_qf)
             valid_indices.append(i)
@@ -548,16 +536,6 @@ class Qwen3TTSCode2Wav(nn.Module):
             # Slice on exact codec-frame boundaries instead of proportionally.
             start = max(0, ctx_frames * upsample)
             end = max(start, actual_frames * upsample)
-            logger.info(
-                "[Code2Wav] trim req_index=%d ctx_frames=%d actual_frames=%d upsample=%d wav_len=%d start=%d end=%d",
-                idx,
-                ctx_frames,
-                actual_frames,
-                upsample,
-                int(wav.shape[0]),
-                start,
-                end,
-            )
             if start >= wav.shape[0]:
                 logger.warning(
                     "Context trim start %d >= decoded length %d; returning empty audio.",

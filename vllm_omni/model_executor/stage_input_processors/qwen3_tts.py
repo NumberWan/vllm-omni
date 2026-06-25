@@ -469,10 +469,6 @@ def talker2code2wav_token_only(
                 mm_processor_kwargs=None,
             )
         )
-    logger.info(
-        "[talker2code2wav_token_only] built %d code2wav inputs",
-        len(code2wav_inputs),
-    )
     return code2wav_inputs
 
 

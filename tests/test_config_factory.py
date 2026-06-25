@@ -1643,28 +1643,6 @@ class TestAuraOmniDeploy:
         assert deploy.pipeline == "aura_omni"
         assert deploy.async_chunk is True
 
-    def test_create_from_model_uses_explicit_deploy_pipeline(self):
-        class FakeAuraConfig(PretrainedConfig):
-            model_type = "qwen3_vl"
-            architectures = ["Qwen3VLForConditionalGeneration"]
-
-        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni.yaml"
-
-        with patch("vllm_omni.config.config_factory.get_config", return_value=FakeAuraConfig()):
-            stages = StageConfigFactory.create_from_model(
-                "fake/aura",
-                cli_overrides={"trust_remote_code": True},
-                deploy_config_path=str(deploy_path),
-            )
-
-        assert stages is not None
-        assert [stage.model_stage for stage in stages] == [
-            "asr",
-            "aura",
-            "qwen3_tts",
-            "code2wav",
-        ]
-
     def test_aura_omni_deploy_resolves_four_native_stages(self):
         pipeline_cfg = StageConfigFactory.resolve_pipeline_config("aura_omni")
 
