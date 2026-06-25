@@ -459,14 +459,13 @@ class Orchestrator:
         if self._running_counter is not None:
             self._running_counter.increment()
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
+        req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
-
-        req_state.stage_submit_ts[stage_id] = _time.time()
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,

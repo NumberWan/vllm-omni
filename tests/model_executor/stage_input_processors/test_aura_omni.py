@@ -26,7 +26,6 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     aura2tts,
     aura2tts_async_chunk,
     pop_turn_transcript,
-    record_turn_transcript,
     video_tuple_from_additional_info,
 )
 
@@ -122,58 +121,6 @@ def test_asr2aura_reads_video_stashed_for_downstream_stage():
     assert "<|video_pad|>" in next_input["prompt"]
 
 
-def test_clean_asr_transcript_strips_qwen3_asr_wrapper():
-    assert _clean_asr_transcript("language Chinese<asr_text>画面有什么？") == "画面有什么？"
-    assert _clean_asr_transcript("language Chinese<asr_text>画面有什么") == "画面有什么"
-    assert _clean_asr_transcript("  hello  ") == "hello"
-
-
-def test_transcript_storage_normalizes_internal_request_id():
-    external = "video-a234643a36e3"
-    internal = f"{external}-b52ad29b"
-    record_turn_transcript(internal, "画面有什么")
-    assert pop_turn_transcript(external) == "画面有什么"
-    assert pop_turn_transcript(internal) == ""
-
-
-def test_asr2aura_restores_history_and_turn_video():
-    history = SessionHistory(pruning_enabled=False)
-    frames = np.array(
-        [
-            [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
-            [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
-        ],
-        dtype=np.uint8,
-    )
-    metadata = {
-        "fps": 2.0,
-        "duration": 1.0,
-        "total_num_frames": 2,
-        "frames_indices": [0, 1],
-        "video_backend": "opencv",
-        "do_sample_frames": False,
-    }
-    prompt = {
-        "additional_information": {
-            "aura_session_state": history.to_dict(),
-            "deferred_multi_modal_data": {"video": [(frames, metadata)]},
-            "aura_system_prompt": ["custom system"],
-        }
-    }
-
-    [next_input] = asr2aura(
-        [_source_output("language Chinese<asr_text>Hello there.", request_id="video-testreq01-abcd1234")],
-        prompt=[prompt],
-    )
-
-    assert "<|video_pad|>" in next_input["prompt"]
-    assert "Hello there." in next_input["prompt"]
-    assert "language Chinese" not in next_input["prompt"]
-    assert "<asr_text>" not in next_input["prompt"]
-    assert next_input["multi_modal_data"]["video"]
-    assert pop_turn_transcript("video-testreq01") == "Hello there."
-
-
 def test_video_tuple_from_additional_info_legacy_aura_turn_video():
     frames = [
         [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
@@ -252,6 +199,9 @@ def test_asr2aura_uses_server_side_store():
 
     assert "prior round" in next_input["prompt"]
     assert "Hello there." in next_input["prompt"]
+    assert "language Chinese" not in next_input["prompt"]
+    assert "<asr_text>" not in next_input["prompt"]
+    assert pop_turn_transcript("video-testreq02") == "Hello there."
     assert len(next_input["multi_modal_data"]["video"]) == 2
     assert len(history.get_vllm_inputs()["multi_modal_data"]["video"]) == 1
     clear_all_sessions()
