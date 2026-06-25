@@ -553,7 +553,6 @@ def test_full_payload_emits_eof_even_when_request_not_marked_finished():
         transfer_manager=None,
         pooling_output=pooling_output,
         request=request,
-        is_finished=False,
     )
 
     assert payload is not None

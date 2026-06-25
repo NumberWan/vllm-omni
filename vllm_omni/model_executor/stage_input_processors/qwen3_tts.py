@@ -482,7 +482,6 @@ def talker2code2wav_full_payload(
     transfer_manager,
     pooling_output,
     request,
-    is_finished: bool = False,
 ):
     """Producer-side payload builder.
 
