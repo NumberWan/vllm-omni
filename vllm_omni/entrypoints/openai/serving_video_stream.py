@@ -28,7 +28,6 @@ Model-specific handlers:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -36,14 +35,16 @@ from pydantic import Field
 
 from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import (
     CrossTurnPenalty,
+    merge_penalty_sampling_params,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    build_aura_streaming_turn_additional_information,
+    frames_to_video_tuple,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    AuraSessionState,
     DEFAULT_AURA_SYSTEM_PROMPT,
-    SessionHistory,
-    create_session_id,
-    is_effectively_silent,
-    normalize_assistant_text,
-    register_session,
+    create_streaming_session,
     unregister_session,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
@@ -91,22 +92,6 @@ def _resolve_deploy_pipeline(engine_client: Any) -> str | None:
         path = candidate
     pipeline = load_deploy_config(path).pipeline
     return str(pipeline) if pipeline else None
-
-
-def _default_qwen3_tts_ref_audio_path() -> str:
-    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-        default_qwen3_tts_ref_audio_path,
-    )
-
-    return default_qwen3_tts_ref_audio_path()
-
-
-def _default_qwen3_tts_ref_text() -> str:
-    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-        DEFAULT_QWEN3_TTS_REF_TEXT,
-    )
-
-    return DEFAULT_QWEN3_TTS_REF_TEXT
 
 
 class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
@@ -225,26 +210,6 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
         default_factory=lambda: [3, 4, 5],
         description="N-gram sizes for bad_words hard blocking in cross-turn penalty.",
     )
-    tts_task_type: str = Field(default="Base", description="Qwen3-TTS task type: Base or CustomVoice.")
-    tts_language: str = Field(default="English", description="Qwen3-TTS language.")
-    tts_instruct: str = Field(default="", description="Optional Qwen3-TTS style instruct.")
-    tts_ref_audio: str = Field(
-        default_factory=_default_qwen3_tts_ref_audio_path,
-        description="Base-mode reference audio path (server-visible).",
-    )
-    tts_ref_text: str = Field(
-        default_factory=_default_qwen3_tts_ref_text,
-        description="Base-mode reference audio transcript.",
-    )
-    tts_speaker: str = Field(default="Vivian", description="CustomVoice-mode speaker name.")
-    tts_x_vector_only_mode: bool = Field(
-        default=False,
-        description="Base mode: speaker embedding only (no ICL ref_text conditioning).",
-    )
-    tts_pass_token_ids: bool = Field(
-        default=False,
-        description="Pass AURA assistant token ids to Qwen3-TTS instead of decoded text.",
-    )
     stream_text_deltas: bool = Field(
         default=False,
         description=(
@@ -252,17 +217,6 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
             "emit response.text.done to the client. Audio streaming is unaffected."
         ),
     )
-
-
-@dataclass
-class AuraSessionState:
-    """Per-WebSocket session state for AURA streaming."""
-
-    history: SessionHistory
-    turn_frame_arrays: list[np.ndarray]
-    session_id: str = ""
-    cross_turn_penalty: CrossTurnPenalty | None = None
-    pending_turn_video: dict[str, Any] | None = None  # deferred_multi_modal_data for next turn
 
 
 class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
@@ -274,30 +228,12 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     def supports_query_interrupt(self) -> bool:
         return False
 
-    @staticmethod
-    def _tts_additional_information(config: AuraStreamingVideoSessionConfig) -> dict[str, Any]:
-        if "audio" not in config.modalities:
-            return {}
-        info: dict[str, Any] = {
-            "tts_task_type": config.tts_task_type,
-            "tts_language": config.tts_language,
-            "tts_instruct": config.tts_instruct,
-            "tts_x_vector_only_mode": config.tts_x_vector_only_mode,
-            "tts_pass_token_ids": config.tts_pass_token_ids,
-        }
-        if config.tts_task_type == "Base":
-            info["tts_ref_audio"] = config.tts_ref_audio
-            info["tts_ref_text"] = config.tts_ref_text
-        elif config.tts_task_type == "CustomVoice":
-            info["tts_speaker"] = config.tts_speaker
-        return info
-
     def releases_turn_after_text_done(self) -> bool:
         return True
 
     def create_message_history(self, config: StreamingVideoSessionConfig) -> AuraSessionState:
         aura_config = self._as_aura_config(config)
-        history = SessionHistory(
+        return create_streaming_session(
             max_rounds=aura_config.max_rounds,
             num_rounds_keep=aura_config.num_rounds_keep,
             pruning_enabled=aura_config.pruning_enabled,
@@ -305,9 +241,6 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             max_1qna_rounds=aura_config.max_1qna_rounds,
             system_prompt=aura_config.aura_system_prompt or DEFAULT_AURA_SYSTEM_PROMPT,
         )
-        session_id = create_session_id()
-        register_session(session_id, history)
-        return AuraSessionState(history=history, turn_frame_arrays=[], session_id=session_id)
 
     def on_session_end(self, message_history: Any) -> None:
         if isinstance(message_history, AuraSessionState) and message_history.session_id:
@@ -340,7 +273,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         if not isinstance(message_history, AuraSessionState):
             return
         frame = _decode_frame_bytes(raw_bytes)
-        message_history.turn_frame_arrays.append(np.asarray(frame))
+        message_history.append_turn_frame(frame)
 
     def build_engine_prompt(
         self,
@@ -357,7 +290,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             raise TypeError("AURA streaming requires AuraSessionState message history")
 
         frames = list(message_history.turn_frame_arrays)
-        video_array, metadata = self._frames_to_video_tuple(
+        video_array, metadata = frames_to_video_tuple(
             frames,
             fps=aura_config.video_fps,
             max_frames=aura_config.max_frames_per_round,
@@ -382,15 +315,14 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         messages = [user_message]
 
         system_prompt = aura_config.aura_system_prompt or DEFAULT_AURA_SYSTEM_PROMPT
-        additional_information: dict[str, Any] = {
-            "aura_session_id": message_history.session_id,
-            "deferred_multi_modal_data": {
-                "video": [(video_array, metadata)],
-            },
-            "aura_system_prompt": [system_prompt],
-            "omni_skip_stages": [0] if len(audio_buffer) == 0 else [],
-        }
-        additional_information.update(self._tts_additional_information(aura_config))
+        additional_information = build_aura_streaming_turn_additional_information(
+            session_id=message_history.session_id,
+            video_array=video_array,
+            video_metadata=metadata,
+            system_prompt=system_prompt,
+            skip_asr=len(audio_buffer) == 0,
+            include_tts="audio" in aura_config.modalities,
+        )
         user_message[_AURA_ADDITIONAL_INFO_KEY] = additional_information
 
         return messages, user_message
@@ -405,57 +337,10 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         del user_message
         if not isinstance(message_history, AuraSessionState):
             return
-
-        from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-            pop_turn_transcript,
-            video_tuple_from_deferred_multi_modal,
+        message_history.commit_turn(
+            response_text=response_text,
+            request_id=request_id,
         )
-
-        transcript = pop_turn_transcript(request_id)
-        video_tuple = video_tuple_from_deferred_multi_modal(message_history.pending_turn_video)
-        if video_tuple is None and message_history.turn_frame_arrays:
-            video_tuple = self._frames_to_video_tuple(
-                list(message_history.turn_frame_arrays),
-                fps=2.0,
-                max_frames=16,
-            )
-        if video_tuple is not None or transcript:
-            message_history.history.add_user_message(transcript, video_tuple=video_tuple)
-
-        message_history.pending_turn_video = None
-        normalized = normalize_assistant_text(response_text)
-        message_history.history.add_assistant_message(normalized)
-        message_history.turn_frame_arrays.clear()
-        if message_history.cross_turn_penalty is not None:
-            if is_effectively_silent(response_text):
-                message_history.cross_turn_penalty.record(None)
-            else:
-                message_history.cross_turn_penalty.record(response_text)
-
-    @staticmethod
-    def _merge_penalty_sampling_params(
-        sampling_params_list: list[dict[str, Any]] | None,
-        penalty_kwargs: dict[str, Any],
-        *,
-        stage_index: int = 1,
-        num_stages: int = 4,
-    ) -> list[dict[str, Any]]:
-        if not penalty_kwargs:
-            return list(sampling_params_list or [])
-        params = [dict(stage) for stage in (sampling_params_list or [])]
-        while len(params) < num_stages:
-            params.append({})
-        stage_params = dict(params[stage_index])
-        if "logit_bias" in penalty_kwargs:
-            merged_bias = dict(stage_params.get("logit_bias") or {})
-            merged_bias.update(penalty_kwargs["logit_bias"])
-            stage_params["logit_bias"] = merged_bias
-        if "bad_words" in penalty_kwargs:
-            merged_bad = list(stage_params.get("bad_words") or [])
-            merged_bad.extend(penalty_kwargs["bad_words"])
-            stage_params["bad_words"] = merged_bad
-        params[stage_index] = stage_params
-        return params
 
     async def _ensure_cross_turn_penalty(
         self,
@@ -569,7 +454,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             "add_special_tokens": False,
         }
         if config.sampling_params_list or penalty_kwargs:
-            request_kwargs["sampling_params_list"] = self._merge_penalty_sampling_params(
+            request_kwargs["sampling_params_list"] = merge_penalty_sampling_params(
                 config.sampling_params_list,
                 penalty_kwargs,
             )
@@ -737,37 +622,6 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         if isinstance(config, AuraStreamingVideoSessionConfig):
             return config
         return AuraStreamingVideoSessionConfig(**config.model_dump())
-
-    @staticmethod
-    def _frames_to_video_tuple(
-        frames: list[np.ndarray],
-        *,
-        fps: float,
-        max_frames: int,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
-        if not frames:
-            raise ValueError("At least one frame is required to build video_tuple")
-
-        selected = list(frames[-max_frames:])
-        if len(selected) == 1:
-            all_frames = np.stack([selected[0], selected[0]], axis=0)
-        else:
-            all_frames = np.stack(selected, axis=0)
-
-        if all_frames.shape[0] < 2:
-            all_frames = np.concatenate([all_frames, all_frames], axis=0)[:2]
-        elif all_frames.shape[0] > max_frames:
-            all_frames = all_frames[-max_frames:]
-
-        metadata = {
-            "fps": fps,
-            "duration": all_frames.shape[0] / fps,
-            "total_num_frames": int(all_frames.shape[0]),
-            "frames_indices": list(range(all_frames.shape[0])),
-            "video_backend": "opencv",
-            "do_sample_frames": False,
-        }
-        return all_frames, metadata
 
 
 def create_streaming_video_handler(

@@ -145,3 +145,29 @@ class CrossTurnPenalty:
 
     def reset(self) -> None:
         self._history.clear()
+
+
+def merge_penalty_sampling_params(
+    sampling_params_list: list[dict[str, Any]] | None,
+    penalty_kwargs: dict[str, Any],
+    *,
+    stage_index: int = 1,
+    num_stages: int = 4,
+) -> list[dict[str, Any]]:
+    """Merge cross-turn penalty kwargs into per-stage sampling params."""
+    if not penalty_kwargs:
+        return list(sampling_params_list or [])
+    params = [dict(stage) for stage in (sampling_params_list or [])]
+    while len(params) < num_stages:
+        params.append({})
+    stage_params = dict(params[stage_index])
+    if "logit_bias" in penalty_kwargs:
+        merged_bias = dict(stage_params.get("logit_bias") or {})
+        merged_bias.update(penalty_kwargs["logit_bias"])
+        stage_params["logit_bias"] = merged_bias
+    if "bad_words" in penalty_kwargs:
+        merged_bad = list(stage_params.get("bad_words") or [])
+        merged_bad.extend(penalty_kwargs["bad_words"])
+        stage_params["bad_words"] = merged_bad
+    params[stage_index] = stage_params
+    return params

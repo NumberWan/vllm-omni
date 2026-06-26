@@ -16,8 +16,11 @@ import pytest
 from PIL import Image
 
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import SessionHistory
-from vllm_omni.entrypoints.openai.serving_video_stream import (
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
     AuraSessionState,
+    SessionHistory,
+)
+from vllm_omni.entrypoints.openai.serving_video_stream import (
     AuraStreamingVideoHandler,
     AuraStreamingVideoSessionConfig,
 )

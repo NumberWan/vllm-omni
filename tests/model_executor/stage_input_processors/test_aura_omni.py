@@ -281,6 +281,15 @@ def test_aura2tts_supports_base_ref_audio_override():
     assert tts_input["additional_information"]["x_vector_only_mode"] == [False]
 
 
+def test_aura2tts_uses_bundled_ref_when_tts_fields_omitted():
+    [tts_input] = aura2tts([_source_output("Hello.")], prompt=[{}])
+
+    info = tts_input["additional_information"]
+    assert info["task_type"] == ["Base"]
+    assert info["ref_audio"] and info["ref_audio"][0]
+    assert info["ref_text"] and info["ref_text"][0]
+
+
 @pytest.mark.parametrize(
     "response_text",
     [SILENT_TEXT, " ﹑"],
