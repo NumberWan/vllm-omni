@@ -94,14 +94,17 @@ def default_qwen3_tts_ref_audio_path() -> str:
 
 
 def default_aura_tts_additional_information() -> dict[str, Any]:
-    """Default Qwen3-TTS fields for AURA ``additional_information`` (Base / bundled ref)."""
+    """Default Qwen3-TTS fields for AURA ``additional_information``.
+
+    Matches Base checkpoint deployments (e.g. ``aura_omni_gpu23.yaml``).
+    For CustomVoice checkpoints, set ``tts_task_type`` / ``tts_speaker`` explicitly.
+    """
     return {
         "tts_task_type": "Base",
-        "tts_language": "English",
+        "tts_language": "Chinese",
         "tts_instruct": "",
         "tts_ref_audio": default_qwen3_tts_ref_audio_path(),
         "tts_ref_text": DEFAULT_QWEN3_TTS_REF_TEXT,
-        "tts_x_vector_only_mode": False,
         "tts_pass_token_ids": False,
     }
 
