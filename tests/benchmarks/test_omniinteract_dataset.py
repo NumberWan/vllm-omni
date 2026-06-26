@@ -242,6 +242,104 @@ def test_omniinteract_dataset_aura_mode_passes_custom_voice_speaker(omniinteract
     assert "tts_ref_text" not in additional_info
 
 
+def test_omniinteract_dataset_aura_streaming_carries_media_paths(omniinteract_root: Path, mock_tokenizer):
+    audio_dir = omniinteract_root / "1q1a" / "audios"
+    audio_dir.mkdir()
+    (audio_dir / "0001_0.wav").write_bytes(b"fake-wav")
+    ds = OmniInteractDataset(
+        dataset_path=str(omniinteract_root),
+        random_seed=0,
+        disable_shuffle=True,
+        input_mode="aura_streaming",
+        aura_tts_task_type="CustomVoice",
+        aura_tts_language="English",
+        aura_tts_speaker="Ethan",
+        streaming_sample_fps=4.0,
+        streaming_send_fps=0.0,
+        streaming_max_frames=8,
+    )
+
+    [req] = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
+
+    assert req.omni_chat_messages is None
+    assert req.omni_extra_body is None
+    assert req.omniinteract_video == "videos/0001.mp4"
+    assert req.omniinteract_streaming_video_path.endswith("1q1a/videos/0001.mp4")
+    assert req.omniinteract_streaming_audio_path == ""
+    assert req.omniinteract_streaming_audio_schedule is not None
+    assert req.omniinteract_streaming_audio_schedule[0]["at_sec"] == 1.0
+    assert req.omniinteract_streaming_audio_schedule[0]["audio_path"].endswith("1q1a/audios/0001_0.wav")
+    assert req.omniinteract_streaming_slots is not None
+    assert req.omniinteract_streaming_slots[0]["start"] == 1.0
+    assert req.omniinteract_streaming_slots[0]["t_a"] == 4.0
+    assert req.omniinteract_streaming_config is not None
+    assert req.omniinteract_streaming_config["modalities"] == ["text", "audio"]
+    assert req.omniinteract_streaming_config["video_fps"] == 4.0
+    assert req.omniinteract_streaming_config["max_frames_per_round"] == 8
+    assert req.omniinteract_streaming_config["tts_task_type"] == "CustomVoice"
+    assert req.omniinteract_streaming_config["tts_speaker"] == "Ethan"
+
+
+def test_omniinteract_dataset_aura_streaming_supports_1qna_video_audio(tmp_path: Path, mock_tokenizer):
+    root = tmp_path / "data"
+    ann_dir = root / "1qna" / "annotations" / "captaincook4d"
+    video_dir = root / "1qna" / "videos_bench" / "captaincook4d"
+    ann_dir.mkdir(parents=True)
+    video_dir.mkdir(parents=True)
+    (video_dir / "demo.mp4").write_bytes(b"fake-mp4")
+    (ann_dir / "demo.json").write_text(
+        json.dumps(
+            {
+                "question_time": "00:00",
+                "question_text": "Guide me through the task.",
+                "answers": [
+                    {
+                        "answer_time": "00:05",
+                        "answer_text": "stir the pot",
+                        "label": "step",
+                    },
+                    {
+                        "answer_time": "00:08",
+                        "answer_text": "turn off the stove",
+                        "label": "step",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "1q1a" / "videos").mkdir(parents=True)
+    (root / "1q1a" / "annotations").mkdir(parents=True)
+    (root / "1q1a" / "video_json_map.json").write_text(json.dumps({"total": 0, "entries": []}), encoding="utf-8")
+    (root / "1q1a_math" / "videos").mkdir(parents=True)
+    (root / "1q1a_math" / "annotations").mkdir(parents=True)
+    (root / "1q1a_math" / "video_json_map.json").write_text(json.dumps({"total": 0, "entries": []}), encoding="utf-8")
+
+    ds = OmniInteractDataset(
+        dataset_path=str(root),
+        random_seed=0,
+        disable_shuffle=True,
+        subsets=["1qna"],
+        input_mode="aura_streaming",
+        aura_tts_task_type="CustomVoice",
+        aura_tts_language="English",
+        aura_tts_speaker="Ethan",
+    )
+
+    [req] = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
+
+    assert req.omniinteract_subset == "1qna"
+    assert req.omniinteract_video == "videos_bench/captaincook4d/demo.mp4"
+    assert req.omniinteract_streaming_audio_from_video is True
+    assert req.omniinteract_streaming_audio_schedule == []
+    assert req.omniinteract_streaming_slots is not None
+    assert [slot["scene_type"] for slot in req.omniinteract_streaming_slots] == ["1QnA", "1QnA"]
+    assert req.omniinteract_streaming_slots[0]["start"] == 0.0
+    assert req.omniinteract_streaming_slots[0]["t_a"] == 5.0
+    assert req.omniinteract_streaming_slots[1]["start"] == 8.0
+    assert req.omniinteract_streaming_slots[1]["t_a"] == 8.0
+
+
 def test_omniinteract_dataset_aura_mode_requires_base_tts_refs(omniinteract_root: Path, mock_tokenizer):
     audio_dir = omniinteract_root / "1q1a" / "audios"
     audio_dir.mkdir()

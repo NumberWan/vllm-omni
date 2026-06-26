@@ -53,7 +53,7 @@ Accuracy benchmarks for image generation/editing models, adapting external suite
 Omni-specific benchmark datasets currently include:
 
 - `daily-omni` (audio-visual MCQ)
-- `omniinteract` (speech-QA + video)
+- [`omniinteract`](omniinteract/README.md) (streaming speech-QA + video, including AURA streaming and 1QnA)
 - `seed-tts` / `seed-tts-text` / `seed-tts-design` / `ttsd` / `sound-effect`
 
 See `vllm_omni/benchmarks/serve.py` for the `vllm bench serve --omni` runner wrapper and `vllm_omni/benchmarks/metrics/` for Omni metric definitions.

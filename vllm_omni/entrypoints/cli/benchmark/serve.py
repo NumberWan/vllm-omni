@@ -156,14 +156,51 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--omniinteract-input-mode",
         type=str,
-        choices=["video", "aura"],
+        choices=["video", "aura", "aura_streaming"],
         default="video",
         help=(
             "OmniInteract request protocol. 'video' sends subvideo_url + text question with "
             "mm_processor_kwargs.use_audio_in_video=true. 'aura' sends paired audio_url + "
             "subvideo_url and AURA/TTS extra_body fields for the ASR -> AURA -> TTS pipeline. "
+            "'aura_streaming' streams paired local audio/video over /v1/video/chat/stream. "
             "Generate subvideos/ and audios/ under 1q1a before benchmarking."
         ),
+    )
+    g.add_argument(
+        "--omniinteract-streaming-sample-fps",
+        type=float,
+        default=2.0,
+        help="For aura_streaming: frames extracted per source-video second.",
+    )
+    g.add_argument(
+        "--omniinteract-streaming-send-fps",
+        type=float,
+        default=0.0,
+        help="For aura_streaming: WebSocket frame send rate. 0 sends frames as fast as possible.",
+    )
+    g.add_argument(
+        "--omniinteract-streaming-max-frames",
+        type=int,
+        default=16,
+        help=(
+            "For aura_streaming: max sampled frames sent per OmniInteract request. "
+            "Use 16 for stable smoke/perf runs; 0 maps to the server cap and can be slow."
+        ),
+    )
+    g.add_argument(
+        "--omniinteract-streaming-auto-trigger-min-frames",
+        type=int,
+        default=0,
+        help=(
+            "For aura_streaming: AURA auto-trigger threshold. 0 means use all sampled frames "
+            "for a single-turn clip request."
+        ),
+    )
+    g.add_argument(
+        "--omniinteract-streaming-enable-frame-filter",
+        action="store_true",
+        default=False,
+        help="For aura_streaming: enable server-side frame similarity filtering.",
     )
     g.add_argument(
         "--omniinteract-aura-tts-task-type",
@@ -304,7 +341,7 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
                 if extra:
                     action.choices = list(action.choices) + extra
             if action.dest == "backend" and action.choices is not None:
-                extra = [c for c in ("openai-image-edits-omni",) if c not in action.choices]
+                extra = [c for c in ("openai-image-edits-omni", "openai-video-stream") if c not in action.choices]
                 if extra:
                     action.choices = list(action.choices) + extra
         _extend_omni_dataset_name_choices(parser)

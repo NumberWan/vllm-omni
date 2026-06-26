@@ -2,7 +2,9 @@
 The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
-We currently only support using the "openai-chat-omni" and "openai-image-edits-omni" backend.
+The Omni benchmark runner extends the upstream `vllm bench serve` backends with
+Omni-specific adapters such as `openai-chat-omni`, `openai-image-edits-omni`, and
+`openai-video-stream`.
 
 ## Basic Parameter Description
 You can use `vllm bench serve --omni --help=all` to get descriptions of all parameters. The commonly used parameters are described below:
@@ -22,6 +24,8 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   The name of the dataset used; random-mm indicates generating random multimodal inputs (images, videos, audio).
   Omni dataset extensions include `daily-omni`, `omniinteract`, `seed-tts`,
   `seed-tts-text`, `seed-tts-design`, `ttsd`, and `sound-effect`.
+  For OmniInteract streaming and non-streaming examples, see
+  `benchmarks/omniinteract/README.md`.
 
 - `--num-prompts`
   The total number of requests to send, an integer.
