@@ -227,6 +227,78 @@ async def test_aura_releases_turn_after_text_allows_next_trigger_during_tts(monk
 
 
 @pytest.mark.asyncio
+async def test_aura_releases_turn_lock_when_generation_raises(monkeypatch):
+    """A failed generation must not leave the turn lock held for the next trigger."""
+    query_count = 0
+    second_turn_started = asyncio.Event()
+
+    class FailingThenOkEngine:
+        def __init__(self) -> None:
+            self._calls = 0
+
+        def generate(self, **_kwargs):
+            self._calls += 1
+            call = self._calls
+
+            async def _gen():
+                if call == 1:
+                    raise RuntimeError("boom")
+                yield _text_result("第二輪")
+                yield _audio_result_with_b64("unused")
+
+            return _gen()
+
+    class CapturingAuraHandler(AuraStreamingVideoHandler):
+        async def _process_query(self, *args, **kwargs):
+            nonlocal query_count
+            query_count += 1
+            if query_count == 2:
+                second_turn_started.set()
+            await super()._process_query(*args, **kwargs)
+
+        async def _preprocess_to_engine_prompt(self, request):
+            return {"prompt": "engine"}
+
+    monkeypatch.setenv("VLLM_VIDEO_ASYNC_CHUNK", "on")
+    monkeypatch.setattr(
+        CapturingAuraHandler,
+        "_extract_audio_delta_b64",
+        classmethod(lambda cls, result, chunks_drained: ("UklGRiQAAABXQVZFZm10IBAAAAABAAEA", chunks_drained + 1)),
+    )
+
+    ws = TimedWebSocket()
+    handler = CapturingAuraHandler(
+        chat_service=object(),
+        engine_client=FailingThenOkEngine(),
+        idle_timeout=5.0,
+    )
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "modalities": ["text", "audio"],
+            "auto_trigger_min_frames": 2,
+            "enable_frame_filter": False,
+        }
+    )
+    await asyncio.sleep(0.05)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10, 10, 10))})
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(20, 20, 20))})
+    await asyncio.sleep(0.2)
+    assert query_count == 1
+
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(30, 30, 30))})
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(40, 40, 40))})
+    await asyncio.wait_for(second_turn_started.wait(), timeout=2.0)
+    assert query_count == 2
+
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=3.0)
+
+
+@pytest.mark.asyncio
 async def test_aura_websocket_streams_text_and_audio(monkeypatch):
     class TextAudioEngine:
         def generate(self, **_kwargs):

@@ -408,11 +408,10 @@ class OmniStreamingVideoHandler:
                             release_turn_lock=release_cb,
                         )
                     finally:
-                        if not self.releases_turn_after_text_done():
-                            if active_request_id == request_id:
-                                prev_request_id = request_id
-                                active_request_id = None
+                        if active_request_id == request_id:
                             is_turn_locked = False
+                            prev_request_id = request_id
+                            active_request_id = None
 
                 query_task = asyncio.create_task(_run_query())
                 _register_query_task(query_task)
