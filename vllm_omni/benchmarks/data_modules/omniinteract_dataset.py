@@ -3,13 +3,17 @@
 OmniInteract is a streaming audio-visual QA benchmark:
 https://huggingface.co/datasets/lucky-lance/OmniInteract
 
-This loader flattens per-QA annotation entries into independent benchmark
-requests. For ``1q1a`` / ``1q1a_math`` each request uses the per-QA
-``subvideos/{video}_{qa_idx}.mp4`` clip together with the matching
+For non-streaming modes this loader flattens per-QA annotation entries into
+independent benchmark requests. For ``1q1a`` / ``1q1a_math`` each request uses
+the per-QA ``subvideos/{video}_{qa_idx}.mp4`` clip together with the matching
 ``audios/{video}_{qa_idx}.wav`` when present. The default ``video`` input mode
 sends one ``video_url`` (native audio in the video stream) plus a text question.
 The ``aura`` input mode sends only ``audio_url`` + ``video_url`` so ASR receives
 the spoken question while AURA receives the subvideo clip.
+
+``aura_streaming`` follows the original OmniInteract online protocol: one
+request streams the full ``videos/*.mp4`` file and injects the per-QA audio
+question at the annotation ``question_time``.
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ from vllm.tokenizers.hf import get_cached_tokenizer
 logger = logging.getLogger(__name__)
 
 OmniInteractSubset = Literal["1q1a", "1q1a_math", "1qna"]
-OmniInteractInputMode = Literal["video", "aura"]
+OmniInteractInputMode = Literal["video", "aura", "aura_streaming"]
 
 DEFAULT_AURA_SYSTEM_PROMPT_FOR_OMNIINTERACT = (
     "You are answering OmniInteract audio-visual QA tasks. Use the ASR transcript "
@@ -61,6 +65,12 @@ class OmniInteractSampleRequest(SampleRequest):
     omniinteract_nested_role: str = ""
     omni_extra_body: dict[str, Any] | None = None
     omni_chat_messages: list[dict[str, Any]] | None = None
+    omniinteract_streaming_video_path: str = ""
+    omniinteract_streaming_audio_path: str = ""
+    omniinteract_streaming_audio_schedule: list[dict[str, Any]] | None = None
+    omniinteract_streaming_audio_from_video: bool = False
+    omniinteract_streaming_slots: list[dict[str, Any]] | None = None
+    omniinteract_streaming_config: dict[str, Any] | None = None
 
 
 @dataclass
@@ -78,6 +88,16 @@ class _OmniInteractEntry:
     scene_type: str = "multi_turn"
     nested_group_id: int | None = None
     nested_role: str = ""
+
+
+@dataclass
+class _OmniInteractStreamingEntry:
+    subset: str
+    video_rel: str
+    video_path: Path
+    annotation_path: Path
+    scene_type: str
+    rows: list[dict[str, Any]]
 
 
 def aura_sampling_params_list() -> list[dict[str, Any]]:
@@ -142,6 +162,49 @@ def aura_extra_body(
     }
 
 
+def aura_streaming_config(
+    *,
+    tts_task_type: str,
+    tts_language: str,
+    tts_speaker: str | None = None,
+    tts_ref_audio: str | None = None,
+    tts_ref_text: str | None = None,
+    sample_fps: float = 2.0,
+    max_frames: int = 16,
+    auto_trigger_min_frames: int = 0,
+    send_fps: float = 0.0,
+    enable_frame_filter: bool = False,
+) -> dict[str, Any]:
+    """Build ``session.config`` fields for AURA WebSocket streaming benchmark."""
+
+    config: dict[str, Any] = {
+        "modalities": ["text", "audio"],
+        "auto_trigger": True,
+        # 0 means the request function chooses a small cadence-based trigger.
+        "auto_trigger_min_frames": int(auto_trigger_min_frames),
+        "max_frames": int(max_frames),
+        "max_frames_per_round": int(max_frames),
+        "video_fps": float(sample_fps),
+        "send_fps": float(send_fps),
+        "enable_frame_filter": bool(enable_frame_filter),
+        "sampling_params_list": aura_sampling_params_list(),
+        "aura_system_prompt": DEFAULT_AURA_SYSTEM_PROMPT_FOR_OMNIINTERACT,
+        "tts_task_type": tts_task_type,
+        "tts_language": tts_language,
+    }
+    if tts_task_type == "Base":
+        if not tts_ref_audio or not tts_ref_text:
+            raise ValueError(
+                "OmniInteract AURA streaming Base TTS requires both "
+                "--omniinteract-aura-tts-ref-audio and --omniinteract-aura-tts-ref-text."
+            )
+        config["tts_ref_audio"] = tts_ref_audio
+        config["tts_ref_text"] = tts_ref_text
+    elif tts_speaker:
+        config["tts_speaker"] = tts_speaker
+    return config
+
+
 def _parse_time_seconds(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
@@ -198,6 +261,197 @@ def _infer_nested_roles(ann: list[dict[str, Any]]) -> dict[int, tuple[int, str]]
         group_id += 1
         cursor = inner_pos + 1
     return nested_meta
+
+
+def _slot_end_for_rows(rows: list[dict[str, Any]], idx: int, *, last_slot_tail_sec: float = 60.0) -> float:
+    q_time = float(rows[idx]["q_time"])
+    a_time = float(rows[idx]["a_time"])
+    if idx + 1 < len(rows):
+        return max(float(rows[idx + 1]["q_time"]), q_time)
+    return max(a_time + float(last_slot_tail_sec), q_time)
+
+
+def _streaming_slots_for_rows(rows: list[dict[str, Any]], scene_type: str) -> list[dict[str, Any]]:
+    """Build enough official OmniInteract slot metadata for benchmark scoring."""
+
+    if scene_type == "1QnA":
+        slots: list[dict[str, Any]] = []
+        q_start = float(rows[0]["q_time"]) if rows else 0.0
+        question_text = str(rows[0].get("question_text") or "") if rows else ""
+        for idx, row in enumerate(rows):
+            t_a = float(row["a_time"])
+            start = q_start if idx == 0 else t_a
+            end = float(rows[idx + 1]["a_time"]) if idx + 1 < len(rows) else t_a + 60.0
+            slots.append(
+                {
+                    "slot_id": idx + 1,
+                    "start": start,
+                    "t_a": t_a,
+                    "end": max(end, start),
+                    "boundary_type": "Soft",
+                    "question_text": question_text,
+                    "gt_answer": row["answer_text"],
+                    "scene_type": "1QnA",
+                    "step_index": idx + 1,
+                    "turn_index": 1,
+                    "question_type": row["question_type"],
+                    "is_interrupted": bool(row["is_interrupted"]),
+                    "label": row.get("label", ""),
+                    "nested_group_id": None,
+                    "nested_role": "",
+                    "inferred_knowledge": row.get("inferred_knowledge", ""),
+                }
+            )
+        return slots
+
+    if scene_type == "nested":
+        slots: list[dict[str, Any]] = []
+        slot_id = 1
+        group_id = 1
+        idx = 0
+        while idx < len(rows):
+            outer = rows[idx]
+            inner_idx = None
+            for cand_idx in range(idx + 1, len(rows)):
+                cand = rows[cand_idx]
+                if outer["q_time"] < cand["q_time"] < outer["a_time"] and cand["a_time"] <= outer["a_time"]:
+                    inner_idx = cand_idx
+                    break
+            if inner_idx is None:
+                idx += 1
+                continue
+            inner = rows[inner_idx]
+            next_outer_q = rows[inner_idx + 1]["q_time"] if inner_idx + 1 < len(rows) else outer["a_time"] + 60.0
+            slots.append(
+                {
+                    "slot_id": slot_id,
+                    "start": float(outer["q_time"]),
+                    "t_a": float(outer["a_time"]),
+                    "end": max(float(next_outer_q), float(outer["a_time"])),
+                    "boundary_type": "Hard",
+                    "question_text": outer["question_text"],
+                    "gt_answer": outer["answer_text"],
+                    "scene_type": "nested",
+                    "turn_index": group_id,
+                    "question_type": outer["question_type"],
+                    "is_interrupted": bool(outer["is_interrupted"]),
+                    "nested_group_id": group_id,
+                    "nested_role": "outer",
+                }
+            )
+            slot_id += 1
+            slots.append(
+                {
+                    "slot_id": slot_id,
+                    "start": float(inner["q_time"]),
+                    "t_a": float(inner["a_time"]),
+                    "end": float(outer["a_time"]),
+                    "boundary_type": "Hard",
+                    "question_text": inner["question_text"],
+                    "gt_answer": inner["answer_text"],
+                    "scene_type": "nested",
+                    "turn_index": group_id,
+                    "question_type": inner["question_type"],
+                    "is_interrupted": bool(inner["is_interrupted"]),
+                    "nested_group_id": group_id,
+                    "nested_role": "inner",
+                }
+            )
+            slot_id += 1
+            group_id += 1
+            idx = inner_idx + 1
+        return slots
+
+    return [
+        {
+            "slot_id": idx + 1,
+            "start": float(row["q_time"]),
+            "t_a": float(row["a_time"]),
+            "end": _slot_end_for_rows(rows, idx),
+            "boundary_type": "Hard",
+            "question_text": row["question_text"],
+            "gt_answer": row["answer_text"],
+            "scene_type": scene_type,
+            "turn_index": idx + 1,
+            "question_type": row["question_type"],
+            "is_interrupted": bool(row["is_interrupted"]),
+            "nested_group_id": None,
+            "nested_role": "",
+        }
+        for idx, row in enumerate(rows)
+    ]
+
+
+def _parse_1qna_rows(ann: Any) -> list[dict[str, Any]]:
+    """Parse OmniInteract 1QnA annotations into answer-step rows."""
+
+    if not isinstance(ann, dict):
+        return []
+    inferred = str(ann.get("inferred_knowledge", "") or "").strip()
+    q_time = _parse_time_seconds(ann.get("question_time"))
+    question_text = str(ann.get("question_text", "") or "").strip()
+    rows: list[dict[str, Any]] = []
+
+    conversations = ann.get("conversations")
+    if isinstance(conversations, list):
+        first_user = next(
+            (
+                item
+                for item in conversations
+                if isinstance(item, dict) and str(item.get("from", "")).strip().lower() == "user"
+            ),
+            None,
+        )
+        if first_user is not None:
+            q_time = _parse_time_seconds(first_user.get("timestamp")) or q_time
+            question_text = str(first_user.get("value", "") or question_text).strip()
+        for idx, item in enumerate(conversations):
+            if not isinstance(item, dict) or str(item.get("from", "")).strip().lower() != "assistant":
+                continue
+            a_time = _parse_time_seconds(item.get("timestamp"))
+            answer = str(item.get("value", "") or "").strip()
+            if a_time is None or not answer:
+                continue
+            rows.append(
+                {
+                    "qa_index": idx,
+                    "q_time": float(q_time or 0.0),
+                    "a_time": float(a_time),
+                    "question_time": str(q_time or 0.0),
+                    "answer_time": str(item.get("timestamp") or "").strip(),
+                    "question_text": question_text,
+                    "answer_text": answer,
+                    "question_type": str(item.get("label", "") or "step").strip().lower() or "step",
+                    "is_interrupted": bool(item.get("interrupted", item.get("is_interrupted", False))),
+                    "label": str(item.get("label", "") or "").strip(),
+                    "inferred_knowledge": inferred,
+                }
+            )
+    elif isinstance(ann.get("answers"), list):
+        for idx, item in enumerate(ann["answers"]):
+            if not isinstance(item, dict):
+                continue
+            a_time = _parse_time_seconds(item.get("answer_time"))
+            answer = str(item.get("answer_text", "") or "").strip()
+            if a_time is None or not answer:
+                continue
+            rows.append(
+                {
+                    "qa_index": idx,
+                    "q_time": float(q_time or 0.0),
+                    "a_time": float(a_time),
+                    "question_time": str(q_time or 0.0),
+                    "answer_time": str(item.get("answer_time") or "").strip(),
+                    "question_text": question_text,
+                    "answer_text": answer,
+                    "question_type": str(item.get("label", "") or "step").strip().lower() or "step",
+                    "is_interrupted": bool(item.get("interrupted", item.get("is_interrupted", False))),
+                    "label": str(item.get("label", "") or "").strip(),
+                    "inferred_knowledge": inferred,
+                }
+            )
+    rows.sort(key=lambda row: (float(row["a_time"]), int(row["qa_index"])))
+    return rows
 
 
 def _hf_cache_root() -> Path:
@@ -342,6 +596,11 @@ class OmniInteractDataset(BenchmarkDataset):
         aura_tts_speaker: str | None = None,
         aura_tts_ref_audio: str | None = None,
         aura_tts_ref_text: str | None = None,
+        streaming_sample_fps: float = 2.0,
+        streaming_send_fps: float = 0.0,
+        streaming_max_frames: int = 16,
+        streaming_auto_trigger_min_frames: int = 0,
+        streaming_enable_frame_filter: bool = False,
         **kwargs: Any,
     ) -> None:
         self.dataset_path = dataset_path or self.DEFAULT_HF_DATASET_ID
@@ -354,8 +613,14 @@ class OmniInteractDataset(BenchmarkDataset):
         self.aura_tts_speaker = aura_tts_speaker
         self.aura_tts_ref_audio = self._normalize_aura_ref_audio(aura_tts_ref_audio)
         self.aura_tts_ref_text = aura_tts_ref_text
+        self.streaming_sample_fps = streaming_sample_fps
+        self.streaming_send_fps = streaming_send_fps
+        self.streaming_max_frames = streaming_max_frames
+        self.streaming_auto_trigger_min_frames = streaming_auto_trigger_min_frames
+        self.streaming_enable_frame_filter = streaming_enable_frame_filter
         self._data_root: Path | None = None
         self._entries: list[_OmniInteractEntry] = []
+        self._streaming_entries: list[_OmniInteractStreamingEntry] = []
 
         super().__init__(
             dataset_path=self.dataset_path,
@@ -443,47 +708,144 @@ class OmniInteractDataset(BenchmarkDataset):
             if not video_path.is_file():
                 continue
             ann = self._read_json(ann_path)
-            if not isinstance(ann, list):
-                continue
             video_rel = str(video_path.relative_to(subset_root))
-            for qa_idx, qa in enumerate(ann):
-                q = str(qa.get("question_text") or "").strip()
-                a = str(qa.get("answer_text") or "").strip()
-                if not q or not a:
-                    continue
-                audio_path = subset_root / "audios" / rel.parent / f"{rel.stem}_{qa_idx}.wav"
+            rows = _parse_1qna_rows(ann)
+            for row in rows:
                 entries.append(
                     _OmniInteractEntry(
                         subset=subset,
                         video_rel=video_rel,
                         video_path=video_path,
-                        question_text=q,
-                        answer_text=a,
-                        question_time=str(qa.get("question_time") or "").strip(),
-                        answer_time=str(qa.get("answer_time") or "").strip(),
-                        question_type=str(qa.get("question_type") or "").strip(),
-                        is_interrupted=qa.get("is_interrupted"),
-                        audio_path=audio_path,
-                        scene_type="1qna",
+                        question_text=str(row.get("question_text") or ""),
+                        answer_text=str(row.get("answer_text") or ""),
+                        question_time=str(row.get("question_time") or "").strip(),
+                        answer_time=str(row.get("answer_time") or "").strip(),
+                        question_type=str(row.get("question_type") or "").strip(),
+                        is_interrupted=bool(row.get("is_interrupted")),
+                        audio_path=None,
+                        scene_type="1QnA",
                     )
                 )
+        return entries
+
+    def _iter_subset_streaming_entries(
+        self,
+        data_root: Path,
+        subset: OmniInteractSubset,
+    ) -> list[_OmniInteractStreamingEntry]:
+        entries: list[_OmniInteractStreamingEntry] = []
+        subset_root = data_root / subset
+        if not subset_root.is_dir():
+            return entries
+        if subset == "1qna":
+            ann_root = subset_root / "annotations"
+            video_root = subset_root / "videos_bench"
+            if not ann_root.is_dir() or not video_root.is_dir():
+                return entries
+            for ann_path in sorted(ann_root.rglob("*.json")):
+                rel = ann_path.relative_to(ann_root)
+                video_path = (video_root / rel).with_suffix(".mp4")
+                if not video_path.is_file():
+                    continue
+                rows = _parse_1qna_rows(self._read_json(ann_path))
+                if not rows:
+                    continue
+                entries.append(
+                    _OmniInteractStreamingEntry(
+                        subset=subset,
+                        video_rel=str(video_path.relative_to(subset_root)),
+                        video_path=video_path,
+                        annotation_path=ann_path,
+                        scene_type="1QnA",
+                        rows=rows,
+                    )
+                )
+            return entries
+
+        if subset not in ("1q1a", "1q1a_math"):
+            return entries
+
+        map_path = subset_root / "video_json_map.json"
+        map_data = self._read_json(map_path) if map_path.is_file() else {"entries": []}
+        for item in map_data.get("entries", []):
+            video_rel = str(item.get("video") or "").strip()
+            ann_rel = str(item.get("annotation") or "").strip()
+            scene_type = str(item.get("scene_type") or "multi_turn").strip().lower() or "multi_turn"
+            if not video_rel or not ann_rel:
+                continue
+            video_path = subset_root / video_rel
+            ann_path = subset_root / ann_rel
+            if not video_path.is_file() or not ann_path.is_file():
+                continue
+            ann = self._read_json(ann_path)
+            if not isinstance(ann, list):
+                continue
+            rows: list[dict[str, Any]] = []
+            video_stem = Path(video_rel).stem
+            nested_meta = _infer_nested_roles(ann) if scene_type == "nested" else {}
+            for qa_idx, qa in enumerate(ann):
+                q_time = _parse_time_seconds(qa.get("question_time"))
+                a_time = _parse_time_seconds(qa.get("answer_time"))
+                q = str(qa.get("question_text") or "").strip()
+                a = str(qa.get("answer_text") or "").strip()
+                audio_path = subset_root / "audios" / f"{video_stem}_{qa_idx}.wav"
+                if q_time is None or a_time is None or not q or not a or not audio_path.is_file():
+                    continue
+                nested_group_id, nested_role = nested_meta.get(qa_idx, (None, ""))
+                rows.append(
+                    {
+                        "qa_index": qa_idx,
+                        "q_time": float(q_time),
+                        "a_time": float(a_time),
+                        "question_time": str(qa.get("question_time") or "").strip(),
+                        "answer_time": str(qa.get("answer_time") or "").strip(),
+                        "question_text": q,
+                        "answer_text": a,
+                        "question_type": str(qa.get("question_type") or "").strip().lower() or "unknown",
+                        "is_interrupted": bool(qa.get("is_interrupted")),
+                        "audio_path": str(audio_path.expanduser().resolve()),
+                        "nested_group_id": nested_group_id,
+                        "nested_role": nested_role,
+                    }
+                )
+            if not rows:
+                continue
+            rows.sort(key=lambda row: (float(row["q_time"]), float(row["a_time"]), int(row["qa_index"])))
+            entries.append(
+                _OmniInteractStreamingEntry(
+                    subset=subset,
+                    video_rel=video_rel,
+                    video_path=video_path,
+                    annotation_path=ann_path,
+                    scene_type="nested" if scene_type == "nested" else "multi_turn",
+                    rows=rows,
+                )
+            )
         return entries
 
     def load_data(self) -> None:
         root = self._resolve_data_root()
         all_entries: list[_OmniInteractEntry] = []
+        all_streaming_entries: list[_OmniInteractStreamingEntry] = []
         for subset in self.subsets:
-            all_entries.extend(self._iter_subset_entries(root, subset))
-        if not all_entries:
+            if self.input_mode == "aura_streaming":
+                all_streaming_entries.extend(self._iter_subset_streaming_entries(root, subset))
+            else:
+                all_entries.extend(self._iter_subset_entries(root, subset))
+        if self.input_mode == "aura_streaming":
+            if not all_streaming_entries:
+                raise ValueError(f"No OmniInteract streaming videos found under {root} (subsets={self.subsets})")
+        elif not all_entries:
             raise ValueError(f"No OmniInteract QA entries found under {root} (subsets={self.subsets})")
         if not getattr(self, "disable_shuffle", False):
             import random
 
             rng = random.Random(self.random_seed)
-            rng.shuffle(all_entries)
+            rng.shuffle(all_streaming_entries if self.input_mode == "aura_streaming" else all_entries)
         self._entries = all_entries
-        self.data = self._entries
-        logger.info("Loaded OmniInteract: root=%s subsets=%s rows=%d", root, self.subsets, len(all_entries))
+        self._streaming_entries = all_streaming_entries
+        self.data = self._streaming_entries if self.input_mode == "aura_streaming" else self._entries
+        logger.info("Loaded OmniInteract: root=%s subsets=%s rows=%d", root, self.subsets, len(self.data))
 
     @staticmethod
     def _question_prompt(e: _OmniInteractEntry) -> str:
@@ -568,19 +930,75 @@ class OmniInteractDataset(BenchmarkDataset):
         out: list[SampleRequest] = []
         tok = get_cached_tokenizer(tokenizer)
 
+        if self.input_mode == "aura_streaming":
+            for i, entry in enumerate(self._streaming_entries):
+                if len(out) >= num_requests:
+                    break
+                slots = _streaming_slots_for_rows(entry.rows, entry.scene_type)
+                if not slots:
+                    continue
+                prompt = "\n".join(row["question_text"] for row in entry.rows)
+                config = aura_streaming_config(
+                    tts_task_type=self.aura_tts_task_type,
+                    tts_language=self.aura_tts_language,
+                    tts_speaker=self.aura_tts_speaker,
+                    tts_ref_audio=self.aura_tts_ref_audio,
+                    tts_ref_text=self.aura_tts_ref_text,
+                    sample_fps=self.streaming_sample_fps,
+                    send_fps=self.streaming_send_fps,
+                    max_frames=self.streaming_max_frames,
+                    auto_trigger_min_frames=self.streaming_auto_trigger_min_frames,
+                    enable_frame_filter=self.streaming_enable_frame_filter,
+                )
+                out.append(
+                    OmniInteractSampleRequest(
+                        prompt=prompt,
+                        prompt_len=len(tok.encode(prompt)),
+                        expected_output_len=output_len,
+                        multi_modal_data=None,
+                        request_id=f"{request_id_prefix}{i}",
+                        omniinteract_gold_answer="\n".join(row["answer_text"] for row in entry.rows),
+                        omniinteract_subset=entry.subset,
+                        omniinteract_question_type="streaming",
+                        omniinteract_video=entry.video_rel,
+                        omniinteract_scene_type=entry.scene_type,
+                        omni_extra_body=None,
+                        omni_chat_messages=None,
+                        omniinteract_streaming_video_path=str(entry.video_path.expanduser().resolve()),
+                        omniinteract_streaming_audio_schedule=[
+                            {
+                                "at_sec": float(row["q_time"]),
+                                "audio_path": row["audio_path"],
+                                "qa_index": int(row["qa_index"]),
+                                "question_text": row["question_text"],
+                            }
+                            for row in entry.rows
+                            if row.get("audio_path")
+                        ],
+                        omniinteract_streaming_audio_from_video=entry.subset == "1qna",
+                        omniinteract_streaming_slots=slots,
+                        omniinteract_streaming_config=config,
+                    )
+                )
+            self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)
+            return out
+
         for i, entry in enumerate(self._entries):
             if len(out) >= num_requests:
                 break
             if not entry.video_path.is_file():
                 continue
-            if self.input_mode == "aura":
+            if self.input_mode in ("aura", "aura_streaming"):
                 prompt = entry.question_text
             else:
                 prompt = self._question_prompt(entry)
             payload = self._video_payload(entry.video_path)
             audio_payload = None
             extra_body = {"mm_processor_kwargs": {"use_audio_in_video": True}}
-            if self.input_mode == "aura":
+            streaming_config = None
+            streaming_video_path = ""
+            streaming_audio_path = ""
+            if self.input_mode in ("aura", "aura_streaming"):
                 if entry.audio_path is None or not entry.audio_path.is_file():
                     logger.warning(
                         "Skipping OmniInteract row without synthesized audio for AURA mode: subset=%s video=%s audio=%s",
@@ -589,14 +1007,31 @@ class OmniInteractDataset(BenchmarkDataset):
                         entry.audio_path,
                     )
                     continue
-                audio_payload = self._audio_payload(entry.audio_path)
-                extra_body = aura_extra_body(
-                    tts_task_type=self.aura_tts_task_type,
-                    tts_language=self.aura_tts_language,
-                    tts_speaker=self.aura_tts_speaker,
-                    tts_ref_audio=self.aura_tts_ref_audio,
-                    tts_ref_text=self.aura_tts_ref_text,
-                )
+                if self.input_mode == "aura_streaming":
+                    extra_body = None
+                    streaming_video_path = str(entry.video_path.expanduser().resolve())
+                    streaming_audio_path = str(entry.audio_path.expanduser().resolve())
+                    streaming_config = aura_streaming_config(
+                        tts_task_type=self.aura_tts_task_type,
+                        tts_language=self.aura_tts_language,
+                        tts_speaker=self.aura_tts_speaker,
+                        tts_ref_audio=self.aura_tts_ref_audio,
+                        tts_ref_text=self.aura_tts_ref_text,
+                        sample_fps=self.streaming_sample_fps,
+                        send_fps=self.streaming_send_fps,
+                        max_frames=self.streaming_max_frames,
+                        auto_trigger_min_frames=self.streaming_auto_trigger_min_frames,
+                        enable_frame_filter=self.streaming_enable_frame_filter,
+                    )
+                else:
+                    audio_payload = self._audio_payload(entry.audio_path)
+                    extra_body = aura_extra_body(
+                        tts_task_type=self.aura_tts_task_type,
+                        tts_language=self.aura_tts_language,
+                        tts_speaker=self.aura_tts_speaker,
+                        tts_ref_audio=self.aura_tts_ref_audio,
+                        tts_ref_text=self.aura_tts_ref_text,
+                    )
             messages = self._build_messages(entry, payload, audio_payload)
             prompt_len = len(tok.encode(prompt))
             out.append(
@@ -617,7 +1052,10 @@ class OmniInteractDataset(BenchmarkDataset):
                     omniinteract_nested_group_id=entry.nested_group_id,
                     omniinteract_nested_role=entry.nested_role,
                     omni_extra_body=extra_body,
-                    omni_chat_messages=messages,
+                    omni_chat_messages=None if self.input_mode == "aura_streaming" else messages,
+                    omniinteract_streaming_video_path=streaming_video_path,
+                    omniinteract_streaming_audio_path=streaming_audio_path,
+                    omniinteract_streaming_config=streaming_config,
                 )
             )
 

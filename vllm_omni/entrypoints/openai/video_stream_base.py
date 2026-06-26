@@ -141,6 +141,10 @@ class StreamingVideoSessionConfig(BaseModel):
         default=True,
         description="EVS pixel-similarity pre-filter to drop near-duplicate frames.",
     )
+    return_stage_metrics: bool = Field(
+        default=False,
+        description="Include per-stage engine metrics in WebSocket response events.",
+    )
     frame_filter_threshold: float = Field(
         default=0.95,
         ge=0.0,
