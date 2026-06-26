@@ -612,8 +612,6 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         release_turn_lock=None,
     ) -> None:
         """Stream engine outputs; release turn lock after assistant text when configured."""
-        import time as _time
-
         from vllm_omni.entrypoints.openai import video_stream_envs
         from vllm_omni.outputs import OmniRequestOutput
 
@@ -625,9 +623,6 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         audio_chunks_drained = 0
         previous_text = ""
         interrupted = False
-        t_start = _time.monotonic()
-        t_first_text = None
-        t_first_audio = None
 
         async_chunk_mode = video_stream_envs.VLLM_VIDEO_ASYNC_CHUNK
         streaming = async_chunk_mode == "on"
@@ -672,8 +667,6 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                         text_done_sent = True
                         await _try_release_turn_lock(full_text)
 
-                    if t_first_audio is None:
-                        t_first_audio = _time.monotonic()
                     audio_chunk_count += 1
                     if streaming:
                         b64, audio_chunks_drained = self._extract_audio_delta_b64(
@@ -695,8 +688,6 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 else:
                     delta_text, previous_text = self._extract_text_delta(output, previous_text)
                     if delta_text:
-                        if t_first_text is None:
-                            t_first_text = _time.monotonic()
                         text_parts.append(delta_text)
                         if streaming and stream_text_deltas:
                             await websocket.send_json({"type": "response.text.delta", "delta": delta_text})
@@ -733,9 +724,6 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             if release_turn_lock is None and not turn_lock_released:
                 response_text = "".join(text_parts)
                 self.on_turn_complete(message_history, user_message, response_text, request_id)
-
-            t_end = _time.monotonic()
-            del t_start, t_first_text, t_first_audio, t_end
 
         except Exception:
             await self._send_error(websocket, "Query processing failed")
