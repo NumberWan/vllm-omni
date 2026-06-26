@@ -30,7 +30,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
 from pydantic import Field
 
 from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import (
