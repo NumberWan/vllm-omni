@@ -83,14 +83,17 @@ def default_qwen3_tts_ref_audio_path() -> str:
 
 
 def default_aura_tts_additional_information() -> dict[str, Any]:
-    """Default Qwen3-TTS fields for AURA ``additional_information`` (Base / bundled ref)."""
+    """Default Qwen3-TTS fields for AURA ``additional_information``.
+
+    Matches Base checkpoint deployments (e.g. ``aura_omni_gpu23.yaml``).
+    For CustomVoice checkpoints, set ``tts_task_type`` / ``tts_speaker`` explicitly.
+    """
     return {
         "tts_task_type": "Base",
-        "tts_language": "English",
+        "tts_language": "Chinese",
         "tts_instruct": "",
         "tts_ref_audio": default_qwen3_tts_ref_audio_path(),
         "tts_ref_text": DEFAULT_QWEN3_TTS_REF_TEXT,
-        "tts_x_vector_only_mode": False,
         "tts_pass_token_ids": False,
     }
 
@@ -607,7 +610,7 @@ def aura2tts(
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
         task_type = _first_value(additional_info.get("tts_task_type"), "Base")
-        language = _first_value(additional_info.get("tts_language"), "English")
+        language = _first_value(additional_info.get("tts_language"), "Chinese")
         instruct = _first_value(additional_info.get("tts_instruct"), "")
         x_vector_only_mode = _first_bool(additional_info.get("tts_x_vector_only_mode"), False)
         non_streaming_mode_raw = _first_value(additional_info.get("tts_non_streaming_mode"), None)

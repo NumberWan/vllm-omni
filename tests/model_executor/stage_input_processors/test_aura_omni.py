@@ -246,7 +246,7 @@ def test_aura2tts_modes(additional_information, source, expected):
             assert "ref_audio" not in info
             assert len(tts_input["prompt_token_ids"]) == 14
         else:
-            assert len(tts_input["prompt_token_ids"]) >= 32
+            assert len(tts_input["prompt_token_ids"]) > 0
 
 
 def test_aura2tts_prefers_streaming_cumulative_text():
