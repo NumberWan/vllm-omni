@@ -673,3 +673,27 @@ def test_aura2tts_streaming_partial_content_enters_tts():
 
 def test_aura2tts_drops_punctuation_only_filler():
     assert aura2tts([_source_output(" ﹑")]) == []
+
+
+def test_frames_to_video_tuple_stacks_turn_frames():
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        build_aura_streaming_turn_additional_information,
+        frames_to_video_tuple,
+    )
+
+    frames = [np.zeros((4, 4, 3), dtype=np.uint8), np.ones((4, 4, 3), dtype=np.uint8)]
+    array, metadata = frames_to_video_tuple(frames, fps=2.0, max_frames=16)
+    assert array.shape[0] == 2
+    assert metadata["fps"] == 2.0
+
+    additional = build_aura_streaming_turn_additional_information(
+        session_id="aura-test",
+        video_array=array,
+        video_metadata=metadata,
+        system_prompt="system",
+        skip_asr=True,
+        include_tts=True,
+    )
+    assert additional["aura_session_id"] == "aura-test"
+    assert additional["omni_skip_stages"] == [0]
+    assert additional["tts_ref_audio"]
