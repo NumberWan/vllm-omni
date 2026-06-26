@@ -13,14 +13,17 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import (
+    merge_penalty_sampling_params,
+)
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    AuraSessionState,
     SessionHistory,
     clear_all_sessions,
     get_session_history,
     register_session,
 )
 from vllm_omni.entrypoints.openai.serving_video_stream import (
-    AuraSessionState,
     AuraStreamingVideoHandler,
     AuraStreamingVideoSessionConfig,
 )
@@ -324,7 +327,7 @@ async def test_process_query_merges_cross_turn_penalty_sampling_params():
     assert len(sampling) >= 2
     assert sampling[1].get("logit_bias") or sampling[1].get("bad_words")
 
-    merged = AuraStreamingVideoHandler._merge_penalty_sampling_params(
+    merged = merge_penalty_sampling_params(
         [{"temperature": 0.7}, {"top_p": 0.9}],
         {"logit_bias": {42: -1.5}, "bad_words": ["foo"]},
     )

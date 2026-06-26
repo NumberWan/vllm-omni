@@ -361,6 +361,16 @@ def test_aura2tts_supports_base_ref_audio_override():
     assert tts_input["additional_information"]["x_vector_only_mode"] == [False]
 
 
+def test_aura2tts_uses_bundled_ref_when_tts_fields_omitted():
+    [tts_input] = aura2tts([_source_output("Hello.")], prompt=[{}])
+
+    info = tts_input["additional_information"]
+    assert info["task_type"] == ["Base"]
+    assert info["ref_audio"]
+    assert info["ref_text"]
+    assert info["x_vector_only_mode"] == [False]
+
+
 def test_aura2tts_supports_x_vector_only_mode_for_base():
     prompt = {
         "additional_information": {

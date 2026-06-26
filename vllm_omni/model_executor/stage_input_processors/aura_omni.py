@@ -93,6 +93,74 @@ def default_qwen3_tts_ref_audio_path() -> str:
     return DEFAULT_QWEN3_TTS_REF_AUDIO
 
 
+def default_aura_tts_additional_information() -> dict[str, Any]:
+    """Default Qwen3-TTS fields for AURA ``additional_information`` (Base / bundled ref)."""
+    return {
+        "tts_task_type": "Base",
+        "tts_language": "English",
+        "tts_instruct": "",
+        "tts_ref_audio": default_qwen3_tts_ref_audio_path(),
+        "tts_ref_text": DEFAULT_QWEN3_TTS_REF_TEXT,
+        "tts_x_vector_only_mode": False,
+        "tts_pass_token_ids": False,
+    }
+
+
+def frames_to_video_tuple(
+    frames: list[np.ndarray],
+    *,
+    fps: float,
+    max_frames: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Stack per-turn frames into a ``(ndarray, metadata)`` video tuple for AURA."""
+    if not frames:
+        raise ValueError("At least one frame is required to build video_tuple")
+
+    selected = list(frames[-max_frames:])
+    if len(selected) == 1:
+        all_frames = np.stack([selected[0], selected[0]], axis=0)
+    else:
+        all_frames = np.stack(selected, axis=0)
+
+    if all_frames.shape[0] < 2:
+        all_frames = np.concatenate([all_frames, all_frames], axis=0)[:2]
+    elif all_frames.shape[0] > max_frames:
+        all_frames = all_frames[-max_frames:]
+
+    metadata = {
+        "fps": fps,
+        "duration": all_frames.shape[0] / fps,
+        "total_num_frames": int(all_frames.shape[0]),
+        "frames_indices": list(range(all_frames.shape[0])),
+        "video_backend": "opencv",
+        "do_sample_frames": False,
+    }
+    return all_frames, metadata
+
+
+def build_aura_streaming_turn_additional_information(
+    *,
+    session_id: str,
+    video_array: np.ndarray,
+    video_metadata: dict[str, Any],
+    system_prompt: str,
+    skip_asr: bool,
+    include_tts: bool,
+) -> dict[str, Any]:
+    """Build ``additional_information`` for one AURA streaming inference turn."""
+    additional_information: dict[str, Any] = {
+        "aura_session_id": session_id,
+        "deferred_multi_modal_data": {
+            "video": [(video_array, video_metadata)],
+        },
+        "aura_system_prompt": [system_prompt],
+        "omni_skip_stages": [0] if skip_asr else [],
+    }
+    if include_tts:
+        additional_information.update(default_aura_tts_additional_information())
+    return additional_information
+
+
 def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -916,13 +984,9 @@ def aura2tts(
             text=text,
             prompt_len_token_ids=assistant_token_ids_for_len if not use_token_ids else None,
             default_language="English",
-            allow_default_base_refs=False,
+            allow_default_base_refs=True,
         )
 
-        task_type = _first_value(additional_info.get("tts_task_type"), "Base")
-        if task_type == "Base":
-            if not tts_info.get("ref_audio") or not tts_info.get("ref_text"):
-                raise ValueError("AURA Base TTS requires tts_ref_audio and tts_ref_text.")
         next_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * prompt_len,

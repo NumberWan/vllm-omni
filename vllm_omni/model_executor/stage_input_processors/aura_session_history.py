@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,7 @@ AURA_PUNCT_CHARS = frozenset(".,!?;:，。！？；：、'\"()[]{}''…—–\n\
 
 __all__ = [
     "AURA_PUNCT_CHARS",
+    "AuraSessionState",
     "SessionHistory",
     "DEFAULT_AURA_SYSTEM_PROMPT",
     "SILENT_TEXT",
@@ -30,6 +32,7 @@ __all__ = [
     "is_effectively_silent",
     "normalize_assistant_text",
     "create_session_id",
+    "create_streaming_session",
     "register_session",
     "get_session_history",
     "unregister_session",
@@ -489,6 +492,79 @@ class SessionHistory:
         history._system_msg = {"role": "system", "content": history.system_prompt}
         history._rebuild_history()
         return history
+
+
+@dataclass
+class AuraSessionState:
+    """Per-WebSocket session state for AURA streaming."""
+
+    history: SessionHistory
+    turn_frame_arrays: list[np.ndarray] = field(default_factory=list)
+    session_id: str = ""
+    cross_turn_penalty: Any = None
+    pending_turn_video: dict[str, Any] | None = None
+
+    def append_turn_frame(self, frame: np.ndarray) -> None:
+        self.turn_frame_arrays.append(np.asarray(frame))
+
+    def commit_turn(
+        self,
+        *,
+        response_text: str,
+        request_id: str | None = None,
+        video_fps: float = 2.0,
+        max_frames_per_round: int = 16,
+    ) -> None:
+        """Commit the finished turn into SessionHistory and reset per-turn buffers."""
+        from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+            frames_to_video_tuple,
+            pop_turn_transcript,
+            video_tuple_from_deferred_multi_modal,
+        )
+
+        transcript = pop_turn_transcript(request_id)
+        video_tuple = video_tuple_from_deferred_multi_modal(self.pending_turn_video)
+        if video_tuple is None and self.turn_frame_arrays:
+            video_tuple = frames_to_video_tuple(
+                list(self.turn_frame_arrays),
+                fps=video_fps,
+                max_frames=max_frames_per_round,
+            )
+        if video_tuple is not None or transcript:
+            self.history.add_user_message(transcript, video_tuple=video_tuple)
+
+        self.pending_turn_video = None
+        normalized = normalize_assistant_text(response_text)
+        self.history.add_assistant_message(normalized)
+        self.turn_frame_arrays.clear()
+        if self.cross_turn_penalty is not None:
+            if is_effectively_silent(response_text):
+                self.cross_turn_penalty.record(None)
+            else:
+                self.cross_turn_penalty.record(response_text)
+
+
+def create_streaming_session(
+    *,
+    max_rounds: int = 45,
+    num_rounds_keep: int = 30,
+    pruning_enabled: bool = True,
+    max_context_qas: int = 10,
+    max_1qna_rounds: int = 4,
+    system_prompt: str | None = None,
+) -> AuraSessionState:
+    """Create server-side SessionHistory state for an AURA streaming WebSocket session."""
+    session_id = create_session_id()
+    history = SessionHistory(
+        max_rounds=max_rounds,
+        num_rounds_keep=num_rounds_keep,
+        pruning_enabled=pruning_enabled,
+        max_context_qas=max_context_qas,
+        max_1qna_rounds=max_1qna_rounds,
+        system_prompt=system_prompt or DEFAULT_AURA_SYSTEM_PROMPT,
+    )
+    register_session(session_id, history)
+    return AuraSessionState(history=history, session_id=session_id)
 
 
 # In-process registry: aura_session_id -> SessionHistory (per WebSocket session).
