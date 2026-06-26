@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen-Omni streaming video WebSocket handler.
+"""Streaming video WebSocket handlers for multi-model pipelines.
 
-Accepts video frames incrementally via WebSocket, buffers them, and
-generates text + optional audio responses using the Qwen3-Omni multi-stage
-pipeline (thinker -> talker -> code2wav).
-
-Protocol:
+Shared protocol (see :mod:`video_stream_base`):
     Client -> Server:
         {"type": "session.config", ...}         # Session config (sent once)
         {"type": "video.frame", "data": "..."}  # base64 JPEG/PNG frame
@@ -22,28 +18,80 @@ Protocol:
         {"type": "response.audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
+
+Model-specific handlers:
+    :class:`QwenOmniStreamingVideoHandler` — Qwen3-Omni (thinker -> talker -> code2wav);
+        turns start on ``video.query`` only.
+    :class:`AuraStreamingVideoHandler` — AURA Omni (ASR -> AURA -> TTS -> code2wav);
+        auto-trigger on buffered frames; ``video.query`` is ignored.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+from pydantic import Field
+
+from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import (
+    CrossTurnPenalty,
+    merge_penalty_sampling_params,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    build_aura_streaming_turn_additional_information,
+    frames_to_video_tuple,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    AuraSessionState,
+    DEFAULT_AURA_SYSTEM_PROMPT,
+    create_streaming_session,
+    unregister_session,
+)
 from vllm_omni.entrypoints.openai.video_stream_base import (
     _BAD_FRAME,
     _DEFAULT_CONFIG_TIMEOUT,
     _DEFAULT_IDLE_TIMEOUT,
     StreamingVideoSessionConfig,
     VideoStreamTurnTrigger,
+    _decode_frame_bytes,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
     OmniStreamingVideoHandler as OmniStreamingVideoHandlerBase,
 )
 
 __all__ = [
+    "AuraSessionState",
+    "AuraStreamingVideoHandler",
+    "AuraStreamingVideoSessionConfig",
     "QwenOmniStreamingVideoHandler",
     "StreamingVideoSessionConfig",
     "create_streaming_video_handler",
 ]
+
+_AURA_PIPELINE_NAMES = frozenset({"aura_omni"})
+_AURA_ADDITIONAL_INFO_KEY = "_aura_additional_information"
+
+
+def _resolve_deploy_pipeline(engine_client: Any) -> str | None:
+    """Read ``pipeline:`` from the engine deploy YAML (entrypoints-only; no engine field)."""
+    config_path = getattr(engine_client, "config_path", None)
+    if config_path is None:
+        return None
+    from pathlib import Path
+
+    from vllm_omni.config.stage_config import _DEPLOY_DIR, load_deploy_config
+
+    path = Path(config_path)
+    if not path.exists():
+        if path.parent != Path("."):
+            return None
+        bare_name = path.name if path.name.endswith(".yaml") else f"{path.name}.yaml"
+        candidate = _DEPLOY_DIR / bare_name
+        if not candidate.exists():
+            return None
+        path = candidate
+    pipeline = load_deploy_config(path).pipeline
+    return str(pipeline) if pipeline else None
 
 
 class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
@@ -126,7 +174,9 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         message_history: list[dict[str, Any]],
         user_message: dict[str, Any],
         response_text: str,
+        request_id: str | None = None,
     ) -> None:
+        del request_id
         message_history.append(user_message)
         message_history.append({"role": "assistant", "content": response_text})
 
@@ -160,26 +210,6 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
         default_factory=lambda: [3, 4, 5],
         description="N-gram sizes for bad_words hard blocking in cross-turn penalty.",
     )
-    tts_task_type: str = Field(default="Base", description="Qwen3-TTS task type: Base or CustomVoice.")
-    tts_language: str = Field(default="English", description="Qwen3-TTS language.")
-    tts_instruct: str = Field(default="", description="Optional Qwen3-TTS style instruct.")
-    tts_ref_audio: str = Field(
-        default_factory=_default_qwen3_tts_ref_audio_path,
-        description="Base-mode reference audio path (server-visible).",
-    )
-    tts_ref_text: str = Field(
-        default_factory=_default_qwen3_tts_ref_text,
-        description="Base-mode reference audio transcript.",
-    )
-    tts_speaker: str = Field(default="Vivian", description="CustomVoice-mode speaker name.")
-    tts_x_vector_only_mode: bool = Field(
-        default=False,
-        description="Base mode: speaker embedding only (no ICL ref_text conditioning).",
-    )
-    tts_pass_token_ids: bool = Field(
-        default=False,
-        description="Pass AURA assistant token ids to Qwen3-TTS instead of decoded text.",
-    )
     stream_text_deltas: bool = Field(
         default=False,
         description=(
@@ -187,17 +217,6 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
             "emit response.text.done to the client. Audio streaming is unaffected."
         ),
     )
-
-
-@dataclass
-class AuraSessionState:
-    """Per-WebSocket session state for AURA streaming."""
-
-    history: SessionHistory
-    turn_frame_arrays: list[np.ndarray]
-    session_id: str = ""
-    cross_turn_penalty: CrossTurnPenalty | None = None
-    pending_turn_video: dict[str, Any] | None = None  # deferred_multi_modal_data for next turn
 
 
 class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
@@ -209,30 +228,12 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     def supports_query_interrupt(self) -> bool:
         return False
 
-    @staticmethod
-    def _tts_additional_information(config: AuraStreamingVideoSessionConfig) -> dict[str, Any]:
-        if "audio" not in config.modalities:
-            return {}
-        info: dict[str, Any] = {
-            "tts_task_type": config.tts_task_type,
-            "tts_language": config.tts_language,
-            "tts_instruct": config.tts_instruct,
-            "tts_x_vector_only_mode": config.tts_x_vector_only_mode,
-            "tts_pass_token_ids": config.tts_pass_token_ids,
-        }
-        if config.tts_task_type == "Base":
-            info["tts_ref_audio"] = config.tts_ref_audio
-            info["tts_ref_text"] = config.tts_ref_text
-        elif config.tts_task_type == "CustomVoice":
-            info["tts_speaker"] = config.tts_speaker
-        return info
-
     def releases_turn_after_text_done(self) -> bool:
         return True
 
     def create_message_history(self, config: StreamingVideoSessionConfig) -> AuraSessionState:
         aura_config = self._as_aura_config(config)
-        history = SessionHistory(
+        return create_streaming_session(
             max_rounds=aura_config.max_rounds,
             num_rounds_keep=aura_config.num_rounds_keep,
             pruning_enabled=aura_config.pruning_enabled,
@@ -240,9 +241,6 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             max_1qna_rounds=aura_config.max_1qna_rounds,
             system_prompt=aura_config.aura_system_prompt or DEFAULT_AURA_SYSTEM_PROMPT,
         )
-        session_id = create_session_id()
-        register_session(session_id, history)
-        return AuraSessionState(history=history, turn_frame_arrays=[], session_id=session_id)
 
     def on_session_end(self, message_history: Any) -> None:
         if isinstance(message_history, AuraSessionState) and message_history.session_id:
@@ -275,7 +273,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         if not isinstance(message_history, AuraSessionState):
             return
         frame = _decode_frame_bytes(raw_bytes)
-        message_history.turn_frame_arrays.append(np.asarray(frame))
+        message_history.append_turn_frame(frame)
 
     def build_engine_prompt(
         self,
@@ -292,7 +290,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             raise TypeError("AURA streaming requires AuraSessionState message history")
 
         frames = list(message_history.turn_frame_arrays)
-        video_array, metadata = self._frames_to_video_tuple(
+        video_array, metadata = frames_to_video_tuple(
             frames,
             fps=aura_config.video_fps,
             max_frames=aura_config.max_frames_per_round,
@@ -317,15 +315,14 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         messages = [user_message]
 
         system_prompt = aura_config.aura_system_prompt or DEFAULT_AURA_SYSTEM_PROMPT
-        additional_information: dict[str, Any] = {
-            "aura_session_id": message_history.session_id,
-            "deferred_multi_modal_data": {
-                "video": [(video_array, metadata)],
-            },
-            "aura_system_prompt": [system_prompt],
-            "omni_skip_stages": [0] if len(audio_buffer) == 0 else [],
-        }
-        additional_information.update(self._tts_additional_information(aura_config))
+        additional_information = build_aura_streaming_turn_additional_information(
+            session_id=message_history.session_id,
+            video_array=video_array,
+            video_metadata=metadata,
+            system_prompt=system_prompt,
+            skip_asr=len(audio_buffer) == 0,
+            include_tts="audio" in aura_config.modalities,
+        )
         user_message[_AURA_ADDITIONAL_INFO_KEY] = additional_information
 
         return messages, user_message
@@ -340,57 +337,10 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         del user_message
         if not isinstance(message_history, AuraSessionState):
             return
-
-        from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-            pop_turn_transcript,
-            video_tuple_from_deferred_multi_modal,
+        message_history.commit_turn(
+            response_text=response_text,
+            request_id=request_id,
         )
-
-        transcript = pop_turn_transcript(request_id)
-        video_tuple = video_tuple_from_deferred_multi_modal(message_history.pending_turn_video)
-        if video_tuple is None and message_history.turn_frame_arrays:
-            video_tuple = self._frames_to_video_tuple(
-                list(message_history.turn_frame_arrays),
-                fps=2.0,
-                max_frames=16,
-            )
-        if video_tuple is not None or transcript:
-            message_history.history.add_user_message(transcript, video_tuple=video_tuple)
-
-        message_history.pending_turn_video = None
-        normalized = normalize_assistant_text(response_text)
-        message_history.history.add_assistant_message(normalized)
-        message_history.turn_frame_arrays.clear()
-        if message_history.cross_turn_penalty is not None:
-            if is_effectively_silent(response_text):
-                message_history.cross_turn_penalty.record(None)
-            else:
-                message_history.cross_turn_penalty.record(response_text)
-
-    @staticmethod
-    def _merge_penalty_sampling_params(
-        sampling_params_list: list[dict[str, Any]] | None,
-        penalty_kwargs: dict[str, Any],
-        *,
-        stage_index: int = 1,
-        num_stages: int = 4,
-    ) -> list[dict[str, Any]]:
-        if not penalty_kwargs:
-            return list(sampling_params_list or [])
-        params = [dict(stage) for stage in (sampling_params_list or [])]
-        while len(params) < num_stages:
-            params.append({})
-        stage_params = dict(params[stage_index])
-        if "logit_bias" in penalty_kwargs:
-            merged_bias = dict(stage_params.get("logit_bias") or {})
-            merged_bias.update(penalty_kwargs["logit_bias"])
-            stage_params["logit_bias"] = merged_bias
-        if "bad_words" in penalty_kwargs:
-            merged_bad = list(stage_params.get("bad_words") or [])
-            merged_bad.extend(penalty_kwargs["bad_words"])
-            stage_params["bad_words"] = merged_bad
-        params[stage_index] = stage_params
-        return params
 
     async def _ensure_cross_turn_penalty(
         self,
@@ -504,7 +454,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             "add_special_tokens": False,
         }
         if config.sampling_params_list or penalty_kwargs:
-            request_kwargs["sampling_params_list"] = self._merge_penalty_sampling_params(
+            request_kwargs["sampling_params_list"] = merge_penalty_sampling_params(
                 config.sampling_params_list,
                 penalty_kwargs,
             )
@@ -547,8 +497,6 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         release_turn_lock=None,
     ) -> None:
         """Stream engine outputs; release turn lock after assistant text when configured."""
-        import time as _time
-
         from vllm_omni.entrypoints.openai import video_stream_envs
         from vllm_omni.outputs import OmniRequestOutput
 
@@ -560,28 +508,12 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         audio_chunks_drained = 0
         previous_text = ""
         interrupted = False
-        t_start = _time.monotonic()
-        t_first_text = None
-        t_first_audio = None
 
         async_chunk_mode = video_stream_envs.VLLM_VIDEO_ASYNC_CHUNK
         streaming = async_chunk_mode == "on"
         aura_config = self._as_aura_config(config)
         stream_text_deltas = aura_config.stream_text_deltas
         audio_tail_tensors: list[Any] = []
-        last_text_metrics: dict[str, Any] | None = None
-        last_audio_metrics: dict[str, Any] | None = None
-
-        def _event_metrics(output: OmniRequestOutput | None) -> dict[str, Any] | None:
-            if not getattr(config, "return_stage_metrics", False) or output is None:
-                return None
-            metrics = getattr(output, "metrics", None)
-            return metrics if isinstance(metrics, dict) else None
-
-        def _with_metrics(payload: dict[str, Any], metrics: dict[str, Any] | None) -> dict[str, Any]:
-            if metrics:
-                payload["metrics"] = metrics
-            return payload
 
         async def _try_release_turn_lock(full_text: str) -> None:
             nonlocal turn_lock_released
@@ -612,21 +544,15 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     continue
 
                 out_type = getattr(output, "final_output_type", "text")
-                metrics = _event_metrics(output)
 
                 if out_type == "audio":
                     if streaming and not text_done_sent:
                         full_text = "".join(text_parts)
-                        await websocket.send_json(
-                            _with_metrics({"type": "response.text.done", "text": full_text}, last_text_metrics)
-                        )
+                        await websocket.send_json({"type": "response.text.done", "text": full_text})
                         text_done_sent = True
                         await _try_release_turn_lock(full_text)
 
-                    if t_first_audio is None:
-                        t_first_audio = _time.monotonic()
                     audio_chunk_count += 1
-                    last_audio_metrics = metrics or last_audio_metrics
                     if streaming:
                         b64, audio_chunks_drained = self._extract_audio_delta_b64(
                             output,
@@ -634,36 +560,26 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                         )
                         if b64:
                             await websocket.send_json(
-                                _with_metrics(
-                                    {
-                                        "type": "response.audio.delta",
-                                        "data": b64,
-                                        "format": "wav",
-                                    },
-                                    metrics,
-                                )
+                                {
+                                    "type": "response.audio.delta",
+                                    "data": b64,
+                                    "format": "wav",
+                                }
                             )
                     else:
                         audio_data = self._get_audio_data(output)
                         if audio_data is not None:
                             audio_tail_tensors = list(audio_data) if isinstance(audio_data, list) else [audio_data]
                 else:
-                    last_text_metrics = metrics or last_text_metrics
                     delta_text, previous_text = self._extract_text_delta(output, previous_text)
                     if delta_text:
-                        if t_first_text is None:
-                            t_first_text = _time.monotonic()
                         text_parts.append(delta_text)
                         if streaming and stream_text_deltas:
-                            await websocket.send_json(
-                                _with_metrics({"type": "response.text.delta", "delta": delta_text}, metrics)
-                            )
+                            await websocket.send_json({"type": "response.text.delta", "delta": delta_text})
 
             if not text_done_sent:
                 full_text = "".join(text_parts)
-                await websocket.send_json(
-                    _with_metrics({"type": "response.text.done", "text": full_text}, last_text_metrics)
-                )
+                await websocket.send_json({"type": "response.text.done", "text": full_text})
                 text_done_sent = True
                 await _try_release_turn_lock(full_text)
 
@@ -678,71 +594,34 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     b64, _ = self._encode_tail(tail_np, 0, new_drained=len(audio_tail_tensors), is_first=True)
                     if b64:
                         await websocket.send_json(
-                            _with_metrics(
-                                {
-                                    "type": "response.audio.delta",
-                                    "data": b64,
-                                    "format": "wav",
-                                },
-                                last_audio_metrics,
-                            )
+                            {
+                                "type": "response.audio.delta",
+                                "data": b64,
+                                "format": "wav",
+                            }
                         )
                 except Exception:
                     pass
 
             if audio_chunk_count > 0:
-                await websocket.send_json(_with_metrics({"type": "response.audio.done"}, last_audio_metrics))
+                await websocket.send_json({"type": "response.audio.done"})
 
             if release_turn_lock is None and not turn_lock_released:
                 response_text = "".join(text_parts)
                 self.on_turn_complete(message_history, user_message, response_text, request_id)
-
-            t_end = _time.monotonic()
-            del t_start, t_first_text, t_first_audio, t_end
 
         except Exception:
             await self._send_error(websocket, "Query processing failed")
 
         if not text_done_sent:
             full_text = "".join(text_parts)
-            await websocket.send_json(_with_metrics({"type": "response.text.done", "text": full_text}, last_text_metrics))
+            await websocket.send_json({"type": "response.text.done", "text": full_text})
 
     @staticmethod
     def _as_aura_config(config: StreamingVideoSessionConfig) -> AuraStreamingVideoSessionConfig:
         if isinstance(config, AuraStreamingVideoSessionConfig):
             return config
         return AuraStreamingVideoSessionConfig(**config.model_dump())
-
-    @staticmethod
-    def _frames_to_video_tuple(
-        frames: list[np.ndarray],
-        *,
-        fps: float,
-        max_frames: int,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
-        if not frames:
-            raise ValueError("At least one frame is required to build video_tuple")
-
-        selected = list(frames[-max_frames:])
-        if len(selected) == 1:
-            all_frames = np.stack([selected[0], selected[0]], axis=0)
-        else:
-            all_frames = np.stack(selected, axis=0)
-
-        if all_frames.shape[0] < 2:
-            all_frames = np.concatenate([all_frames, all_frames], axis=0)[:2]
-        elif all_frames.shape[0] > max_frames:
-            all_frames = all_frames[-max_frames:]
-
-        metadata = {
-            "fps": fps,
-            "duration": all_frames.shape[0] / fps,
-            "total_num_frames": int(all_frames.shape[0]),
-            "frames_indices": list(range(all_frames.shape[0])),
-            "video_backend": "opencv",
-            "do_sample_frames": False,
-        }
-        return all_frames, metadata
 
 
 def create_streaming_video_handler(
@@ -753,9 +632,18 @@ def create_streaming_video_handler(
 ) -> OmniStreamingVideoHandlerBase:
     """Create the handler for ``/v1/video/chat/stream``.
 
-    Returns :class:`QwenOmniStreamingVideoHandler` today. Additional pipelines
-    can be selected here in follow-up PRs.
+    Routes to :class:`AuraStreamingVideoHandler` when the deploy YAML
+    ``pipeline`` is ``aura_omni``.
     """
+    pipeline = _resolve_deploy_pipeline(engine_client) if engine_client is not None else None
+    if pipeline in _AURA_PIPELINE_NAMES:
+        return AuraStreamingVideoHandler(
+            chat_service=chat_service,
+            idle_timeout=idle_timeout,
+            config_timeout=config_timeout,
+            engine_client=engine_client,
+        )
+
     return QwenOmniStreamingVideoHandler(
         chat_service=chat_service,
         idle_timeout=idle_timeout,
