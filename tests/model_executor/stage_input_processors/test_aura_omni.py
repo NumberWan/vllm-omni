@@ -314,6 +314,47 @@ def test_frames_to_video_tuple_stacks_turn_frames():
     assert additional["tts_ref_audio"]
 
 
+def test_aura_tts_additional_information_from_session_custom_voice():
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        aura_tts_additional_information_from_session,
+    )
+
+    info = aura_tts_additional_information_from_session(
+        task_type="CustomVoice",
+        language="English",
+        speaker="vivian",
+    )
+    assert info["tts_task_type"] == "CustomVoice"
+    assert info["tts_language"] == "English"
+    assert info["tts_speaker"] == "Vivian"
+    assert "tts_ref_audio" not in info
+    assert "tts_ref_text" not in info
+
+
+def test_build_aura_streaming_turn_additional_information_custom_voice_tts():
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        build_aura_streaming_turn_additional_information,
+        frames_to_video_tuple,
+    )
+
+    frames = [np.zeros((4, 4, 3), dtype=np.uint8)]
+    array, metadata = frames_to_video_tuple(frames, fps=2.0, max_frames=16)
+    additional = build_aura_streaming_turn_additional_information(
+        session_id="aura-test",
+        video_array=array,
+        video_metadata=metadata,
+        system_prompt="system",
+        skip_asr=True,
+        include_tts=True,
+        tts_task_type="CustomVoice",
+        tts_language="English",
+        tts_speaker="Vivian",
+    )
+    assert additional["tts_task_type"] == "CustomVoice"
+    assert additional["tts_speaker"] == "Vivian"
+    assert "tts_ref_audio" not in additional
+
+
 @pytest.mark.parametrize(
     "response_text",
     [SILENT_TEXT, " ﹑"],

@@ -196,12 +196,12 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
     aura_system_prompt: str | None = Field(default=None, description="Override AURA system prompt.")
     video_fps: float = Field(default=2.0, gt=0.0, description="FPS metadata for video_tuple.")
     cross_turn_penalty: float = Field(
-        default=0.0,
+        default=1.0,
         ge=0.0,
         description="Cross-turn repetition penalty strength (0=disabled, 2.0–3.0 recommended).",
     )
     cross_turn_lookback: int = Field(
-        default=2,
+        default=10,
         ge=1,
         description="Number of recent assistant responses for cross-turn penalty window.",
     )
@@ -215,6 +215,16 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
             "When false (default), accumulate assistant text server-side and only "
             "emit response.text.done to the client. Audio streaming is unaffected."
         ),
+    )
+    tts_task_type: str | None = Field(default=None, description="Qwen3-TTS task type override.")
+    tts_language: str | None = Field(default=None, description="Qwen3-TTS language override.")
+    tts_speaker: str | None = Field(default=None, description="CustomVoice speaker name.")
+    tts_ref_audio: str | None = Field(default=None, description="Base TTS reference audio path.")
+    tts_ref_text: str | None = Field(default=None, description="Base TTS reference transcript.")
+    tts_instruct: str | None = Field(default=None, description="VoiceDesign / style instruct text.")
+    tts_pass_token_ids: bool | None = Field(
+        default=None,
+        description="Pass AURA assistant token ids directly to Qwen3-TTS.",
     )
 
 
@@ -321,6 +331,13 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             system_prompt=system_prompt,
             skip_asr=len(audio_buffer) == 0,
             include_tts="audio" in aura_config.modalities,
+            tts_task_type=aura_config.tts_task_type,
+            tts_language=aura_config.tts_language,
+            tts_speaker=aura_config.tts_speaker,
+            tts_ref_audio=aura_config.tts_ref_audio,
+            tts_ref_text=aura_config.tts_ref_text,
+            tts_instruct=aura_config.tts_instruct,
+            tts_pass_token_ids=aura_config.tts_pass_token_ids,
         )
         user_message[_AURA_ADDITIONAL_INFO_KEY] = additional_information
 
