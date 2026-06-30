@@ -64,6 +64,12 @@ def test_aura_disables_manual_query_and_interrupt():
     assert handler.releases_turn_after_text_done() is True
 
 
+def test_aura_streaming_session_config_native_aligned_defaults():
+    config = AuraStreamingVideoSessionConfig(model="test")
+    assert config.cross_turn_penalty == 1.0
+    assert config.cross_turn_lookback == 10
+
+
 def test_should_trigger_turn_respects_auto_trigger_gate():
     handler = AuraStreamingVideoHandler(chat_service=object())
     config = AuraStreamingVideoSessionConfig(model="test", auto_trigger=True, auto_trigger_min_frames=2)
