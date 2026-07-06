@@ -41,9 +41,13 @@ __all__ = [
     "create_session_id",
     "create_streaming_session",
     "register_session",
+    "register_session_state",
     "get_session_history",
+    "get_session_state",
     "unregister_session",
     "clear_all_sessions",
+    "record_transcript_for_request",
+    "pop_transcript_for_request",
 ]
 
 
@@ -529,9 +533,31 @@ class AuraSessionState:
     session_id: str = ""
     cross_turn_penalty: Any = None
     pending_turn_video: dict[str, Any] | None = None
+    pending_transcripts_by_request_id: dict[str, str] = field(default_factory=dict)
 
     def append_turn_frame(self, frame: np.ndarray) -> None:
         self.turn_frame_arrays.append(np.asarray(frame))
+
+    @staticmethod
+    def _normalize_request_id(request_id: str) -> str:
+        """Map AsyncOmni internal ids (``{external}-{uuid8}``) to the external id."""
+        rid = str(request_id).strip()
+        if not rid:
+            return rid
+        if "-" not in rid:
+            return rid
+        head, tail = rid.rsplit("-", 1)
+        if len(tail) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in tail):
+            return head
+        return rid
+
+    def record_turn_transcript(self, request_id: str, transcript: str) -> None:
+        self.pending_transcripts_by_request_id[self._normalize_request_id(request_id)] = transcript
+
+    def pop_turn_transcript(self, request_id: str | None) -> str:
+        if not request_id:
+            return ""
+        return self.pending_transcripts_by_request_id.pop(self._normalize_request_id(str(request_id)), "")
 
     def commit_turn(
         self,
@@ -544,11 +570,10 @@ class AuraSessionState:
         """Commit the finished turn into SessionHistory and reset per-turn buffers."""
         from vllm_omni.model_executor.stage_input_processors.aura_omni import (
             frames_to_video_tuple,
-            pop_turn_transcript,
             video_tuple_from_deferred_multi_modal,
         )
 
-        transcript = pop_turn_transcript(request_id)
+        transcript = self.pop_turn_transcript(request_id)
         video_tuple = video_tuple_from_deferred_multi_modal(self.pending_turn_video)
         if video_tuple is None and self.turn_frame_arrays:
             video_tuple = frames_to_video_tuple(
@@ -590,12 +615,15 @@ def create_streaming_session(
         system_prompt=system_prompt or DEFAULT_AURA_SYSTEM_PROMPT,
     )
     register_session(session_id, history)
-    return AuraSessionState(history=history, session_id=session_id)
+    state = AuraSessionState(history=history, session_id=session_id)
+    register_session_state(session_id, state)
+    return state
 
 
-# In-process registry: aura_session_id -> SessionHistory (per WebSocket session).
+# In-process registry: aura_session_id -> per-WebSocket session state.
 _SESSION_LOCK = threading.Lock()
 _SESSIONS: dict[str, SessionHistory] = {}
+_SESSION_STATES: dict[str, AuraSessionState] = {}
 
 
 def create_session_id() -> str:
@@ -607,17 +635,50 @@ def register_session(session_id: str, history: SessionHistory) -> None:
         _SESSIONS[session_id] = history
 
 
+def register_session_state(session_id: str, state: AuraSessionState) -> None:
+    with _SESSION_LOCK:
+        _SESSION_STATES[session_id] = state
+        _SESSIONS[session_id] = state.history
+
+
 def get_session_history(session_id: str) -> SessionHistory | None:
     with _SESSION_LOCK:
         return _SESSIONS.get(session_id)
 
 
+def get_session_state(session_id: str) -> AuraSessionState | None:
+    with _SESSION_LOCK:
+        return _SESSION_STATES.get(session_id)
+
+
+def record_transcript_for_request(session_id: str | None, request_id: str, transcript: str) -> None:
+    if not session_id:
+        return
+    state = get_session_state(str(session_id))
+    if state is not None:
+        state.record_turn_transcript(request_id, transcript)
+
+
+def pop_transcript_for_request(request_id: str | None) -> str:
+    if not request_id:
+        return ""
+    with _SESSION_LOCK:
+        states = list(_SESSION_STATES.values())
+    for state in states:
+        transcript = state.pop_turn_transcript(request_id)
+        if transcript:
+            return transcript
+    return ""
+
+
 def unregister_session(session_id: str) -> None:
     with _SESSION_LOCK:
         _SESSIONS.pop(session_id, None)
+        _SESSION_STATES.pop(session_id, None)
 
 
 def clear_all_sessions() -> None:
     """Clear all registered sessions (for tests)."""
     with _SESSION_LOCK:
         _SESSIONS.clear()
+        _SESSION_STATES.clear()

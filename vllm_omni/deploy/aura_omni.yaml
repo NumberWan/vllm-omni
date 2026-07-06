@@ -4,12 +4,16 @@
 # `--model` at any local placeholder repo if needed; each stage overrides its
 # own model below.
 pipeline: aura_omni
+# AURA has a semantic ASR -> AURA -> TTS dependency.
+# async_chunk: false
+
 # ASR and AURA run in semantic order; the orchestrator prewarms downstream
 # stages and the connector moves async payloads between stages. Stage 1 buffers
 # each AURA request and sends one complete payload to TTS when AURA finishes.
+
+# TODO: Enable the feature for AURA to send chunks to TTS. This requires qwen3-tts to support streaming input first;
+# otherwise, in the absence of historical context, the speech quality of individual chunks will be inconsistent.
 async_chunk: false
-# Single deploy profile for HTTP single-turn and WebSocket multi-turn.
-# Stage-1 ``asr2aura`` uses SessionHistory when ``aura_session_id`` is present.
 
 connectors:
   connector_of_shared_memory:
@@ -28,7 +32,7 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 8
-    gpu_memory_utilization: 0.3
+    gpu_memory_utilization: 0.1
     trust_remote_code: true
     enable_prefix_caching: true
     async_scheduling: true
@@ -45,14 +49,14 @@ stages:
       max_tokens: 256
 
   - stage_id: 1
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.9
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.4
     trust_remote_code: true
     enable_prefix_caching: true
     async_scheduling: true
     max_model_len: 262144
     max_num_batched_tokens: 15360
-    devices: "1"
+    devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
     output_connectors:
@@ -67,7 +71,7 @@ stages:
 
   - stage_id: 2
     max_num_seqs: 8
-    gpu_memory_utilization: 0.4
+    gpu_memory_utilization: 0.2
     trust_remote_code: true
     enable_prefix_caching: false
     async_scheduling: true

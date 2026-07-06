@@ -672,25 +672,16 @@ class OmniStreamingVideoHandler:
     # Engine-client path (async_chunk audio streaming)
     # ------------------------------------------------------------------
 
-    async def _process_query_engine(
+    async def prepare_chat_request_kwargs(
         self,
-        websocket: WebSocket,
         config: StreamingVideoSessionConfig,
         frame_buffer: list[str],
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        request_id: str,
-        interrupt_event: asyncio.Event,
         prewarmed_frames: dict[str, tuple[Any, str]],
-        release_turn_lock: ReleaseTurnLockFn | None = None,
-    ) -> None:
-        """Direct engine_client.generate() path for async_chunk audio."""
-        del release_turn_lock
-        from vllm.entrypoints.openai.chat_completion.protocol import (
-            ChatCompletionRequest,
-        )
-
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Build ChatCompletionRequest kwargs plus extra request attrs."""
         messages, user_message = self.build_engine_prompt(
             config,
             frame_buffer,
@@ -715,12 +706,42 @@ class OmniStreamingVideoHandler:
             }
         if config.sampling_params_list:
             request_kwargs["sampling_params_list"] = config.sampling_params_list
+        return request_kwargs, user_message, {}
+
+    async def _process_query_engine(
+        self,
+        websocket: WebSocket,
+        config: StreamingVideoSessionConfig,
+        frame_buffer: list[str],
+        audio_buffer: bytearray,
+        message_history: list[dict[str, Any]],
+        query_text: str,
+        request_id: str,
+        interrupt_event: asyncio.Event,
+        prewarmed_frames: dict[str, tuple[Any, str]],
+        release_turn_lock: ReleaseTurnLockFn | None = None,
+    ) -> None:
+        """Direct engine_client.generate() path for async_chunk audio."""
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+        )
+
+        request_kwargs, user_message, extra_attrs = await self.prepare_chat_request_kwargs(
+            config,
+            frame_buffer,
+            audio_buffer,
+            message_history,
+            query_text,
+            prewarmed_frames,
+        )
 
         try:
             chat_request = ChatCompletionRequest(**request_kwargs)
         except Exception as e:
             await self._send_error(websocket, f"Failed to build request: {e}")
             return
+        for attr_name, attr_value in extra_attrs.items():
+            setattr(chat_request, attr_name, attr_value)
 
         try:
             engine_prompt = await self._preprocess_to_engine_prompt(chat_request)
@@ -728,6 +749,30 @@ class OmniStreamingVideoHandler:
             await self._send_error(websocket, f"Preprocess failed: {e}")
             return
 
+        await self._run_engine_generation(
+            websocket,
+            config,
+            message_history,
+            user_message,
+            request_id,
+            interrupt_event,
+            engine_prompt,
+            release_turn_lock=release_turn_lock,
+        )
+
+    async def _run_engine_generation(
+        self,
+        websocket: WebSocket,
+        config: StreamingVideoSessionConfig,
+        message_history: Any,
+        user_message: dict[str, Any],
+        request_id: str,
+        interrupt_event: asyncio.Event,
+        engine_prompt: Any,
+        release_turn_lock: ReleaseTurnLockFn | None = None,
+    ) -> None:
+        """Stream engine outputs and update session history when complete."""
+        del release_turn_lock
         await websocket.send_json({"type": "response.start"})
         text_parts: list[str] = []
         text_done_sent = False

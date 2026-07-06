@@ -229,6 +229,34 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
         description="Pass AURA assistant token ids directly to Qwen3-TTS.",
     )
 
+    def session_history_kwargs(self) -> dict[str, Any]:
+        return {
+            "max_rounds": self.max_rounds,
+            "num_rounds_keep": self.num_rounds_keep,
+            "pruning_enabled": self.pruning_enabled,
+            "max_context_qas": self.max_context_qas,
+            "max_1qna_rounds": self.max_1qna_rounds,
+            "system_prompt": self.aura_system_prompt or DEFAULT_AURA_SYSTEM_PROMPT,
+        }
+
+    def tts_kwargs(self) -> dict[str, Any]:
+        return {
+            "tts_task_type": self.tts_task_type,
+            "tts_language": self.tts_language,
+            "tts_speaker": self.tts_speaker,
+            "tts_ref_audio": self.tts_ref_audio,
+            "tts_ref_text": self.tts_ref_text,
+            "tts_instruct": self.tts_instruct,
+            "tts_pass_token_ids": self.tts_pass_token_ids,
+        }
+
+    def cross_turn_penalty_kwargs(self) -> dict[str, Any]:
+        return {
+            "window": self.cross_turn_lookback,
+            "logit_penalty": self.cross_turn_penalty,
+            "ngram_sizes": self.cross_turn_ngram_sizes,
+        }
+
 
 class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     """AURA pipeline: frame-only auto trigger (no ``video.query`` / interrupt)."""
@@ -244,14 +272,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
     def create_message_history(self, config: StreamingVideoSessionConfig) -> AuraSessionState:
         aura_config = self._as_aura_config(config)
-        return create_streaming_session(
-            max_rounds=aura_config.max_rounds,
-            num_rounds_keep=aura_config.num_rounds_keep,
-            pruning_enabled=aura_config.pruning_enabled,
-            max_context_qas=aura_config.max_context_qas,
-            max_1qna_rounds=aura_config.max_1qna_rounds,
-            system_prompt=aura_config.aura_system_prompt or DEFAULT_AURA_SYSTEM_PROMPT,
-        )
+        return create_streaming_session(**aura_config.session_history_kwargs())
 
     def on_session_end(self, message_history: Any) -> None:
         if isinstance(message_history, AuraSessionState) and message_history.session_id:
@@ -337,13 +358,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             system_prompt=system_prompt,
             skip_asr=len(audio_buffer) == 0,
             include_tts="audio" in aura_config.modalities,
-            tts_task_type=aura_config.tts_task_type,
-            tts_language=aura_config.tts_language,
-            tts_speaker=aura_config.tts_speaker,
-            tts_ref_audio=aura_config.tts_ref_audio,
-            tts_ref_text=aura_config.tts_ref_text,
-            tts_instruct=aura_config.tts_instruct,
-            tts_pass_token_ids=aura_config.tts_pass_token_ids,
+            **aura_config.tts_kwargs(),
         )
         user_message[_AURA_ADDITIONAL_INFO_KEY] = additional_information
 
@@ -379,9 +394,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             return None
         message_history.cross_turn_penalty = CrossTurnPenalty(
             tokenizer,
-            window=config.cross_turn_lookback,
-            logit_penalty=config.cross_turn_penalty,
-            ngram_sizes=config.cross_turn_ngram_sizes,
+            **config.cross_turn_penalty_kwargs(),
         )
         return message_history.cross_turn_penalty
 
@@ -426,25 +439,15 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             await self._send_error(websocket, f"Invalid session config: {e}")
             return None
 
-    async def _process_query_engine(
+    async def prepare_chat_request_kwargs(
         self,
-        websocket,
         config: StreamingVideoSessionConfig,
         frame_buffer: list[str],
         audio_buffer: bytearray,
-        message_history: list[dict[str, Any]],
+        message_history: Any,
         query_text: str,
-        request_id: str,
-        interrupt_event,
         prewarmed_frames: dict[str, tuple[Any, str]],
-        release_turn_lock=None,
-    ) -> None:
-        from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-
-        if self._engine_client is None:
-            await self._send_error(websocket, "Streaming video requires an engine client")
-            return
-
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         messages, user_message = self.build_engine_prompt(
             config,
             frame_buffer,
@@ -481,31 +484,10 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 penalty_kwargs,
             )
 
-        try:
-            chat_request = ChatCompletionRequest(**request_kwargs)
-        except Exception as e:
-            await self._send_error(websocket, f"Failed to build request: {e}")
-            return
-
+        extra_attrs: dict[str, Any] = {}
         if isinstance(additional_information, dict):
-            chat_request.additional_information = additional_information  # type: ignore[attr-defined]
-
-        try:
-            engine_prompt = await self._preprocess_to_engine_prompt(chat_request)
-        except Exception as e:
-            await self._send_error(websocket, f"Preprocess failed: {e}")
-            return
-
-        await self._run_engine_generation(
-            websocket,
-            config,
-            message_history,
-            user_message,
-            request_id,
-            interrupt_event,
-            engine_prompt,
-            release_turn_lock=release_turn_lock,
-        )
+            extra_attrs["additional_information"] = additional_information
+        return request_kwargs, user_message, extra_attrs
 
     async def _run_engine_generation(
         self,
