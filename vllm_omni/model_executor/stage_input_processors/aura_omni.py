@@ -72,6 +72,7 @@ def aura_tts_additional_information_from_session(
     speaker: str | None = None,
     ref_audio: str | None = None,
     ref_text: str | None = None,
+    non_streaming_mode: bool | None = None,
     instruct: str | None = None,
     pass_token_ids: bool | None = None,
 ) -> dict[str, Any]:
@@ -89,6 +90,8 @@ def aura_tts_additional_information_from_session(
         info["tts_ref_audio"] = ref_audio.strip()
     if isinstance(ref_text, str) and ref_text.strip():
         info["tts_ref_text"] = ref_text.strip()
+    if non_streaming_mode is not None:
+        info["tts_non_streaming_mode"] = bool(non_streaming_mode)
     if pass_token_ids is not None:
         info["tts_pass_token_ids"] = bool(pass_token_ids)
     if info.get("tts_task_type") == "CustomVoice":
@@ -142,6 +145,7 @@ def build_aura_streaming_turn_additional_information(
     tts_speaker: str | None = None,
     tts_ref_audio: str | None = None,
     tts_ref_text: str | None = None,
+    tts_non_streaming_mode: bool | None = None,
     tts_instruct: str | None = None,
     tts_pass_token_ids: bool | None = None,
 ) -> dict[str, Any]:
@@ -162,6 +166,7 @@ def build_aura_streaming_turn_additional_information(
                 speaker=tts_speaker,
                 ref_audio=tts_ref_audio,
                 ref_text=tts_ref_text,
+                non_streaming_mode=tts_non_streaming_mode,
                 instruct=tts_instruct,
                 pass_token_ids=tts_pass_token_ids,
             )

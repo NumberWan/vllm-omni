@@ -1,5 +1,8 @@
 # OmniInteract Benchmark
 
+> **Setup & run guide:** [SETUP_AND_RUN.md](./SETUP_AND_RUN.md)  
+> Native AURA alignment notes: `/public/wtk/docs/aura/vllm_omni_benchmark_alignment_backlog.md`
+
 This benchmark evaluates audio-visual interaction on the
 [OmniInteract](https://github.com/Lucky-Lance/OmniInteract) dataset with
 `vllm bench serve --omni`.
@@ -52,10 +55,10 @@ Use this mode for AURA's WebSocket endpoint:
   - `1qna`: extracts the MP4 audio track with `ffmpeg` and sends it in sync with video frames, matching the original online benchmark protocol.
 - Accuracy metrics are computed from timestamped response chunks and annotation slots.
 
-The recommended default is `--omniinteract-streaming-max-frames 16`, which is
-stable with the current AURA WebSocket server. Larger values increase one-turn
-latency and memory pressure. `0` maps to the server cap and is only intended for
-long-running experiments after a smoke test succeeds.
+The recommended default is `--omniinteract-streaming-max-frames 0` (full video
+extract) with `send_fps=2`, matching native AURA OmniInteract bench. Use
+`STREAMING_MAX_FRAMES=16` only for a legacy quick smoke (see `run_streaming_bench.sh`
+comments). Server `session.config.max_frames` is still capped at 256 (rolling buffer).
 
 ### `video`
 

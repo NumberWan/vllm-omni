@@ -38,6 +38,7 @@ from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import is_effectively_silent
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     OmniInteractDataset,
@@ -53,6 +54,10 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
+from vllm_omni.benchmarks.streaming_metrics_delta import (
+    _delta_cumulative_audio_done_metrics,
+    _delta_cumulative_text_done_metrics,
+)
 from vllm_omni.metrics import definitions as defs
 
 logger = init_logger(__name__)
@@ -144,6 +149,19 @@ get_samples_old = datasets.get_samples
 
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
 _DEFAULT_OMNIINTERACT_REPO = "lucky-lance/OmniInteract"
+
+
+def _parse_csv_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def _resolve_streaming_extract_max_frames(max_frames_value: Any) -> int:
+    """Frames to extract client-side. 0 = full video (no cap)."""
+    if max_frames_value is None:
+        return 0
+    return max(0, int(max_frames_value))
 
 
 def _seed_tts_capture_pcm_for_wer() -> bool:
@@ -498,11 +516,18 @@ def get_samples(args, tokenizer):
             aura_tts_ref_audio=getattr(args, "omniinteract_aura_tts_ref_audio", None),
             aura_tts_ref_text=getattr(args, "omniinteract_aura_tts_ref_text", None),
             streaming_sample_fps=getattr(args, "omniinteract_streaming_sample_fps", 2.0),
-            streaming_send_fps=getattr(args, "omniinteract_streaming_send_fps", 0.0),
-            streaming_max_frames=getattr(args, "omniinteract_streaming_max_frames", 16),
-            streaming_auto_trigger_min_frames=getattr(args, "omniinteract_streaming_auto_trigger_min_frames", 0),
+            streaming_send_fps=getattr(args, "omniinteract_streaming_send_fps", 2.0),
+            streaming_max_frames=getattr(args, "omniinteract_streaming_max_frames", 0),
+            streaming_auto_trigger_min_frames=getattr(args, "omniinteract_streaming_auto_trigger_min_frames", 2),
             streaming_enable_frame_filter=getattr(args, "omniinteract_streaming_enable_frame_filter", False),
-            disable_shuffle=getattr(args, "disable_shuffle", False),
+            streaming_cross_turn_penalty=getattr(args, "omniinteract_cross_turn_penalty", 0.0),
+            streaming_cross_turn_lookback=getattr(args, "omniinteract_cross_turn_lookback", 2),
+            streaming_video_ids=_parse_csv_list(getattr(args, "omniinteract_video_ids", None)),
+            streaming_aura_system_prompt_mode=getattr(
+                args, "omniinteract_streaming_system_prompt_mode", "native"
+            ),
+            disable_shuffle=getattr(args, "disable_shuffle", False)
+            or bool(_parse_csv_list(getattr(args, "omniinteract_video_ids", None))),
         )
         out_len = getattr(args, "output_len", None)
         if out_len is None:
@@ -945,12 +970,37 @@ def _video_time_from_wall(
     return elapsed
 
 
+def _merge_turn_metrics(dest_metrics: dict[str, Any], src_metrics: dict[str, Any]) -> None:
+    """Merge TTS/audio metrics from ``response.audio.done`` into a turn record."""
+    if not src_metrics:
+        return
+    for key in ("e2el_ms", "ttft_ms", "audio_duration_s", "audio_frames", "audio_ttfp_ms", "audio_rtf"):
+        if src_metrics.get(key) is not None:
+            dest_metrics[key] = src_metrics[key]
+    dest_sm = dest_metrics.get("stage_metrics")
+    if not isinstance(dest_sm, dict):
+        dest_sm = {}
+        dest_metrics["stage_metrics"] = dest_sm
+    src_sm = src_metrics.get("stage_metrics")
+    if not isinstance(src_sm, dict):
+        return
+    for sid, stage in src_sm.items():
+        if not isinstance(stage, dict):
+            continue
+        key = str(sid)
+        if key in dest_sm and isinstance(dest_sm[key], dict):
+            dest_sm[key].update(stage)
+        else:
+            dest_sm[key] = dict(stage)
+
+
 def _normalize_streaming_chunks(responses: list[dict[str, Any]]) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
     for idx, response in enumerate(responses):
         text = str(response.get("text") or "").strip()
-        if not text:
+        if not text and not response.get("metrics"):
             continue
+        silent = is_effectively_silent(text) if text else True
         start = float(response.get("start", 0.0) or 0.0)
         end = float(response.get("end", start) or start)
         if end < start:
@@ -958,9 +1008,13 @@ def _normalize_streaming_chunks(responses: list[dict[str, Any]]) -> list[dict[st
         chunks.append(
             {
                 "timestamp": [start, end],
-                "text": text,
+                "text": text or "<|silent|>",
+                "is_silent": silent,
                 "response_index": idx,
                 "chunk_id": idx,
+                "e2el_ms": response.get("e2el_ms"),
+                "wall_e2el_ms": response.get("wall_e2el_ms"),
+                "metrics": response.get("metrics"),
             }
         )
     return chunks
@@ -996,8 +1050,7 @@ async def async_request_openai_video_stream(
         return output
 
     try:
-        max_frames_value = config.get("max_frames_per_round", config.get("max_frames", 16))
-        max_frames = 256 if max_frames_value is None or int(max_frames_value) <= 0 else min(int(max_frames_value), 256)
+        max_frames = _resolve_streaming_extract_max_frames(config.get("max_frames", 0))
         sample_fps = float(config.get("video_fps") or 2.0)
         send_fps = float(config.pop("send_fps", 0.0) or 0.0)
         frames = _load_video_jpeg_frames(video_path, sample_fps=sample_fps, max_frames=max_frames)
@@ -1054,8 +1107,16 @@ async def async_request_openai_video_stream(
     if trigger <= 0:
         trigger = len(frames)
     config["auto_trigger_min_frames"] = max(1, min(trigger, len(frames)))
-    config["max_frames"] = max(1, min(max(int(config.get("max_frames") or 0), len(frames)), 256))
-    config["max_frames_per_round"] = max(2, min(max(int(config.get("max_frames_per_round") or 0), len(frames)), 256))
+    # StreamingVideoSessionConfig.max_frames is capped at 256 (rolling frame buffer).
+    # max_frames=0 in bench config means "extract full video client-side", not unlimited server buffer.
+    _SERVER_MAX_FRAMES = 256
+    session_max = int(config.get("max_frames") or 0)
+    if session_max <= 0:
+        config["max_frames"] = min(len(frames), _SERVER_MAX_FRAMES)
+    else:
+        config["max_frames"] = min(session_max, len(frames), _SERVER_MAX_FRAMES)
+    per_round = int(config.get("max_frames_per_round") or 16)
+    config["max_frames_per_round"] = max(2, min(per_round, len(frames)))
     logger.info(
         "OmniInteract streaming request: video=%s frames=%d sample_fps=%.2f send_fps=%.2f audio_items=%d audio_bytes=%d config=%s",
         video_path,
@@ -1073,6 +1134,8 @@ async def async_request_openai_video_stream(
     generated_parts: list[str] = []
     responses: list[dict[str, Any]] = []
     current_response: dict[str, Any] | None = None
+    turn_wall_start: float | None = None
+    previous_cumulative_metrics: dict[str, Any] | None = None
     st = time.perf_counter()
     timestamp = st
     output.start_time = st
@@ -1084,50 +1147,26 @@ async def async_request_openai_video_stream(
             chunk_size = 16000 * 2
             frame_interval_s = (1.0 / send_fps) if send_fps > 0 else 0.0
             stream_wall_start = time.perf_counter()
-            for source_time, frame in frames:
-                for item in scheduled_audio:
-                    if item["sent"] or float(item["at_sec"]) > source_time:
-                        continue
-                    pcm = item["pcm"]
-                    for offset in range(0, len(pcm), chunk_size):
-                        await ws.send_str(
-                            json.dumps(
-                                {
-                                    "type": "audio.chunk",
-                                    "data": base64.b64encode(pcm[offset : offset + chunk_size]).decode("ascii"),
-                                }
-                            )
-                        )
-                    item["sent"] = True
-                await ws.send_str(
-                    json.dumps(
-                        {
-                            "type": "video.frame",
-                            "data": base64.b64encode(frame).decode("ascii"),
-                        }
-                    )
-                )
-                if frame_interval_s > 0:
-                    await asyncio.sleep(frame_interval_s)
+            stop_sending = asyncio.Event()
+            session_finished = asyncio.Event()
 
-            await ws.send_str(json.dumps({"type": "video.done"}))
-
-            async for msg in ws:
-                timestamp = time.perf_counter()
-                video_time = _video_time_from_wall(
-                    now=timestamp,
+            def _current_video_time() -> float:
+                return _video_time_from_wall(
+                    now=time.perf_counter(),
                     start_wall=stream_wall_start,
                     send_fps=send_fps,
                     sample_fps=sample_fps,
                 )
-                if msg.type == aiohttp.WSMsgType.ERROR:
-                    raise RuntimeError(f"WebSocket error: {ws.exception()}")
-                if msg.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
-                    continue
-                data = json.loads(msg.data.decode("utf-8") if isinstance(msg.data, bytes) else msg.data)
+
+            async def _handle_server_payload(data: dict[str, Any]) -> None:
+                nonlocal timestamp, current_response, audio_generate_time, wav_audio_params, turn_wall_start
+                nonlocal previous_cumulative_metrics
+                timestamp = time.perf_counter()
+                video_time = _current_video_time()
                 _update_output_stage_metrics_from_payload(output, data)
                 msg_type = data.get("type")
                 if msg_type == "response.start":
+                    turn_wall_start = timestamp
                     current_response = {"start": video_time, "end": video_time, "text_parts": []}
                 elif msg_type == "response.text.delta":
                     delta = data.get("delta") or ""
@@ -1155,8 +1194,33 @@ async def async_request_openai_video_stream(
                         current_response = {"start": video_time, "end": video_time, "text_parts": []}
                     current_response["text"] = text
                     current_response["end"] = video_time
+                    if turn_wall_start is not None:
+                        current_response["wall_e2el_ms"] = (timestamp - turn_wall_start) * 1000.0
+                    metrics = data.get("metrics")
+                    if isinstance(metrics, dict):
+                        turn_metrics = _delta_cumulative_text_done_metrics(metrics, previous_cumulative_metrics)
+                        if turn_metrics is not None:
+                            current_response["metrics"] = turn_metrics
+                            if turn_metrics.get("e2el_ms") is not None:
+                                current_response["e2el_ms"] = float(turn_metrics["e2el_ms"])
+                        previous_cumulative_metrics = metrics
                     responses.append(current_response)
                     current_response = None
+                    turn_wall_start = None
+                elif msg_type == "response.audio.done":
+                    metrics = data.get("metrics")
+                    if isinstance(metrics, dict) and responses:
+                        audio_metrics = _delta_cumulative_audio_done_metrics(metrics, previous_cumulative_metrics)
+                        if audio_metrics is not None:
+                            last = responses[-1]
+                            existing = last.get("metrics")
+                            if isinstance(existing, dict):
+                                _merge_turn_metrics(existing, audio_metrics)
+                            else:
+                                last["metrics"] = dict(audio_metrics)
+                            if audio_metrics.get("e2el_ms") is not None:
+                                last["e2el_ms"] = float(audio_metrics["e2el_ms"])
+                        previous_cumulative_metrics = metrics
                 elif msg_type == "response.audio.delta":
                     if output.audio_ttfp == 0.0:
                         output.audio_ttfp = timestamp - st
@@ -1180,7 +1244,8 @@ async def async_request_openai_video_stream(
                 elif msg_type == "error":
                     output.success = False
                     output.error = data.get("message") or "streaming video request failed"
-                    break
+                    stop_sending.set()
+                    session_finished.set()
                 elif msg_type == "session.done":
                     if current_response is not None:
                         current_response["text"] = "".join(current_response.get("text_parts", []) or [])
@@ -1188,7 +1253,65 @@ async def async_request_openai_video_stream(
                         responses.append(current_response)
                         current_response = None
                     output.success = True
-                    break
+                    session_finished.set()
+
+            async def _receiver() -> None:
+                try:
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.ERROR:
+                            raise RuntimeError(f"WebSocket error: {ws.exception()}")
+                        if msg.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
+                            continue
+                        data = json.loads(msg.data.decode("utf-8") if isinstance(msg.data, bytes) else msg.data)
+                        await _handle_server_payload(data)
+                        if session_finished.is_set():
+                            break
+                finally:
+                    session_finished.set()
+
+            async def _sender() -> None:
+                for source_time, frame in frames:
+                    if stop_sending.is_set():
+                        return
+                    for item in scheduled_audio:
+                        if item["sent"] or float(item["at_sec"]) > source_time:
+                            continue
+                        pcm = item["pcm"]
+                        for offset in range(0, len(pcm), chunk_size):
+                            if stop_sending.is_set():
+                                return
+                            await ws.send_str(
+                                json.dumps(
+                                    {
+                                        "type": "audio.chunk",
+                                        "data": base64.b64encode(pcm[offset : offset + chunk_size]).decode("ascii"),
+                                    }
+                                )
+                            )
+                        item["sent"] = True
+                    await ws.send_str(
+                        json.dumps(
+                            {
+                                "type": "video.frame",
+                                "data": base64.b64encode(frame).decode("ascii"),
+                            }
+                        )
+                    )
+                    if frame_interval_s > 0:
+                        await asyncio.sleep(frame_interval_s)
+                if not stop_sending.is_set():
+                    await ws.send_str(json.dumps({"type": "video.done"}))
+
+            receiver_task = asyncio.create_task(_receiver())
+            try:
+                await _sender()
+                await receiver_task
+            except Exception:
+                stop_sending.set()
+                receiver_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await receiver_task
+                raise
 
         output.latency = timestamp - st
         streaming_chunks = _normalize_streaming_chunks(responses)
@@ -2391,6 +2514,11 @@ async def benchmark(
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:
             print("Profiler stopped")
+
+    if task_type == TaskType.GENERATION:
+        from vllm_omni.benchmarks.format_bench_report import enrich_result_with_per_requests
+
+        enrich_result_with_per_requests(result, input_requests, outputs)
 
     await session.close()
     return result

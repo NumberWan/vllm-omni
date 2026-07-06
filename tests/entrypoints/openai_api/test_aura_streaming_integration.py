@@ -403,3 +403,60 @@ async def test_aura_multi_turn_accumulates_session_history():
     await asyncio.wait_for(task, timeout=3.0)
 
     assert turns_completed == 2
+
+
+def _text_result_with_token_ids(token_ids: list[int], text: str = "") -> OmniRequestOutput:
+    class Output:
+        pass
+
+    class RequestOutput:
+        pass
+
+    output = Output()
+    output.text = text
+    output.token_ids = list(token_ids)
+    output.cumulative_token_ids = list(token_ids)
+    request_output = RequestOutput()
+    request_output.outputs = [output]
+    return OmniRequestOutput(final_output_type="text", request_output=request_output)
+
+
+@pytest.mark.asyncio
+async def test_aura_silent_turn_drains_generate_without_abort():
+    """Silent early-stop must drain ``generate()``; breaking aborts the next spoken turn."""
+
+    class SilentDrainEngine:
+        def __init__(self) -> None:
+            self.generator_exhausted = False
+
+        def generate(self, **_kwargs):
+            engine = self
+
+            async def _gen():
+                yield _text_result_with_token_ids([151669], "<|silent|>")
+                yield _text_result_with_token_ids([151669, 151645], "<|silent|>")
+                yield _text_result("tail-should-be-drained")
+                engine.generator_exhausted = True
+
+            return _gen()
+
+    handler = AuraStreamingVideoHandler(chat_service=object(), engine_client=SilentDrainEngine())
+    config = AuraStreamingVideoSessionConfig(model="test", modalities=["text"])
+    ws = TimedWebSocket()
+    engine = handler._engine_client
+    assert isinstance(engine, SilentDrainEngine)
+
+    await handler._run_engine_generation(
+        ws,
+        config,
+        AuraSessionState(history=SessionHistory(pruning_enabled=False)),
+        {"role": "user", "content": []},
+        "req-silent-drain",
+        asyncio.Event(),
+        {"prompt": "engine"},
+    )
+
+    assert engine.generator_exhausted
+    text_done = [m for m in ws.sent if m.get("type") == "response.text.done"]
+    assert len(text_done) == 1
+    assert text_done[0].get("text") == "<|silent|>"

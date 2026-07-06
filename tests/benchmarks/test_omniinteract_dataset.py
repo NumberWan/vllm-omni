@@ -275,7 +275,9 @@ def test_omniinteract_dataset_aura_streaming_carries_media_paths(omniinteract_ro
     assert req.omniinteract_streaming_config is not None
     assert req.omniinteract_streaming_config["modalities"] == ["text", "audio"]
     assert req.omniinteract_streaming_config["video_fps"] == 4.0
-    assert req.omniinteract_streaming_config["max_frames_per_round"] == 8
+    assert req.omniinteract_streaming_config["max_frames"] == 8
+    assert req.omniinteract_streaming_config["max_frames_per_round"] == 16
+    assert req.omniinteract_streaming_config["auto_trigger_min_frames"] == 2
     assert req.omniinteract_streaming_config["tts_task_type"] == "CustomVoice"
     assert req.omniinteract_streaming_config["tts_speaker"] == "Ethan"
 
@@ -521,3 +523,96 @@ def test_omniinteract_dataset_infers_nested_roles(tmp_path: Path, mock_tokenizer
     assert reqs[1].omniinteract_scene_type == "nested"
     roles = {reqs[0].omniinteract_nested_role, reqs[1].omniinteract_nested_role}
     assert roles == {"outer", "inner"}
+
+
+def test_aura_streaming_config_includes_cross_turn_penalty() -> None:
+    from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
+        DEFAULT_AURA_SYSTEM_PROMPT_FOR_OMNIINTERACT,
+        aura_streaming_config,
+    )
+    from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+        DEFAULT_AURA_SYSTEM_PROMPT,
+    )
+
+    disabled = aura_streaming_config(
+        tts_task_type="CustomVoice",
+        tts_language="English",
+        tts_speaker="Vivian",
+    )
+    assert disabled["aura_system_prompt"] == DEFAULT_AURA_SYSTEM_PROMPT
+    assert "cross_turn_penalty" not in disabled
+
+    qa = aura_streaming_config(
+        tts_task_type="CustomVoice",
+        tts_language="English",
+        tts_speaker="Vivian",
+        aura_system_prompt_mode="omniinteract_qa",
+    )
+    assert qa["aura_system_prompt"] == DEFAULT_AURA_SYSTEM_PROMPT_FOR_OMNIINTERACT
+
+    enabled = aura_streaming_config(
+        tts_task_type="CustomVoice",
+        tts_language="English",
+        tts_speaker="Vivian",
+        cross_turn_penalty=1.0,
+        cross_turn_lookback=10,
+    )
+    assert enabled["cross_turn_penalty"] == 1.0
+    assert enabled["cross_turn_lookback"] == 10
+
+
+def test_omniinteract_streaming_video_ids_filter(omniinteract_root: Path, mock_tokenizer):
+    s1 = omniinteract_root / "1q1a"
+    audio_dir = s1 / "audios"
+    audio_dir.mkdir(exist_ok=True)
+    for stem in ("0001", "0002"):
+        (s1 / "videos" / f"{stem}.mp4").write_bytes(b"fake-mp4")
+        (s1 / "annotations" / f"{stem}.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "question_time": "00:01",
+                        "question_text": f"Q for {stem}",
+                        "answer_time": "00:04",
+                        "answer_text": "a",
+                        "question_type": "realtime",
+                        "is_interrupted": False,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (audio_dir / f"{stem}_0.wav").write_bytes(b"fake-wav")
+    (s1 / "video_json_map.json").write_text(
+        json.dumps(
+            {
+                "total": 2,
+                "entries": [
+                    {
+                        "video": f"videos/{stem}.mp4",
+                        "annotation": f"annotations/{stem}.json",
+                        "scene_type": "multi_turn",
+                    }
+                    for stem in ("0001", "0002")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ds = OmniInteractDataset(
+        dataset_path=str(omniinteract_root),
+        random_seed=0,
+        disable_shuffle=True,
+        input_mode="aura_streaming",
+        subsets=["1q1a"],
+        streaming_video_ids=["0002"],
+    )
+    reqs = ds.sample(mock_tokenizer, num_requests=5, no_oversample=True)
+    assert len(reqs) == 1
+    assert reqs[0].omniinteract_streaming_video_path.endswith("1q1a/videos/0002.mp4")
+
+
+def test_aura_sampling_params_list_stops_on_silent_token():
+    aura_sampling_params_list = sys.modules[_DS_MODULE_NAME].aura_sampling_params_list
+    params = aura_sampling_params_list()
+    assert params[1]["stop_token_ids"] == [151669, 151645]

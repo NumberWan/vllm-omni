@@ -267,12 +267,20 @@ class SessionHistory:
         else:
             self._context_history.append(list(truncated_messages))
 
-    def _prune_history(self) -> None:
+    def _prune_history(self, *, pending_round: bool = False) -> None:
+        """Prune sliding-window rounds into context history.
+
+        When ``pending_round`` is True, assume one additional user round will be
+        appended for inference (``preview_vllm_inputs``) without mutating history
+        yet. This matches native AURA, which prunes in ``add_user_message``
+        before ``get_vllm_inputs``.
+        """
         rounds = self._parse_sw_rounds()
-        if len(rounds) <= self.max_rounds:
+        effective_total = len(rounds) + (1 if pending_round else 0)
+        if effective_total <= self.max_rounds:
             return
 
-        num_to_move = len(rounds) - self.num_rounds_keep
+        num_to_move = effective_total - self.num_rounds_keep
         if num_to_move <= 0:
             return
         rounds_to_move = rounds[:num_to_move]
@@ -360,6 +368,9 @@ class SessionHistory:
             pending_content.extend([{"type": "image", "image": img} for img in images])
         if text:
             pending_content.append({"type": "text", "text": text})
+
+        if pending_content and self.pruning_enabled and self._sw_round_count() + 1 > self.max_rounds:
+            self._prune_history(pending_round=True)
 
         messages = list(self.history)
         if pending_content:

@@ -59,6 +59,72 @@ def test_preview_vllm_inputs_matches_committed_turn():
     assert len(preview["multi_modal_data"]["video"]) == len(committed["multi_modal_data"]["video"])
 
 
+def test_preview_prunes_before_inference_like_native_add_user():
+    """Preview must prune when pending turn would exceed max_rounds (native parity)."""
+    history = SessionHistory(
+        max_rounds=4,
+        num_rounds_keep=2,
+        pruning_enabled=True,
+        max_context_qas=10,
+    )
+    for round_idx in range(4):
+        history.add_user_message("", video_tuple=_video_tuple())
+        history.add_assistant_message(f"answer {round_idx}")
+
+    assert history._sw_round_count() == 4
+
+    preview = history.preview_vllm_inputs("", video_tuple=_video_tuple(3))
+    assert history._sw_round_count() == 1
+    assert len(preview["multi_modal_data"]["video"]) == 2
+
+    native_aligned = SessionHistory(
+        max_rounds=4,
+        num_rounds_keep=2,
+        pruning_enabled=True,
+        max_context_qas=10,
+    )
+    for round_idx in range(4):
+        native_aligned.add_user_message("", video_tuple=_video_tuple())
+        native_aligned.add_assistant_message(f"answer {round_idx}")
+    native_aligned.add_user_message("", video_tuple=_video_tuple(3))
+    committed = native_aligned.get_vllm_inputs()
+
+    assert preview["prompt"] == committed["prompt"]
+    assert len(preview["multi_modal_data"]["video"]) == len(committed["multi_modal_data"]["video"])
+
+
+def test_preview_prunes_at_max_rounds_45_boundary():
+    """Regression: turn 46 with max_rounds=45 should prefill ~30 video rounds, not 46."""
+    history = SessionHistory(
+        max_rounds=45,
+        num_rounds_keep=30,
+        pruning_enabled=True,
+        max_context_qas=10,
+    )
+    for _ in range(45):
+        history.add_user_message("", video_tuple=_video_tuple())
+        history.add_assistant_message("<|silent|>")
+
+    preview = history.preview_vllm_inputs("", video_tuple=_video_tuple())
+    assert history._sw_round_count() == 29
+    assert len(preview["multi_modal_data"]["video"]) == 30
+
+    native_aligned = SessionHistory(
+        max_rounds=45,
+        num_rounds_keep=30,
+        pruning_enabled=True,
+        max_context_qas=10,
+    )
+    for _ in range(45):
+        native_aligned.add_user_message("", video_tuple=_video_tuple())
+        native_aligned.add_assistant_message("<|silent|>")
+    native_aligned.add_user_message("", video_tuple=_video_tuple())
+    committed = native_aligned.get_vllm_inputs()
+
+    assert preview["prompt"] == committed["prompt"]
+    assert len(preview["multi_modal_data"]["video"]) == len(committed["multi_modal_data"]["video"])
+
+
 def test_to_dict_roundtrip_preserves_history():
     history = SessionHistory(max_rounds=4, num_rounds_keep=2, pruning_enabled=False)
     history.add_user_message("", video_tuple=_video_tuple())
