@@ -298,20 +298,47 @@ def test_aura2tts_async_chunk_reads_nested_request_additional_information():
     assert "ref_text" not in payload
 
 
-def test_aura2tts_async_chunk_uses_cached_tts_metadata_when_request_info_is_cleared():
+def test_aura2tts_async_chunk_keeps_tts_metadata_when_request_info_is_cleared():
     transfer_manager = _transfer_manager()
-    transfer_manager.request_payload["req-1"] = {
-        "_request_tts_metadata": {
-            "tts_task_type": ["CustomVoice"],
-            "tts_speaker": ["vivian"],
-            "tts_language": ["Chinese"],
-        }
-    }
+    request = SimpleNamespace(
+        request_id="req-1",
+        external_req_id="req-1",
+        output_token_ids=[108386, 1773],
+        additional_information={
+            "additional_information": {
+                "tts_task_type": ["CustomVoice"],
+                "tts_speaker": ["vivian"],
+                "tts_language": ["Chinese"],
+            }
+        },
+        is_finished=lambda: False,
+    )
+
+    assert aura2tts_async_chunk(transfer_manager, None, request, is_finished=False) is None
+    request.additional_information = {}
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+
+    assert payload["task_type"] == ["CustomVoice"]
+    assert payload["speaker"] == ["Vivian"]
+    assert payload["language"] == ["Chinese"]
+    assert "ref_audio" not in payload
+
+
+def test_aura2tts_async_chunk_reads_tts_metadata_from_stage_payload_when_request_info_is_cleared():
+    transfer_manager = _transfer_manager()
     request = SimpleNamespace(
         request_id="req-1",
         external_req_id="req-1",
         output_token_ids=[108386, 1773],
         additional_information={},
+        omni_stage_payload={
+            "prompt": "aura prompt",
+            "additional_information": {
+                "tts_task_type": ["CustomVoice"],
+                "tts_speaker": ["vivian"],
+                "tts_language": ["Chinese"],
+            },
+        },
         is_finished=lambda: False,
     )
 

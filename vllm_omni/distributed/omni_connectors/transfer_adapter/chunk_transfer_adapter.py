@@ -10,7 +10,6 @@ import torch
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
-from vllm_omni.engine.serialization import deserialize_additional_information
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
@@ -43,75 +42,6 @@ def _replace_request_prompt_token_ids(request: Any, prompt_token_ids: list[int])
     if hasattr(request, "update_block_hashes"):
         request.update_block_hashes()
     return True
-
-
-def _request_tts_metadata(value: Any) -> dict[str, Any]:
-    try:
-        info = deserialize_additional_information(value)
-    except Exception:
-        return {}
-    if not isinstance(info, dict):
-        return {}
-    return {key: val for key, val in info.items() if isinstance(key, str) and key.startswith("tts_")}
-
-
-def _debug_keys(value: Any) -> list[str]:
-    return sorted(str(key) for key in value.keys()) if isinstance(value, dict) else []
-
-
-def _preserve_request_tts_metadata(request: Any, payload_data: dict[str, Any]) -> None:
-    tts_metadata = _request_tts_metadata(getattr(request, "additional_information", None))
-    if not tts_metadata:
-        logger.warning(
-            "[AURA-DEBUG][chunk-load] no request-level tts metadata req=%s request_ai_keys=%s payload_keys=%s "
-            "payload_ai_keys=%s",
-            getattr(request, "request_id", None),
-            _debug_keys(deserialize_additional_information(getattr(request, "additional_information", None))),
-            _debug_keys(payload_data),
-            _debug_keys(payload_data.get("additional_information")),
-        )
-        return
-    nested_info = payload_data.get("additional_information")
-    if isinstance(nested_info, dict):
-        payload_data["additional_information"] = {**tts_metadata, **nested_info}
-    else:
-        payload_data["additional_information"] = dict(tts_metadata)
-    merged_info = payload_data.get("additional_information")
-    logger.warning(
-        "[AURA-DEBUG][chunk-load] preserved tts metadata req=%s tts_task_type=%r tts_speaker=%r "
-        "request_tts_keys=%s payload_keys=%s payload_ai_keys=%s",
-        getattr(request, "request_id", None),
-        merged_info.get("tts_task_type") if isinstance(merged_info, dict) else None,
-        merged_info.get("tts_speaker") if isinstance(merged_info, dict) else None,
-        _debug_keys(tts_metadata),
-        _debug_keys(payload_data),
-        _debug_keys(merged_info),
-    )
-
-
-def _cache_request_tts_metadata(adapter: Any, request_id: str, payload_data: dict[str, Any]) -> None:
-    nested_info = payload_data.get("additional_information")
-    if not isinstance(nested_info, dict):
-        return
-    tts_metadata = {key: val for key, val in nested_info.items() if isinstance(key, str) and key.startswith("tts_")}
-    if not tts_metadata:
-        return
-    request_payload = getattr(adapter, "request_payload", None)
-    if request_payload is None:
-        request_payload = {}
-        adapter.request_payload = request_payload
-    state = request_payload.setdefault(str(request_id), {})
-    if not isinstance(state, dict):
-        state = {}
-        request_payload[str(request_id)] = state
-    state["_request_tts_metadata"] = dict(tts_metadata)
-    logger.warning(
-        "[AURA-DEBUG][chunk-load] cached tts metadata req=%s tts_task_type=%r tts_speaker=%r keys=%s",
-        request_id,
-        tts_metadata.get("tts_task_type"),
-        tts_metadata.get("tts_speaker"),
-        _debug_keys(tts_metadata),
-    )
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -326,21 +256,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     isinstance(token_id, int) for token_id in prompt_token_ids
                 ):
                     _replace_request_prompt_token_ids(request, prompt_token_ids)
-                logger.warning(
-                    "[AURA-DEBUG][chunk-load] stage=%s req=%s ext_req=%s chunk=%s ar payload_keys=%s "
-                    "payload_ai_keys=%s prompt_len=%s finished=%s segment_finished=%s",
-                    stage_id,
-                    req_id,
-                    external_req_id,
-                    chunk_id,
-                    _debug_keys(payload_data),
-                    _debug_keys(payload_data.get("additional_information")),
-                    len(prompt_token_ids) if isinstance(prompt_token_ids, list) else None,
-                    payload_finished,
-                    payload_segment_finished,
-                )
-                _preserve_request_tts_metadata(request, payload_data)
-                _cache_request_tts_metadata(self, external_req_id, payload_data)
+                request.omni_stage_payload = payload_data
                 request.additional_information = payload_data
                 if chunk_id > 0 and request.resumable:
                     # For new streaming input segment, we should update prompt from payload
