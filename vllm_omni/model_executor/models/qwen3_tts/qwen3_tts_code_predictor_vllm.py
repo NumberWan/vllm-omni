@@ -31,11 +31,12 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         talker_config: Qwen3TTSTalkerConfig,
         prefix: str = "code_predictor",
     ) -> None:
+        enforce_eager = bool(getattr(vllm_config.model_config, "enforce_eager", False))
         super().__init__(
             vllm_config=vllm_config,
             cp_config=config,
             wrapper_config=CodePredictorWrapperConfig(
-                use_cuda_graphs=True,
+                use_cuda_graphs=not enforce_eager,
                 use_parallel_embedding=False,
                 use_projection=(config.hidden_size != talker_config.hidden_size),
                 return_proj_buf=False,

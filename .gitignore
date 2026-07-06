@@ -274,3 +274,7 @@ tests/.ci_generated/
 
 # Local Lance precision-matching dump scripts (not part of the repo)
 lance_compare/
+
+# Local OmniInteract benchmark outputs and debug bisect artifacts
+.bisect/
+omniinteract_bench/

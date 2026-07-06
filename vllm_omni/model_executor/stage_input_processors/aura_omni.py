@@ -49,6 +49,131 @@ def default_qwen3_tts_ref_audio_path() -> str:
     return DEFAULT_QWEN3_TTS_REF_AUDIO
 
 
+def default_aura_tts_additional_information() -> dict[str, Any]:
+    """Default Qwen3-TTS fields for AURA ``additional_information``.
+
+    Matches Base checkpoint deployments (e.g. ``aura_omni_gpu23.yaml``).
+    For CustomVoice checkpoints, set ``tts_task_type`` / ``tts_speaker`` explicitly.
+    """
+    return {
+        "tts_task_type": "Base",
+        "tts_language": "Chinese",
+        "tts_instruct": "",
+        "tts_ref_audio": default_qwen3_tts_ref_audio_path(),
+        "tts_ref_text": DEFAULT_QWEN3_TTS_REF_TEXT,
+        "tts_pass_token_ids": False,
+    }
+
+
+def aura_tts_additional_information_from_session(
+    *,
+    task_type: str | None = None,
+    language: str | None = None,
+    speaker: str | None = None,
+    ref_audio: str | None = None,
+    ref_text: str | None = None,
+    non_streaming_mode: bool | None = None,
+    instruct: str | None = None,
+    pass_token_ids: bool | None = None,
+) -> dict[str, Any]:
+    """Merge WebSocket ``session.config`` TTS fields into ``additional_information``."""
+    info = default_aura_tts_additional_information()
+    if isinstance(task_type, str) and task_type.strip():
+        info["tts_task_type"] = task_type.strip()
+    if isinstance(language, str) and language.strip():
+        info["tts_language"] = language.strip()
+    if isinstance(instruct, str):
+        info["tts_instruct"] = instruct
+    if isinstance(speaker, str) and speaker.strip():
+        info["tts_speaker"] = _normalize_qwen3_tts_speaker(speaker.strip())
+    if isinstance(ref_audio, str) and ref_audio.strip():
+        info["tts_ref_audio"] = ref_audio.strip()
+    if isinstance(ref_text, str) and ref_text.strip():
+        info["tts_ref_text"] = ref_text.strip()
+    if non_streaming_mode is not None:
+        info["tts_non_streaming_mode"] = bool(non_streaming_mode)
+    if pass_token_ids is not None:
+        info["tts_pass_token_ids"] = bool(pass_token_ids)
+    if info.get("tts_task_type") == "CustomVoice":
+        info.pop("tts_ref_audio", None)
+        info.pop("tts_ref_text", None)
+    return info
+
+
+def frames_to_video_tuple(
+    frames: list[np.ndarray],
+    *,
+    fps: float,
+    max_frames: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Stack per-turn frames into a ``(ndarray, metadata)`` video tuple for AURA."""
+    if not frames:
+        raise ValueError("At least one frame is required to build video_tuple")
+
+    selected = list(frames[-max_frames:])
+    if len(selected) == 1:
+        all_frames = np.stack([selected[0], selected[0]], axis=0)
+    else:
+        all_frames = np.stack(selected, axis=0)
+
+    if all_frames.shape[0] < 2:
+        all_frames = np.concatenate([all_frames, all_frames], axis=0)[:2]
+    elif all_frames.shape[0] > max_frames:
+        all_frames = all_frames[-max_frames:]
+
+    metadata = {
+        "fps": fps,
+        "duration": all_frames.shape[0] / fps,
+        "total_num_frames": int(all_frames.shape[0]),
+        "frames_indices": list(range(all_frames.shape[0])),
+        "video_backend": "opencv",
+        "do_sample_frames": False,
+    }
+    return all_frames, metadata
+
+
+def build_aura_streaming_turn_additional_information(
+    *,
+    session_id: str,
+    video_array: np.ndarray,
+    video_metadata: dict[str, Any],
+    system_prompt: str,
+    skip_asr: bool,
+    include_tts: bool,
+    tts_task_type: str | None = None,
+    tts_language: str | None = None,
+    tts_speaker: str | None = None,
+    tts_ref_audio: str | None = None,
+    tts_ref_text: str | None = None,
+    tts_non_streaming_mode: bool | None = None,
+    tts_instruct: str | None = None,
+    tts_pass_token_ids: bool | None = None,
+) -> dict[str, Any]:
+    """Build ``additional_information`` for one AURA streaming inference turn."""
+    additional_information: dict[str, Any] = {
+        "aura_session_id": session_id,
+        "deferred_multi_modal_data": {
+            "video": [(video_array, video_metadata)],
+        },
+        "aura_system_prompt": [system_prompt],
+        "omni_skip_stages": [0] if skip_asr else [],
+    }
+    if include_tts:
+        additional_information.update(
+            aura_tts_additional_information_from_session(
+                task_type=tts_task_type,
+                language=tts_language,
+                speaker=tts_speaker,
+                ref_audio=tts_ref_audio,
+                ref_text=tts_ref_text,
+                non_streaming_mode=tts_non_streaming_mode,
+                instruct=tts_instruct,
+                pass_token_ids=tts_pass_token_ids,
+            )
+        )
+    return additional_information
+
+
 def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -329,7 +454,7 @@ def aura2tts(
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
         task_type = _first_value(additional_info.get("tts_task_type"), "Base")
-        language = _first_value(additional_info.get("tts_language"), "English")
+        language = _first_value(additional_info.get("tts_language"), "Chinese")
         instruct = _first_value(additional_info.get("tts_instruct"), "")
         x_vector_only_mode = _first_bool(additional_info.get("tts_x_vector_only_mode"), False)
         non_streaming_mode_raw = _first_value(additional_info.get("tts_non_streaming_mode"), None)
@@ -369,8 +494,10 @@ def aura2tts(
         if task_type == "Base":
             ref_audio = ref_audio or _first_value(additional_info.get("tts_ref_audio"), None)
             ref_text = _first_value(additional_info.get("tts_ref_text"), None)
-            if not ref_audio or not ref_text:
-                raise ValueError("AURA Base TTS requires tts_ref_audio and tts_ref_text.")
+            if not ref_audio:
+                ref_audio = default_qwen3_tts_ref_audio_path()
+            if not ref_text:
+                ref_text = DEFAULT_QWEN3_TTS_REF_TEXT
             x_vector_only_mode = _first_bool(additional_info.get("tts_x_vector_only_mode"), False)
             tts_info["ref_audio"] = [ref_audio]
             tts_info["ref_text"] = [ref_text]

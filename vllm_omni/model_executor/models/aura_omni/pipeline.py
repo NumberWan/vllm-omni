@@ -49,7 +49,10 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="text",
             model_arch="AuraQwen3VLForConditionalGeneration",
             custom_process_input_func=f"{_AURA_PROC}.asr2aura",
-            sampling_constraints={"detokenize": True},
+            sampling_constraints={
+                "detokenize": True,
+                "stop_token_ids": [151669, 151645],
+            },
         ),
         StagePipelineConfig(
             stage_id=2,

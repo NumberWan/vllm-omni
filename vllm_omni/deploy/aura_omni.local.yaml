@@ -1,11 +1,9 @@
-# AURA Omni deploy profile: Qwen3-ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Code2Wav.
-#
-# Pass `--deploy-config vllm_omni/deploy/aura_omni.yaml` and point the parent
-# `--model` at any local placeholder repo if needed; each stage overrides its
-# own model below.
+# Local deploy profile for this machine (/models/*).
+# Usage:
+#   vllm serve /models/AURA --omni \
+#     --deploy-config vllm_omni/deploy/aura_omni.local.yaml \
+#     --port 8666 --trust-remote-code
 pipeline: aura_omni
-# AURA has a semantic ASR -> AURA -> TTS dependency. Do not prewarm downstream
-# stages before AURA text is converted into Qwen3-TTS metadata by aura2tts.
 async_chunk: false
 
 connectors:
@@ -32,7 +30,7 @@ stages:
     max_model_len: 8192
     max_num_batched_tokens: 4096
     devices: "0"
-    model: Qwen/Qwen3-ASR-1.7B
+    model: /models/Qwen3-ASR-1.7B
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -47,8 +45,8 @@ stages:
     async_scheduling: true
     max_model_len: 262144
     max_num_batched_tokens: 15360
-    devices: "0"
-    model: aurateam/AURA
+    devices: "1"
+    model: /models/AURA
     default_sampling_params:
       temperature: 0.5
       top_p: 1.0
@@ -69,8 +67,7 @@ stages:
     devices: "0"
     output_connectors:
       to_stage_3: connector_of_shared_memory
-    model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-    # model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    model: /models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -95,8 +92,7 @@ stages:
     devices: "0"
     input_connectors:
       from_stage_2: connector_of_shared_memory
-    model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-    # model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    model: /models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

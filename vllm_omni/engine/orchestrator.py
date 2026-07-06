@@ -1386,6 +1386,7 @@ class Orchestrator:
             return
 
         # Build and submit requests for each input
+        submitted_to_next = already_submitted
         for next_input in next_inputs:
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
@@ -1400,10 +1401,11 @@ class Orchestrator:
                 resumable=next_stage_resumable,
             )
 
-            if already_submitted:
+            if submitted_to_next:
                 await next_pool.submit_update(req_id, req_state, request)
             else:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                submitted_to_next = True
 
         req_state.stage_submit_ts[next_logical] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0

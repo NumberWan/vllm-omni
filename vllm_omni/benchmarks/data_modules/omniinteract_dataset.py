@@ -31,6 +31,9 @@ from typing import Any, Literal
 from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.hf import get_cached_tokenizer
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    DEFAULT_AURA_SYSTEM_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +113,7 @@ def aura_sampling_params_list() -> list[dict[str, Any]]:
             "max_tokens": 256,
             "seed": 42,
             "repetition_penalty": 1.0,
+            "stop_token_ids": [151669, 151645],
         },
         {
             "temperature": 0.9,
@@ -152,6 +156,8 @@ def aura_extra_body(
             )
         additional_information["tts_ref_audio"] = tts_ref_audio
         additional_information["tts_ref_text"] = tts_ref_text
+        # Match native AURA tts_service: full-sentence ICL synthesis per turn.
+        additional_information["tts_non_streaming_mode"] = True
     elif tts_speaker:
         additional_information["tts_speaker"] = tts_speaker
     return {
@@ -162,6 +168,23 @@ def aura_extra_body(
     }
 
 
+def resolve_aura_streaming_system_prompt(
+    *,
+    mode: Literal["native", "omniinteract_qa"] = "native",
+    override: str | None = None,
+) -> str:
+    """Pick system prompt for aura_streaming ``session.config``.
+
+    ``native`` matches original AURA TCP server (allows ``<|silent|>``).
+    ``omniinteract_qa`` is the legacy bench prompt (forbids silent; QA-style).
+    """
+    if override:
+        return override
+    if mode == "omniinteract_qa":
+        return DEFAULT_AURA_SYSTEM_PROMPT_FOR_OMNIINTERACT
+    return DEFAULT_AURA_SYSTEM_PROMPT
+
+
 def aura_streaming_config(
     *,
     tts_task_type: str,
@@ -170,25 +193,32 @@ def aura_streaming_config(
     tts_ref_audio: str | None = None,
     tts_ref_text: str | None = None,
     sample_fps: float = 2.0,
-    max_frames: int = 16,
-    auto_trigger_min_frames: int = 0,
-    send_fps: float = 0.0,
+    max_frames: int = 0,
+    max_frames_per_round: int = 16,
+    auto_trigger_min_frames: int = 2,
+    send_fps: float = 2.0,
     enable_frame_filter: bool = False,
+    cross_turn_penalty: float = 0.0,
+    cross_turn_lookback: int = 2,
+    aura_system_prompt_mode: Literal["native", "omniinteract_qa"] = "native",
+    aura_system_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Build ``session.config`` fields for AURA WebSocket streaming benchmark."""
 
     config: dict[str, Any] = {
         "modalities": ["text", "audio"],
         "auto_trigger": True,
-        # 0 means the request function chooses a small cadence-based trigger.
         "auto_trigger_min_frames": int(auto_trigger_min_frames),
         "max_frames": int(max_frames),
-        "max_frames_per_round": int(max_frames),
+        "max_frames_per_round": int(max_frames_per_round),
         "video_fps": float(sample_fps),
         "send_fps": float(send_fps),
         "enable_frame_filter": bool(enable_frame_filter),
         "sampling_params_list": aura_sampling_params_list(),
-        "aura_system_prompt": DEFAULT_AURA_SYSTEM_PROMPT_FOR_OMNIINTERACT,
+        "aura_system_prompt": resolve_aura_streaming_system_prompt(
+            mode=aura_system_prompt_mode,
+            override=aura_system_prompt,
+        ),
         "tts_task_type": tts_task_type,
         "tts_language": tts_language,
     }
@@ -200,8 +230,13 @@ def aura_streaming_config(
             )
         config["tts_ref_audio"] = tts_ref_audio
         config["tts_ref_text"] = tts_ref_text
+        # Match native AURA tts_service: full-sentence ICL synthesis per turn.
+        config["tts_non_streaming_mode"] = True
     elif tts_speaker:
         config["tts_speaker"] = tts_speaker
+    if float(cross_turn_penalty) > 0:
+        config["cross_turn_penalty"] = float(cross_turn_penalty)
+        config["cross_turn_lookback"] = max(1, int(cross_turn_lookback))
     return config
 
 
@@ -597,10 +632,14 @@ class OmniInteractDataset(BenchmarkDataset):
         aura_tts_ref_audio: str | None = None,
         aura_tts_ref_text: str | None = None,
         streaming_sample_fps: float = 2.0,
-        streaming_send_fps: float = 0.0,
-        streaming_max_frames: int = 16,
-        streaming_auto_trigger_min_frames: int = 0,
+        streaming_send_fps: float = 2.0,
+        streaming_max_frames: int = 0,
+        streaming_auto_trigger_min_frames: int = 2,
         streaming_enable_frame_filter: bool = False,
+        streaming_cross_turn_penalty: float = 0.0,
+        streaming_cross_turn_lookback: int = 2,
+        streaming_video_ids: list[str] | None = None,
+        streaming_aura_system_prompt_mode: Literal["native", "omniinteract_qa"] = "native",
         **kwargs: Any,
     ) -> None:
         self.dataset_path = dataset_path or self.DEFAULT_HF_DATASET_ID
@@ -618,6 +657,10 @@ class OmniInteractDataset(BenchmarkDataset):
         self.streaming_max_frames = streaming_max_frames
         self.streaming_auto_trigger_min_frames = streaming_auto_trigger_min_frames
         self.streaming_enable_frame_filter = streaming_enable_frame_filter
+        self.streaming_cross_turn_penalty = streaming_cross_turn_penalty
+        self.streaming_cross_turn_lookback = streaming_cross_turn_lookback
+        self.streaming_video_ids = [v.strip() for v in (streaming_video_ids or []) if v and v.strip()]
+        self.streaming_aura_system_prompt_mode = streaming_aura_system_prompt_mode
         self._data_root: Path | None = None
         self._entries: list[_OmniInteractEntry] = []
         self._streaming_entries: list[_OmniInteractStreamingEntry] = []
@@ -837,7 +880,22 @@ class OmniInteractDataset(BenchmarkDataset):
                 raise ValueError(f"No OmniInteract streaming videos found under {root} (subsets={self.subsets})")
         elif not all_entries:
             raise ValueError(f"No OmniInteract QA entries found under {root} (subsets={self.subsets})")
-        if not getattr(self, "disable_shuffle", False):
+        if self.input_mode == "aura_streaming" and self.streaming_video_ids:
+            wanted = set(self.streaming_video_ids)
+            filtered = [
+                entry
+                for entry in all_streaming_entries
+                if Path(entry.video_rel).stem in wanted
+            ]
+            order = {vid: idx for idx, vid in enumerate(self.streaming_video_ids)}
+            filtered.sort(key=lambda entry: order.get(Path(entry.video_rel).stem, 10_000))
+            missing = [vid for vid in self.streaming_video_ids if vid not in {Path(e.video_rel).stem for e in filtered}]
+            if missing:
+                raise ValueError(
+                    f"OmniInteract streaming video id(s) not found under {root}: {', '.join(missing)}"
+                )
+            all_streaming_entries = filtered
+        if not getattr(self, "disable_shuffle", False) and not self.streaming_video_ids:
             import random
 
             rng = random.Random(self.random_seed)
@@ -949,6 +1007,9 @@ class OmniInteractDataset(BenchmarkDataset):
                     max_frames=self.streaming_max_frames,
                     auto_trigger_min_frames=self.streaming_auto_trigger_min_frames,
                     enable_frame_filter=self.streaming_enable_frame_filter,
+                    cross_turn_penalty=self.streaming_cross_turn_penalty,
+                    cross_turn_lookback=self.streaming_cross_turn_lookback,
+                    aura_system_prompt_mode=self.streaming_aura_system_prompt_mode,
                 )
                 out.append(
                     OmniInteractSampleRequest(
@@ -1022,6 +1083,9 @@ class OmniInteractDataset(BenchmarkDataset):
                         max_frames=self.streaming_max_frames,
                         auto_trigger_min_frames=self.streaming_auto_trigger_min_frames,
                         enable_frame_filter=self.streaming_enable_frame_filter,
+                        cross_turn_penalty=self.streaming_cross_turn_penalty,
+                        cross_turn_lookback=self.streaming_cross_turn_lookback,
+                        aura_system_prompt_mode=self.streaming_aura_system_prompt_mode,
                     )
                 else:
                     audio_payload = self._audio_payload(entry.audio_path)
