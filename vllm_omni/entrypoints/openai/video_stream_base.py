@@ -53,6 +53,9 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 _DEFAULT_IDLE_TIMEOUT = 60.0
+# While a turn is still running (TTS can take many minutes), do not drop the
+# session for lack of client messages.
+_GENERATION_IDLE_TIMEOUT = 1800.0
 _DEFAULT_CONFIG_TIMEOUT = 10.0
 _MAX_FRAME_SIZE = 10 * 1024 * 1024  # 10MB per frame
 _MAX_BUFFER_FRAMES = 64
@@ -240,9 +243,18 @@ class OmniStreamingVideoHandler:
                 try:
                     while True:
                         try:
+                            pending_queries = (
+                                active_request_id is not None
+                                or (query_task is not None and not query_task.done())
+                                or any(not t.done() for t in background_query_tasks)
+                                or not msg_queue.empty()
+                            )
+                            recv_timeout = (
+                                _GENERATION_IDLE_TIMEOUT if pending_queries else self._idle_timeout
+                            )
                             raw = await asyncio.wait_for(
                                 websocket.receive_text(),
-                                timeout=self._idle_timeout,
+                                timeout=recv_timeout,
                             )
                         except asyncio.TimeoutError:
                             await self._send_error(websocket, "Idle timeout")

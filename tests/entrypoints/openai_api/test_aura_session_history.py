@@ -8,9 +8,13 @@ import numpy as np
 import pytest
 
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    AURA_IM_END_TOKEN_ID,
+    AURA_SILENT_TOKEN_ID,
     SessionHistory,
+    aura_silent_stop_token_ids,
     is_effectively_silent,
     normalize_assistant_text,
+    should_stop_aura_silent_generation,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -142,3 +146,13 @@ def test_aura_session_state_commit_turn_writes_history():
     assert state.pending_turn_video is None
     assert state.history.history[-2]["content"] != ""
     assert state.history.history[-1]["content"] == "reply"
+
+
+def test_should_stop_aura_silent_generation_on_first_token():
+    assert aura_silent_stop_token_ids() == (AURA_SILENT_TOKEN_ID, AURA_IM_END_TOKEN_ID)
+    assert should_stop_aura_silent_generation(token_ids=[AURA_SILENT_TOKEN_ID])
+    assert should_stop_aura_silent_generation(token_ids=[AURA_IM_END_TOKEN_ID])
+    assert not should_stop_aura_silent_generation(token_ids=[42])
+    assert should_stop_aura_silent_generation(text="<|silent|>")
+    assert should_stop_aura_silent_generation(text=" ﹑")
+    assert not should_stop_aura_silent_generation(text="好的")

@@ -44,9 +44,16 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
 )
-from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.model_executor.stage_input_processors.stage_bypass import (
+    make_mock_text_stage_output,
+    should_skip_stage,
+    should_skip_stage_from_info,
+)
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
@@ -114,6 +121,31 @@ def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) 
             if sample_rate > 0:
                 return sample_rate
     return default
+
+
+def _resolve_prompt_additional_information(prompt: Any) -> dict[str, Any] | None:
+    """Return a plain dict from ``additional_information`` on a prompt or request."""
+    if isinstance(prompt, dict):
+        info = prompt.get("additional_information")
+        if isinstance(info, dict):
+            return info
+        if info is not None:
+            return deserialize_additional_information(info)
+    info_payload = getattr(prompt, "additional_information", None)
+    if info_payload is not None:
+        return deserialize_additional_information(info_payload)
+    return None
+
+
+def _should_skip_stage_submission(prompt: Any, original_prompt: Any, stage_id: int) -> bool:
+    """Return True when ``omni_skip_stages`` requests bypassing ``stage_id``."""
+    for candidate in (prompt, original_prompt):
+        if should_skip_stage(candidate, stage_id):
+            return True
+        info = _resolve_prompt_additional_information(candidate)
+        if should_skip_stage_from_info(info, stage_id):
+            return True
+    return False
 
 
 def build_engine_core_request_from_tokens(
@@ -222,7 +254,6 @@ class Orchestrator:
         running_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
         log_stats: bool = False,
-        enable_orch_monitor: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -231,13 +262,6 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
-        self._orch_monitor = create_orch_monitor(
-            enabled=enable_orch_monitor,
-            replica_sampler=self._sample_replica_metrics,
-        )
-        for stage_id, pool in enumerate(self.stage_pools):
-            for replica_id in pool.live_replica_ids():
-                self._orch_monitor.register_replica(stage_id, replica_id)
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -381,7 +405,6 @@ class Orchestrator:
                 await self._membership.drain_tasks(timeout=10.0)
                 self._membership.shutdown()
 
-            self._orch_monitor.flush()
             self._shutdown_stages()
 
             loop = asyncio.get_running_loop()
@@ -412,7 +435,6 @@ class Orchestrator:
             elif isinstance(msg, RegisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_register(msg.stage_id, msg.replica_id)
-                    self._orch_monitor.register_replica(msg.stage_id, msg.replica_id)
             elif isinstance(msg, UnregisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
@@ -476,6 +498,13 @@ class Orchestrator:
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+
+        if _should_skip_stage_submission(prompt, original_prompt, stage_id):
+            await self._forward_bypassed_stage_zero(request_id, req_state)
+            if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+                await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+            return
+
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
@@ -519,6 +548,13 @@ class Orchestrator:
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
+
+        if _should_skip_stage_submission(request, msg.original_prompt, stage_id):
+            await self._forward_bypassed_stage_zero(request_id, req_state)
+            if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+                await self._prewarm_async_chunk_stages(request_id, request, req_state)
+            return
+
         await self.stage_pools[stage_id].submit_update(
             request_id,
             req_state,
@@ -640,14 +676,6 @@ class Orchestrator:
 
     # ---- Orchestration loop ----
 
-    def _sample_replica_metrics(self) -> dict[str, tuple[int, int]]:
-        samples: dict[str, tuple[int, int]] = {}
-        for stage_id, pool in enumerate(self.stage_pools):
-            for replica_id in pool.live_replica_ids():
-                key = replica_key(stage_id, replica_id)
-                samples[key] = pool.replica_monitor_sample(replica_id)
-        return samples
-
     async def _orchestration_output_handler(self) -> None:
         """Poll all stages, handle transfers, send final outputs to main."""
         try:
@@ -756,7 +784,6 @@ class Orchestrator:
                         await self._handle_processed_outputs(stage_id, replica_id, raw_output)
                         idle = False
 
-            self._orch_monitor.note_loop(idle=idle)
             if idle:
                 await asyncio.sleep(0.001)
             else:
@@ -967,6 +994,49 @@ class Orchestrator:
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
+
+    async def _forward_bypassed_stage_zero(
+        self,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Skip stage-0 GPU work when ``omni_skip_stages`` includes 0 (video-only turns)."""
+        mock_output = make_mock_text_stage_output(request_id, text="")
+        logger.debug(
+            "[Orchestrator] Bypassing stage-0 for req=%s (omni_skip_stages)",
+            request_id,
+        )
+        is_streaming = req_state.streaming.enabled
+        if is_streaming:
+            await self._forward_to_next_stage(
+                request_id,
+                0,
+                mock_output,
+                req_state,
+                src_replica_id=0,
+                is_streaming_session=True,
+                is_final_update=False,
+            )
+            if getattr(mock_output, "finished", True):
+                await self._forward_to_next_stage(
+                    request_id,
+                    0,
+                    mock_output,
+                    req_state,
+                    src_replica_id=0,
+                    is_streaming_session=True,
+                    is_final_update=True,
+                )
+        else:
+            await self._forward_to_next_stage(
+                request_id,
+                0,
+                mock_output,
+                req_state,
+                src_replica_id=0,
+                is_streaming_session=False,
+                is_final_update=True,
+            )
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)
@@ -1236,31 +1306,6 @@ class Orchestrator:
                     src_stage_id,
                     next_logical,
                 )
-                if diffusion_prompt is None:
-                    error_output = OmniRequestOutput.from_error(
-                        req_id,
-                        f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
-                    )
-                    logger.warning(
-                        "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
-                        "routing terminal error output",
-                        req_id,
-                        src_stage_id,
-                        next_logical,
-                    )
-                    await self.output_async_queue.put(
-                        OutputMessage(
-                            request_id=req_id,
-                            stage_id=next_logical,
-                            engine_outputs=error_output,
-                            metrics=None,
-                            finished=True,
-                        )
-                    )
-                    await self._cleanup_request_ids(
-                        [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
-                    )
-                    return
                 if isinstance(diffusion_prompt, list):
                     if not diffusion_prompt:
                         error_output = OmniRequestOutput.from_error(
@@ -1287,7 +1332,7 @@ class Orchestrator:
                             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
                         )
                         return
-                    if len(diffusion_prompt) == 1:
+                    if already_submitted and len(diffusion_prompt) == 1:
                         diffusion_prompt = diffusion_prompt[0]
             else:
                 diffusion_prompt = req_state.prompt

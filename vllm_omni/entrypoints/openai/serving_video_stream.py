@@ -43,7 +43,9 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
     AuraSessionState,
     DEFAULT_AURA_SYSTEM_PROMPT,
+    SILENT_TEXT,
     create_streaming_session,
+    should_stop_aura_silent_generation,
     unregister_session,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
@@ -196,12 +198,12 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
     aura_system_prompt: str | None = Field(default=None, description="Override AURA system prompt.")
     video_fps: float = Field(default=2.0, gt=0.0, description="FPS metadata for video_tuple.")
     cross_turn_penalty: float = Field(
-        default=0.0,
+        default=1.0,
         ge=0.0,
         description="Cross-turn repetition penalty strength (0=disabled, 2.0–3.0 recommended).",
     )
     cross_turn_lookback: int = Field(
-        default=2,
+        default=10,
         ge=1,
         description="Number of recent assistant responses for cross-turn penalty window.",
     )
@@ -216,6 +218,16 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
             "emit response.text.done to the client. Audio streaming is unaffected."
         ),
     )
+    tts_task_type: str | None = Field(default=None, description="Qwen3-TTS task type override.")
+    tts_language: str | None = Field(default=None, description="Qwen3-TTS language override.")
+    tts_speaker: str | None = Field(default=None, description="CustomVoice speaker name.")
+    tts_ref_audio: str | None = Field(default=None, description="Base TTS reference audio path.")
+    tts_ref_text: str | None = Field(default=None, description="Base TTS reference transcript.")
+    tts_instruct: str | None = Field(default=None, description="VoiceDesign / style instruct text.")
+    tts_pass_token_ids: bool | None = Field(
+        default=None,
+        description="Pass AURA assistant token ids directly to Qwen3-TTS.",
+    )
 
 
 class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
@@ -228,7 +240,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         return False
 
     def releases_turn_after_text_done(self) -> bool:
-        return True
+        return False
 
     def create_message_history(self, config: StreamingVideoSessionConfig) -> AuraSessionState:
         aura_config = self._as_aura_config(config)
@@ -248,6 +260,10 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
         config = self._as_aura_config(trigger.config)
         if not config.auto_trigger:
+            return False
+        # Match native AURA: never start a new turn while the prior engine
+        # request is still running (including silent-turn drain after text.done).
+        if trigger.is_generating:
             return False
         return trigger.frame_count >= config.auto_trigger_min_frames and not trigger.is_turn_locked
 
@@ -321,6 +337,13 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             system_prompt=system_prompt,
             skip_asr=len(audio_buffer) == 0,
             include_tts="audio" in aura_config.modalities,
+            tts_task_type=aura_config.tts_task_type,
+            tts_language=aura_config.tts_language,
+            tts_speaker=aura_config.tts_speaker,
+            tts_ref_audio=aura_config.tts_ref_audio,
+            tts_ref_text=aura_config.tts_ref_text,
+            tts_instruct=aura_config.tts_instruct,
+            tts_pass_token_ids=aura_config.tts_pass_token_ids,
         )
         user_message[_AURA_ADDITIONAL_INFO_KEY] = additional_information
 
@@ -526,6 +549,33 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 request_id=request_id,
             )
 
+        async def _finalize_silent_turn() -> None:
+            """Mark the WebSocket response as silent; keep draining ``generate()``.
+
+            Do not ``break`` out of the ``async for`` over ``generate()``: closing
+            the async generator runs ``GeneratorExit`` in ``AsyncOmni.generate``,
+            which aborts the orchestrator request and can poison stage-2/3 for the
+            next spoken turn on the same session.  Do not call
+            ``engine_client.abort()`` either for the same reason.
+            """
+            nonlocal previous_text, interrupted
+            interrupted = True
+            text_parts.clear()
+            text_parts.append(SILENT_TEXT)
+            previous_text = SILENT_TEXT
+
+        async def _maybe_finalize_silent_turn() -> None:
+            """Send silent ``text.done`` early, then drain engine outputs to completion."""
+            nonlocal text_done_sent
+            if interrupted:
+                return
+            await _finalize_silent_turn()
+            if not text_done_sent:
+                full_text = "".join(text_parts)
+                await websocket.send_json({"type": "response.text.done", "text": full_text})
+                text_done_sent = True
+                await _try_release_turn_lock(full_text)
+
         try:
             result_gen = self._engine_client.generate(
                 prompt=engine_prompt,
@@ -537,6 +587,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 if interrupt_event.is_set():
                     if not interrupted:
                         interrupted = True
+                if interrupted:
                     continue
 
                 if not isinstance(output, OmniRequestOutput):
@@ -570,9 +621,17 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                         if audio_data is not None:
                             audio_tail_tensors = list(audio_data) if isinstance(audio_data, list) else [audio_data]
                 else:
+                    token_ids = self._output_token_ids(output)
+                    if should_stop_aura_silent_generation(token_ids=token_ids):
+                        await _maybe_finalize_silent_turn()
+                        continue
                     delta_text, previous_text = self._extract_text_delta(output, previous_text)
                     if delta_text:
                         text_parts.append(delta_text)
+                        full_text = "".join(text_parts)
+                        if should_stop_aura_silent_generation(text=full_text):
+                            await _maybe_finalize_silent_turn()
+                            continue
                         if streaming and stream_text_deltas:
                             await websocket.send_json({"type": "response.text.delta", "delta": delta_text})
 
@@ -621,6 +680,22 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         if isinstance(config, AuraStreamingVideoSessionConfig):
             return config
         return AuraStreamingVideoSessionConfig(**config.model_dump())
+
+    @staticmethod
+    def _output_token_ids(output: Any) -> list[int]:
+        """First completion sequence token ids from an engine output chunk."""
+        request_output = getattr(output, "request_output", None)
+        if request_output is None:
+            return []
+        outputs = getattr(request_output, "outputs", None)
+        if not isinstance(outputs, list) or not outputs:
+            return []
+        first = outputs[0]
+        cumulative = getattr(first, "cumulative_token_ids", None)
+        if cumulative:
+            return list(cumulative)
+        token_ids = getattr(first, "token_ids", None)
+        return list(token_ids) if token_ids else []
 
 
 def create_streaming_video_handler(

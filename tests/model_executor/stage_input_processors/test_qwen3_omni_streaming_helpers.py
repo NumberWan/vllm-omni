@@ -554,6 +554,27 @@ def test_mimo_audio_full_payload_nested_fallback() -> None:
     assert len(payload["codes"]["audio"]) == audio.numel() + int(audio.shape[0]) * 4
 
 
+def test_qwen3_tts_talker2code2wav_token_only_schedules_empty_codec():
+    from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
+        talker2code2wav_token_only,
+    )
+
+    class _Out:
+        def __init__(self, mm, tids):
+            self.multimodal_output = mm
+            self.cumulative_token_ids = tids
+
+    class _Wrap:
+        def __init__(self, mm, tids):
+            self.outputs = [_Out(mm, tids)]
+            self.finished = True
+
+    src = [_Wrap({"codes": {"audio": torch.zeros((0,))}}, [1, 2])]
+    out = talker2code2wav_token_only(src)
+    assert len(out) == 1
+    assert len(out[0]["prompt_token_ids"]) == 1
+
+
 def test_qwen3_tts_talker2code2wav_token_only_smoke() -> None:
     """Smoke: qwen3_tts token-only sizes placeholder."""
     import torch
@@ -921,6 +942,7 @@ def test_cosyvoice3_full_payload_replace_keys_present() -> None:
 def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
     """Smoke: ming_flash_omni token-only carries voice metadata."""
     from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import (
+        thinker2talker,
         thinker2talker_token_only,
     )
 
@@ -938,14 +960,15 @@ def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
 
     src = [_Wrap("hello world")]
     prompt = _Prompt({"voice_name": "ZH_FEMALE", "prompt_text": "ref text"})
-    out = thinker2talker_token_only(src, prompt=prompt)
-    assert len(out) == 1
-    assert out[0]["prompt_token_ids"] == [0]
-    info = out[0]["additional_information"]
-    assert info["text"] == "hello world"
-    assert info["voice_name"] == "ZH_FEMALE"
-    assert info["prompt_text"] == "ref text"
-    assert info["ming_task"] == "omni"
+    for func in (thinker2talker, thinker2talker_token_only):
+        out = func(src, prompt=prompt)
+        assert len(out) == 1
+        assert out[0]["prompt_token_ids"] == [0]
+        info = out[0]["additional_information"]
+        assert info["text"] == "hello world"
+        assert info["voice_name"] == "ZH_FEMALE"
+        assert info["prompt_text"] == "ref text"
+        assert info["ming_task"] == "omni"
 
 
 def test_qwen2_5_omni_thinker2talker_token_only_smoke() -> None:
