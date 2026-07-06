@@ -928,13 +928,11 @@ class Orchestrator:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
-        should_forward_stage = stage_id < req_state.final_stage_id and not self.async_chunk
-        should_forward_now = finished or (req_state.streaming.enabled and req_state.streaming.segment_finished)
-        allow_repeated_forward = req_state.streaming.enabled
         if (
-            should_forward_now
-            and should_forward_stage
-            and (not self._next_stage_already_submitted(stage_id, req_state) or allow_repeated_forward)
+            (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
+            and stage_id < req_state.final_stage_id
+            and not self.async_chunk
+            and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
         ):
             if (
                 finished
@@ -1482,8 +1480,6 @@ class Orchestrator:
             return
 
         for next_stage_id in range(1, req_state.final_stage_id + 1):
-            if next_stage_id in req_state.stage_submit_ts:
-                continue
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
 

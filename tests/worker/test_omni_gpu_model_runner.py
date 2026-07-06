@@ -452,7 +452,7 @@ def test_fresh_chunk_payload_replaces_intermediate_buffer():
     }
 
     payload = {
-        "_qwen3_tts_text_ids": [[1, 2, 3]],
+        "precomputed_text_id": [[1, 2, 3]],
         "prompt_token_ids": [0, 0],
         "task_type": ["Base"],
         "meta": {"finished": torch.tensor(False)},
@@ -460,7 +460,7 @@ def test_fresh_chunk_payload_replaces_intermediate_buffer():
     OmniGPUModelRunner._set_or_update_intermediate_buffer(runner, "r1", payload)
 
     buf = runner.model_intermediate_buffer["r1"]
-    assert buf["_qwen3_tts_text_ids"] == [[1, 2, 3]]
+    assert buf["precomputed_text_id"] == [[1, 2, 3]]
     assert buf["task_type"] == ["Base"]
     assert "embed" not in buf
     assert "hidden_states" not in buf

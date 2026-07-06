@@ -1492,9 +1492,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         # such as embed/hidden_states/codes/generated_len into the next chunk.
         if not isinstance(payload_info, dict):
             return False
-        if "prompt_token_ids" not in payload_info:
-            return False
-        return any(key in payload_info for key in ("_qwen3_tts_text_ids", "text", "prompt", "ids"))
+        return "prompt_token_ids" in payload_info
 
     def _set_or_update_intermediate_buffer(self, req_id: str, payload_info: Any) -> None:
         if not isinstance(payload_info, dict) or not payload_info:

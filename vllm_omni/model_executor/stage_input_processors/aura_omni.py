@@ -102,14 +102,6 @@ def _normalize_qwen3_tts_speaker(speaker: Any) -> Any:
     return speaker[0].upper() + speaker[1:].lower()
 
 
-def _debug_keys(value: Any) -> list[str]:
-    return sorted(str(key) for key in value.keys()) if isinstance(value, dict) else []
-
-
-def _debug_first(value: Any) -> Any:
-    return value[0] if isinstance(value, list) and value else value
-
-
 def _extract_output(source_output: Any) -> Any:
     outputs = getattr(source_output, "outputs", None)
     if isinstance(outputs, list) and outputs:
@@ -186,15 +178,20 @@ def _is_silent_token_prefix(content_ids: list[int]) -> bool:
 
 
 def _request_additional_info(request: Any) -> dict[str, Any]:
-    raw_info = getattr(request, "additional_information", None)
-    if isinstance(raw_info, dict):
-        info = raw_info
-    else:
+    def decode_info(raw_info: Any) -> dict[str, Any]:
+        if isinstance(raw_info, dict):
+            return raw_info
         info = deserialize_additional_information(raw_info)
+        return info if isinstance(info, dict) else {}
+
+    info = decode_info(getattr(request, "omni_stage_payload", None))
+    current_info = decode_info(getattr(request, "additional_information", None))
+    if current_info:
+        info = {**info, **current_info}
 
     nested_info = info.get("additional_information") if isinstance(info, dict) else None
     if nested_info is not None:
-        nested_info = deserialize_additional_information(nested_info)
+        nested_info = decode_info(nested_info)
         if isinstance(nested_info, dict):
             # Connector payloads wrap the original OpenAI request metadata under
             # `additional_information`; expose those tts_* keys at the level
@@ -474,20 +471,6 @@ def asr2aura_async_chunk(
         mm_processor_kwargs=mm_processor_kwargs,
         tokenizer=tokenizer,
     )
-    nested_info = payload.get("additional_information")
-    logger.warning(
-        "[AURA-DEBUG][asr2aura] req=%s finished=%s info_keys=%s tts_task_type=%r tts_speaker=%r "
-        "payload_keys=%s payload_ai_keys=%s prompt_len=%s has_mm=%s",
-        request_id,
-        finished,
-        _debug_keys(additional_info),
-        _debug_first(additional_info.get("tts_task_type")),
-        _debug_first(additional_info.get("tts_speaker")),
-        _debug_keys(payload),
-        _debug_keys(nested_info),
-        len(payload.get("prompt_token_ids") or []),
-        bool(multi_modal_data),
-    )
     return payload
 
 
@@ -689,6 +672,11 @@ def aura2tts_async_chunk(
             request_text if request_text.startswith(previous_text) else _clean_tts_text(previous_text + request_text)
         )
 
+    additional_info = _request_additional_info(request)
+    tts_metadata = _tts_additional_info(additional_info)
+    if tts_metadata:
+        state["aura2tts_tts_metadata"] = dict(tts_metadata)
+
     if not finished:
         return None
 
@@ -698,21 +686,9 @@ def aura2tts_async_chunk(
     if _is_silent_token_prefix(content_ids):
         return None
 
-    additional_info = _request_additional_info(request)
-    cached_tts_metadata = state.get("_request_tts_metadata")
+    cached_tts_metadata = state.get("aura2tts_tts_metadata")
     if isinstance(cached_tts_metadata, dict):
         additional_info = {**cached_tts_metadata, **additional_info}
-    logger.warning(
-        "[AURA-DEBUG][aura2tts] req=%s finished=%s info_keys=%s tts_task_type=%r tts_speaker=%r "
-        "content_ids_len=%s request_text_len=%s",
-        request_id,
-        finished,
-        _debug_keys(additional_info),
-        _debug_first(additional_info.get("tts_task_type")),
-        _debug_first(additional_info.get("tts_speaker")),
-        len(content_ids),
-        len(request_text),
-    )
     pass_token_ids = _first_bool(additional_info.get("tts_pass_token_ids"), False)
     request_text = _clean_tts_text(str(state.get("aura2tts_text", ""))) or request_text
     if not request_text and not pass_token_ids:
@@ -740,15 +716,4 @@ def aura2tts_async_chunk(
         **tts_info,
         "prompt_token_ids": [0] * prompt_len,
     }
-    logger.warning(
-        "[AURA-DEBUG][aura2tts] emit req=%s task_type=%r speaker=%r payload_keys=%s prompt_len=%s "
-        "has_text=%s has_token_ids=%s",
-        request_id,
-        _debug_first(tts_info.get("task_type")),
-        _debug_first(tts_info.get("speaker")),
-        _debug_keys(payload),
-        prompt_len,
-        bool(payload.get("text")),
-        PRECOMPUTED_TEXT_IDS_KEY in payload,
-    )
     return payload

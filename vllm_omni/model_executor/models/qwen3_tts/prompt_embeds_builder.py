@@ -57,7 +57,7 @@ logger = init_logger(__name__)
 PRECOMPUTED_REF_CODE_KEY = "precomputed_ref"
 NORMALIZED_REF_AUDIO_KEY = "_qwen3_tts_normalized_ref_audio"
 REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
-PRECOMPUTED_TEXT_IDS_KEY = "_qwen3_tts_text_ids"
+PRECOMPUTED_TEXT_IDS_KEY = "precomputed_text_id"
 PRECOMPUTED_REF_IDS_KEY = "_qwen3_tts_ref_ids"
 
 
