@@ -13,7 +13,7 @@ pipeline: aura_omni
 
 # TODO: Enable the feature for AURA to send chunks to TTS. This requires qwen3-tts to support streaming input first;
 # otherwise, in the absence of historical context, the speech quality of individual chunks will be inconsistent.
-async_chunk: true
+async_chunk: false
 
 connectors:
   connector_of_shared_memory:
@@ -41,7 +41,7 @@ stages:
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
-    model: Qwen/Qwen3-ASR-1.7B
+    model: /data/models/Qwen3-ASR-1.7B
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -61,7 +61,7 @@ stages:
       from_stage_0: connector_of_shared_memory
     output_connectors:
       to_stage_2: connector_of_shared_memory
-    model: aurateam/AURA
+    model: /data/models/AURA
     default_sampling_params:
       temperature: 0.5
       top_p: 1.0
@@ -82,7 +82,7 @@ stages:
       from_stage_1: connector_of_shared_memory
     output_connectors:
       to_stage_3: connector_of_shared_memory
-    model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    model: /data/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe
     # model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
     default_sampling_params:
       temperature: 0.9
@@ -108,7 +108,7 @@ stages:
     devices: "0"
     input_connectors:
       from_stage_2: connector_of_shared_memory
-    model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    model: /data/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe
     # model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
     default_sampling_params:
       temperature: 0.0

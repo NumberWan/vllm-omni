@@ -97,9 +97,10 @@ def _load_pcm16_16k(path: str) -> bytes:
 def _summarize_outbound(msg: dict[str, Any]) -> str:
     t = msg.get("type", "?")
     if t == "session.config":
-        return (
-            f"session.config modalities={msg.get('modalities')} auto_trigger_min={msg.get('auto_trigger_min_frames')}"
-        )
+        tts = ""
+        if msg.get("tts_task_type") or msg.get("tts_speaker"):
+            tts = f" tts_task_type={msg.get('tts_task_type')} tts_speaker={msg.get('tts_speaker')}"
+        return f"session.config modalities={msg.get('modalities')} auto_trigger_min={msg.get('auto_trigger_min_frames')}{tts}"
     if t == "video.frame":
         data = msg.get("data", "")
         return f"video.frame b64_len={len(data)}"
@@ -435,6 +436,20 @@ async def _stream_video(
         config["max_context_qas"] = args.max_context_qas
     if args.no_pruning:
         config["pruning_enabled"] = False
+    if args.tts_task_type:
+        config["tts_task_type"] = args.tts_task_type
+    if args.tts_language:
+        config["tts_language"] = args.tts_language
+    if args.tts_speaker:
+        config["tts_speaker"] = args.tts_speaker
+    if args.tts_ref_audio:
+        config["tts_ref_audio"] = args.tts_ref_audio
+    if args.tts_ref_text:
+        config["tts_ref_text"] = args.tts_ref_text
+    if args.tts_instruct:
+        config["tts_instruct"] = args.tts_instruct
+    if args.tts_pass_token_ids:
+        config["tts_pass_token_ids"] = True
     await _send_json(ws, config, log)
 
     if args.burst_interval > 0:
@@ -551,6 +566,22 @@ def main() -> None:
     )
     p.add_argument("--no-pruning", action="store_true", help="Disable SessionHistory pruning.")
     p.add_argument("--text-only", action="store_true")
+    p.add_argument(
+        "--tts-task-type",
+        choices=["Base", "CustomVoice", "VoiceDesign"],
+        default=None,
+        help="Qwen3-TTS task type to send in session.config. Use CustomVoice for CustomVoice checkpoints.",
+    )
+    p.add_argument("--tts-language", default=None, help="Qwen3-TTS language override, e.g. Chinese or English.")
+    p.add_argument("--tts-speaker", default=None, help="CustomVoice speaker name, e.g. Vivian.")
+    p.add_argument("--tts-ref-audio", default=None, help="Base/VoiceDesign reference audio path.")
+    p.add_argument("--tts-ref-text", default=None, help="Base/VoiceDesign reference transcript.")
+    p.add_argument("--tts-instruct", default=None, help="VoiceDesign/style instruction text.")
+    p.add_argument(
+        "--tts-pass-token-ids",
+        action="store_true",
+        help="Ask the server to pass AURA assistant token ids directly to Qwen3-TTS.",
+    )
     p.add_argument("--no-evs", action="store_true")
     p.add_argument("--evs-threshold", type=float, default=0.95)
     p.add_argument("--recv-timeout", type=float, default=600.0)
