@@ -44,8 +44,16 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
 )
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.model_executor.stage_input_processors.stage_bypass import (
+    make_mock_text_stage_output,
+    should_skip_stage,
+    should_skip_stage_from_info,
+)
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
@@ -113,6 +121,31 @@ def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) 
             if sample_rate > 0:
                 return sample_rate
     return default
+
+
+def _resolve_prompt_additional_information(prompt: Any) -> dict[str, Any] | None:
+    """Return a plain dict from ``additional_information`` on a prompt or request."""
+    if isinstance(prompt, dict):
+        info = prompt.get("additional_information")
+        if isinstance(info, dict):
+            return info
+        if info is not None:
+            return deserialize_additional_information(info)
+    info_payload = getattr(prompt, "additional_information", None)
+    if info_payload is not None:
+        return deserialize_additional_information(info_payload)
+    return None
+
+
+def _should_skip_stage_submission(prompt: Any, original_prompt: Any, stage_id: int) -> bool:
+    """Return True when ``omni_skip_stages`` requests bypassing ``stage_id``."""
+    for candidate in (prompt, original_prompt):
+        if should_skip_stage(candidate, stage_id):
+            return True
+        info = _resolve_prompt_additional_information(candidate)
+        if should_skip_stage_from_info(info, stage_id):
+            return True
+    return False
 
 
 def build_engine_core_request_from_tokens(
@@ -466,6 +499,13 @@ class Orchestrator:
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+
+        if _should_skip_stage_submission(prompt, original_prompt, stage_id):
+            await self._forward_bypassed_stage_zero(request_id, req_state)
+            if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+                await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+            return
+
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
@@ -509,6 +549,13 @@ class Orchestrator:
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
+
+        if _should_skip_stage_submission(request, msg.original_prompt, stage_id):
+            await self._forward_bypassed_stage_zero(request_id, req_state)
+            if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+                await self._prewarm_async_chunk_stages(request_id, request, req_state)
+            return
+
         await self.stage_pools[stage_id].submit_update(
             request_id,
             req_state,
@@ -948,6 +995,49 @@ class Orchestrator:
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
+
+    async def _forward_bypassed_stage_zero(
+        self,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Skip stage-0 GPU work when ``omni_skip_stages`` includes 0 (video-only turns)."""
+        mock_output = make_mock_text_stage_output(request_id, text="")
+        logger.debug(
+            "[Orchestrator] Bypassing stage-0 for req=%s (omni_skip_stages)",
+            request_id,
+        )
+        is_streaming = req_state.streaming.enabled
+        if is_streaming:
+            await self._forward_to_next_stage(
+                request_id,
+                0,
+                mock_output,
+                req_state,
+                src_replica_id=0,
+                is_streaming_session=True,
+                is_final_update=False,
+            )
+            if getattr(mock_output, "finished", True):
+                await self._forward_to_next_stage(
+                    request_id,
+                    0,
+                    mock_output,
+                    req_state,
+                    src_replica_id=0,
+                    is_streaming_session=True,
+                    is_final_update=True,
+                )
+        else:
+            await self._forward_to_next_stage(
+                request_id,
+                0,
+                mock_output,
+                req_state,
+                src_replica_id=0,
+                is_streaming_session=False,
+                is_final_update=True,
+            )
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)

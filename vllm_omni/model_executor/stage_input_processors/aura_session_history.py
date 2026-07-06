@@ -12,6 +12,9 @@ from typing import Any
 import numpy as np
 
 SILENT_TEXT = "<|silent|>"
+# Qwen3-VL / AURA (matches native AURA ContextManaged SILENT_TOKEN_ID for VL paths).
+AURA_SILENT_TOKEN_ID = 151669
+AURA_IM_END_TOKEN_ID = 151645
 DEFAULT_AURA_SYSTEM_PROMPT = (
     "You are receiving a live video stream where the final frame is the present moment. "
     "Respond only when a response is needed based on the user's message or the visual context. "
@@ -23,14 +26,18 @@ DEFAULT_AURA_SYSTEM_PROMPT = (
 AURA_PUNCT_CHARS = frozenset(".,!?;:，。！？；：、'\"()[]{}''…—–\n\t\r /-_@#$%^&*+=<>~`|\\（）【】《》﹑·")
 
 __all__ = [
+    "AURA_IM_END_TOKEN_ID",
     "AURA_PUNCT_CHARS",
+    "AURA_SILENT_TOKEN_ID",
     "AuraSessionState",
     "SessionHistory",
     "DEFAULT_AURA_SYSTEM_PROMPT",
     "SILENT_TEXT",
+    "aura_silent_stop_token_ids",
     "is_punctuation_only_text",
     "is_effectively_silent",
     "normalize_assistant_text",
+    "should_stop_aura_silent_generation",
     "create_session_id",
     "create_streaming_session",
     "register_session",
@@ -38,6 +45,25 @@ __all__ = [
     "unregister_session",
     "clear_all_sessions",
 ]
+
+
+def aura_silent_stop_token_ids() -> tuple[int, ...]:
+    """Token ids that end an AURA silent turn (aligned with native AURA bench)."""
+    return (AURA_SILENT_TOKEN_ID, AURA_IM_END_TOKEN_ID)
+
+
+def should_stop_aura_silent_generation(
+    *,
+    token_ids: list[int] | None = None,
+    text: str | None = None,
+) -> bool:
+    """True when generation should stop like native AURA (first token silent or filler)."""
+    ids = list(token_ids or [])
+    if ids and ids[0] in aura_silent_stop_token_ids():
+        return True
+    if text is not None and is_effectively_silent(text):
+        return True
+    return False
 
 
 def is_punctuation_only_text(text: str) -> bool:
