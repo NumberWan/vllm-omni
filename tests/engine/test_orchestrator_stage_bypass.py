@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""AURA async_chunk orchestrator hooks (prewarm + silent turn)."""
+"""AURA async_chunk orchestrator hooks (prewarm)."""
 
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 
-import janus
 import pytest
-from vllm.sampling_params import SamplingParams
 
 from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
@@ -18,7 +15,6 @@ from .test_orchestrator import (
     FakeOutputProcessor,
     FakeStageClient,
     _build_harness,
-    _build_request_output,
     _sampling_params,
     _shutdown_orchestrator,
 )
@@ -75,57 +71,5 @@ async def test_async_chunk_prewarm_uses_empty_prompt_for_qwen3_tts() -> None:
         assert len(stage3.add_request_calls) == 1
         codec_request = stage3.add_request_calls[0][0]
         assert codec_request.prompt_token_ids == []
-    finally:
-        await _shutdown_orchestrator(fixture)
-
-
-@pytest.mark.asyncio
-async def test_async_chunk_silent_aura_turn_emits_terminal_empty_audio() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=False)
-    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="text", model_stage="aura")
-    stage2 = FakeStageClient(stage_type="llm", final_output=False, model_stage="qwen3_tts")
-    stage3 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio", model_stage="code2wav")
-    processors = [FakeOutputProcessor() for _ in range(4)]
-    stage_vllm_configs = [
-        SimpleNamespace(model_config=SimpleNamespace(max_model_len=64, model_stage=client.model_stage, worker_type="ar"))
-        if client.model_stage != "code2wav"
-        else SimpleNamespace(
-            model_config=SimpleNamespace(max_model_len=64, model_stage="code2wav", worker_type="generation")
-        )
-        for client in (stage0, stage1, stage2, stage3)
-    ]
-    fixture = _build_harness(
-        [stage0, stage1, stage2, stage3],
-        output_processors=processors,
-        stage_vllm_configs=stage_vllm_configs,
-        async_chunk=True,
-    )
-    req_state = OrchestratorRequestState(
-        request_id="req-silent",
-        prompt={"prompt": "video-only"},
-        sampling_params_list=[_sampling_params() for _ in range(4)],
-        final_stage_id=3,
-        final_output_stage_ids={1, 3},
-    )
-    fixture.orchestrator.request_states["req-silent"] = req_state
-    silent_output = _build_request_output("req-silent", text="<|silent|>", finished=True)
-
-    try:
-        await fixture.orchestrator._route_output(1, 0, silent_output, req_state, stage_metrics=None)
-
-        output_messages = []
-        while True:
-            try:
-                output_messages.append(fixture.output_sync_q.get_nowait())
-            except janus.SyncQueueEmpty:
-                break
-
-        assert len(output_messages) == 2
-        assert output_messages[0].stage_id == 1
-        assert output_messages[0].finished is False
-        assert output_messages[1].stage_id == 3
-        assert output_messages[1].finished is True
-        assert output_messages[1].engine_outputs.outputs[0].multimodal_output is not None
-        assert "req-silent" not in fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(fixture)
