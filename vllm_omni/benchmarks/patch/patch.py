@@ -974,6 +974,10 @@ def _omniinteract_save_output_wav_enabled() -> bool:
     return os.environ.get("OMNIINTERACT_SAVE_OUTPUT_WAV", "").lower() in ("1", "true", "yes")
 
 
+def _omniinteract_save_turn_wav_enabled() -> bool:
+    return os.environ.get("OMNIINTERACT_SAVE_TURN_WAV", "").lower() in ("1", "true", "yes")
+
+
 def _save_omniinteract_streaming_output_wav(
     *,
     video_path: str,
@@ -1002,6 +1006,51 @@ def _save_omniinteract_streaming_output_wav(
         frame_rate,
     )
     return out_path
+
+
+def _save_omniinteract_streaming_turn_wav(
+    *,
+    video_path: str,
+    turn_index: int,
+    pcm_bytes: bytes,
+    channels: int,
+    sample_width: int,
+    frame_rate: int,
+) -> Path | None:
+    """Optional bench-only artifact: save one WAV per spoken turn."""
+    if not _omniinteract_save_turn_wav_enabled() or not pcm_bytes:
+        return None
+    root = Path(os.environ.get("OMNIINTERACT_BENCH_OUTPUT_DIR", "omniinteract_bench")).expanduser()
+    video_id = Path(video_path).stem or "unknown"
+    out_dir = root / "videos" / video_id / "turn_wavs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"turn_{turn_index:03d}.wav"
+    with wave.open(str(out_path), "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(frame_rate)
+        wf.writeframes(pcm_bytes)
+    return out_path
+
+
+def _finalize_turn_wav_artifact(response: dict[str, Any], *, video_path: str, turn_index: int) -> None:
+    """Save a spoken turn WAV without affecting the response path."""
+    pcm_buffer = response.pop("_audio_pcm_buffer", None)
+    audio_params = response.pop("_audio_wav_params", None)
+    if not isinstance(pcm_buffer, bytearray) or not pcm_buffer or not isinstance(audio_params, tuple):
+        return
+    if len(audio_params) != 3:
+        return
+    saved = _save_omniinteract_streaming_turn_wav(
+        video_path=video_path,
+        turn_index=turn_index,
+        pcm_bytes=bytes(pcm_buffer),
+        channels=int(audio_params[0]),
+        sample_width=int(audio_params[1]),
+        frame_rate=int(audio_params[2]),
+    )
+    if saved is not None:
+        response["wav_path"] = str(saved)
 
 
 def _merge_turn_metrics(dest_metrics: dict[str, Any], src_metrics: dict[str, Any]) -> None:
@@ -1049,6 +1098,7 @@ def _normalize_streaming_chunks(responses: list[dict[str, Any]]) -> list[dict[st
                 "e2el_ms": response.get("e2el_ms"),
                 "wall_e2el_ms": response.get("wall_e2el_ms"),
                 "metrics": response.get("metrics"),
+                "wav_path": response.get("wav_path"),
             }
         )
     return chunks
@@ -1272,7 +1322,16 @@ async def async_request_openai_video_stream(
                                 if wav_audio_params is None:
                                     wav_audio_params = params
                                 if wav_audio_params == params:
-                                    wav_pcm_buffer.extend(wav_reader.readframes(wav_reader.getnframes()))
+                                    pcm = wav_reader.readframes(wav_reader.getnframes())
+                                    wav_pcm_buffer.extend(pcm)
+                                    target_response = current_response if current_response is not None else (
+                                        responses[-1] if responses else None
+                                    )
+                                    if target_response is not None:
+                                        turn_buf = target_response.setdefault("_audio_pcm_buffer", bytearray())
+                                        if isinstance(turn_buf, bytearray):
+                                            turn_buf.extend(pcm)
+                                        target_response.setdefault("_audio_wav_params", params)
                         except Exception as ex:
                             logger.warning("Failed to parse streaming video wav chunk: %s", ex)
                 elif msg_type == "error":
@@ -1348,6 +1407,8 @@ async def async_request_openai_video_stream(
                 raise
 
         output.latency = timestamp - st
+        for idx, response in enumerate(responses, start=1):
+            _finalize_turn_wav_artifact(response, video_path=video_path, turn_index=idx)
         streaming_chunks = _normalize_streaming_chunks(responses)
         response_texts = [str(chunk.get("text") or "") for chunk in streaming_chunks if str(chunk.get("text") or "")]
         output.generated_text = "\n".join(response_texts) if response_texts else "".join(generated_parts)
