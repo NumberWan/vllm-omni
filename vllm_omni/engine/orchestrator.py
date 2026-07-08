@@ -49,10 +49,6 @@ from vllm_omni.engine.serialization import (
     serialize_additional_information,
 )
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.model_executor.stage_input_processors.aura_omni import _extract_text
-from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
-    is_effectively_silent,
-)
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
@@ -937,16 +933,6 @@ class Orchestrator:
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
         if (
-            self.async_chunk
-            and finished
-            and stage_id < req_state.final_stage_id
-            and self._stage_model_stage(stage_id) == "aura"
-            and is_effectively_silent(_extract_text(output))
-        ):
-            await self._complete_async_chunk_silent_turn(req_id, stage_id, req_state)
-            return
-
-        if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
             and not self.async_chunk
@@ -985,52 +971,6 @@ class Orchestrator:
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
-
-    def _stage_model_stage(self, stage_id: int) -> str | None:
-        pool = self.stage_pools[stage_id]
-        return getattr(getattr(pool.stage_vllm_config, "model_config", None), "model_stage", None)
-
-    async def _complete_async_chunk_silent_turn(
-        self,
-        req_id: str,
-        aura_stage_id: int,
-        req_state: OrchestratorRequestState,
-    ) -> None:
-        """Finish a silent async-chunk turn without waiting for TTS stages."""
-        final_stage_id = req_state.final_stage_id
-        final_pool = self.stage_pools[final_stage_id]
-        final_output_type = getattr(final_pool.stage_client, "final_output_type", None)
-        terminal_output = _build_terminal_empty_output(
-            req_id,
-            final_output_type=final_output_type,
-            audio_sample_rate=_infer_stage_audio_sample_rate(final_pool),
-        )
-        submit_ts = _time.time()
-        req_state.stage_submit_ts[final_stage_id] = submit_ts
-        req_state.finished_final_output_stage_ids.add(final_stage_id)
-        logger.info(
-            "[Orchestrator] req=%s stage-%s silent in async_chunk; "
-            "returning empty %s output from final stage-%s",
-            req_id,
-            aura_stage_id,
-            final_output_type or "text",
-            final_stage_id,
-        )
-        await self.output_async_queue.put(
-            OutputMessage(
-                request_id=req_id,
-                stage_id=final_stage_id,
-                replica_id=0,
-                engine_outputs=terminal_output,
-                metrics=None,
-                finished=True,
-                stage_submit_ts=submit_ts,
-            )
-        )
-        await self._cleanup_request_ids(
-            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
-            abort=True,
-        )
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)
