@@ -137,6 +137,33 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _should_defer_waiting_admission(self) -> bool:
         return False
 
+    def _finish_empty_prompt_chunk_requests(self) -> None:
+        """Finish async_chunk requests whose upstream sent no tokens before done."""
+        adapter = self.chunk_transfer_adapter
+        if adapter is None:
+            return
+
+        to_finish: list[Request] = []
+        for queue in (self.waiting, self.running):
+            for req in list(queue):
+                if not adapter.is_done_receiving_chunks(req.request_id):
+                    continue
+                if req.prompt_token_ids:
+                    continue
+                queue.remove(req)
+                to_finish.append(req)
+        for req in to_finish:
+            adapter._send_single_request(
+                {
+                    "multimodal_output": None,
+                    "request": req,
+                    "is_finished": True,
+                    "is_segment_finished": True,
+                }
+            )
+        if to_finish:
+            self.finish_requests([req.request_id for req in to_finish], RequestStatus.FINISHED_STOPPED)
+
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
         Check triggers and process side effects (marking transfer).
@@ -225,6 +252,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
             )
+            self._finish_empty_prompt_chunk_requests()
 
         original_waiting = None
         if self._should_defer_waiting_admission():

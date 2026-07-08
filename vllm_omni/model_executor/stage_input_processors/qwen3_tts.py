@@ -247,6 +247,11 @@ def talker2code2wav_async_chunk(
         emitted_frames_by_req[request_id] = 0
 
     if length <= 0:
+        if finished:
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
         return None
 
     new_frames = length - emitted_frames
