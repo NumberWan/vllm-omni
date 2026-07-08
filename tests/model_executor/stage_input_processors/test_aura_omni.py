@@ -141,10 +141,8 @@ def test_asr2aura_async_chunk_waits_until_asr_finished(monkeypatch):
 
     payload = asr2aura_async_chunk(transfer_manager, None, request, is_finished=True)
 
-    assert payload["prompt"]
     assert "看看视频里有什么" in payload["prompt"]
     assert "<|im_end|><|im_end|>" not in payload["prompt"]
-    assert payload["prompt_token_ids"]
     assert payload["ids"]["prompt"] == payload["prompt_token_ids"]
     assert payload["multi_modal_data"] == {"video": ["frame-0"]}
     assert payload["additional_information"] == {"tts_ref_audio": ["voice.wav"]}

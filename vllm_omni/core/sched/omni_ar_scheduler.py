@@ -492,7 +492,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         mm_output,
                         request,
                         is_segment_finished,
-                        processor_is_finished=processor_is_finished,
                     )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
