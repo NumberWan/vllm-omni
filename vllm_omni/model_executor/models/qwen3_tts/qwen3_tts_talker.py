@@ -1093,6 +1093,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.
         layer0 = audio_codes[:, :1]
         invalid0 = (layer0 < 0) | (layer0 >= int(self._codebook_vocab_size))
+        eos0 = layer0 == int(self._codec_eos_token_id)
+        if bool(invalid0.any().item()) or bool(eos0.any().item()):
+            logger.info(
+                "[Qwen3TTS Talker codec] layer0 eos_or_invalid eos_count=%d invalid_count=%d "
+                "codec_eos_token_id=%d codebook_vocab_size=%d layer0_sample=%s",
+                int(eos0.sum().item()),
+                int(invalid0.sum().item()),
+                int(self._codec_eos_token_id),
+                int(self._codebook_vocab_size),
+                layer0.reshape(-1).detach().cpu().tolist()[:8],
+            )
         audio_codes = torch.where(invalid0.expand_as(audio_codes), torch.zeros_like(audio_codes), audio_codes)
 
         # Single gather over stacked [Q-1, V, H] replaces Q-1 serial embedding kernels.

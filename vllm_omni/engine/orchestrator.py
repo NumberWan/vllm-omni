@@ -118,6 +118,28 @@ def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) 
     return default
 
 
+def _extract_max_new_tokens_override(next_input: Any) -> int:
+    if isinstance(next_input, dict):
+        additional = next_input.get("additional_information")
+    else:
+        additional = getattr(next_input, "additional_information", None)
+    if not isinstance(additional, dict):
+        return 0
+    return _coerce_int_scalar(additional.get("max_new_tokens") or additional.get("tts_max_new_tokens"))
+
+
+def _apply_next_input_max_tokens_override(
+    params: SamplingParams | PoolingParams,
+    next_input: Any,
+) -> SamplingParams | PoolingParams:
+    max_new_tokens = _extract_max_new_tokens_override(next_input)
+    if max_new_tokens <= 0 or not isinstance(params, SamplingParams):
+        return params
+    cloned = params.clone()
+    cloned.max_tokens = max_new_tokens if cloned.max_tokens is None else min(int(cloned.max_tokens), max_new_tokens)
+    return cloned
+
+
 def build_engine_core_request_from_tokens(
     request_id: str,
     prompt: dict[str, Any],
@@ -132,6 +154,7 @@ def build_engine_core_request_from_tokens(
         arrival_time = _time.time()
 
     prompt_token_ids = prompt["prompt_token_ids"]
+    additional_info = prompt.get("additional_information")
 
     sampling_params = None
     pooling_params = None
@@ -139,12 +162,32 @@ def build_engine_core_request_from_tokens(
         sampling_params = params.clone()
         if sampling_params.max_tokens is None and model_config is not None:
             sampling_params.max_tokens = model_config.max_model_len - len(prompt_token_ids)
+        if isinstance(additional_info, dict):
+            requested_max_new_tokens = _coerce_int_scalar(
+                additional_info.get("max_new_tokens") or additional_info.get("tts_max_new_tokens")
+            )
+            if requested_max_new_tokens > 0:
+                sampling_params.max_tokens = (
+                    requested_max_new_tokens
+                    if sampling_params.max_tokens is None
+                    else min(int(sampling_params.max_tokens), requested_max_new_tokens)
+                )
+                logger.info(
+                    "[Orchestrator][TTS max_tokens] req=%s prompt_len=%d resumable=%s "
+                    "requested_max_new_tokens=%d effective_sampling_max_tokens=%s model_max_len=%s",
+                    request_id,
+                    len(prompt_token_ids),
+                    resumable,
+                    requested_max_new_tokens,
+                    sampling_params.max_tokens,
+                    getattr(model_config, "max_model_len", None),
+                )
     else:
         pooling_params = params.clone()
 
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
     additional_info_payload = serialize_additional_information(
-        prompt.get("additional_information"),
+        additional_info,
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
     )
 
@@ -1436,6 +1479,7 @@ class Orchestrator:
 
         # Build and submit requests for each input
         for next_input in next_inputs:
+            next_params = _apply_next_input_max_tokens_override(params, next_input)
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
@@ -1444,7 +1488,7 @@ class Orchestrator:
                 req_id,
                 next_logical,
                 next_input,
-                params=params,
+                params=next_params,
                 mm_features=mm_features,
                 resumable=next_stage_resumable,
             )

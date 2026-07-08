@@ -27,6 +27,8 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
+    _apply_next_input_max_tokens_override,
+    build_engine_core_request_from_tokens,
     _build_terminal_empty_output,
     _infer_stage_audio_sample_rate,
 )
@@ -152,6 +154,33 @@ def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
     )
 
     assert terminal_output.outputs[0].multimodal_output["sr"] == 44100
+
+
+def test_tts_max_new_tokens_overrides_token_request_sampling_params() -> None:
+    request = build_engine_core_request_from_tokens(
+        "req-tts",
+        {
+            "prompt_token_ids": [0, 0],
+            "additional_information": {"max_new_tokens": [96]},
+        },
+        SamplingParams(max_tokens=4096),
+    )
+
+    assert request.sampling_params.max_tokens == 96
+
+
+def test_next_input_max_new_tokens_overrides_sampling_params_clone() -> None:
+    params = SamplingParams(max_tokens=4096)
+    next_input = {
+        "prompt_token_ids": [0, 0],
+        "additional_information": {"max_new_tokens": [96]},
+    }
+
+    overridden = _apply_next_input_max_tokens_override(params, next_input)
+
+    assert overridden is not params
+    assert overridden.max_tokens == 96
+    assert params.max_tokens == 4096
 
 
 class FakeCollectiveRpcStageClient(FakeStageClient):

@@ -117,6 +117,7 @@ def aura_tts_additional_information_from_session(
     ref_audio: str | None = None,
     ref_text: str | None = None,
     instruct: str | None = None,
+    max_new_tokens: int | None = None,
     pass_token_ids: bool | None = None,
 ) -> dict[str, Any]:
     """Merge WebSocket ``session.config`` TTS fields into ``additional_information``."""
@@ -133,6 +134,8 @@ def aura_tts_additional_information_from_session(
         info["tts_ref_audio"] = ref_audio.strip()
     if isinstance(ref_text, str) and ref_text.strip():
         info["tts_ref_text"] = ref_text.strip()
+    if max_new_tokens is not None:
+        info["tts_max_new_tokens"] = int(max_new_tokens)
     if pass_token_ids is not None:
         info["tts_pass_token_ids"] = bool(pass_token_ids)
     if info.get("tts_task_type") == "CustomVoice":
@@ -187,6 +190,7 @@ def build_aura_streaming_turn_additional_information(
     tts_ref_audio: str | None = None,
     tts_ref_text: str | None = None,
     tts_instruct: str | None = None,
+    tts_max_new_tokens: int | None = None,
     tts_pass_token_ids: bool | None = None,
 ) -> dict[str, Any]:
     """Build ``additional_information`` for one AURA streaming inference turn."""
@@ -207,6 +211,7 @@ def build_aura_streaming_turn_additional_information(
                 ref_audio=tts_ref_audio,
                 ref_text=tts_ref_text,
                 instruct=tts_instruct,
+                max_new_tokens=tts_max_new_tokens,
                 pass_token_ids=tts_pass_token_ids,
             )
         )
@@ -234,6 +239,22 @@ def _first_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _estimate_tts_max_new_tokens(text: str, content_ids: list[int], explicit: Any = None) -> int:
+    explicit = _first_value(explicit, None)
+    if explicit is not None:
+        try:
+            return max(1, int(explicit))
+        except (TypeError, ValueError):
+            pass
+
+    # Qwen3-TTS emits one layer-0 codec token per 12 Hz audio frame. Keep the
+    # default cap proportional to spoken text so bad EOS or degenerate AURA
+    # text does not run to the deploy-wide upper bound.
+    spoken_chars = sum(1 for ch in text if not ch.isspace())
+    basis = max(spoken_chars, len(content_ids))
+    return min(1024, max(48, int(math.ceil(basis * 7 + 32))))
 
 
 def _normalize_qwen3_tts_speaker(speaker: Any) -> Any:
@@ -816,7 +837,13 @@ def build_tts_talker_input(
         "task_type": [task_type],
         "language": [language],
         "instruct": [instruct],
-        "max_new_tokens": [int(_first_value(additional_info.get("tts_max_new_tokens"), 2048))],
+        "max_new_tokens": [
+            _estimate_tts_max_new_tokens(
+                text,
+                content_ids,
+                additional_info.get("tts_max_new_tokens"),
+            )
+        ],
     }
     if pass_token_ids and assistant_token_ids:
         tts_info[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids]
@@ -847,6 +874,23 @@ def build_tts_talker_input(
         tts_info["x_vector_only_mode"] = [x_vector_only_mode]
     elif task_type == "CustomVoice":
         tts_info["speaker"] = [_normalize_qwen3_tts_speaker(_first_value(additional_info.get("tts_speaker"), "Vivian"))]
+
+    logger.info(
+        "[aura2tts] build talker input task=%s language=%s speaker=%s text_len=%d "
+        "content_ids=%d pass_token_ids=%s prompt_len=%d max_new_tokens=%s ref_code_len=%s "
+        "has_ref_audio=%s text_preview=%r",
+        task_type,
+        language,
+        tts_info.get("speaker", [None])[0],
+        len(text),
+        len(content_ids),
+        pass_token_ids,
+        prompt_len,
+        tts_info.get("max_new_tokens"),
+        ref_code_len,
+        bool(tts_info.get("ref_audio")),
+        text[:120],
+    )
 
     return OmniTokensPrompt(
         prompt_token_ids=[0] * prompt_len,
@@ -895,12 +939,27 @@ def aura2tts_async_chunk(
 
     content_ids = _trim_aura_response_token_ids(_ensure_int_list(getattr(request, "output_token_ids", []) or []))
     finished = bool(is_finished or request.is_finished())
+    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
+    logger.info(
+        "[aura2tts_async_chunk] req=%s is_finished_arg=%s request_finished=%s "
+        "content_ids=%d output_text_len=%d",
+        request_id,
+        is_finished,
+        finished,
+        len(content_ids),
+        len(_request_output_text(request) or ""),
+    )
     if content_ids and _is_silent_token_prefix(content_ids):
         if not finished:
+            logger.info(
+                "[aura2tts_async_chunk] req=%s holding silent-prefix partial content_ids=%d",
+                request_id,
+                len(content_ids),
+            )
             return None
+        logger.info("[aura2tts_async_chunk] req=%s emitting silent finished payload", request_id)
         return _aura2tts_empty_finished_payload()
 
-    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     request_payload = getattr(transfer_manager, "request_payload", None)
     if request_payload is None:
         request_payload = {}
@@ -925,12 +984,22 @@ def aura2tts_async_chunk(
         state["aura2tts_tts_metadata"] = dict(tts_metadata)
 
     if not finished:
+        logger.info(
+            "[aura2tts_async_chunk] req=%s waiting for final AURA chunk accumulated_text_len=%d "
+            "accumulated_content_ids=%d tts_metadata_keys=%s",
+            request_id,
+            len(str(state.get("aura2tts_text", ""))),
+            len(state.get("aura2tts_content_ids", []) or []),
+            sorted(tts_metadata.keys()),
+        )
         return None
 
     content_ids = list(state.get("aura2tts_content_ids", content_ids) or [])
     if not content_ids:
+        logger.info("[aura2tts_async_chunk] req=%s finished with no content ids; no TTS input", request_id)
         return None
     if _is_silent_token_prefix(content_ids):
+        logger.info("[aura2tts_async_chunk] req=%s final content is silent; emitting finish payload", request_id)
         return _aura2tts_empty_finished_payload()
 
     cached_tts_metadata = state.get("aura2tts_tts_metadata")
@@ -956,7 +1025,14 @@ def aura2tts_async_chunk(
     )
     if tts_input is None:
         if is_effectively_silent(request_text) or _is_silent_token_prefix(content_ids):
+            logger.info("[aura2tts_async_chunk] req=%s TTS input is silent; emitting finish payload", request_id)
             return _aura2tts_empty_finished_payload()
+        logger.info(
+            "[aura2tts_async_chunk] req=%s build_tts_talker_input returned None text_len=%d content_ids=%d",
+            request_id,
+            len(request_text),
+            len(content_ids),
+        )
         return None
     payload = dict(tts_input["additional_information"])
     payload["prompt_token_ids"] = list(tts_input["prompt_token_ids"])
@@ -964,4 +1040,15 @@ def aura2tts_async_chunk(
     if pass_token_ids and assistant_token_ids:
         payload[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids]
         payload.pop("text", None)
+    logger.info(
+        "[aura2tts_async_chunk] req=%s emitting TTS payload prompt_len=%d text_len=%d "
+        "content_ids=%d pass_token_ids=%s max_new_tokens=%s keys=%s",
+        request_id,
+        len(payload.get("prompt_token_ids", []) or []),
+        len(request_text),
+        len(content_ids),
+        pass_token_ids,
+        payload.get("max_new_tokens"),
+        sorted(payload.keys()),
+    )
     return payload

@@ -420,7 +420,8 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Streaming requires `response_format="pcm"` and `async_chunk: true` on the stage config (default in `qwen3_tts.yaml`). `speed` is not supported when streaming.
 
 ### Streaming WebSocket
-The `/v1/audio/speech/stream` endpoint accepts text incrementally, splits it at sentence boundaries, and emits one PCM stream per sentence:
+The `/v1/audio/speech/stream` endpoint accepts text incrementally. By default it
+buffers text until `input.done`, then emits one PCM stream for the buffered text:
 ```bash
 python qwen3_tts/streaming_speech_client.py --text "Hello world. How are you? I am fine."
 python qwen3_tts/streaming_speech_client.py --text "..." --simulate-stt --stt-delay 0.1

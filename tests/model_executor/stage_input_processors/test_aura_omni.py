@@ -171,6 +171,21 @@ def test_aura2tts_builds_qwen3_tts_prompt_information():
     assert tts_input["additional_information"]["ref_text"] == ["Reference transcript sample."]
     assert tts_input["additional_information"]["x_vector_only_mode"] == [False]
     assert tts_input["additional_information"]["instruct"] == ["Calm voice."]
+    assert tts_input["additional_information"]["max_new_tokens"][0] < 2048
+
+
+def test_aura2tts_preserves_explicit_tts_max_new_tokens():
+    prompt = {
+        "additional_information": {
+            "tts_task_type": ["CustomVoice"],
+            "tts_speaker": ["Vivian"],
+            "tts_max_new_tokens": [96],
+        }
+    }
+
+    [tts_input] = aura2tts([_source_output("Hello.")], prompt=[prompt])
+
+    assert tts_input["additional_information"]["max_new_tokens"] == [96]
 
 
 def test_aura2tts_prefers_streaming_cumulative_text():

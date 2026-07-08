@@ -39,19 +39,3 @@ def should_skip_stage_from_info(additional_info: Any, stage_id: int) -> bool:
     if not isinstance(additional_info, dict):
         return False
     return stage_id in _parse_skip_stage_ids(additional_info.get(OMNI_SKIP_STAGES_KEY))
-
-
-def make_mock_text_stage_output(request_id: str, text: str = "", *, finished: bool = True) -> Any:
-    """Synthetic text-stage output used when an upstream stage is bypassed."""
-    output = SimpleNamespace(
-        text=text,
-        cumulative_text=text,
-        cumulative_token_ids=[],
-        multimodal_output={},
-        finished=finished,
-    )
-    return SimpleNamespace(
-        request_id=request_id,
-        outputs=[output],
-        finished=finished,
-    )

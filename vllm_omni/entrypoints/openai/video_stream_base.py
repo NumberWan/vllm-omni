@@ -970,12 +970,24 @@ class OmniStreamingVideoHandler:
     ) -> tuple[str | None, int]:
         """Emit only tensors appended since the last call."""
         # Single tensor: output_processor hands us one tensor before it becomes a
-        # list (see output_processor.py:89). Treat it as chunk #0.
+        # list (see output_processor.py:89).  Some streaming pipelines (AURA
+        # Code2Wav) also yield each audio delta as a fresh single tensor, not a
+        # cumulative list, so every non-list tensor is emitted as a new chunk.
+        # The cumulative-list path below still uses chunks_drained to avoid
+        # replaying already-sent tensors.
         if not isinstance(audio_data, list):
-            if chunks_drained >= 1:
-                return None, chunks_drained
             tail_np = cls._tensor_to_1d_np(audio_data)
-            return cls._encode_tail(tail_np, chunks_drained, new_drained=1, is_first=True)
+            logger.info(
+                "[video_stream audio.delta] single_tensor old_drained=%d samples=%s",
+                chunks_drained,
+                None if tail_np is None else len(tail_np),
+            )
+            return cls._encode_tail(
+                tail_np,
+                chunks_drained,
+                new_drained=chunks_drained + 1,
+                is_first=(chunks_drained == 0),
+            )
 
         n = len(audio_data)
         if n <= chunks_drained:
@@ -984,6 +996,13 @@ class OmniStreamingVideoHandler:
         new_chunks = audio_data[chunks_drained:]
         tail = new_chunks[0] if len(new_chunks) == 1 else torch.cat(new_chunks, dim=-1)
         tail_np = cls._tensor_to_1d_np(tail)
+        logger.info(
+            "[video_stream audio.delta] list_chunks old_drained=%d new_drained=%d new_chunks=%d samples=%s",
+            chunks_drained,
+            n,
+            len(new_chunks),
+            None if tail_np is None else len(tail_np),
+        )
         return cls._encode_tail(tail_np, chunks_drained, new_drained=n, is_first=(chunks_drained == 0))
 
     @classmethod
@@ -1040,6 +1059,15 @@ class OmniStreamingVideoHandler:
         if len(tail_np) == 0:
             return None, new_drained
         try:
+            logger.info(
+                "[video_stream audio.delta] encoding old_drained=%d new_drained=%d is_first=%s "
+                "samples=%d duration_s=%.3f",
+                old_drained,
+                new_drained,
+                is_first,
+                len(tail_np),
+                len(tail_np) / 24000.0,
+            )
             return cls._encode_audio_wav_b64(tail_np), new_drained
         except Exception:
             logger.exception("Failed to encode audio delta WAV")

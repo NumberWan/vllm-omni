@@ -86,6 +86,12 @@ class _AudioCollector:
         return out_path
 
 
+def _segment_wav_path(output_wav: str | Path, turn: int, segment: int) -> Path:
+    base = Path(output_wav).expanduser()
+    stem = base.stem or "aura_stream_output"
+    return base.with_name(f"{stem}_turn{turn:02d}_segment{segment:03d}{base.suffix or '.wav'}")
+
+
 SILENT_TEXT = "<|silent|>"
 # Keep in sync with vllm_omni.model_executor.stage_input_processors.aura_session_history.
 _AURA_PUNCT_CHARS = frozenset(".,!?;:，。！？；：、'\"()[]{}''…—–\n\t\r /-_@#$%^&*+=<>~`|\\（）【】《》﹑·")
@@ -185,10 +191,11 @@ async def _receiver(
     ws: Any,
     log: SessionLog,
     done: asyncio.Event,
-    audio_collector: _AudioCollector,
     output_wav: str | None,
 ) -> None:
     turn_text: list[str] = []
+    audio_collector = _AudioCollector()
+    audio_segment_count = 0
     while not done.is_set():
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
@@ -203,6 +210,7 @@ async def _receiver(
         if msg_type == "response.start":
             log.turn += 1
             turn_text = []
+            audio_collector = _AudioCollector()
             log.note(f"\n{'=' * 60}\n[{ts}] <<< TURN {log.turn} response.start")
         elif msg_type == "response.text.delta":
             delta = data.get("delta", "")
@@ -224,24 +232,34 @@ async def _receiver(
                 log.note(f"[{ts}] <<< {_summarize_inbound(data)}")
         elif msg_type == "response.audio.done":
             log.note(f"[{ts}] <<< response.audio.done (deltas={audio_collector.delta_count})")
+            if output_wav:
+                audio_segment_count += 1
+                segment_path = _segment_wav_path(output_wav, log.turn, audio_segment_count)
+                saved = audio_collector.save(segment_path)
+                if saved is not None:
+                    log.note(
+                        f"Saved spoken audio to {saved} "
+                        f"({audio_collector.duration_s:.2f}s, {audio_collector.delta_count} delta(s))"
+                    )
+                audio_collector = _AudioCollector()
         elif msg_type == "session.done":
             log.note(f"\n[{ts}] <<< session.done")
             log.note(
                 f"Session summary: {log.turn} turn(s), {log.frames_sent} frame(s) sent, audio_sent={log.audio_sent}"
             )
-            if output_wav:
-                saved = audio_collector.save(output_wav)
+            if output_wav and audio_collector.delta_count:
+                audio_segment_count += 1
+                segment_path = _segment_wav_path(output_wav, log.turn, audio_segment_count)
+                saved = audio_collector.save(segment_path)
                 if saved is not None:
-                    log.note(
-                        f"Saved audio to {saved} "
-                        f"({audio_collector.duration_s:.2f}s, {audio_collector.delta_count} delta(s))"
-                    )
+                    log.note(f"Saved partial spoken audio to {saved}")
             done.set()
             break
         elif msg_type == "error":
             log.note(f"[{ts}] <<< ERROR: {data.get('message')}")
-            if output_wav:
-                saved = audio_collector.save(output_wav)
+            if output_wav and audio_collector.delta_count:
+                audio_segment_count += 1
+                saved = audio_collector.save(_segment_wav_path(output_wav, log.turn, audio_segment_count))
                 if saved is not None:
                     log.note(f"Saved partial audio to {saved}")
             done.set()
@@ -498,6 +516,20 @@ async def _stream_video(
         "enable_frame_filter": not args.no_evs,
         "frame_filter_threshold": args.evs_threshold,
     }
+    tts_config = {
+        "tts_task_type": args.tts_task_type,
+        "tts_language": args.tts_language,
+        "tts_speaker": args.tts_speaker,
+        "tts_ref_audio": args.tts_ref_audio,
+        "tts_ref_text": args.tts_ref_text,
+        "tts_instruct": args.tts_instruct,
+        "tts_max_new_tokens": args.tts_max_new_tokens,
+    }
+    for key, value in tts_config.items():
+        if value is not None:
+            config[key] = value
+    if args.tts_pass_token_ids:
+        config["tts_pass_token_ids"] = True
     if args.max_rounds is not None:
         config["max_rounds"] = args.max_rounds
     if args.num_rounds_keep is not None:
@@ -531,25 +563,17 @@ async def run(args: argparse.Namespace) -> None:
         print(f"Audio schedule: t={item.at_sec}s -> {item.label} ({len(item.pcm)} pcm bytes)")
 
     log = SessionLog()
-    audio_collector = _AudioCollector()
     output_wav = args.output_wav.strip() or None
 
     async with websockets.connect(uri, max_size=32 * 1024 * 1024) as ws:
         done = asyncio.Event()
-        recv_task = asyncio.create_task(_receiver(ws, log, done, audio_collector, output_wav))
+        recv_task = asyncio.create_task(_receiver(ws, log, done, output_wav))
         try:
             print("Connected. Streaming video/audio ...", flush=True)
             await _stream_video(ws, log, args, audio_schedule, done)
             await asyncio.wait_for(done.wait(), timeout=args.recv_timeout)
         except asyncio.TimeoutError:
             log.note(f"Timed out after {args.recv_timeout}s waiting for session.done")
-            if output_wav:
-                saved = audio_collector.save(output_wav)
-                if saved is not None:
-                    log.note(
-                        f"Saved partial audio to {saved} "
-                        f"({audio_collector.duration_s:.2f}s, {audio_collector.delta_count} delta(s))"
-                    )
         finally:
             if not done.is_set():
                 done.set()
@@ -631,10 +655,18 @@ def main() -> None:
     )
     p.add_argument("--no-pruning", action="store_true", help="Disable SessionHistory pruning.")
     p.add_argument("--text-only", action="store_true")
+    p.add_argument("--tts-task-type", help="Qwen3-TTS task type, e.g. Base or CustomVoice")
+    p.add_argument("--tts-language", help="Qwen3-TTS language override")
+    p.add_argument("--tts-speaker", help="CustomVoice speaker name, e.g. Vivian")
+    p.add_argument("--tts-ref-audio", help="Base TTS reference audio path")
+    p.add_argument("--tts-ref-text", help="Base TTS reference transcript")
+    p.add_argument("--tts-instruct", help="VoiceDesign/style instruction text")
+    p.add_argument("--tts-max-new-tokens", type=int, help="Maximum Qwen3-TTS codec tokens per spoken turn")
+    p.add_argument("--tts-pass-token-ids", action="store_true", help="Pass AURA assistant token ids to Qwen3-TTS")
     p.add_argument(
         "--output-wav",
         default="outputs/aura_stream_output.wav",
-        help="Save concatenated TTS audio from response.audio.delta (empty to disable)",
+        help="Base path for per-spoken-turn TTS wav files (empty to disable)",
     )
     p.add_argument("--no-evs", action="store_true")
     p.add_argument("--evs-threshold", type=float, default=0.95)

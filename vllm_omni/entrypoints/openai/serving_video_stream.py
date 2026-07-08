@@ -31,6 +31,7 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import Field
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import (
     CrossTurnPenalty,
@@ -68,6 +69,8 @@ __all__ = [
     "StreamingVideoSessionConfig",
     "create_streaming_video_handler",
 ]
+
+logger = init_logger(__name__)
 
 _AURA_PIPELINE_NAMES = frozenset({"aura_omni"})
 _AURA_ADDITIONAL_INFO_KEY = "_aura_additional_information"
@@ -224,6 +227,7 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
     tts_ref_audio: str | None = Field(default=None, description="Base TTS reference audio path.")
     tts_ref_text: str | None = Field(default=None, description="Base TTS reference transcript.")
     tts_instruct: str | None = Field(default=None, description="VoiceDesign / style instruct text.")
+    tts_max_new_tokens: int | None = Field(default=None, ge=1, description="Max Qwen3-TTS codec tokens per spoken turn.")
     tts_pass_token_ids: bool | None = Field(
         default=None,
         description="Pass AURA assistant token ids directly to Qwen3-TTS.",
@@ -247,6 +251,7 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
             "tts_ref_audio": self.tts_ref_audio,
             "tts_ref_text": self.tts_ref_text,
             "tts_instruct": self.tts_instruct,
+            "tts_max_new_tokens": self.tts_max_new_tokens,
             "tts_pass_token_ids": self.tts_pass_token_ids,
         }
 
@@ -591,6 +596,16 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                             audio_chunks_drained,
                         )
                         if b64:
+                            logger.info(
+                                "[video_stream response.audio.delta] req=%s chunk=%d drained=%d "
+                                "b64_len=%d current_text_len=%d text_done_sent=%s",
+                                request_id,
+                                audio_chunk_count,
+                                audio_chunks_drained,
+                                len(b64),
+                                len("".join(text_parts)),
+                                text_done_sent,
+                            )
                             await websocket.send_json(
                                 {
                                     "type": "response.audio.delta",
@@ -644,6 +659,13 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     pass
 
             if audio_chunk_count > 0:
+                logger.info(
+                    "[video_stream response.audio.done] req=%s audio_chunks=%d drained=%d text_len=%d",
+                    request_id,
+                    audio_chunk_count,
+                    audio_chunks_drained,
+                    len("".join(text_parts)),
+                )
                 await websocket.send_json({"type": "response.audio.done"})
 
             if release_turn_lock is None and not turn_lock_released:
