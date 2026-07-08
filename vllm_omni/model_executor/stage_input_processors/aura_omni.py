@@ -771,6 +771,18 @@ def _estimate_tts_prompt_len_from_token_ids(
     return int(base_len + max(assistant_len, 1))
 
 
+def _aura2tts_empty_finished_payload() -> dict[str, Any]:
+    """Finish-sentinel for silent AURA turns in async_chunk.
+
+    Releases the prewarmed Talker wait gate without running synthesis,
+    matching the empty-finished payload pattern used by Qwen3-TTS stages.
+    """
+    return {
+        "prompt_token_ids": [],
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+
+
 def build_tts_talker_input(
     text: str,
     content_ids: list[int],
@@ -884,7 +896,9 @@ def aura2tts_async_chunk(
     content_ids = _trim_aura_response_token_ids(_ensure_int_list(getattr(request, "output_token_ids", []) or []))
     finished = bool(is_finished or request.is_finished())
     if content_ids and _is_silent_token_prefix(content_ids):
-        return None
+        if not finished:
+            return None
+        return _aura2tts_empty_finished_payload()
 
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     request_payload = getattr(transfer_manager, "request_payload", None)
@@ -917,7 +931,7 @@ def aura2tts_async_chunk(
     if not content_ids:
         return None
     if _is_silent_token_prefix(content_ids):
-        return None
+        return _aura2tts_empty_finished_payload()
 
     cached_tts_metadata = state.get("aura2tts_tts_metadata")
     if isinstance(cached_tts_metadata, dict):
@@ -941,6 +955,8 @@ def aura2tts_async_chunk(
         pass_token_ids,
     )
     if tts_input is None:
+        if is_effectively_silent(request_text) or _is_silent_token_prefix(content_ids):
+            return _aura2tts_empty_finished_payload()
         return None
     payload = dict(tts_input["additional_information"])
     payload["prompt_token_ids"] = list(tts_input["prompt_token_ids"])
