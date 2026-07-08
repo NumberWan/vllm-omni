@@ -1,130 +1,131 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""AURA async_chunk orchestrator hooks (prewarm + silent turn)."""
+
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import janus
 import pytest
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.engine.orchestrator import (
-    Orchestrator,
-    OrchestratorRequestState,
-    _should_skip_stage_submission,
-)
-from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.model_executor.stage_input_processors.stage_bypass import OMNI_SKIP_STAGES_KEY
+from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 from .test_orchestrator import (
     FakeOutputProcessor,
     FakeStageClient,
     _build_harness,
-    _enqueue_add_request,
+    _build_request_output,
     _sampling_params,
     _shutdown_orchestrator,
-    _wait_for,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_should_skip_stage_submission_reads_omni_skip_stages() -> None:
-    original_prompt = {
-        "prompt": "video turn",
-        "additional_information": {OMNI_SKIP_STAGES_KEY: [0]},
-    }
-    prompt = SimpleNamespace(request_id="req-skip", prompt_token_ids=[1, 2, 3])
-    assert _should_skip_stage_submission(prompt, original_prompt, stage_id=0) is True
-    assert _should_skip_stage_submission(prompt, original_prompt, stage_id=1) is False
-
-
 @pytest.mark.asyncio
-async def test_forward_bypassed_stage_zero_skips_asr_submit() -> None:
+async def test_async_chunk_prewarm_uses_empty_prompt_for_qwen3_tts() -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
-    stage1 = FakeStageClient(
+    stage1 = FakeStageClient(stage_type="llm", final_output=False, model_stage="aura")
+    stage2 = FakeStageClient(
+        stage_type="llm",
+        final_output=False,
+        model_stage="qwen3_tts",
+        final_output_type="latent",
+    )
+    stage3 = FakeStageClient(
         stage_type="llm",
         final_output=True,
-        next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
+        final_output_type="audio",
+        model_stage="code2wav",
     )
-    processors = [
-        FakeOutputProcessor(request_outputs=[]),
-        FakeOutputProcessor(request_outputs=[]),
+    processors = [FakeOutputProcessor() for _ in range(4)]
+    stage_vllm_configs = [
+        SimpleNamespace(model_config=SimpleNamespace(max_model_len=64, model_stage=client.model_stage, worker_type="ar"))
+        if client.model_stage != "code2wav"
+        else SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=64, model_stage="code2wav", worker_type="generation")
+        )
+        for client in (stage0, stage1, stage2, stage3)
     ]
-    stage_pools = [
-        StagePool(
-            0,
-            [stage0],
-            output_processor=processors[0],
-            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
-        ),
-        StagePool(
-            1,
-            [stage1],
-            output_processor=processors[1],
-            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
-        ),
-    ]
-    request_q = janus.Queue()
-    output_q = janus.Queue()
-    rpc_q = janus.Queue()
-    orchestrator = Orchestrator(
-        request_async_queue=request_q.async_q,
-        output_async_queue=output_q.async_q,
-        rpc_async_queue=rpc_q,
-        stage_pools=stage_pools,
-        async_chunk=False,
+    fixture = _build_harness(
+        [stage0, stage1, stage2, stage3],
+        output_processors=processors,
+        stage_vllm_configs=stage_vllm_configs,
+        async_chunk=True,
     )
-
-    original_prompt = {
-        "prompt": "video-only",
-        "additional_information": {OMNI_SKIP_STAGES_KEY: [0]},
-    }
+    request = SimpleNamespace(request_id="req-prewarm-tts", prompt_token_ids=[1, 2, 3, 4, 5])
     req_state = OrchestratorRequestState(
-        request_id="req-bypass",
-        prompt=original_prompt,
-        sampling_params_list=[_sampling_params(), _sampling_params()],
-        final_stage_id=1,
+        request_id="req-prewarm-tts",
+        prompt={"prompt": "video-only"},
+        sampling_params_list=[_sampling_params() for _ in range(4)],
+        final_stage_id=3,
     )
-
-    await orchestrator._forward_bypassed_stage_zero("req-bypass", req_state)
-
-    assert len(stage0.add_request_calls) == 0
-    assert len(stage1.add_request_calls) == 1
-    assert stage1.add_request_calls[0][0].request_id == "req-bypass"
-
-
-@pytest.mark.asyncio
-async def test_add_request_bypasses_stage_zero_end_to_end() -> None:
-    stage0 = FakeStageClient(stage_type="llm", final_output=False)
-    stage1 = FakeStageClient(
-        stage_type="llm",
-        final_output=True,
-        next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
-    )
-    processors = [
-        FakeOutputProcessor(request_outputs=[]),
-        FakeOutputProcessor(request_outputs=[]),
-    ]
-    fixture = _build_harness([stage0, stage1], output_processors=processors)
-    request = SimpleNamespace(request_id="req-skip-asr", prompt_token_ids=[1, 2, 3])
+    fixture.orchestrator.request_states["req-prewarm-tts"] = req_state
 
     try:
-        await _enqueue_add_request(
-            fixture,
-            request_id="req-skip-asr",
-            prompt=request,
-            original_prompt={
-                "prompt": "video-only",
-                "additional_information": {OMNI_SKIP_STAGES_KEY: [0]},
-            },
-            sampling_params_list=[_sampling_params(), _sampling_params()],
-            final_stage_id=1,
-        )
+        await fixture.orchestrator._prewarm_async_chunk_stages("req-prewarm-tts", request, req_state)
 
-        await _wait_for(lambda: len(stage1.add_request_calls) == 1, timeout=3.0)
-        assert len(stage0.add_request_calls) == 0
-        assert stage1.add_request_calls[0][0].request_id == "req-skip-asr"
+        assert len(stage2.add_request_calls) == 1
+        talker_request = stage2.add_request_calls[0][0]
+        assert talker_request.prompt_token_ids == []
+        assert len(stage3.add_request_calls) == 1
+        codec_request = stage3.add_request_calls[0][0]
+        assert codec_request.prompt_token_ids == []
+    finally:
+        await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_silent_aura_turn_emits_terminal_empty_audio() -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="text", model_stage="aura")
+    stage2 = FakeStageClient(stage_type="llm", final_output=False, model_stage="qwen3_tts")
+    stage3 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio", model_stage="code2wav")
+    processors = [FakeOutputProcessor() for _ in range(4)]
+    stage_vllm_configs = [
+        SimpleNamespace(model_config=SimpleNamespace(max_model_len=64, model_stage=client.model_stage, worker_type="ar"))
+        if client.model_stage != "code2wav"
+        else SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=64, model_stage="code2wav", worker_type="generation")
+        )
+        for client in (stage0, stage1, stage2, stage3)
+    ]
+    fixture = _build_harness(
+        [stage0, stage1, stage2, stage3],
+        output_processors=processors,
+        stage_vllm_configs=stage_vllm_configs,
+        async_chunk=True,
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-silent",
+        prompt={"prompt": "video-only"},
+        sampling_params_list=[_sampling_params() for _ in range(4)],
+        final_stage_id=3,
+        final_output_stage_ids={1, 3},
+    )
+    fixture.orchestrator.request_states["req-silent"] = req_state
+    silent_output = _build_request_output("req-silent", text="<|silent|>", finished=True)
+
+    try:
+        await fixture.orchestrator._route_output(1, 0, silent_output, req_state, stage_metrics=None)
+
+        output_messages = []
+        while True:
+            try:
+                output_messages.append(fixture.output_sync_q.get_nowait())
+            except janus.SyncQueueEmpty:
+                break
+
+        assert len(output_messages) == 2
+        assert output_messages[0].stage_id == 1
+        assert output_messages[0].finished is False
+        assert output_messages[1].stage_id == 3
+        assert output_messages[1].finished is True
+        assert output_messages[1].engine_outputs.outputs[0].multimodal_output is not None
+        assert "req-silent" not in fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(fixture)
