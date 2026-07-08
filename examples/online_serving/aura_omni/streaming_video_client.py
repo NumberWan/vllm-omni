@@ -10,6 +10,7 @@ Usage:
     python streaming_video_client.py --synthetic-frames 8
     python streaming_video_client.py --video clip.mp4 --audio mic.pcm
     python streaming_video_client.py --text-only
+    python streaming_video_client.py --video clip.mp4 --output-wav outputs/my_session.wav
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ import io
 import json
 import sys
 import wave
+from dataclasses import dataclass, field
+from pathlib import Path
 
 try:
     import websockets
@@ -29,6 +32,48 @@ except ImportError:
     sys.exit(1)
 
 from PIL import Image
+
+
+@dataclass
+class _AudioCollector:
+    pcm_buffer: bytearray = field(default_factory=bytearray)
+    sample_rate: int = 24000
+    channels: int = 1
+    sample_width: int = 2
+    delta_count: int = 0
+
+    def append_wav_b64(self, wav_b64: str) -> int:
+        if not wav_b64:
+            return 0
+        with wave.open(io.BytesIO(base64.b64decode(wav_b64)), "rb") as wf:
+            sample_rate = wf.getframerate()
+            channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            pcm = wf.readframes(wf.getnframes())
+        if not self.pcm_buffer:
+            self.sample_rate, self.channels, self.sample_width = sample_rate, channels, sample_width
+        self.pcm_buffer.extend(pcm)
+        self.delta_count += 1
+        return len(pcm)
+
+    @property
+    def duration_s(self) -> float:
+        frame_width = self.channels * self.sample_width
+        if frame_width <= 0 or self.sample_rate <= 0:
+            return 0.0
+        return (len(self.pcm_buffer) // frame_width) / self.sample_rate
+
+    def save(self, path: str | Path) -> Path | None:
+        if not self.pcm_buffer:
+            return None
+        out_path = Path(path).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(out_path), "wb") as wf:
+            wf.setnchannels(self.channels)
+            wf.setsampwidth(self.sample_width)
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(bytes(self.pcm_buffer))
+        return out_path
 
 
 def _generate_synthetic_frame(index: int, width: int = 320, height: int = 240) -> bytes:
@@ -70,23 +115,20 @@ def _load_video_frames(path: str, max_frames: int = 64, fps: int = 2) -> list[by
     return frames
 
 
-def _pcm_from_wav_bytes(wav_bytes: bytes) -> tuple[bytes, int]:
-    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-        sample_rate = wf.getframerate()
-        pcm = wf.readframes(wf.getnframes())
-    return pcm, sample_rate
-
-
-def _write_wav_pcm16(path: str, pcm: bytes, sample_rate: int) -> None:
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm)
+def _save_collected_audio(collector: _AudioCollector, output_wav: str | None) -> None:
+    if not output_wav:
+        return
+    saved = collector.save(output_wav)
+    if saved is not None:
+        print(
+            f"Saved audio to {saved} "
+            f"({collector.duration_s:.2f}s, {collector.delta_count} delta(s))"
+        )
 
 
 async def run(args: argparse.Namespace) -> None:
     uri = args.url or f"ws://{args.host}:{args.port}/v1/video/chat/stream"
+    output_wav = args.output_wav.strip() or None
 
     if args.video:
         frames = _load_video_frames(args.video, max_frames=args.max_frames, fps=args.fps)
@@ -155,9 +197,7 @@ async def run(args: argparse.Namespace) -> None:
         await ws.send(json.dumps({"type": "video.done"}))
 
         recv_timeout = 120
-        audio_pcm_parts: list[bytes] = []
-        audio_sample_rate = 24000
-        audio_delta_count = 0
+        audio_collector = _AudioCollector()
         while True:
             raw = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
             data = json.loads(raw)
@@ -172,26 +212,24 @@ async def run(args: argparse.Namespace) -> None:
                 else:
                     print()
             elif msg_type == "response.audio.delta":
-                audio_delta_count += 1
                 wav_b64 = data.get("data", "")
                 if wav_b64:
-                    pcm, sr = _pcm_from_wav_bytes(base64.b64decode(wav_b64))
-                    audio_pcm_parts.append(pcm)
-                    audio_sample_rate = sr
-                    print(f"[audio.delta #{audio_delta_count}] {len(pcm)} pcm bytes @ {sr} Hz")
+                    pcm_len = audio_collector.append_wav_b64(wav_b64)
+                    print(
+                        f"[audio.delta #{audio_collector.delta_count}] "
+                        f"{pcm_len} pcm bytes @ {audio_collector.sample_rate} Hz"
+                    )
             elif msg_type == "response.audio.done":
-                print(f"[audio.done] received {audio_delta_count} delta(s)")
-                if audio_pcm_parts and args.output_wav:
-                    all_pcm = b"".join(audio_pcm_parts)
-                    _write_wav_pcm16(args.output_wav, all_pcm, audio_sample_rate)
-                    print(f"Saved audio to {args.output_wav}")
+                print(f"[audio.done] received {audio_collector.delta_count} delta(s)")
             elif msg_type == "response.start":
                 print("\n[response.start]")
             elif msg_type == "session.done":
                 print("Session complete.")
+                _save_collected_audio(audio_collector, output_wav)
                 break
             elif msg_type == "error":
                 print(f"\nError: {data.get('message')}")
+                _save_collected_audio(audio_collector, output_wav)
                 break
 
 
@@ -211,7 +249,11 @@ def main() -> None:
     parser.add_argument("--fps", type=int, default=2)
     parser.add_argument("--frame-interval-ms", type=int, default=100)
     parser.add_argument("--text-only", action="store_true", help="Request text-only modalities")
-    parser.add_argument("--output-wav", default="aura_stream_output.wav", help="Save concatenated TTS audio")
+    parser.add_argument(
+        "--output-wav",
+        default="outputs/aura_stream_output.wav",
+        help="Save concatenated TTS audio at session end (empty string to disable)",
+    )
     parser.add_argument("--cross-turn-penalty", type=float, default=0.0)
     parser.add_argument("--cross-turn-lookback", type=int, default=2)
     parser.add_argument("--no-evs", dest="evs", action="store_false")
