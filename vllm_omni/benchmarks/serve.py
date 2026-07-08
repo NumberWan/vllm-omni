@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+from pathlib import Path
 from typing import Any
 
 from vllm.benchmarks.serve import main_async
@@ -28,4 +29,21 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         getattr(args, "extra_body", None),
         enabled=should_request_stage_metrics(args),
     )
-    return asyncio.run(main_async(args))
+    result = asyncio.run(main_async(args))
+    if (
+        isinstance(result, dict)
+        and getattr(args, "save_result", False)
+        and getattr(args, "dataset_name", None) == "omniinteract"
+        and os.environ.get("OMNIINTERACT_WRITE_BENCH_REPORT", "1").lower() not in ("0", "false", "no")
+    ):
+        from vllm_omni.benchmarks.format_bench_report import write_bench_reports
+
+        result_dir = Path(getattr(args, "result_dir", ".") or ".")
+        json_name = getattr(args, "result_filename", None) or "bench_result.json"
+        report_path = write_bench_reports(
+            result,
+            result_dir=result_dir,
+            json_path=result_dir / json_name,
+        )
+        print(f"Wrote OmniInteract bench report: {report_path}")
+    return result
