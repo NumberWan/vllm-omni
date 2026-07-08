@@ -249,7 +249,9 @@ def print_text_metrics(task_type, selected_percentile_metrics, metrics: MultiMod
 
 def _has_audio_output(metrics: MultiModalsBenchmarkMetrics) -> bool:
     return bool(
-        getattr(metrics, defs.TOTAL_AUDIO_DURATION_S, 0.0) > 0 or getattr(metrics, defs.TOTAL_AUDIO_FRAMES, 0) > 0
+        getattr(metrics, defs.TOTAL_AUDIO_DURATION_S, 0.0) > 0
+        or getattr(metrics, defs.TOTAL_AUDIO_FRAMES, 0) > 0
+        or getattr(metrics, defs.MEAN_AUDIO_TTFP_MS, 0.0) > 0
     )
 
 

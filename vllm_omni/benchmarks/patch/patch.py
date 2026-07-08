@@ -6,6 +6,7 @@ import mimetypes
 import os
 import random
 import ssl
+import subprocess
 import sys
 import time
 import traceback
@@ -36,9 +37,8 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
-logger = init_logger(__name__)
-
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import is_effectively_silent
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     OmniInteractDataset,
@@ -54,7 +54,13 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
+from vllm_omni.benchmarks.streaming_metrics_delta import (
+    _delta_cumulative_audio_done_metrics,
+    _delta_cumulative_text_done_metrics,
+)
 from vllm_omni.metrics import definitions as defs
+
+logger = init_logger(__name__)
 
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
@@ -115,10 +121,47 @@ def _audio_continuity_threshold_s() -> float:
     return max(value, 0.0)
 
 
+def _pcm_s16le_to_seed_tts_wer_bytes(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> bytes:
+    """Normalize streamed raw PCM to the 24 kHz mono PCM used by Seed-TTS WER."""
+    if not pcm_bytes:
+        return b""
+    channels = max(1, int(channels))
+    pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if channels > 1:
+        usable = (pcm.size // channels) * channels
+        pcm = pcm[:usable].reshape(-1, channels).mean(axis=1)
+    pcm_f32 = pcm.astype(np.float32) / 32767.0
+    if int(sample_rate) != 24000 and pcm_f32.size:
+        from vllm.multimodal.audio import AudioResampler
+
+        resampler = AudioResampler(target_sr=24000)
+        pcm_f32 = resampler.resample(pcm_f32, orig_sr=int(sample_rate))
+    pcm_f32 = np.clip(pcm_f32, -1.0, 1.0)
+    return (pcm_f32 * 32767).astype(np.int16).tobytes()
+
+
 get_samples_old = datasets.get_samples
 
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
 _DEFAULT_OMNIINTERACT_REPO = "lucky-lance/OmniInteract"
+
+
+def _parse_csv_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def _resolve_streaming_extract_max_frames(max_frames_value: Any) -> int:
+    """Frames to extract client-side. 0 = full video (no cap)."""
+    if max_frames_value is None:
+        return 0
+    return max(0, int(max_frames_value))
 
 
 def _seed_tts_capture_pcm_for_wer() -> bool:
@@ -193,6 +236,17 @@ def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: Reque
     rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
     if sample.omni_chat_messages is not None:
         setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
+    if sample.omniinteract_streaming_video_path:
+        setattr(rfi, "omniinteract_streaming_video_path", sample.omniinteract_streaming_video_path)
+    if sample.omniinteract_streaming_audio_path:
+        setattr(rfi, "omniinteract_streaming_audio_path", sample.omniinteract_streaming_audio_path)
+    if sample.omniinteract_streaming_audio_schedule is not None:
+        setattr(rfi, "omniinteract_streaming_audio_schedule", sample.omniinteract_streaming_audio_schedule)
+    setattr(rfi, "omniinteract_streaming_audio_from_video", sample.omniinteract_streaming_audio_from_video)
+    if sample.omniinteract_streaming_slots is not None:
+        setattr(rfi, "omniinteract_streaming_slots", sample.omniinteract_streaming_slots)
+    if sample.omniinteract_streaming_config is not None:
+        setattr(rfi, "omniinteract_streaming_config", sample.omniinteract_streaming_config)
 #         audio_urls, video_urls = _omniinteract_media_urls(sample.omni_chat_messages)
 #         logger.info(
 #             "OmniInteract request media: request_id=%s video=%s audio=%s",
@@ -280,7 +334,7 @@ def get_samples(args, tokenizer):
     )
 
     # Check if we need to handle omni-related backends/datasets
-    is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni"]
+    is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni", "openai-video-stream"]
     is_omni_dataset = is_daily_omni or is_omniinteract or is_seed_tts or args.dataset_name == "random-mm"
 
     if not is_omni_backend and not is_omni_dataset:
@@ -421,10 +475,10 @@ def get_samples(args, tokenizer):
         )
 
     if is_omniinteract:
-        if args.backend not in ["openai-chat-omni", "daily-omni"]:
+        if args.backend not in ["openai-chat-omni", "daily-omni", "openai-video-stream"]:
             raise ValueError(
                 "OmniInteract requires a multimodal backend that supports video/audio. "
-                f"Got backend={args.backend!r}; use --backend openai-chat-omni."
+                f"Got backend={args.backend!r}; use --backend openai-chat-omni or openai-video-stream."
             )
 
         dataset_path = getattr(args, "dataset_path", None) or getattr(args, "hf_name", None)
@@ -461,7 +515,19 @@ def get_samples(args, tokenizer):
             aura_tts_speaker=getattr(args, "omniinteract_aura_tts_speaker", None),
             aura_tts_ref_audio=getattr(args, "omniinteract_aura_tts_ref_audio", None),
             aura_tts_ref_text=getattr(args, "omniinteract_aura_tts_ref_text", None),
-            disable_shuffle=getattr(args, "disable_shuffle", False),
+            streaming_sample_fps=getattr(args, "omniinteract_streaming_sample_fps", 2.0),
+            streaming_send_fps=getattr(args, "omniinteract_streaming_send_fps", 2.0),
+            streaming_max_frames=getattr(args, "omniinteract_streaming_max_frames", 0),
+            streaming_auto_trigger_min_frames=getattr(args, "omniinteract_streaming_auto_trigger_min_frames", 2),
+            streaming_enable_frame_filter=getattr(args, "omniinteract_streaming_enable_frame_filter", False),
+            streaming_cross_turn_penalty=getattr(args, "omniinteract_cross_turn_penalty", 0.0),
+            streaming_cross_turn_lookback=getattr(args, "omniinteract_cross_turn_lookback", 2),
+            streaming_video_ids=_parse_csv_list(getattr(args, "omniinteract_video_ids", None)),
+            streaming_aura_system_prompt_mode=getattr(
+                args, "omniinteract_streaming_system_prompt_mode", "native"
+            ),
+            disable_shuffle=getattr(args, "disable_shuffle", False)
+            or bool(_parse_csv_list(getattr(args, "omniinteract_video_ids", None))),
         )
         out_len = getattr(args, "output_len", None)
         if out_len is None:
@@ -776,6 +842,570 @@ def _decode_audio_bytes_for_benchmark(audio_bytes: bytes, response_format: str) 
     except Exception as ex:
         logger.warning("Failed to decode accumulated audio bytes: %s", ex)
         return 0.0, 0
+
+
+def _api_url_to_ws_url(api_url: str) -> str:
+    if api_url.startswith("https://"):
+        return "wss://" + api_url[len("https://") :]
+    if api_url.startswith("http://"):
+        return "ws://" + api_url[len("http://") :]
+    return api_url
+
+
+def _load_pcm16_16k_mono(path: str) -> bytes:
+    """Load WAV/raw PCM as 16 kHz mono int16 bytes for ``audio.chunk``."""
+
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw[:4] != b"RIFF":
+        return raw
+
+    import soundfile as sf
+
+    audio, sr = sf.read(path, dtype="float32", always_2d=True)
+    if audio.shape[1] > 1:
+        audio = audio.mean(axis=1)
+    else:
+        audio = audio[:, 0]
+    if sr != 16000 and len(audio) > 0:
+        n_out = int(round(len(audio) * 16000 / sr))
+        if n_out > 0:
+            old_x = np.arange(len(audio), dtype=np.float64)
+            new_x = np.linspace(0, len(audio) - 1, n_out)
+            audio = np.interp(new_x, old_x, audio).astype(np.float32)
+    return (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+
+
+def _load_video_audio_pcm16_16k_mono(path: str) -> bytes:
+    """Extract a video's audio track as 16 kHz mono int16 PCM bytes."""
+
+    cmd = [
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-i",
+        path,
+        "-vn",
+        "-f",
+        "s16le",
+        "-acodec",
+        "pcm_s16le",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-",
+    ]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("openai-video-stream benchmark requires ffmpeg for MP4 audio extraction.") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
+        raise RuntimeError(f"Failed to extract audio from video with ffmpeg: {stderr}") from exc
+    return result.stdout
+
+
+def _pcm_schedule_from_video_audio(path: str, *, chunk_duration_s: float = 0.1) -> list[dict[str, Any]]:
+    pcm = _load_video_audio_pcm16_16k_mono(path)
+    bytes_per_second = 16000 * 2
+    chunk_size = max(2, int(round(bytes_per_second * chunk_duration_s)))
+    if chunk_size % 2:
+        chunk_size += 1
+    return [
+        {
+            "at_sec": offset / bytes_per_second,
+            "pcm": pcm[offset : offset + chunk_size],
+            "sent": False,
+            "source": "video_audio",
+            "audio_path": path,
+        }
+        for offset in range(0, len(pcm), chunk_size)
+        if pcm[offset : offset + chunk_size]
+    ]
+
+
+def _load_video_jpeg_frames(path: str, *, sample_fps: float, max_frames: int) -> list[tuple[float, bytes]]:
+    """Extract ``(source_time_sec, jpeg_bytes)`` frames from a local video file."""
+
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("openai-video-stream benchmark requires opencv-python to read MP4 files.") from exc
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video for streaming benchmark: {path}")
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    step = max(1, int(round(src_fps / max(float(sample_fps), 0.1))))
+    frames: list[tuple[float, bytes]] = []
+    idx = 0
+    try:
+        while max_frames <= 0 or len(frames) < max_frames:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % step == 0:
+                encoded, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if encoded:
+                    frames.append((float(idx) / float(src_fps), buf.tobytes()))
+            idx += 1
+    finally:
+        cap.release()
+    if not frames:
+        raise RuntimeError(f"No frames extracted from video: {path}")
+    return frames
+
+
+def _video_time_from_wall(
+    *,
+    now: float,
+    start_wall: float,
+    send_fps: float,
+    sample_fps: float,
+) -> float:
+    elapsed = max(now - start_wall, 0.0)
+    if send_fps > 0:
+        return elapsed * (sample_fps / send_fps)
+    return elapsed
+
+
+def _omniinteract_save_output_wav_enabled() -> bool:
+    return os.environ.get("OMNIINTERACT_SAVE_OUTPUT_WAV", "").lower() in ("1", "true", "yes")
+
+
+def _save_omniinteract_streaming_output_wav(
+    *,
+    video_path: str,
+    pcm_bytes: bytes,
+    channels: int,
+    sample_width: int,
+    frame_rate: int,
+) -> Path | None:
+    """Optional bench-only artefact: ``videos/<id>/output.wav`` under result dir."""
+    if not _omniinteract_save_output_wav_enabled() or not pcm_bytes:
+        return None
+    root = Path(os.environ.get("OMNIINTERACT_BENCH_OUTPUT_DIR", "omniinteract_bench")).expanduser()
+    video_id = Path(video_path).stem or "unknown"
+    out_dir = root / "videos" / video_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "output.wav"
+    with wave.open(str(out_path), "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(frame_rate)
+        wf.writeframes(pcm_bytes)
+    logger.info(
+        "Saved OmniInteract streaming output wav: %s (%d pcm bytes, %d Hz)",
+        out_path,
+        len(pcm_bytes),
+        frame_rate,
+    )
+    return out_path
+
+
+def _merge_turn_metrics(dest_metrics: dict[str, Any], src_metrics: dict[str, Any]) -> None:
+    """Merge TTS/audio metrics from ``response.audio.done`` into a turn record."""
+    if not src_metrics:
+        return
+    for key in ("e2el_ms", "ttft_ms", "audio_duration_s", "audio_frames", "audio_ttfp_ms", "audio_rtf"):
+        if src_metrics.get(key) is not None:
+            dest_metrics[key] = src_metrics[key]
+    dest_sm = dest_metrics.get("stage_metrics")
+    if not isinstance(dest_sm, dict):
+        dest_sm = {}
+        dest_metrics["stage_metrics"] = dest_sm
+    src_sm = src_metrics.get("stage_metrics")
+    if not isinstance(src_sm, dict):
+        return
+    for sid, stage in src_sm.items():
+        if not isinstance(stage, dict):
+            continue
+        key = str(sid)
+        if key in dest_sm and isinstance(dest_sm[key], dict):
+            dest_sm[key].update(stage)
+        else:
+            dest_sm[key] = dict(stage)
+
+
+def _normalize_streaming_chunks(responses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    for idx, response in enumerate(responses):
+        text = str(response.get("text") or "").strip()
+        if not text and not response.get("metrics"):
+            continue
+        silent = is_effectively_silent(text) if text else True
+        start = float(response.get("start", 0.0) or 0.0)
+        end = float(response.get("end", start) or start)
+        if end < start:
+            start, end = end, start
+        chunks.append(
+            {
+                "timestamp": [start, end],
+                "text": text or "<|silent|>",
+                "is_silent": silent,
+                "response_index": idx,
+                "chunk_id": idx,
+                "e2el_ms": response.get("e2el_ms"),
+                "wall_e2el_ms": response.get("wall_e2el_ms"),
+                "metrics": response.get("metrics"),
+            }
+        )
+    return chunks
+
+
+async def async_request_openai_video_stream(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    """Benchmark AURA ``/v1/video/chat/stream`` WebSocket input."""
+
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.itl = []
+    output.stage_metrics = {}
+    output.output_tokens = 0
+    output.generated_text = ""
+
+    video_path = getattr(request_func_input, "omniinteract_streaming_video_path", "")
+    legacy_audio_path = getattr(request_func_input, "omniinteract_streaming_audio_path", "")
+    audio_schedule = list(getattr(request_func_input, "omniinteract_streaming_audio_schedule", None) or [])
+    audio_from_video = bool(getattr(request_func_input, "omniinteract_streaming_audio_from_video", False))
+    streaming_slots = list(getattr(request_func_input, "omniinteract_streaming_slots", None) or [])
+    config = dict(getattr(request_func_input, "omniinteract_streaming_config", None) or {})
+    if legacy_audio_path and not audio_schedule:
+        audio_schedule = [{"at_sec": 0.0, "audio_path": legacy_audio_path}]
+    if not video_path or (not audio_schedule and not audio_from_video) or not config:
+        output.success = False
+        output.error = "openai-video-stream requires OmniInteract aura_streaming samples."
+        if pbar:
+            pbar.update(1)
+        return output
+
+    try:
+        max_frames = _resolve_streaming_extract_max_frames(config.get("max_frames", 0))
+        sample_fps = float(config.get("video_fps") or 2.0)
+        send_fps = float(config.pop("send_fps", 0.0) or 0.0)
+        frames = _load_video_jpeg_frames(video_path, sample_fps=sample_fps, max_frames=max_frames)
+        if audio_from_video:
+            scheduled_audio = _pcm_schedule_from_video_audio(video_path)
+        else:
+            scheduled_audio = [
+                {
+                    **item,
+                    "at_sec": float(item.get("at_sec", 0.0) or 0.0),
+                    "pcm": _load_pcm16_16k_mono(str(item.get("audio_path") or "")),
+                    "sent": False,
+                }
+                for item in sorted(audio_schedule, key=lambda x: float(x.get("at_sec", 0.0) or 0.0))
+            ]
+        audio_budget = 3_500_000
+        budgeted_audio: list[dict[str, Any]] = []
+        total_audio_bytes = 0
+        for item in scheduled_audio:
+            pcm = item.get("pcm", b"")
+            if total_audio_bytes + len(pcm) > audio_budget:
+                logger.warning(
+                    "OmniInteract streaming audio truncated before overflow: video=%s kept_audio=%d/%d bytes",
+                    video_path,
+                    total_audio_bytes,
+                    sum(len(x.get("pcm", b"")) for x in scheduled_audio),
+                )
+                break
+            total_audio_bytes += len(pcm)
+            budgeted_audio.append(item)
+        scheduled_audio = budgeted_audio
+    except Exception:
+        frames_for_log = locals().get("frames", [])
+        audio_for_log = locals().get("scheduled_audio", [])
+        logger.exception(
+            "OmniInteract streaming request failed: video=%s frames=%d audio_items=%d audio_bytes=%d",
+            video_path,
+            len(frames_for_log),
+            len(audio_for_log),
+            sum(len(item.get("pcm", b"")) for item in audio_for_log),
+        )
+        output.success = False
+        output.error = traceback.format_exc()
+        if pbar:
+            pbar.update(1)
+        return output
+
+    model_name = request_func_input.model_name if request_func_input.model_name else request_func_input.model
+    config["type"] = "session.config"
+    config["model"] = model_name
+    if _PRINT_STAGE:
+        config[RETURN_STAGE_METRICS_FIELD] = True
+    trigger = int(config.get("auto_trigger_min_frames") or 0)
+    if trigger <= 0:
+        trigger = len(frames)
+    config["auto_trigger_min_frames"] = max(1, min(trigger, len(frames)))
+    # StreamingVideoSessionConfig.max_frames is capped at 256 (rolling frame buffer).
+    # max_frames=0 in bench config means "extract full video client-side", not unlimited server buffer.
+    _SERVER_MAX_FRAMES = 256
+    session_max = int(config.get("max_frames") or 0)
+    if session_max <= 0:
+        config["max_frames"] = min(len(frames), _SERVER_MAX_FRAMES)
+    else:
+        config["max_frames"] = min(session_max, len(frames), _SERVER_MAX_FRAMES)
+    per_round = int(config.get("max_frames_per_round") or 16)
+    config["max_frames_per_round"] = max(2, min(per_round, len(frames)))
+    logger.info(
+        "OmniInteract streaming request: video=%s frames=%d sample_fps=%.2f send_fps=%.2f audio_items=%d audio_bytes=%d config=%s",
+        video_path,
+        len(frames),
+        sample_fps,
+        send_fps,
+        len(scheduled_audio),
+        sum(len(item.get("pcm", b"")) for item in scheduled_audio),
+        {k: v for k, v in config.items() if k != "sampling_params_list"},
+    )
+
+    ws_url = _api_url_to_ws_url(request_func_input.api_url)
+    wav_pcm_buffer = bytearray()
+    wav_audio_params: tuple[int, int, int] | None = None
+    generated_parts: list[str] = []
+    responses: list[dict[str, Any]] = []
+    current_response: dict[str, Any] | None = None
+    turn_wall_start: float | None = None
+    previous_cumulative_metrics: dict[str, Any] | None = None
+    st = time.perf_counter()
+    timestamp = st
+    output.start_time = st
+    audio_generate_time = 0.0
+    try:
+        async with session.ws_connect(ws_url, max_msg_size=32 * 1024 * 1024) as ws:
+            await ws.send_str(json.dumps(config))
+
+            chunk_size = 16000 * 2
+            frame_interval_s = (1.0 / send_fps) if send_fps > 0 else 0.0
+            stream_wall_start = time.perf_counter()
+            stop_sending = asyncio.Event()
+            session_finished = asyncio.Event()
+
+            def _current_video_time() -> float:
+                return _video_time_from_wall(
+                    now=time.perf_counter(),
+                    start_wall=stream_wall_start,
+                    send_fps=send_fps,
+                    sample_fps=sample_fps,
+                )
+
+            async def _handle_server_payload(data: dict[str, Any]) -> None:
+                nonlocal timestamp, current_response, audio_generate_time, wav_audio_params, turn_wall_start
+                nonlocal previous_cumulative_metrics
+                timestamp = time.perf_counter()
+                video_time = _current_video_time()
+                _update_output_stage_metrics_from_payload(output, data)
+                msg_type = data.get("type")
+                if msg_type == "response.start":
+                    turn_wall_start = timestamp
+                    current_response = {"start": video_time, "end": video_time, "text_parts": []}
+                elif msg_type == "response.text.delta":
+                    delta = data.get("delta") or ""
+                    if delta:
+                        if output.ttft == 0.0:
+                            output.ttft = timestamp - st
+                        else:
+                            output.itl.append(max(timestamp - (st + output.text_latency), 0.0))
+                        generated_parts.append(delta)
+                        if current_response is None:
+                            current_response = {"start": video_time, "end": video_time, "text_parts": []}
+                        current_response.setdefault("text_parts", []).append(delta)
+                        current_response["end"] = video_time
+                        output.text_latency = timestamp - st
+                elif msg_type == "response.text.done":
+                    response_parts = []
+                    if current_response is not None:
+                        response_parts = list(current_response.get("text_parts", []) or [])
+                    text = data.get("text") or "".join(response_parts) or "".join(generated_parts)
+                    if text and not generated_parts:
+                        output.ttft = output.ttft or (timestamp - st)
+                        output.text_latency = timestamp - st
+                    output.generated_text = text
+                    if current_response is None:
+                        current_response = {"start": video_time, "end": video_time, "text_parts": []}
+                    current_response["text"] = text
+                    current_response["end"] = video_time
+                    if turn_wall_start is not None:
+                        current_response["wall_e2el_ms"] = (timestamp - turn_wall_start) * 1000.0
+                    metrics = data.get("metrics")
+                    if isinstance(metrics, dict):
+                        turn_metrics = _delta_cumulative_text_done_metrics(metrics, previous_cumulative_metrics)
+                        if turn_metrics is not None:
+                            current_response["metrics"] = turn_metrics
+                            if turn_metrics.get("e2el_ms") is not None:
+                                current_response["e2el_ms"] = float(turn_metrics["e2el_ms"])
+                        previous_cumulative_metrics = metrics
+                    responses.append(current_response)
+                    current_response = None
+                    turn_wall_start = None
+                elif msg_type == "response.audio.done":
+                    metrics = data.get("metrics")
+                    if isinstance(metrics, dict) and responses:
+                        audio_metrics = _delta_cumulative_audio_done_metrics(metrics, previous_cumulative_metrics)
+                        if audio_metrics is not None:
+                            last = responses[-1]
+                            existing = last.get("metrics")
+                            if isinstance(existing, dict):
+                                _merge_turn_metrics(existing, audio_metrics)
+                            else:
+                                last["metrics"] = dict(audio_metrics)
+                            if audio_metrics.get("e2el_ms") is not None:
+                                last["e2el_ms"] = float(audio_metrics["e2el_ms"])
+                        previous_cumulative_metrics = metrics
+                elif msg_type == "response.audio.delta":
+                    if output.audio_ttfp == 0.0:
+                        output.audio_ttfp = timestamp - st
+                    audio_generate_time = timestamp - st
+                    audio_b64 = data.get("data") or ""
+                    if audio_b64:
+                        audio_bytes = base64.b64decode(audio_b64)
+                        try:
+                            with wave.open(io.BytesIO(audio_bytes), "rb") as wav_reader:
+                                params = (
+                                    wav_reader.getnchannels(),
+                                    wav_reader.getsampwidth(),
+                                    wav_reader.getframerate(),
+                                )
+                                if wav_audio_params is None:
+                                    wav_audio_params = params
+                                if wav_audio_params == params:
+                                    wav_pcm_buffer.extend(wav_reader.readframes(wav_reader.getnframes()))
+                        except Exception as ex:
+                            logger.warning("Failed to parse streaming video wav chunk: %s", ex)
+                elif msg_type == "error":
+                    output.success = False
+                    output.error = data.get("message") or "streaming video request failed"
+                    stop_sending.set()
+                    session_finished.set()
+                elif msg_type == "session.done":
+                    if current_response is not None:
+                        current_response["text"] = "".join(current_response.get("text_parts", []) or [])
+                        current_response["end"] = video_time
+                        responses.append(current_response)
+                        current_response = None
+                    output.success = True
+                    session_finished.set()
+
+            async def _receiver() -> None:
+                try:
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.ERROR:
+                            raise RuntimeError(f"WebSocket error: {ws.exception()}")
+                        if msg.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
+                            continue
+                        data = json.loads(msg.data.decode("utf-8") if isinstance(msg.data, bytes) else msg.data)
+                        await _handle_server_payload(data)
+                        if session_finished.is_set():
+                            break
+                finally:
+                    session_finished.set()
+
+            async def _sender() -> None:
+                for source_time, frame in frames:
+                    if stop_sending.is_set():
+                        return
+                    for item in scheduled_audio:
+                        if item["sent"] or float(item["at_sec"]) > source_time:
+                            continue
+                        pcm = item["pcm"]
+                        for offset in range(0, len(pcm), chunk_size):
+                            if stop_sending.is_set():
+                                return
+                            await ws.send_str(
+                                json.dumps(
+                                    {
+                                        "type": "audio.chunk",
+                                        "data": base64.b64encode(pcm[offset : offset + chunk_size]).decode("ascii"),
+                                    }
+                                )
+                            )
+                        item["sent"] = True
+                    await ws.send_str(
+                        json.dumps(
+                            {
+                                "type": "video.frame",
+                                "data": base64.b64encode(frame).decode("ascii"),
+                            }
+                        )
+                    )
+                    if frame_interval_s > 0:
+                        await asyncio.sleep(frame_interval_s)
+                if not stop_sending.is_set():
+                    await ws.send_str(json.dumps({"type": "video.done"}))
+
+            receiver_task = asyncio.create_task(_receiver())
+            try:
+                await _sender()
+                await receiver_task
+            except Exception:
+                stop_sending.set()
+                receiver_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await receiver_task
+                raise
+
+        output.latency = timestamp - st
+        streaming_chunks = _normalize_streaming_chunks(responses)
+        response_texts = [str(chunk.get("text") or "") for chunk in streaming_chunks if str(chunk.get("text") or "")]
+        output.generated_text = "\n".join(response_texts) if response_texts else "".join(generated_parts)
+        setattr(output, "omniinteract_streaming_chunks", streaming_chunks)
+        setattr(output, "omniinteract_streaming_slots", streaming_slots)
+        setattr(
+            output,
+            "omniinteract_streaming_model_json",
+            {
+                "chunks": streaming_chunks,
+                "responses": responses,
+                "meta": {
+                    "video_path": video_path,
+                    "sample_fps": sample_fps,
+                    "send_fps": send_fps,
+                    "audio_from_video": audio_from_video,
+                    "audio_schedule": (
+                        [
+                            {
+                                "source": "video_audio",
+                                "audio_path": video_path,
+                                "num_chunks": len(scheduled_audio),
+                                "chunk_duration_s": 0.1,
+                            }
+                        ]
+                        if audio_from_video
+                        else [
+                            {k: v for k, v in item.items() if k not in {"pcm", "sent"}}
+                            for item in scheduled_audio
+                        ]
+                    ),
+                },
+            },
+        )
+        if wav_pcm_buffer and wav_audio_params is not None:
+            channels, sample_width, frame_rate = wav_audio_params
+            frame_width = channels * sample_width
+            audio_frames = len(wav_pcm_buffer) // frame_width if frame_width > 0 else 0
+            output.audio_frames = audio_frames
+            output.audio_duration = audio_frames / frame_rate if frame_rate > 0 else 0.0
+            output.audio_rtf = audio_generate_time / output.audio_duration if output.audio_duration > 0 else 0.0
+            saved_wav = _save_omniinteract_streaming_output_wav(
+                video_path=video_path,
+                pcm_bytes=bytes(wav_pcm_buffer),
+                channels=channels,
+                sample_width=sample_width,
+                frame_rate=frame_rate,
+            )
+            if saved_wav is not None:
+                setattr(output, "omniinteract_output_wav_path", str(saved_wav))
+    except Exception:
+        logger.exception("OmniInteract streaming request failed during websocket exchange: video=%s", video_path)
+        output.success = False
+        output.error = traceback.format_exc()
+
+    if pbar:
+        pbar.update(1)
+    return output
 
 
 def _image_generation_ms_from_content(content: Any) -> float:
@@ -1322,9 +1952,9 @@ async def async_request_openai_audio_speech(
 ) -> MixRequestFuncOutput:
     """Streaming request to /v1/audio/speech endpoint.
 
-    Sends ``stream=true`` with ``response_format=pcm`` so the server returns
-    raw PCM chunks as they are decoded. This allows measuring TTFP (time to
-    first audio packet) separately from E2EL.
+    Sends ``stream=true`` with ``stream_format=audio`` and ``response_format=pcm``
+    so the server returns raw PCM chunks as they are decoded. This allows measuring
+    TTFP (time to first audio packet) separately from E2EL.
     """
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Audio Speech API", "audio/speech")
@@ -1333,12 +1963,14 @@ async def async_request_openai_audio_speech(
         "model": request_func_input.model_name if request_func_input.model_name else request_func_input.model,
         "input": request_func_input.prompt,
         "stream": True,
+        "stream_format": "audio",
         "response_format": "pcm",
     }
     _update_payload_common(payload, request_func_input)
     # Seed-TTS + WER: ``--extra-body`` may set stream=false / other formats; speech must stream PCM.
     if getattr(request_func_input, "seed_tts_row", False) and _seed_tts_capture_pcm_for_wer():
         payload["stream"] = True
+        payload["stream_format"] = "audio"
         payload["response_format"] = "pcm"
 
     headers = {
@@ -1350,10 +1982,9 @@ async def async_request_openai_audio_speech(
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
 
-    # PCM format: 16-bit signed, 24 kHz, mono
-    sample_rate = 24000
+    # PCM format: 16-bit signed; sample_rate/channels are model-dependent.
+    sample_rate, channels = defs.stream_pcm_format_from_env()
     sample_width = 2  # 16-bit = 2 bytes
-    channels = 1
 
     st = time.perf_counter()
     output.start_time = st
@@ -1403,12 +2034,20 @@ async def async_request_openai_audio_speech(
                 output.audio_continuity_ok = continuity.is_continuous
                 output.audio_underrun_event_count = continuity.underrun_event_count
                 if pcm_capture is not None and pcm_capture:
-                    output.tts_output_pcm_bytes = bytes(pcm_capture)
+                    try:
+                        output.tts_output_pcm_bytes = _pcm_s16le_to_seed_tts_wer_bytes(
+                            bytes(pcm_capture),
+                            sample_rate=sample_rate,
+                            channels=channels,
+                        )
+                    except Exception as ex:
+                        logger.warning("Seed-TTS WER PCM normalization failed: %s", ex)
+                        output.tts_output_pcm_bytes = bytes(pcm_capture)
                 elif capture_wer_pcm:
                     ct = response.headers.get("Content-Type", "")
                     logger.warning(
                         "Seed-TTS WER: HTTP 200 but no PCM bytes (Content-Type=%r, url=%s). "
-                        "Check stream=true and response_format=pcm on the server.",
+                        "Check stream=true, stream_format=audio, and response_format=pcm on the server.",
                         ct,
                         api_url,
                     )
@@ -1438,6 +2077,10 @@ ASYNC_REQUEST_FUNCS["openai-image-edits-omni"] = async_request_openai_image_edit
 if "openai-image-edits-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-image-edits-omni")
 
+ASYNC_REQUEST_FUNCS["openai-video-stream"] = async_request_openai_video_stream
+if "openai-video-stream" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-video-stream")
+
 # Daily-Omni backend for audio-visual reasoning benchmark
 # Reuses openai-chat-omni completions for video+text understanding
 ASYNC_REQUEST_FUNCS["daily-omni"] = async_request_openai_chat_omni_completions
@@ -1458,6 +2101,35 @@ from vllm_omni.benchmarks.metrics.metrics import (
 # ruff: noqa: E402
 
 benchmark_old = serve.benchmark
+
+
+def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
+    """Merge benchmark extra_body with per-request overrides.
+
+    vLLM 0.24 removed the private helper from ``vllm.benchmarks.serve``.
+    Keep the same shallow-merge behavior here, with request overrides winning.
+    """
+    if not base and not overrides:
+        return None
+    merged = dict(base or {})
+    merged.update(overrides or {})
+    return merged
+
+
+def _sample_request_overrides(request: SampleRequest) -> dict | None:
+    """Per-request extra_body overrides (vLLM 0.24+ or omni datasets)."""
+    overrides = getattr(request, "request_overrides", None)
+    if overrides is not None:
+        return overrides
+    return getattr(request, "omni_extra_body", None)
+
+
+def _sample_chat_messages(request: SampleRequest):
+    """Optional chat messages for multimodal bench requests."""
+    messages = getattr(request, "chat_messages", None)
+    if messages is not None:
+        return messages
+    return getattr(request, "omni_chat_messages", None)
 
 
 async def benchmark(
@@ -1521,6 +2193,7 @@ async def benchmark(
         input_requests[0].expected_output_len,
         input_requests[0].multi_modal_data,
     )
+    test_extra_body = _merge_overrides(extra_body, _sample_request_overrides(input_requests[0]))
 
     assert (
         test_mm_content is None
@@ -1538,7 +2211,7 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
         extra_headers=extra_headers,
-        extra_body=extra_body,
+        extra_body=test_extra_body,
     )
     setattr(test_input, "no_stream", _BENCH_NO_STREAM)
     _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
@@ -1604,7 +2277,7 @@ async def benchmark(
             multi_modal_content=test_mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=test_extra_body,
         )
         setattr(profile_input, "no_stream", _BENCH_NO_STREAM)
         _attach_daily_omni_to_request_func_input(input_requests[0], profile_input)
@@ -1672,6 +2345,7 @@ async def benchmark(
             request.multi_modal_data,
             request.request_id,
         )
+        per_request_extra_body = _merge_overrides(extra_body, _sample_request_overrides(request))
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -1688,7 +2362,7 @@ async def benchmark(
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=per_request_extra_body,
             request_id=request_id,
         )
         setattr(request_func_input, "no_stream", _BENCH_NO_STREAM)
@@ -1888,11 +2562,17 @@ async def benchmark(
             prompt_len=test_prompt_len,
             output_len=test_output_len,
             logprobs=logprobs,
+            extra_body=test_extra_body,
         )
         setattr(profile_input, "no_stream", _BENCH_NO_STREAM)
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:
             print("Profiler stopped")
+
+    if task_type == TaskType.GENERATION:
+        from vllm_omni.benchmarks.format_bench_report import enrich_result_with_per_requests
+
+        enrich_result_with_per_requests(result, input_requests, outputs)
 
     await session.close()
     return result

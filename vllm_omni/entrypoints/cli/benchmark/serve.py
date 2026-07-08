@@ -147,6 +147,27 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Comma-separated subsets to evaluate, e.g. '1q1a,1q1a_math' or '1qna'.",
     )
     g.add_argument(
+        "--omniinteract-video-ids",
+        type=str,
+        default=None,
+        help=(
+            "For aura_streaming: comma-separated video stems to run in order "
+            "(e.g. '0002,0003,0004'). Implies --disable-shuffle. "
+            "Use with --omniinteract-subsets 1q1a for native smoke parity."
+        ),
+    )
+    g.add_argument(
+        "--omniinteract-streaming-system-prompt-mode",
+        type=str,
+        choices=["native", "omniinteract_qa"],
+        default="native",
+        help=(
+            "For aura_streaming session.config aura_system_prompt. "
+            "'native' matches original AURA (allows <|silent|>). "
+            "'omniinteract_qa' is the legacy QA prompt (forbids silent)."
+        ),
+    )
+    g.add_argument(
         "--omniinteract-inline-local-video",
         action="store_true",
         default=False,
@@ -156,13 +177,70 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--omniinteract-input-mode",
         type=str,
-        choices=["video", "aura"],
+        choices=["video", "aura", "aura_streaming"],
         default="video",
         help=(
             "OmniInteract request protocol. 'video' sends subvideo_url + text question with "
             "mm_processor_kwargs.use_audio_in_video=true. 'aura' sends paired audio_url + "
             "subvideo_url and AURA/TTS extra_body fields for the ASR -> AURA -> TTS pipeline. "
+            "'aura_streaming' streams paired local audio/video over /v1/video/chat/stream. "
             "Generate subvideos/ and audios/ under 1q1a before benchmarking."
+        ),
+    )
+    g.add_argument(
+        "--omniinteract-streaming-sample-fps",
+        type=float,
+        default=2.0,
+        help="For aura_streaming: frames extracted per source-video second.",
+    )
+    g.add_argument(
+        "--omniinteract-streaming-send-fps",
+        type=float,
+        default=2.0,
+        help="For aura_streaming: WebSocket frame send rate (wall-clock). "
+        "2.0 matches native AURA video_file_driver; 0 sends frames as fast as possible.",
+    )
+    g.add_argument(
+        "--omniinteract-streaming-max-frames",
+        type=int,
+        default=0,
+        help=(
+            "For aura_streaming: max sampled frames extracted per video before sending. "
+            "0 = full video at --omniinteract-streaming-sample-fps (native-aligned). "
+            "Use a small positive value (e.g. 16) for quick smoke tests."
+        ),
+    )
+    g.add_argument(
+        "--omniinteract-streaming-auto-trigger-min-frames",
+        type=int,
+        default=2,
+        help=(
+            "For aura_streaming: minimum buffered frames before auto-triggering a turn. "
+            "Use 2 for multi-turn streaming; 0 falls back to a single-turn clip request."
+        ),
+    )
+    g.add_argument(
+        "--omniinteract-streaming-enable-frame-filter",
+        action="store_true",
+        default=False,
+        help="For aura_streaming: enable server-side frame similarity filtering.",
+    )
+    g.add_argument(
+        "--omniinteract-cross-turn-penalty",
+        type=float,
+        default=0.0,
+        help=(
+            "For aura_streaming: cross-turn repetition penalty in session.config "
+            "(0=disabled; native OmniInteract bench uses 1.0)."
+        ),
+    )
+    g.add_argument(
+        "--omniinteract-cross-turn-lookback",
+        type=int,
+        default=2,
+        help=(
+            "For aura_streaming: recent assistant responses in the cross-turn penalty window "
+            "(native OmniInteract bench uses 10)."
         ),
     )
     g.add_argument(
@@ -304,7 +382,7 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
                 if extra:
                     action.choices = list(action.choices) + extra
             if action.dest == "backend" and action.choices is not None:
-                extra = [c for c in ("openai-image-edits-omni",) if c not in action.choices]
+                extra = [c for c in ("openai-image-edits-omni", "openai-video-stream") if c not in action.choices]
                 if extra:
                     action.choices = list(action.choices) + extra
         _extend_omni_dataset_name_choices(parser)
