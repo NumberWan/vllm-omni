@@ -44,15 +44,14 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
 )
+from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import (
-    deserialize_additional_information,
     serialize_additional_information,
 )
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.model_executor.stage_input_processors.stage_bypass import (
-    make_mock_text_stage_output,
-    should_skip_stage,
-    should_skip_stage_from_info,
+from vllm_omni.model_executor.stage_input_processors.aura_omni import _extract_text
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    is_effectively_silent,
 )
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -123,31 +122,6 @@ def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) 
     return default
 
 
-def _resolve_prompt_additional_information(prompt: Any) -> dict[str, Any] | None:
-    """Return a plain dict from ``additional_information`` on a prompt or request."""
-    if isinstance(prompt, dict):
-        info = prompt.get("additional_information")
-        if isinstance(info, dict):
-            return info
-        if info is not None:
-            return deserialize_additional_information(info)
-    info_payload = getattr(prompt, "additional_information", None)
-    if info_payload is not None:
-        return deserialize_additional_information(info_payload)
-    return None
-
-
-def _should_skip_stage_submission(prompt: Any, original_prompt: Any, stage_id: int) -> bool:
-    """Return True when ``omni_skip_stages`` requests bypassing ``stage_id``."""
-    for candidate in (prompt, original_prompt):
-        if should_skip_stage(candidate, stage_id):
-            return True
-        info = _resolve_prompt_additional_information(candidate)
-        if should_skip_stage_from_info(info, stage_id):
-            return True
-    return False
-
-
 def build_engine_core_request_from_tokens(
     request_id: str,
     prompt: dict[str, Any],
@@ -173,9 +147,8 @@ def build_engine_core_request_from_tokens(
         pooling_params = params.clone()
 
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
-    raw_additional_info = prompt.get("additional_information")
     additional_info_payload = serialize_additional_information(
-        raw_additional_info,
+        prompt.get("additional_information"),
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
     )
 
@@ -255,6 +228,7 @@ class Orchestrator:
         running_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
         log_stats: bool = False,
+        enable_orch_monitor: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -263,6 +237,13 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self._orch_monitor = create_orch_monitor(
+            enabled=enable_orch_monitor,
+            replica_sampler=self._sample_replica_metrics,
+        )
+        for stage_id, pool in enumerate(self.stage_pools):
+            for replica_id in pool.live_replica_ids():
+                self._orch_monitor.register_replica(stage_id, replica_id)
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -406,6 +387,7 @@ class Orchestrator:
                 await self._membership.drain_tasks(timeout=10.0)
                 self._membership.shutdown()
 
+            self._orch_monitor.flush()
             self._shutdown_stages()
 
             loop = asyncio.get_running_loop()
@@ -436,6 +418,7 @@ class Orchestrator:
             elif isinstance(msg, RegisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_register(msg.stage_id, msg.replica_id)
+                    self._orch_monitor.register_replica(msg.stage_id, msg.replica_id)
             elif isinstance(msg, UnregisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
@@ -500,12 +483,6 @@ class Orchestrator:
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
 
-        if _should_skip_stage_submission(prompt, original_prompt, stage_id):
-            await self._forward_bypassed_stage_zero(request_id, req_state)
-            if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-                await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
-            return
-
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
@@ -513,8 +490,8 @@ class Orchestrator:
             prompt_text=msg.output_prompt_text,
         )
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > stage_id:
-            await self._prewarm_async_chunk_stages(request_id, stage_id, prompt, req_state)
+        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
@@ -550,12 +527,6 @@ class Orchestrator:
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
 
-        if _should_skip_stage_submission(request, msg.original_prompt, stage_id):
-            await self._forward_bypassed_stage_zero(request_id, req_state)
-            if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-                await self._prewarm_async_chunk_stages(request_id, request, req_state)
-            return
-
         await self.stage_pools[stage_id].submit_update(
             request_id,
             req_state,
@@ -563,8 +534,8 @@ class Orchestrator:
             prompt_text=msg.output_prompt_text,
         )
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > stage_id:
-            await self._prewarm_async_chunk_stages(request_id, stage_id, request, req_state)
+        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -677,6 +648,14 @@ class Orchestrator:
 
     # ---- Orchestration loop ----
 
+    def _sample_replica_metrics(self) -> dict[str, tuple[int, int]]:
+        samples: dict[str, tuple[int, int]] = {}
+        for stage_id, pool in enumerate(self.stage_pools):
+            for replica_id in pool.live_replica_ids():
+                key = replica_key(stage_id, replica_id)
+                samples[key] = pool.replica_monitor_sample(replica_id)
+        return samples
+
     async def _orchestration_output_handler(self) -> None:
         """Poll all stages, handle transfers, send final outputs to main."""
         try:
@@ -785,6 +764,7 @@ class Orchestrator:
                         await self._handle_processed_outputs(stage_id, replica_id, raw_output)
                         idle = False
 
+            self._orch_monitor.note_loop(idle=idle)
             if idle:
                 await asyncio.sleep(0.001)
             else:
@@ -957,6 +937,16 @@ class Orchestrator:
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
         if (
+            self.async_chunk
+            and finished
+            and stage_id < req_state.final_stage_id
+            and self._stage_model_stage(stage_id) == "aura"
+            and is_effectively_silent(_extract_text(output))
+        ):
+            await self._complete_async_chunk_silent_turn(req_id, stage_id, req_state)
+            return
+
+        if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
             and not self.async_chunk
@@ -996,48 +986,51 @@ class Orchestrator:
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
 
-    async def _forward_bypassed_stage_zero(
+    def _stage_model_stage(self, stage_id: int) -> str | None:
+        pool = self.stage_pools[stage_id]
+        return getattr(getattr(pool.stage_vllm_config, "model_config", None), "model_stage", None)
+
+    async def _complete_async_chunk_silent_turn(
         self,
-        request_id: str,
+        req_id: str,
+        aura_stage_id: int,
         req_state: OrchestratorRequestState,
     ) -> None:
-        """Skip stage-0 GPU work when ``omni_skip_stages`` includes 0 (video-only turns)."""
-        mock_output = make_mock_text_stage_output(request_id, text="")
-        logger.debug(
-            "[Orchestrator] Bypassing stage-0 for req=%s (omni_skip_stages)",
-            request_id,
+        """Finish a silent async-chunk turn without waiting for TTS stages."""
+        final_stage_id = req_state.final_stage_id
+        final_pool = self.stage_pools[final_stage_id]
+        final_output_type = getattr(final_pool.stage_client, "final_output_type", None)
+        terminal_output = _build_terminal_empty_output(
+            req_id,
+            final_output_type=final_output_type,
+            audio_sample_rate=_infer_stage_audio_sample_rate(final_pool),
         )
-        is_streaming = req_state.streaming.enabled
-        if is_streaming:
-            await self._forward_to_next_stage(
-                request_id,
-                0,
-                mock_output,
-                req_state,
-                src_replica_id=0,
-                is_streaming_session=True,
-                is_final_update=False,
+        submit_ts = _time.time()
+        req_state.stage_submit_ts[final_stage_id] = submit_ts
+        req_state.finished_final_output_stage_ids.add(final_stage_id)
+        logger.info(
+            "[Orchestrator] req=%s stage-%s silent in async_chunk; "
+            "returning empty %s output from final stage-%s",
+            req_id,
+            aura_stage_id,
+            final_output_type or "text",
+            final_stage_id,
+        )
+        await self.output_async_queue.put(
+            OutputMessage(
+                request_id=req_id,
+                stage_id=final_stage_id,
+                replica_id=0,
+                engine_outputs=terminal_output,
+                metrics=None,
+                finished=True,
+                stage_submit_ts=submit_ts,
             )
-            if getattr(mock_output, "finished", True):
-                await self._forward_to_next_stage(
-                    request_id,
-                    0,
-                    mock_output,
-                    req_state,
-                    src_replica_id=0,
-                    is_streaming_session=True,
-                    is_final_update=True,
-                )
-        else:
-            await self._forward_to_next_stage(
-                request_id,
-                0,
-                mock_output,
-                req_state,
-                src_replica_id=0,
-                is_streaming_session=False,
-                is_final_update=True,
-            )
+        )
+        await self._cleanup_request_ids(
+            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+            abort=True,
+        )
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)
@@ -1307,6 +1300,31 @@ class Orchestrator:
                     src_stage_id,
                     next_logical,
                 )
+                if diffusion_prompt is None:
+                    error_output = OmniRequestOutput.from_error(
+                        req_id,
+                        f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
+                    )
+                    logger.warning(
+                        "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
+                        "routing terminal error output",
+                        req_id,
+                        src_stage_id,
+                        next_logical,
+                    )
+                    await self.output_async_queue.put(
+                        OutputMessage(
+                            request_id=req_id,
+                            stage_id=next_logical,
+                            engine_outputs=error_output,
+                            metrics=None,
+                            finished=True,
+                        )
+                    )
+                    await self._cleanup_request_ids(
+                        [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                    )
+                    return
                 if isinstance(diffusion_prompt, list):
                     if not diffusion_prompt:
                         error_output = OmniRequestOutput.from_error(
@@ -1333,7 +1351,7 @@ class Orchestrator:
                             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
                         )
                         return
-                    if already_submitted and len(diffusion_prompt) == 1:
+                    if len(diffusion_prompt) == 1:
                         diffusion_prompt = diffusion_prompt[0]
             else:
                 diffusion_prompt = req_state.prompt
@@ -1436,12 +1454,13 @@ class Orchestrator:
         if not next_inputs:
             if not getattr(output, "finished", False):
                 logger.debug(
-                    "[Orchestrator] req=%s stage-%s produced no inputs for stage-%s; waiting for more chunks",
+                    "[Orchestrator] req=%s stage-%s produced no inputs for stage-%s; waiting for more outputs",
                     req_id,
                     src_stage_id,
                     next_logical,
                 )
                 return
+
             final_stage_id = req_state.final_stage_id
             final_pool = self.stage_pools[final_stage_id]
             final_output_type = getattr(final_pool.stage_client, "final_output_type", None)
@@ -1509,26 +1528,35 @@ class Orchestrator:
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
-        source_stage_id: int,
-        source_stage_request: Any,
+        stage0_request: Any,
         req_state: OrchestratorRequestState,
     ) -> None:
         """Pre-submit downstream stages for async-chunk mode."""
-        if req_state.final_stage_id <= source_stage_id:
+        if req_state.final_stage_id <= 0:
             return
 
-        prompt_token_ids = getattr(source_stage_request, "prompt_token_ids", None)
+        prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
         if prompt_token_ids is None:
             logger.warning(
-                "[Orchestrator] async_chunk prewarm skipped for req=%s: stage-%s prompt_token_ids missing",
+                "[Orchestrator] async_chunk prewarm skipped for req=%s: stage0 prompt_token_ids missing",
                 request_id,
-                source_stage_id,
             )
             return
 
         for next_stage_id in range(1, req_state.final_stage_id + 1):
+            if next_stage_id in req_state.stage_submit_ts:
+                logger.debug(
+                    "[Orchestrator] async_chunk prewarm skipped stage-%d for req=%s: already submitted",
+                    next_stage_id,
+                    request_id,
+                )
+                continue
+
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
+            model_config = getattr(next_pool.stage_vllm_config, "model_config", None)
+            worker_type = getattr(model_config, "worker_type", None)
+            model_stage = getattr(model_config, "model_stage", None)
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()
@@ -1550,21 +1578,28 @@ class Orchestrator:
 
                 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 
-                try:
-                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
-                except Exception:
-                    next_prompt_len = max(1, len(prompt_token_ids))
-
                 original_prompt = req_state.prompt
                 if isinstance(original_prompt, dict):
                     base_input = copy.deepcopy(original_prompt)
                 else:
                     base_input = {}
 
-                base_input["prompt_token_ids"] = [0] * next_prompt_len
+                if worker_type == "generation" or model_stage == "qwen3_tts":
+                    # Codec and Talker stages must wait for the first upstream chunk.
+                    # Dummy AR-style prompt_token_ids trigger invalid decode work.
+                    base_input["prompt_token_ids"] = []
+                else:
+                    try:
+                        next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                    except Exception:
+                        next_prompt_len = max(1, len(prompt_token_ids))
+                    base_input["prompt_token_ids"] = [0] * next_prompt_len
+
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                downstream_resumable = bool(getattr(source_stage_request, "resumable", req_state.streaming.enabled))
+                downstream_resumable = bool(
+                    getattr(stage0_request, "resumable", req_state.streaming.enabled)
+                )
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
@@ -1581,7 +1616,8 @@ class Orchestrator:
                 )
 
             # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
-            # replica is the previous stage's bound replica; fall back to 0 if unknown.
+            # replica is stage 0's bound replica (single-replica thinker in
+            # all current configs); fall back to 0 if unknown.
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
             src_replica = self.stage_pools[next_stage_id - 1].get_bound_replica_id(request_id)
             self._emit_tx_edge(
