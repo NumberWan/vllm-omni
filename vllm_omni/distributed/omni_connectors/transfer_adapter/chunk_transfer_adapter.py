@@ -81,6 +81,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
+        self.model_config = model_config
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | dict[str, Any] | None] | None = (
@@ -248,6 +249,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             meta = payload_data.get("meta", {})
             payload_finished = self._is_truthy_scalar(meta.get("finished"))
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
+            if self.model_mode == "ar" and "aura_asr_transcript" in payload_data:
+                from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+                    resolve_aura_async_chunk_stage_payload,
+                )
+
+                resolve_aura_async_chunk_stage_payload(payload_data, request, self.model_config)
             if self.model_mode == "ar":
                 prompt_token_ids = payload_data.get("prompt_token_ids")
                 if prompt_token_ids is None:

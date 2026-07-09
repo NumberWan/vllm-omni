@@ -121,16 +121,13 @@ def test_pruning_moves_old_rounds_to_context_history():
 
 
 def test_aura_session_state_commit_turn_writes_history():
-    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-        record_turn_transcript,
-    )
     from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
         create_streaming_session,
     )
 
     state = create_streaming_session(pruning_enabled=False)
     state.turn_frame_arrays = [np.zeros((4, 4, 3), dtype=np.uint8), np.ones((4, 4, 3), dtype=np.uint8)]
-    record_turn_transcript("req-1", "hello")
+    state.record_turn_transcript("req-1", "hello")
     state.pending_turn_video = {
         "video": [
             (
@@ -144,7 +141,7 @@ def test_aura_session_state_commit_turn_writes_history():
 
     assert state.turn_frame_arrays == []
     assert state.pending_turn_video is None
-    assert state.history.history[-2]["content"] != ""
+    assert "hello" in state.history.history[-2]["content"]
     assert state.history.history[-1]["content"] == "reply"
 
 

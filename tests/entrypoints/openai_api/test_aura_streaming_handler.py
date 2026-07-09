@@ -148,10 +148,6 @@ def test_per_turn_auto_trigger_not_cumulative_session_buffer():
 
 
 def test_on_turn_complete_persists_user_video_and_assistant():
-    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-        record_turn_transcript,
-    )
-
     handler = AuraStreamingVideoHandler(chat_service=object())
     state = _session_state()
     frames = np.array(
@@ -170,7 +166,7 @@ def test_on_turn_complete_persists_user_video_and_assistant():
         "do_sample_frames": False,
     }
     state.pending_turn_video = {"video": [(frames, metadata)]}
-    record_turn_transcript("req-1", "画面有什么？")
+    state.record_turn_transcript("req-1", "画面有什么？")
 
     handler.on_turn_complete(state, {"role": "user", "content": []}, "好的。", request_id="req-1")
 

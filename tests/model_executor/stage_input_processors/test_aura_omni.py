@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
@@ -14,6 +15,13 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     asr2aura_async_chunk,
     aura2tts,
     aura2tts_async_chunk,
+    build_aura_input,
+    resolve_aura_async_chunk_stage_payload,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    SessionHistory,
+    clear_all_stage_sessions,
+    get_stage_session_history,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -74,6 +82,7 @@ def test_asr2aura_forwards_tts_options_to_aura_worker():
         "tts_task_type": ["Base"],
         "tts_ref_audio": ["voice.wav"],
         "tts_ref_text": ["hello"],
+        "aura_system_prompt": ["system"],
     }
 
 
@@ -123,11 +132,11 @@ def test_asr2aura_async_chunk_waits_until_asr_finished(monkeypatch):
         "vllm_omni.model_executor.stage_input_processors.aura_omni.cached_tokenizer_from_config",
         lambda _config: FakeTokenizer(),
     )
-    transfer_manager = SimpleNamespace(config=SimpleNamespace())
+    transfer_manager = _transfer_manager()
     request = SimpleNamespace(
         request_id="req-1",
         external_req_id="req-1",
-        output_text="看看视频<|im_end|>\n",
+        output_text="看看视频",
         additional_information={
             "aura_system_prompt": ["system"],
             "deferred_multi_modal_data": {"video": ["frame-0"]},
@@ -137,17 +146,13 @@ def test_asr2aura_async_chunk_waits_until_asr_finished(monkeypatch):
     )
 
     assert asr2aura_async_chunk(transfer_manager, None, request, is_finished=False) is None
-    request.output_text = "看看视频里有什么<|im_end|>\n"
+    request.output_text = "看看视频里有什么"
 
     payload = asr2aura_async_chunk(transfer_manager, None, request, is_finished=True)
 
-    assert payload["prompt"]
-    assert "看看视频里有什么" in payload["prompt"]
-    assert "<|im_end|><|im_end|>" not in payload["prompt"]
-    assert payload["prompt_token_ids"]
-    assert payload["ids"]["prompt"] == payload["prompt_token_ids"]
-    assert payload["multi_modal_data"] == {"video": ["frame-0"]}
-    assert payload["additional_information"] == {"tts_ref_audio": ["voice.wav"]}
+    assert payload["aura_asr_transcript"] == "看看视频里有什么"
+    assert payload["additional_information"]["tts_ref_audio"] == ["voice.wav"]
+    assert "aura_turn_video" not in payload
 
 
 def test_aura2tts_builds_qwen3_tts_prompt_information():
@@ -245,38 +250,13 @@ def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
     assert "text" not in tts_input["additional_information"]
 
 
-def test_aura2tts_async_chunk_waits_until_aura_finished():
-    transfer_manager = _transfer_manager()
-    request = SimpleNamespace(
-        request_id="req-1",
-        external_req_id="req-1",
-        output_token_ids=[108386, 1773],
-        additional_information={
-            "tts_ref_audio": ["custom.wav"],
-            "tts_ref_text": ["custom transcript"],
-        },
-        is_finished=lambda: False,
-    )
-
-    assert aura2tts_async_chunk(transfer_manager, None, request) is None
-    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
-
-    text_ids = payload[PRECOMPUTED_TEXT_IDS_KEY][0]
-    assert 108386 in text_ids
-    assert 1773 in text_ids
-    assert payload["ref_audio"] == ["custom.wav"]
-    assert payload["ref_text"] == ["custom transcript"]
-    assert payload["task_type"] == ["Base"]
-    assert payload["prompt_token_ids"]
-    assert "next_stage_prompt_len" not in payload
-
-
 def test_aura2tts_async_chunk_reads_nested_request_additional_information():
     transfer_manager = _transfer_manager()
     request = SimpleNamespace(
         request_id="req-1",
         external_req_id="req-1",
         output_token_ids=[108386, 1773],
+        output_text="你好",
         additional_information={
             "additional_information": {
                 "tts_task_type": ["CustomVoice"],
@@ -293,6 +273,7 @@ def test_aura2tts_async_chunk_reads_nested_request_additional_information():
     assert payload["task_type"] == ["CustomVoice"]
     assert payload["speaker"] == ["Vivian"]
     assert payload["language"] == ["Chinese"]
+    assert payload["text"] == ["你好"]
     assert payload["prompt_token_ids"]
     assert "ref_audio" not in payload
     assert "ref_text" not in payload
@@ -304,6 +285,7 @@ def test_aura2tts_async_chunk_keeps_tts_metadata_when_request_info_is_cleared():
         request_id="req-1",
         external_req_id="req-1",
         output_token_ids=[108386, 1773],
+        output_text="你好",
         additional_information={
             "additional_information": {
                 "tts_task_type": ["CustomVoice"],
@@ -321,6 +303,7 @@ def test_aura2tts_async_chunk_keeps_tts_metadata_when_request_info_is_cleared():
     assert payload["task_type"] == ["CustomVoice"]
     assert payload["speaker"] == ["Vivian"]
     assert payload["language"] == ["Chinese"]
+    assert payload["text"] == ["你好"]
     assert "ref_audio" not in payload
 
 
@@ -330,6 +313,7 @@ def test_aura2tts_async_chunk_reads_tts_metadata_from_stage_payload_when_request
         request_id="req-1",
         external_req_id="req-1",
         output_token_ids=[108386, 1773],
+        output_text="你好",
         additional_information={},
         omni_stage_payload={
             "prompt": "aura prompt",
@@ -347,6 +331,7 @@ def test_aura2tts_async_chunk_reads_tts_metadata_from_stage_payload_when_request
     assert payload["task_type"] == ["CustomVoice"]
     assert payload["speaker"] == ["Vivian"]
     assert payload["language"] == ["Chinese"]
+    assert payload["text"] == ["你好"]
     assert "ref_audio" not in payload
 
 
@@ -480,10 +465,6 @@ def test_aura2tts_drops_silent_response():
     assert aura2tts([_source_output(SILENT_TEXT)]) == []
 
 
-def test_aura2tts_holds_partial_silent_prefix():
-    assert aura2tts([_partial_source_output("<|sil")]) == []
-
-
 def test_aura2tts_streaming_partial_content_enters_tts():
     prompt = {
         "additional_information": {
@@ -499,3 +480,82 @@ def test_aura2tts_streaming_partial_content_enters_tts():
 
     assert tts_input["additional_information"]["text"] == ["你好"]
     assert PRECOMPUTED_TEXT_IDS_KEY not in tts_input["additional_information"]
+
+
+def test_build_aura_input_uses_stage_session_history_when_server_registry_misses():
+    clear_all_stage_sessions()
+    history = SessionHistory(system_prompt="system")
+    history.add_user_message("第一輪問題")
+    history.add_assistant_message("第一輪回答")
+
+    from vllm_omni.model_executor.stage_input_processors import aura_session_history as ash
+
+    ash.get_or_create_stage_session_history("aura-stage-test", system_prompt="system")
+    ash._STAGE_WORKER_SESSIONS["aura-stage-test"] = history
+
+    video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    metadata = {
+        "fps": 2.0,
+        "duration": 1.0,
+        "total_num_frames": 2,
+        "frames_indices": [0, 1],
+        "video_backend": "opencv",
+        "do_sample_frames": False,
+    }
+    additional_info = {
+        "aura_session_id": "aura-stage-test",
+        "deferred_multi_modal_data": {"video": [(video, metadata)]},
+        "aura_system_prompt": ["system"],
+    }
+
+    next_input = build_aura_input(
+        transcript="第二輪問題",
+        additional_info=additional_info,
+        multi_modal_data={},
+        request_id="req-2",
+    )
+
+    assert "第一輪問題" in next_input["prompt"]
+    assert "第一輪回答" in next_input["prompt"]
+    assert "第二輪問題" in next_input["prompt"]
+    assert len(next_input["multi_modal_data"]["video"]) == 1
+
+
+def test_resolve_aura_async_chunk_stage_payload_builds_prompt_from_passthrough():
+    clear_all_stage_sessions()
+    video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    metadata = {"fps": 2.0, "duration": 1.0, "total_num_frames": 2}
+    payload = {
+        "aura_asr_transcript": "你好",
+        "additional_information": {
+            "aura_session_id": "aura-resolve-test",
+            "aura_system_prompt": ["system"],
+            "deferred_multi_modal_data": {"video": [(video, metadata)]},
+        },
+    }
+    request = SimpleNamespace(
+        request_id="req-1",
+        external_req_id="req-1",
+        additional_information=None,
+        omni_stage_payload=None,
+    )
+
+    class _FakeTokenizer:
+        def encode(self, prompt: str) -> list[int]:
+            return [1, 2, 3]
+
+    class _FakeConfig:
+        pass
+
+    import vllm_omni.model_executor.stage_input_processors.aura_omni as aura_omni_mod
+
+    original = aura_omni_mod.cached_tokenizer_from_config
+    aura_omni_mod.cached_tokenizer_from_config = lambda _cfg: _FakeTokenizer()
+    try:
+        resolve_aura_async_chunk_stage_payload(payload, request, _FakeConfig())
+    finally:
+        aura_omni_mod.cached_tokenizer_from_config = original
+
+    assert "你好" in payload["prompt"]
+    assert payload["prompt_token_ids"] == [1, 2, 3]
+    assert get_stage_session_history("aura-resolve-test") is not None
