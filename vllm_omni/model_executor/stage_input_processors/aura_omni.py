@@ -667,25 +667,19 @@ def _asr2aura_single_turn(
 ) -> dict[str, Any]:
     """Stateless ASR→AURA prompt when no session fields are present on the request."""
     additional_info = src_prompt.get("additional_information") or {}
-    system_prompt = _first_value(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT)
     transcript = _clean_asr_transcript(_extract_text(source_output))
-    multi_modal_data: dict[str, Any] = {}
-    source_multi_modal_data = src_prompt.get("multi_modal_data") or {}
-    if isinstance(source_multi_modal_data, dict):
-        multi_modal_data.update(source_multi_modal_data)
-    deferred_multi_modal_data = additional_info.get("deferred_multi_modal_data") or {}
-    if isinstance(deferred_multi_modal_data, dict):
-        multi_modal_data.update(deferred_multi_modal_data)
-    multi_modal_data = _vision_multimodal_data(multi_modal_data)
-
-    next_input: dict[str, Any] = {
-        "prompt": _aura_prompt(str(system_prompt), transcript, multi_modal_data),
-    }
-    if requires_multimodal_data:
-        next_input["multi_modal_data"] = multi_modal_data
-    if src_prompt.get("mm_processor_kwargs") is not None:
-        next_input["mm_processor_kwargs"] = src_prompt.get("mm_processor_kwargs")
-    return next_input
+    multi_modal_data = _merged_vision_multimodal_data(
+        src_prompt.get("multi_modal_data") or {},
+        additional_info.get("deferred_multi_modal_data") or {},
+    )
+    return _build_aura_input_payload(
+        transcript=transcript,
+        additional_info=additional_info,
+        multi_modal_data=multi_modal_data,
+        requires_multimodal_data=requires_multimodal_data,
+        mm_processor_kwargs=src_prompt.get("mm_processor_kwargs"),
+        include_empty_multimodal_data=True,
+    )
 
 
 def asr2aura(
