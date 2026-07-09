@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -20,6 +22,15 @@ DEFAULT_AURA_SYSTEM_PROMPT = (
     "Respond only when a response is needed based on the user's message or the visual context. "
     "Otherwise, output '<|silent|>' to signify silence. Respond in Chinese."
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _session_history_diag_enabled() -> bool:
+    """Gate debug logging for diagnosing session_history visibility across stages."""
+    v = os.environ.get("VLLM_AURA_SESSION_HISTORY_DIAG", "").strip().lower()
+    return v in {"1", "true", "yes", "on"}
+
 
 # Same set used by CrossTurnPenalty to skip non-content tokens; extended with
 # common CJK filler glyphs (e.g. ﹑) that models emit instead of <|silent|>.
@@ -48,6 +59,12 @@ __all__ = [
     "clear_all_sessions",
     "record_transcript_for_request",
     "pop_transcript_for_request",
+    "get_or_create_stage_session_history",
+    "get_stage_session_history",
+    "record_stage_pending_turn",
+    "commit_stage_session_turn",
+    "unregister_stage_session",
+    "clear_all_stage_sessions",
 ]
 
 
@@ -617,6 +634,12 @@ def create_streaming_session(
     register_session(session_id, history)
     state = AuraSessionState(history=history, session_id=session_id)
     register_session_state(session_id, state)
+    if _session_history_diag_enabled():
+        logger.info(
+            "AURA session_history create pid=%s session_id=%s",
+            os.getpid(),
+            session_id,
+        )
     return state
 
 
@@ -682,3 +705,84 @@ def clear_all_sessions() -> None:
     with _SESSION_LOCK:
         _SESSIONS.clear()
         _SESSION_STATES.clear()
+
+
+# Stage-worker registry: owned by the AURA stage process in async_chunk mode.
+_STAGE_WORKER_LOCK = threading.Lock()
+_STAGE_WORKER_SESSIONS: dict[str, SessionHistory] = {}
+_STAGE_PENDING_TURNS: dict[str, dict[str, Any]] = {}
+
+
+def get_or_create_stage_session_history(
+    session_id: str,
+    *,
+    system_prompt: str | None = None,
+) -> SessionHistory:
+    """Return process-local SessionHistory for an AURA stage worker."""
+    with _STAGE_WORKER_LOCK:
+        history = _STAGE_WORKER_SESSIONS.get(session_id)
+        if history is None:
+            history = SessionHistory(system_prompt=system_prompt or DEFAULT_AURA_SYSTEM_PROMPT)
+            _STAGE_WORKER_SESSIONS[session_id] = history
+            if _session_history_diag_enabled():
+                logger.info(
+                    "AURA stage_session_history create pid=%s session_id=%s",
+                    os.getpid(),
+                    session_id,
+                )
+        return history
+
+
+def get_stage_session_history(session_id: str) -> SessionHistory | None:
+    with _STAGE_WORKER_LOCK:
+        return _STAGE_WORKER_SESSIONS.get(session_id)
+
+
+def record_stage_pending_turn(
+    session_id: str,
+    *,
+    request_id: str,
+    transcript: str,
+    video_tuple: tuple[Any, dict[str, Any]] | None,
+) -> None:
+    with _STAGE_WORKER_LOCK:
+        _STAGE_PENDING_TURNS[session_id] = {
+            "request_id": request_id,
+            "transcript": transcript,
+            "video_tuple": video_tuple,
+        }
+
+
+def commit_stage_session_turn(session_id: str, response_text: str) -> None:
+    """Commit the finished user/assistant turn into the stage-worker registry."""
+    with _STAGE_WORKER_LOCK:
+        history = _STAGE_WORKER_SESSIONS.get(session_id)
+        pending = _STAGE_PENDING_TURNS.pop(session_id, None)
+    if history is None:
+        return
+    if pending:
+        transcript = str(pending.get("transcript", ""))
+        video_tuple = pending.get("video_tuple")
+        if video_tuple is not None or transcript:
+            history.add_user_message(transcript, video_tuple=video_tuple)
+    history.add_assistant_message(normalize_assistant_text(response_text))
+    if _session_history_diag_enabled():
+        logger.info(
+            "AURA stage_session_history commit pid=%s session_id=%s rounds=%d",
+            os.getpid(),
+            session_id,
+            history.current_rounds,
+        )
+
+
+def unregister_stage_session(session_id: str) -> None:
+    with _STAGE_WORKER_LOCK:
+        _STAGE_WORKER_SESSIONS.pop(session_id, None)
+        _STAGE_PENDING_TURNS.pop(session_id, None)
+
+
+def clear_all_stage_sessions() -> None:
+    """Clear all stage-worker sessions (for tests)."""
+    with _STAGE_WORKER_LOCK:
+        _STAGE_WORKER_SESSIONS.clear()
+        _STAGE_PENDING_TURNS.clear()

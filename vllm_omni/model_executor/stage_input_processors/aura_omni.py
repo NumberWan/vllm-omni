@@ -26,9 +26,13 @@ from vllm_omni.model_executor.stage_input_processors.aura_session_history import
     DEFAULT_AURA_SYSTEM_PROMPT,
     SILENT_TEXT,
     SessionHistory,
+    commit_stage_session_turn,
+    get_or_create_stage_session_history,
     get_session_history,
+    get_stage_session_history,
     is_effectively_silent,
     pop_transcript_for_request,
+    record_stage_pending_turn,
     record_transcript_for_request,
 )
 
@@ -462,23 +466,45 @@ def build_aura_input(
     vision_data = _vision_multimodal_data(multi_modal_data)
 
     if session_id and history is not None:
-        video_tuple = video_tuple_from_additional_info(additional_info)
+        video_tuple = _resolve_turn_video_tuple(additional_info, multi_modal_data)
         record_transcript_for_request(str(session_id), request_id, transcript)
         vllm_inputs = history.preview_vllm_inputs(transcript, video_tuple=video_tuple)
         prompt = vllm_inputs["prompt"]
         vision_data = vllm_inputs.get("multi_modal_data", {})
-    elif additional_info.get("aura_session_state") is not None:
-        history = SessionHistory.from_dict(additional_info["aura_session_state"])
-        history.add_user_message(transcript, video_tuple=video_tuple_from_additional_info(additional_info))
-        vllm_inputs = history.get_vllm_inputs()
-        prompt = vllm_inputs["prompt"]
-        vision_data = vllm_inputs.get("multi_modal_data", {})
-    else:
-        if session_id:
-            logger.warning(
-                "AURA session_id=%s not found in server-side store; falling back to single-turn prompt",
-                session_id,
+    elif session_id:
+        history = get_stage_session_history(str(session_id))
+        if history is None:
+            history = get_or_create_stage_session_history(
+                str(session_id),
+                system_prompt=str(system_prompt),
             )
+        video_tuple = _resolve_turn_video_tuple(additional_info, multi_modal_data)
+        record_stage_pending_turn(
+            str(session_id),
+            request_id=request_id,
+            transcript=transcript,
+            video_tuple=video_tuple,
+        )
+        vllm_inputs = history.preview_vllm_inputs(transcript, video_tuple=video_tuple)
+        prompt = vllm_inputs["prompt"]
+        if history.current_rounds == 0:
+            vision_data = _vision_multimodal_data(multi_modal_data) or vllm_inputs.get("multi_modal_data", {})
+        else:
+            vision_data = vllm_inputs.get("multi_modal_data", {})
+        if os.environ.get("VLLM_AURA_SESSION_HISTORY_DIAG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            logger.info(
+                "AURA stage_session_history hit pid=%s session_id=%s request_id=%s rounds=%d",
+                os.getpid(),
+                session_id,
+                request_id,
+                history.current_rounds,
+            )
+    else:
         prompt = _aura_prompt(str(system_prompt), transcript, vision_data)
 
     if _aura_log_turn_prompt_enabled():
@@ -504,6 +530,65 @@ def build_aura_input(
     if mm_processor_kwargs is not None:
         next_input["mm_processor_kwargs"] = mm_processor_kwargs
     return next_input
+
+
+def _commit_stage_session_turn_if_present(additional_info: dict[str, Any], response_text: str) -> None:
+    session_id = additional_info.get("aura_session_id")
+    if session_id:
+        commit_stage_session_turn(str(_first_value(session_id)), response_text)
+
+
+def resolve_aura_async_chunk_stage_payload(
+    payload_data: dict[str, Any],
+    request: Any,
+    model_config: Any | None = None,
+) -> None:
+    """Build the AURA prompt on the stage-1 worker from an ASR passthrough payload."""
+    if "aura_asr_transcript" not in payload_data:
+        return
+
+    additional_info = payload_data.get("additional_information")
+    if not isinstance(additional_info, dict):
+        additional_info = _request_additional_info(request)
+    else:
+        nested = additional_info.get("additional_information")
+        if isinstance(nested, dict):
+            additional_info = {**nested, **additional_info}
+
+    if payload_data.get("aura_turn_video") is not None:
+        additional_info = {**additional_info, "aura_turn_video": payload_data["aura_turn_video"]}
+
+    multi_modal_data: dict[str, Any] = {}
+    payload_mm = payload_data.get("multi_modal_data")
+    if isinstance(payload_mm, dict):
+        multi_modal_data.update(payload_mm)
+    request_mm = getattr(request, "multi_modal_data", None)
+    if isinstance(request_mm, dict):
+        multi_modal_data.update(request_mm)
+    deferred_mm = additional_info.get("deferred_multi_modal_data")
+    if isinstance(deferred_mm, dict):
+        multi_modal_data.update(deferred_mm)
+
+    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
+    try:
+        tokenizer = cached_tokenizer_from_config(model_config) if model_config is not None else None
+        built = build_aura_input(
+            transcript=str(payload_data.get("aura_asr_transcript", "")),
+            additional_info=additional_info,
+            multi_modal_data=multi_modal_data,
+            request_id=str(request_id),
+            tokenizer=tokenizer,
+            requires_multimodal_data=True,
+            mm_processor_kwargs=payload_data.get("mm_processor_kwargs"),
+        )
+        payload_data.update(built)
+    except Exception:
+        logger.exception(
+            "Failed to resolve AURA async-chunk stage payload for request_id=%s session_id=%s",
+            request_id,
+            additional_info.get("aura_session_id"),
+        )
+        raise
 
 
 def asr2aura(
@@ -575,30 +660,34 @@ def asr2aura_async_chunk(
     if not finished:
         return None
 
-    tokenizer = cached_tokenizer_from_config(transfer_manager.config)
+    additional_info = _request_additional_info(request)
     if not state.get("asr_text"):
+        tokenizer = cached_tokenizer_from_config(transfer_manager.config)
         token_ids = _ensure_int_list(getattr(request, "output_token_ids", []) or [])
         if token_ids:
             state["asr_text"] = _clean_asr_transcript(tokenizer.decode(token_ids))
 
-    additional_info = _request_additional_info(request)
-    multi_modal_data = {}
+    multi_modal_data: dict[str, Any] = {}
     request_mm = getattr(request, "multi_modal_data", None)
     if isinstance(request_mm, dict):
         multi_modal_data.update(request_mm)
     deferred_mm = additional_info.get("deferred_multi_modal_data")
     if isinstance(deferred_mm, dict):
         multi_modal_data.update(deferred_mm)
-    
-    return build_aura_input(
-        transcript=str(state.get("asr_text", "")),
-        additional_info=additional_info,
-        multi_modal_data=multi_modal_data,
-        request_id=str(request_id),
-        tokenizer=tokenizer,
-        requires_multimodal_data=True,
-        mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
-    )
+
+    payload: dict[str, Any] = {
+        "aura_asr_transcript": _clean_asr_transcript(str(state.get("asr_text", ""))),
+        "additional_information": additional_info,
+        "mm_processor_kwargs": getattr(request, "mm_processor_kwargs", None),
+    }
+    video_tuple = _resolve_turn_video_tuple(additional_info, multi_modal_data)
+    if video_tuple is not None:
+        frames, metadata = video_tuple
+        payload["aura_turn_video"] = {
+            "frames": frames.tolist(),
+            "metadata": dict(metadata),
+        }
+    return payload
 
 
 def _normalize_video_tuple(
@@ -640,12 +729,26 @@ def video_tuple_from_deferred_multi_modal(deferred: Any) -> tuple[np.ndarray, di
     return None
 
 
+def video_tuple_from_multi_modal_data(multi_modal_data: Any) -> tuple[np.ndarray, dict[str, Any]] | None:
+    """Read the first video tuple from a ``multi_modal_data`` dict."""
+    if not isinstance(multi_modal_data, dict):
+        return None
+    return video_tuple_from_deferred_multi_modal(multi_modal_data)
+
+
 def video_tuple_from_additional_info(additional_info: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]] | None:
     """Resolve per-turn video from ``deferred_multi_modal_data`` or legacy ``aura_turn_video``."""
     video_tuple = video_tuple_from_deferred_multi_modal(additional_info.get("deferred_multi_modal_data"))
     if video_tuple is not None:
         return video_tuple
     return video_tuple_from_aura_turn_video(additional_info.get("aura_turn_video"))
+
+
+def _resolve_turn_video_tuple(
+    additional_info: dict[str, Any],
+    multi_modal_data: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]] | None:
+    return video_tuple_from_multi_modal_data(multi_modal_data) or video_tuple_from_additional_info(additional_info)
 
 
 def _copy_aura_tts_fields(additional_info: dict[str, Any]) -> dict[str, Any]:
@@ -940,6 +1043,7 @@ def aura2tts_async_chunk(
     content_ids = _trim_aura_response_token_ids(_ensure_int_list(getattr(request, "output_token_ids", []) or []))
     finished = bool(is_finished or request.is_finished())
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
+    additional_info = _request_additional_info(request)
     logger.info(
         "[aura2tts_async_chunk] req=%s is_finished_arg=%s request_finished=%s "
         "content_ids=%d output_text_len=%d",
@@ -958,6 +1062,7 @@ def aura2tts_async_chunk(
             )
             return None
         logger.info("[aura2tts_async_chunk] req=%s emitting silent finished payload", request_id)
+        _commit_stage_session_turn_if_present(additional_info, SILENT_TEXT)
         return _aura2tts_empty_finished_payload()
 
     request_payload = getattr(transfer_manager, "request_payload", None)
@@ -978,7 +1083,6 @@ def aura2tts_async_chunk(
             request_text if request_text.startswith(previous_text) else _clean_tts_text(previous_text + request_text)
         )
 
-    additional_info = _request_additional_info(request)
     tts_metadata = _copy_aura_tts_fields(additional_info)
     if tts_metadata:
         state["aura2tts_tts_metadata"] = dict(tts_metadata)
@@ -1000,6 +1104,7 @@ def aura2tts_async_chunk(
         return None
     if _is_silent_token_prefix(content_ids):
         logger.info("[aura2tts_async_chunk] req=%s final content is silent; emitting finish payload", request_id)
+        _commit_stage_session_turn_if_present(additional_info, SILENT_TEXT)
         return _aura2tts_empty_finished_payload()
 
     cached_tts_metadata = state.get("aura2tts_tts_metadata")
@@ -1026,6 +1131,7 @@ def aura2tts_async_chunk(
     if tts_input is None:
         if is_effectively_silent(request_text) or _is_silent_token_prefix(content_ids):
             logger.info("[aura2tts_async_chunk] req=%s TTS input is silent; emitting finish payload", request_id)
+            _commit_stage_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
             return _aura2tts_empty_finished_payload()
         logger.info(
             "[aura2tts_async_chunk] req=%s build_tts_talker_input returned None text_len=%d content_ids=%d",
@@ -1034,6 +1140,7 @@ def aura2tts_async_chunk(
             len(content_ids),
         )
         return None
+    _commit_stage_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
     payload = dict(tts_input["additional_information"])
     payload["prompt_token_ids"] = list(tts_input["prompt_token_ids"])
     assistant_token_ids = QWEN_ASSISTANT_PREFIX_IDS + content_ids + QWEN_ASSISTANT_SUFFIX_IDS
