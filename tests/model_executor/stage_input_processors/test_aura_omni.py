@@ -9,7 +9,11 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    QWEN_IM_END_ID,
+    QWEN_IM_START_ID,
+    QWEN_TEXT_SILENT_TOKEN_IDS,
     SILENT_TEXT,
+    _trim_aura_response_token_ids,
     asr2aura,
     asr2aura_async_chunk,
     aura2tts,
@@ -439,6 +443,27 @@ def test_aura2tts_async_chunk_holds_silent_token_prefix():
     )
 
     assert aura2tts_async_chunk(None, None, request) is None
+
+
+def test_trim_aura_response_token_ids_keeps_all_speakable_segments():
+    first_sentence = [99692, 3837, 105351, 108519, 3837]
+    second_sentence = [106040, 18493, 108141, 71817, 105465]
+    token_ids = [
+        *first_sentence,
+        QWEN_IM_END_ID,
+        QWEN_IM_START_ID,
+        *second_sentence,
+        *QWEN_TEXT_SILENT_TOKEN_IDS,
+        QWEN_IM_END_ID,
+    ]
+
+    speakable = _trim_aura_response_token_ids(token_ids)
+
+    assert speakable[: len(first_sentence)] == first_sentence
+    assert speakable[len(first_sentence) :] == second_sentence
+    assert QWEN_IM_END_ID not in speakable
+    assert QWEN_IM_START_ID not in speakable
+    assert all(token_id not in speakable for token_id in QWEN_TEXT_SILENT_TOKEN_IDS)
 
 
 def test_aura2tts_drops_silent_response():

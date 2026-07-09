@@ -214,6 +214,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
         }
+        stage_id = self.connector.stage_id
         self._pending_save_reqs.append(task)
         with self._save_cond:
             self._save_cond.notify()
@@ -256,6 +257,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     isinstance(token_id, int) for token_id in prompt_token_ids
                 ):
                     _replace_request_prompt_token_ids(request, prompt_token_ids)
+                prev_info = getattr(request, "additional_information", None)
+                if isinstance(prev_info, dict):
+                    prev_tts_info = {key: value for key, value in prev_info.items() if str(key).startswith("tts_")}
+                    payload_additional_info = payload_data.get("additional_information")
+                    if prev_tts_info and isinstance(payload_additional_info, dict):
+                        payload_data = dict(payload_data)
+                        payload_data["additional_information"] = {**prev_tts_info, **payload_additional_info}
                 request.omni_stage_payload = payload_data
                 request.additional_information = payload_data
                 if chunk_id > 0 and request.resumable:
@@ -320,7 +328,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
-            logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
             return True
 
         return False
@@ -338,6 +345,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
         payload_data: OmniPayloadStruct | dict[str, Any] | None = None
+        processor_name = getattr(self.custom_process_next_stage_input_func, "__name__", None)
         if self.custom_process_next_stage_input_func:
             try:
                 payload_data = self.custom_process_next_stage_input_func(
@@ -349,7 +357,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 )
 
             except Exception as e:
-                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+                logger.error(
+                    "Chunk transfer processor failed at stage=%s processor=%s ext_req=%s: %s",
+                    stage_id,
+                    processor_name,
+                    external_req_id,
+                    e,
+                )
 
         if payload_data is None:
             if not (is_segment_finished or is_finished):
@@ -379,7 +393,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if success:
             self.put_req_chunk[external_req_id] += 1
-            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
             # Sender uses struct attr access here; the receive path in
             # `_load_one_request` / `_update_request_payload` reads dict keys.
             # That asymmetry is intentional: `OmniMsgpackDecoder` is type-erased

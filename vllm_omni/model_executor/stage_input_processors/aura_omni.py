@@ -140,15 +140,71 @@ def _extract_token_ids(source_output: Any) -> list[int]:
     return []
 
 
-def _trim_aura_response_token_ids(token_ids: list[int]) -> list[int]:
+def _strip_boundary_chat_template_tokens(token_ids: list[int]) -> list[int]:
+    seg = list(token_ids)
+    while seg and seg[0] in {QWEN_IM_START_ID, QWEN_IM_END_ID, QWEN_NEWLINE_ID, QWEN_ASSISTANT_ID}:
+        seg.pop(0)
+    while seg and seg[-1] in {QWEN_IM_START_ID, QWEN_IM_END_ID, QWEN_NEWLINE_ID}:
+        seg.pop()
+    return seg
+
+
+def _remove_inline_silent_runs(token_ids: list[int]) -> list[int]:
+    if not token_ids:
+        return []
+    silent_sequences = [AURA_SILENT_TOKEN_IDS, QWEN_TEXT_SILENT_TOKEN_IDS]
+    result: list[int] = []
+    i = 0
+    while i < len(token_ids):
+        skipped = False
+        for silent_seq in silent_sequences:
+            seq_len = len(silent_seq)
+            if seq_len and token_ids[i : i + seq_len] == silent_seq:
+                i += seq_len
+                skipped = True
+                break
+        if skipped:
+            continue
+        result.append(token_ids[i])
+        i += 1
+    return result
+
+
+def _extract_aura_speakable_token_ids(token_ids: list[int]) -> list[int]:
+    """Collect all non-silent AURA content across multi-turn chat-template output.
+
+    AURA may emit multiple assistant segments in one generation, separated by
+    ``im_end`` markers, before trailing ``<|silent|>`` tokens. Legacy trimming
+    stopped at the first ``im_end`` and dropped later speakable paragraphs.
+    """
+    if not token_ids:
+        return []
+
     ids = list(token_ids)
     if ids[: len(QWEN_ASSISTANT_PREFIX_IDS)] == QWEN_ASSISTANT_PREFIX_IDS:
         ids = ids[len(QWEN_ASSISTANT_PREFIX_IDS) :]
-    if QWEN_IM_END_ID in ids:
-        ids = ids[: ids.index(QWEN_IM_END_ID)]
-    while ids and ids[-1] in {QWEN_IM_START_ID, QWEN_IM_END_ID, QWEN_NEWLINE_ID}:
-        ids.pop()
-    return ids
+
+    segments: list[list[int]] = []
+    start = 0
+    for idx, token_id in enumerate(ids):
+        if token_id == QWEN_IM_END_ID:
+            if idx > start:
+                segments.append(ids[start:idx])
+            start = idx + 1
+    if start < len(ids):
+        segments.append(ids[start:])
+
+    speakable: list[int] = []
+    for segment in segments:
+        cleaned = _remove_inline_silent_runs(_strip_boundary_chat_template_tokens(segment))
+        if not cleaned or _is_silent_token_prefix(cleaned):
+            continue
+        speakable.extend(cleaned)
+    return speakable
+
+
+def _trim_aura_response_token_ids(token_ids: list[int]) -> list[int]:
+    return _extract_aura_speakable_token_ids(token_ids)
 
 
 def _qwen3_tts_assistant_token_ids_from_aura(source_output: Any) -> list[int]:
@@ -209,6 +265,40 @@ def _request_output_text(request: Any) -> str:
     if isinstance(output_text, list) and output_text and isinstance(output_text[0], str):
         return output_text[0]
     return ""
+
+
+def _aura_request_log_ctx(request: Any, *, is_finished: bool | None = None) -> str:
+    """Compact request context string for aura pipeline debug logs."""
+    req_id = getattr(request, "request_id", None)
+    ext_req_id = getattr(request, "external_req_id", None)
+    output_token_ids = _ensure_int_list(getattr(request, "output_token_ids", []) or [])
+    output_text = _request_output_text(request)
+    request_finished = bool(getattr(request, "is_finished", lambda: False)())
+    resumable = getattr(request, "resumable", None)
+    num_computed = getattr(request, "num_computed_tokens", None)
+    num_output_ph = getattr(request, "num_output_placeholders", None)
+    parts = [
+        f"req={req_id}",
+        f"ext={ext_req_id}",
+        f"resumable={resumable}",
+        f"request_finished={request_finished}",
+    ]
+    if is_finished is not None:
+        parts.append(f"is_finished_arg={is_finished}")
+    parts.extend(
+        [
+            f"output_token_ids_len={len(output_token_ids)}",
+            f"output_text_len={len(output_text)}",
+            f"num_computed_tokens={num_computed}",
+            f"num_output_placeholders={num_output_ph}",
+        ]
+    )
+    if output_text:
+        preview = output_text[:120] + ("..." if len(output_text) > 120 else "")
+        parts.append(f"output_text_preview={preview!r}")
+    if output_token_ids:
+        parts.append(f"output_token_ids_tail={output_token_ids[-8:]}")
+    return " ".join(parts)
 
 
 def _clean_asr_text(text: Any) -> str:
@@ -597,15 +687,17 @@ def aura2tts(
     prompt_by_request_id = _source_prompt_by_request_id(source_outputs, prompt)
     next_inputs: list[OmniTokensPrompt] = []
     for idx, source_output in enumerate(source_outputs):
+        req_id = getattr(source_output, "request_id", idx)
         text = _extract_text(source_output).strip()
-        if not _is_finished(source_output) and text and SILENT_TEXT.startswith(text):
+        finished = _is_finished(source_output)
+        if not finished and text and SILENT_TEXT.startswith(text):
             # AURA may stream the special silent marker token-by-token. Hold
             # these prefixes until the marker is complete so TTS never speaks it.
             continue
         if not text or text == SILENT_TEXT:
             continue
 
-        src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
+        src_prompt = prompt_by_request_id.get(str(req_id), {})
         additional_info = src_prompt.get("additional_information") or {}
         assistant_token_ids_for_len = _qwen3_tts_assistant_token_ids_from_aura(source_output)
         pass_token_ids = _first_bool(additional_info.get("tts_pass_token_ids"), False)
@@ -646,12 +738,15 @@ def aura2tts_async_chunk(
     if request is None:
         raise ValueError("aura2tts_async_chunk requires request.")
 
-    content_ids = _trim_aura_response_token_ids(_ensure_int_list(getattr(request, "output_token_ids", []) or []))
+    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
+    raw_content_ids = _ensure_int_list(getattr(request, "output_token_ids", []) or [])
+    content_ids = _trim_aura_response_token_ids(raw_content_ids)
     finished = bool(is_finished or request.is_finished())
+    if raw_content_ids and not content_ids:
+        return None
     if content_ids and _is_silent_token_prefix(content_ids):
         return None
 
-    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     request_payload = getattr(transfer_manager, "request_payload", None)
     if request_payload is None:
         request_payload = {}
@@ -695,7 +790,7 @@ def aura2tts_async_chunk(
             request_text = _clean_tts_text(tokenizer.decode(content_ids))
         except Exception:
             logger.exception(
-                "[aura2tts_async_chunk] req=%s failed to decode AURA token ids; falling back to token ids",
+                "Failed to decode AURA token ids for req=%s; falling back to token ids",
                 getattr(request, "request_id", None),
             )
 
