@@ -7,7 +7,7 @@ pipeline: aura_omni
 # ASR and AURA run in semantic order; the orchestrator prewarms downstream
 # stages and the connector moves async payloads between stages. Stage 1 buffers
 # each AURA request and sends one complete payload to TTS when AURA finishes.
-async_chunk: true
+async_chunk: false
 # Single deploy profile for HTTP single-turn and WebSocket multi-turn.
 # Stage-1 ``asr2aura`` uses SessionHistory when ``aura_session_id`` is present.
 

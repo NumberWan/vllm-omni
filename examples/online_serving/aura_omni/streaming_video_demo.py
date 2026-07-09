@@ -27,11 +27,14 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import io
 import json
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+import wave
 
 try:
     import websockets
@@ -56,16 +59,69 @@ def is_effectively_silent(text: str) -> bool:
     return all(ch.isspace() or ch in _AURA_PUNCT_CHARS for ch in stripped)
 
 
+def _decode_b64_payload(value: Any) -> bytes:
+    if not isinstance(value, str) or not value:
+        return b""
+    return base64.b64decode(value)
+
+
+def _write_wav_chunks(path: str, chunks: list[bytes], log: "SessionLog") -> None:
+    if not path:
+        return
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not chunks:
+        log.note(f"No response audio received; skipped writing {output_path}")
+        return
+
+    wav_params: tuple[int, int, int, str, str] | None = None
+    pcm_parts: list[bytes] = []
+    try:
+        for chunk in chunks:
+            with wave.open(io.BytesIO(chunk), "rb") as wf:
+                params = wf.getparams()
+                comparable = (
+                    params.nchannels,
+                    params.sampwidth,
+                    params.framerate,
+                    params.comptype,
+                    params.compname,
+                )
+                if wav_params is None:
+                    wav_params = comparable
+                elif comparable != wav_params:
+                    raise ValueError(f"inconsistent WAV params: {comparable!r} != {wav_params!r}")
+                pcm_parts.append(wf.readframes(params.nframes))
+
+        assert wav_params is not None
+        with wave.open(str(output_path), "wb") as wf:
+            wf.setnchannels(wav_params[0])
+            wf.setsampwidth(wav_params[1])
+            wf.setframerate(wav_params[2])
+            wf.writeframes(b"".join(pcm_parts))
+        log.note(f"Wrote response audio WAV to {output_path} ({sum(len(part) for part in pcm_parts)} pcm bytes)")
+    except Exception as exc:
+        output_path.write_bytes(b"".join(chunks))
+        log.note(
+            f"Could not merge response WAV chunks ({exc}); wrote raw concatenated bytes to {output_path}"
+        )
+
+
 @dataclass
 class SessionLog:
     turn: int = 0
     frames_sent: int = 0
     audio_sent: bool = False
+    audio_chunks: list[bytes] = field(default_factory=list)
     events: list[str] = field(default_factory=list)
 
     def note(self, line: str) -> None:
         self.events.append(line)
         print(line, flush=True)
+
+    def add_audio_delta(self, wav_bytes: bytes) -> None:
+        if wav_bytes:
+            self.audio_chunks.append(wav_bytes)
 
 
 def _load_pcm16_16k(path: str) -> bytes:
@@ -97,8 +153,14 @@ def _load_pcm16_16k(path: str) -> bytes:
 def _summarize_outbound(msg: dict[str, Any]) -> str:
     t = msg.get("type", "?")
     if t == "session.config":
+        tts_bits = {
+            key: msg.get(key)
+            for key in ("tts_task_type", "tts_language", "tts_speaker", "tts_ref_audio", "tts_pass_token_ids")
+            if msg.get(key) is not None
+        }
         return (
             f"session.config modalities={msg.get('modalities')} auto_trigger_min={msg.get('auto_trigger_min_frames')}"
+            f" tts={tts_bits or 'default'}"
         )
     if t == "video.frame":
         data = msg.get("data", "")
@@ -161,6 +223,7 @@ async def _receiver(ws: Any, log: SessionLog, done: asyncio.Event) -> None:
             log.note(f"[{ts}] <<< {_summarize_inbound(data)}")
             log.note(f"         turn {log.turn} full_text={json.dumps(full, ensure_ascii=False)}")
         elif msg_type == "response.audio.delta":
+            log.add_audio_delta(_decode_b64_payload(data.get("data")))
             log.note(f"[{ts}] <<< {_summarize_inbound(data)}")
         elif msg_type == "response.audio.done":
             log.note(f"[{ts}] <<< response.audio.done")
@@ -435,6 +498,16 @@ async def _stream_video(
         config["max_context_qas"] = args.max_context_qas
     if args.no_pruning:
         config["pruning_enabled"] = False
+    tts_config = {
+        "tts_task_type": args.tts_task_type,
+        "tts_language": args.tts_language,
+        "tts_speaker": args.tts_speaker,
+        "tts_ref_audio": args.tts_ref_audio,
+        "tts_ref_text": args.tts_ref_text,
+        "tts_instruct": args.tts_instruct,
+        "tts_pass_token_ids": args.tts_pass_token_ids,
+    }
+    config.update({key: value for key, value in tts_config.items() if value is not None})
     await _send_json(ws, config, log)
 
     if args.burst_interval > 0:
@@ -476,6 +549,8 @@ async def run(args: argparse.Namespace) -> None:
             recv_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await recv_task
+    if args.output_wav:
+        _write_wav_chunks(args.output_wav, log.audio_chunks, log)
 
 
 def main() -> None:
@@ -554,6 +629,19 @@ def main() -> None:
     p.add_argument("--no-evs", action="store_true")
     p.add_argument("--evs-threshold", type=float, default=0.95)
     p.add_argument("--recv-timeout", type=float, default=600.0)
+    p.add_argument("--output-wav", help="Write received response.audio.delta WAV audio to this path")
+    p.add_argument("--tts-task-type", help="Qwen3-TTS task type override, e.g. Base or CustomVoice")
+    p.add_argument("--tts-language", help="Qwen3-TTS language override")
+    p.add_argument("--tts-speaker", help="CustomVoice speaker name")
+    p.add_argument("--tts-ref-audio", help="Base TTS reference audio path")
+    p.add_argument("--tts-ref-text", help="Base TTS reference transcript")
+    p.add_argument("--tts-instruct", help="VoiceDesign / style instruct text")
+    p.add_argument(
+        "--tts-pass-token-ids",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Pass AURA assistant token ids directly to Qwen3-TTS",
+    )
     args = p.parse_args()
     asyncio.run(run(args))
 
