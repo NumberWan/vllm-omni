@@ -249,12 +249,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
-        """Set Omni CUDA IR op priority defaults for diffusion workloads.
-
-        Prefer vLLM CUDA kernels (``vllm_c``) for compiled diffusion paths.
-        Upstream's inductor-aware default selects ``native`` only when inductor
-        is active, which regressed Qwen-Image RMSNorm performance (#4964).
-        """
+        """Prefer ``vllm_c`` CUDA kernels over ``native`` for diffusion IR ops."""
         default = ["vllm_c", "native"]
 
         # Use oink if enabled for rms_norm
