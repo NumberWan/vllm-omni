@@ -249,16 +249,13 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
-        """Copied from upstream CudaPlatformBase with inductor-aware logic.
+        """Set Omni CUDA IR op priority defaults for diffusion workloads.
 
-        When inductor is active (compiling) use native as the default;
-        otherwise prefer vllm_c kernels where available.
+        Prefer vLLM CUDA kernels (``vllm_c``) for compiled diffusion paths.
+        Upstream's inductor-aware default selects ``native`` only when inductor
+        is active, which regressed Qwen-Image RMSNorm performance (#4964).
         """
-        from vllm.config.compilation import CompilationMode
-
-        cc = vllm_config.compilation_config
-        using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
-        default = ["native"] if using_inductor else ["vllm_c", "native"]
+        default = ["vllm_c", "native"]
 
         # Use oink if enabled for rms_norm
         # TODO(Laurawly/luka): remove this env var,
