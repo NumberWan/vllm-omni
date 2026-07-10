@@ -6,6 +6,8 @@ from vllm.config import CompilationConfig, CompilationMode, DeviceConfig, VllmCo
 
 from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _vllm_config(*, backend: str = "inductor", mode: CompilationMode) -> VllmConfig:
     return VllmConfig(
@@ -14,7 +16,6 @@ def _vllm_config(*, backend: str = "inductor", mode: CompilationMode) -> VllmCon
     )
 
 
-@pytest.mark.cpu
 @pytest.mark.parametrize(
     "mode",
     [CompilationMode.NONE, CompilationMode.VLLM_COMPILE, CompilationMode.STOCK_TORCH_COMPILE],
@@ -26,7 +27,6 @@ def test_cuda_default_ir_op_priority_prefers_vllm_c_when_inductor_backend(mode: 
     assert priority.fused_add_rms_norm == ["vllm_c", "native"]
 
 
-@pytest.mark.cpu
 def test_cuda_default_ir_op_priority_with_oink(monkeypatch: pytest.MonkeyPatch) -> None:
     import vllm.envs as envs
 
