@@ -2466,10 +2466,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
-        # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
-        # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
-        mm_output = final_res.outputs[0].multimodal_output
+        mm_output = omni_outputs.multimodal_output
+        if not mm_output:
+            return self._create_error_response("Audio generation completed but no audio was produced.")
         audio_data = mm_output.get("audio")
+        if audio_data is None:
+            audio_data = mm_output.get("model_outputs")
         if isinstance(audio_data, list):
             if not audio_data:
                 audio_tensor = None
@@ -2524,6 +2526,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             expires_at=expires_at,
             transcript="",  # Empty transcript if not available
         )
+
+        if final_res is None or not getattr(final_res, "outputs", None):
+            choices.append(
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role=role, audio=audio_obj),
+                    logprobs=None,
+                    finish_reason="stop",
+                    stop_reason=None,
+                )
+            )
+            return choices
 
         for output in final_res.outputs:
             if stream:
