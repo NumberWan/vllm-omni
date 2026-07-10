@@ -198,8 +198,13 @@ def aura_streaming_config(
     auto_trigger_min_frames: int = 2,
     send_fps: float = 2.0,
     enable_frame_filter: bool = False,
-    cross_turn_penalty: float = 0.0,
-    cross_turn_lookback: int = 2,
+    cross_turn_penalty: float = 1.0,
+    cross_turn_lookback: int = 10,
+    cross_turn_ngram_sizes: list[int] | None = None,
+    pruning_enabled: bool = True,
+    max_rounds: int = 45,
+    num_rounds_keep: int = 30,
+    max_context_qas: int = 10,
     aura_system_prompt_mode: Literal["native", "omniinteract_qa"] = "native",
     aura_system_prompt: str | None = None,
 ) -> dict[str, Any]:
@@ -214,6 +219,10 @@ def aura_streaming_config(
         "video_fps": float(sample_fps),
         "send_fps": float(send_fps),
         "enable_frame_filter": bool(enable_frame_filter),
+        "pruning_enabled": bool(pruning_enabled),
+        "max_rounds": int(max_rounds),
+        "num_rounds_keep": int(num_rounds_keep),
+        "max_context_qas": int(max_context_qas),
         "sampling_params_list": aura_sampling_params_list(),
         "aura_system_prompt": resolve_aura_streaming_system_prompt(
             mode=aura_system_prompt_mode,
@@ -237,6 +246,7 @@ def aura_streaming_config(
     if float(cross_turn_penalty) > 0:
         config["cross_turn_penalty"] = float(cross_turn_penalty)
         config["cross_turn_lookback"] = max(1, int(cross_turn_lookback))
+        config["cross_turn_ngram_sizes"] = list(cross_turn_ngram_sizes or [3, 4, 5])
     return config
 
 
@@ -636,8 +646,8 @@ class OmniInteractDataset(BenchmarkDataset):
         streaming_max_frames: int = 0,
         streaming_auto_trigger_min_frames: int = 2,
         streaming_enable_frame_filter: bool = False,
-        streaming_cross_turn_penalty: float = 0.0,
-        streaming_cross_turn_lookback: int = 2,
+        streaming_cross_turn_penalty: float = 1.0,
+        streaming_cross_turn_lookback: int = 10,
         streaming_video_ids: list[str] | None = None,
         streaming_aura_system_prompt_mode: Literal["native", "omniinteract_qa"] = "native",
         **kwargs: Any,

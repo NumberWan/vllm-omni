@@ -535,9 +535,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
-            if self.chunk_transfer_adapter is not None and (inter_stage_output is not None or is_segment_finished):
+            stage_transfer_payload = inter_stage_output if inter_stage_output is not None else mm_output
+            if self.chunk_transfer_adapter is not None and (
+                stage_transfer_payload is not None or is_segment_finished
+            ):
                 self.chunk_transfer_adapter.save_async(
-                    inter_stage_output,
+                    stage_transfer_payload,
                     request,
                     is_segment_finished,
                 )

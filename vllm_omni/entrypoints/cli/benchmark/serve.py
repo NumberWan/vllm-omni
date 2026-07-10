@@ -228,19 +228,19 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--omniinteract-cross-turn-penalty",
         type=float,
-        default=0.0,
+        default=1.0,
         help=(
             "For aura_streaming: cross-turn repetition penalty in session.config "
-            "(0=disabled; native OmniInteract bench uses 1.0)."
+            "(0=disabled; native AURA uses 1.0)."
         ),
     )
     g.add_argument(
         "--omniinteract-cross-turn-lookback",
         type=int,
-        default=2,
+        default=10,
         help=(
             "For aura_streaming: recent assistant responses in the cross-turn penalty window "
-            "(native OmniInteract bench uses 10)."
+            "(native AURA uses 10)."
         ),
     )
     g.add_argument(

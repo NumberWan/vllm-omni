@@ -13,7 +13,7 @@ pipeline: aura_omni
 
 # TODO: Enable the feature for AURA to send chunks to TTS. This requires qwen3-tts to support streaming input first;
 # otherwise, in the absence of historical context, the speech quality of individual chunks will be inconsistent.
-async_chunk: false
+async_chunk: true
 
 connectors:
   connector_of_shared_memory:

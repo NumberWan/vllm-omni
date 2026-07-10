@@ -1440,5 +1440,33 @@ class TestSendRetry(unittest.TestCase):
         sender.shutdown_omni_connectors()
 
 
+class TestConnectorPayloadBuilderContract(unittest.TestCase):
+    def test_talker2code2wav_async_chunk_matches_payload_builder_contract(self):
+        from vllm_omni.model_executor.stage_input_processors import qwen3_tts
+
+        self.assertTrue(
+            MixinHost._is_connector_payload_builder(qwen3_tts.talker2code2wav_async_chunk)
+        )
+
+    def test_build_custom_process_payload_uses_multimodal_output_kwarg(self):
+        host = MixinHost()
+        seen: dict[str, Any] = {}
+
+        def mock_process(transfer_manager, multimodal_output, request, is_finished=False):
+            seen["multimodal_output"] = multimodal_output
+            seen["request"] = request
+            return {"ok": True}
+
+        host._custom_process_func = mock_process
+        request = _make_request("req-1", "ext-req-1")
+        payload = host._build_custom_process_payload(
+            request_id="ext-req-1",
+            request=request,
+            pooling_output={"codes": {"audio": [1, 2, 3]}},
+        )
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(seen["multimodal_output"], {"codes": {"audio": [1, 2, 3]}})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -155,7 +155,7 @@ def talker2code2wav_async_chunk(
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    request_id = request.external_req_id
+    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     finished = bool(is_finished or request.is_finished())
     request_payload = getattr(transfer_manager, "request_payload", None)
     if request_payload is None:
@@ -167,6 +167,18 @@ def talker2code2wav_async_chunk(
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            logger.debug(
+                "[talker2code2wav_async_chunk] req=%s buffered codec frame total_frames=%d layer0=%s",
+                request_id,
+                len(transfer_manager.code_prompt_token_ids[request_id]),
+                codec_codes[:1],
+            )
+        else:
+            logger.debug(
+                "[talker2code2wav_async_chunk] req=%s skipped empty/invalid codec frame finished=%s",
+                request_id,
+                finished,
+            )
         ref_code = multimodal_output.get("codes", {}).get("ref")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
@@ -248,6 +260,11 @@ def talker2code2wav_async_chunk(
 
     if length <= 0:
         if finished:
+            logger.info(
+                "[talker2code2wav_async_chunk] req=%s finished with no buffered codec frames; "
+                "emitting empty Code2Wav payload",
+                request_id,
+            )
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
@@ -331,6 +348,18 @@ def talker2code2wav_async_chunk(
         meta.ref_context_included = ref_context_included
 
     emitted_frames_by_req[request_id] = length
+    logger.info(
+        "[talker2code2wav_async_chunk] req=%s emitting chunk new_frames=%d emitted_frames=%d/%d "
+        "target_new_frames=%d finished=%s left_context=%d ref_context=%d",
+        request_id,
+        new_frames,
+        emitted_frames_by_req[request_id],
+        length,
+        target_new_frames,
+        finished,
+        left_context_size,
+        ref_context_size,
+    )
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
