@@ -299,13 +299,15 @@ def _extract_text(source_output: Any) -> str:
 
 
 def _clean_asr_transcript(text: str) -> str:
-    """Strip Qwen3-ASR wrappers like ``language Chinese<asr_text>...``."""
+    """Strip Qwen3-ASR wrappers and leaked chat-template special tokens."""
     if not isinstance(text, str):
         return ""
     cleaned = text.strip()
     if "<asr_text>" in cleaned:
         cleaned = cleaned.split("<asr_text>", 1)[-1]
     cleaned = re.sub(r"^language\s+[\w-]+\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<\|im_(?:start|end)\|>", "", cleaned)
+    cleaned = re.sub(r"<\|im_start\|>(?:system|user|assistant)", "", cleaned)
     return cleaned.strip()
 
 
@@ -425,9 +427,12 @@ def _source_prompt_by_request_id(source_outputs: list[Any], prompt: Any) -> dict
     }
 
 
+AURA_VISION_PAD_TEXT = "<|vision_start|><|video_pad|><|vision_end|>"
+
+
 def _vision_placeholder(multi_modal_data: dict[str, Any]) -> str:
     if "video" in multi_modal_data:
-        return "<|vision_start|><|video_pad|><|vision_end|>"
+        return AURA_VISION_PAD_TEXT
     if "image" in multi_modal_data:
         return "<|vision_start|><|image_pad|><|vision_end|>"
     return ""
@@ -435,6 +440,19 @@ def _vision_placeholder(multi_modal_data: dict[str, Any]) -> str:
 
 def _vision_multimodal_data(multi_modal_data: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in multi_modal_data.items() if key in {"image", "video"}}
+
+
+def _pending_vision_pad_text(
+    transcript: str,
+    video_tuple: tuple[Any, dict[str, Any]] | None,
+    multi_modal_data: dict[str, Any],
+) -> str | None:
+    """Text vision pad for live placeholder video when ``video_tuple`` cannot be resolved."""
+    if transcript.strip() or video_tuple is not None:
+        return None
+    if _vision_multimodal_data(multi_modal_data):
+        return AURA_VISION_PAD_TEXT
+    return None
 
 
 def _aura_prompt(system_prompt: str, transcript: str, multi_modal_data: dict[str, Any]) -> str:
@@ -468,7 +486,12 @@ def build_aura_input(
     if session_id and history is not None:
         video_tuple = _resolve_turn_video_tuple(additional_info, multi_modal_data)
         record_transcript_for_request(str(session_id), request_id, transcript)
-        vllm_inputs = history.preview_vllm_inputs(transcript, video_tuple=video_tuple)
+        vision_pad_text = _pending_vision_pad_text(transcript, video_tuple, multi_modal_data)
+        vllm_inputs = history.preview_vllm_inputs(
+            transcript,
+            video_tuple=video_tuple,
+            vision_pad_text=vision_pad_text,
+        )
         prompt = vllm_inputs["prompt"]
         vision_data = vllm_inputs.get("multi_modal_data", {})
     elif session_id:
@@ -479,18 +502,47 @@ def build_aura_input(
                 system_prompt=str(system_prompt),
             )
         video_tuple = _resolve_turn_video_tuple(additional_info, multi_modal_data)
+        pending_kwargs = {
+            "deferred_mm": additional_info.get("deferred_multi_modal_data"),
+            "aura_turn_video": additional_info.get("aura_turn_video"),
+            "multi_modal_data": dict(multi_modal_data) if isinstance(multi_modal_data, dict) else None,
+            "had_vision": False,
+        }
+        if (
+            video_tuple is None
+            and history.current_rounds == 0
+            and _vision_multimodal_data(multi_modal_data)
+        ):
+            prompt = _aura_prompt(str(system_prompt), transcript, _vision_multimodal_data(multi_modal_data))
+            vision_data = _vision_multimodal_data(multi_modal_data)
+        else:
+            vision_pad_text = _pending_vision_pad_text(transcript, video_tuple, multi_modal_data)
+            vllm_inputs = history.preview_vllm_inputs(
+                transcript,
+                video_tuple=video_tuple,
+                vision_pad_text=vision_pad_text,
+            )
+            prompt = vllm_inputs["prompt"]
+            if video_tuple is not None:
+                vision_data = vllm_inputs.get("multi_modal_data", {})
+            else:
+                vision_data = _merge_vision_multimodal_data(
+                    vllm_inputs.get("multi_modal_data", {}),
+                    _vision_multimodal_data(multi_modal_data),
+                )
+        commit_video_tuple = (
+            video_tuple
+            or video_tuple_from_multi_modal_data(vision_data)
+            or video_tuple_from_multi_modal_data(multi_modal_data)
+        )
+        pending_kwargs["had_vision"] = bool(_vision_multimodal_data(vision_data))
         record_stage_pending_turn(
             str(session_id),
             request_id=request_id,
             transcript=transcript,
-            video_tuple=video_tuple,
+            video_tuple=commit_video_tuple,
+            **pending_kwargs,
         )
-        vllm_inputs = history.preview_vllm_inputs(transcript, video_tuple=video_tuple)
-        prompt = vllm_inputs["prompt"]
-        if history.current_rounds == 0:
-            vision_data = _vision_multimodal_data(multi_modal_data) or vllm_inputs.get("multi_modal_data", {})
-        else:
-            vision_data = vllm_inputs.get("multi_modal_data", {})
         if os.environ.get("VLLM_AURA_SESSION_HISTORY_DIAG", "").strip().lower() in {
             "1",
             "true",
@@ -498,11 +550,15 @@ def build_aura_input(
             "on",
         }:
             logger.info(
-                "AURA stage_session_history hit pid=%s session_id=%s request_id=%s rounds=%d",
+                "AURA stage_session_history hit pid=%s session_id=%s request_id=%s rounds=%d "
+                "video_tuple=%s commit_video_tuple=%s transcript_len=%d",
                 os.getpid(),
                 session_id,
                 request_id,
                 history.current_rounds,
+                "ok" if video_tuple is not None else "miss",
+                "ok" if commit_video_tuple is not None else "miss",
+                len(transcript),
             )
     else:
         prompt = _aura_prompt(str(system_prompt), transcript, vision_data)
@@ -517,6 +573,8 @@ def build_aura_input(
 
     additional_for_next = _copy_aura_tts_fields(additional_info)
     additional_for_next["aura_system_prompt"] = [str(system_prompt)]
+    if session_id:
+        additional_for_next["aura_session_id"] = session_id
     next_input: dict[str, Any] = {
         "prompt": prompt,
         "additional_information": additional_for_next,
@@ -680,14 +738,63 @@ def asr2aura_async_chunk(
         "additional_information": additional_info,
         "mm_processor_kwargs": getattr(request, "mm_processor_kwargs", None),
     }
-    video_tuple = _resolve_turn_video_tuple(additional_info, multi_modal_data)
-    if video_tuple is not None:
+    _attach_aura_turn_video_payload(payload, additional_info, multi_modal_data)
+    return payload
+
+
+def _coerce_video_frames_array(frames: Any) -> np.ndarray | None:
+    """Coerce streaming turn frames into a uint8 ``[T, H, W, C]`` array."""
+    if frames is None:
+        return None
+    try:
+        video_array = np.asarray(frames, dtype=np.uint8)
+        if video_array.ndim == 4:
+            return video_array
+        if video_array.ndim == 1 and video_array.dtype == object:
+            return _coerce_video_frames_array(list(video_array))
+    except (ValueError, TypeError):
+        pass
+    if not isinstance(frames, (list, tuple)) or not frames:
+        return None
+    try:
+        arrays = [np.asarray(frame, dtype=np.uint8) for frame in frames]
+    except (ValueError, TypeError):
+        return None
+    arrays = [frame for frame in arrays if frame.ndim == 3]
+    if not arrays:
+        return None
+    target_shape = arrays[0].shape
+    uniform_frames = [frame for frame in arrays if frame.shape == target_shape]
+    if not uniform_frames:
+        return None
+    return np.stack(uniform_frames, axis=0)
+
+
+def _attach_aura_turn_video_payload(
+    payload: dict[str, Any],
+    additional_info: dict[str, Any],
+    multi_modal_data: dict[str, Any],
+) -> None:
+    """Best-effort JSON-serializable turn video for stage-1 resolve."""
+    try:
+        video_tuple = _resolve_turn_video_tuple(additional_info, multi_modal_data)
+        if video_tuple is None:
+            deferred = additional_info.get("deferred_multi_modal_data")
+            if isinstance(deferred, dict):
+                video_tuple = video_tuple_from_deferred_multi_modal(deferred)
+        if video_tuple is None:
+            return
         frames, metadata = video_tuple
         payload["aura_turn_video"] = {
             "frames": frames.tolist(),
             "metadata": dict(metadata),
         }
-    return payload
+    except Exception:
+        logger.warning(
+            "Failed to serialize aura_turn_video for async-chunk passthrough; "
+            "stage 1 will fall back to deferred_multi_modal_data",
+            exc_info=True,
+        )
 
 
 def _normalize_video_tuple(
@@ -695,10 +802,8 @@ def _normalize_video_tuple(
     metadata: dict[str, Any] | None,
 ) -> tuple[np.ndarray, dict[str, Any]] | None:
     """Return (uint8 ndarray [T,H,W,C], metadata) with at least two frames."""
-    if frames is None:
-        return None
-    video_array = np.asarray(frames, dtype=np.uint8)
-    if video_array.ndim != 4:
+    video_array = _coerce_video_frames_array(frames)
+    if video_array is None or video_array.ndim != 4:
         return None
     meta = dict(metadata or {})
     if video_array.shape[0] < 2:
@@ -716,16 +821,58 @@ def video_tuple_from_aura_turn_video(aura_turn_video: Any) -> tuple[np.ndarray, 
     return _normalize_video_tuple(aura_turn_video.get("frames"), aura_turn_video.get("metadata"))
 
 
+def _is_frame_array(value: Any) -> bool:
+    shape = getattr(value, "shape", None)
+    return isinstance(shape, tuple) and len(shape) == 3
+
+
+def _video_entry_to_tuple(entry: Any) -> tuple[np.ndarray, dict[str, Any]] | None:
+    """Best-effort conversion of one multimodal video entry to a normalized tuple."""
+    if isinstance(entry, (tuple, list)) and len(entry) == 2:
+        meta = entry[1] if isinstance(entry[1], dict) else {}
+        return _normalize_video_tuple(entry[0], meta)
+    if isinstance(entry, list) and entry and _is_frame_array(entry[0]):
+        return _normalize_video_tuple(entry, {})
+    if isinstance(entry, list) and entry:
+        return _normalize_video_tuple(entry, {})
+    if hasattr(entry, "shape") and len(entry.shape) == 4:
+        return _normalize_video_tuple(entry, {})
+    return None
+
+
 def video_tuple_from_deferred_multi_modal(deferred: Any) -> tuple[np.ndarray, dict[str, Any]] | None:
-    """Read the first ``(ndarray, metadata)`` video entry from deferred multimodal data."""
+    """Read the first video entry from deferred multimodal data."""
     if not isinstance(deferred, dict):
         return None
     videos = deferred.get("video")
-    if not videos:
+    if videos is None:
         return None
-    first = videos[0] if isinstance(videos, list) else videos
-    if isinstance(first, (tuple, list)) and len(first) == 2:
-        return _normalize_video_tuple(first[0], first[1] if isinstance(first[1], dict) else {})
+
+    # Top-level sibling layout: [frames, metadata]
+    if (
+        isinstance(videos, list)
+        and len(videos) == 2
+        and isinstance(videos[1], dict)
+        and not isinstance(videos[0], dict)
+    ):
+        video_tuple = _normalize_video_tuple(videos[0], videos[1])
+        if video_tuple is not None:
+            return video_tuple
+
+    # Entire clip as one ndarray: (T, H, W, C)
+    if hasattr(videos, "shape") and len(videos.shape) == 4:
+        return _normalize_video_tuple(videos, {})
+
+    items = videos if isinstance(videos, list) else [videos]
+    if len(items) >= 2 and all(_is_frame_array(item) for item in items):
+        video_tuple = _normalize_video_tuple(items, {})
+        if video_tuple is not None:
+            return video_tuple
+
+    for item in items:
+        video_tuple = _video_entry_to_tuple(item)
+        if video_tuple is not None:
+            return video_tuple
     return None
 
 
@@ -733,6 +880,14 @@ def video_tuple_from_multi_modal_data(multi_modal_data: Any) -> tuple[np.ndarray
     """Read the first video tuple from a ``multi_modal_data`` dict."""
     if not isinstance(multi_modal_data, dict):
         return None
+    for entry in multi_modal_data.get("video") or []:
+        if isinstance(entry, dict) and "frames" in entry:
+            video_tuple = video_tuple_from_aura_turn_video(entry)
+            if video_tuple is not None:
+                return video_tuple
+        video_tuple = _video_entry_to_tuple(entry)
+        if video_tuple is not None:
+            return video_tuple
     return video_tuple_from_deferred_multi_modal(multi_modal_data)
 
 
@@ -744,11 +899,36 @@ def video_tuple_from_additional_info(additional_info: dict[str, Any]) -> tuple[n
     return video_tuple_from_aura_turn_video(additional_info.get("aura_turn_video"))
 
 
+def _merge_vision_multimodal_data(
+    preview_mm: dict[str, Any] | None,
+    current_mm: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge preview history videos with the current turn's deferred video payload."""
+    merged: dict[str, Any] = {}
+    preview_videos = list((preview_mm or {}).get("video") or [])
+    current_videos = list((current_mm or {}).get("video") or [])
+    if preview_videos or current_videos:
+        merged["video"] = preview_videos + current_videos
+    preview_images = list((preview_mm or {}).get("image") or [])
+    current_images = list((current_mm or {}).get("image") or [])
+    if preview_images or current_images:
+        merged["image"] = preview_images + current_images
+    return merged
+
+
 def _resolve_turn_video_tuple(
     additional_info: dict[str, Any],
     multi_modal_data: dict[str, Any],
 ) -> tuple[np.ndarray, dict[str, Any]] | None:
-    return video_tuple_from_multi_modal_data(multi_modal_data) or video_tuple_from_additional_info(additional_info)
+    for source in (
+        multi_modal_data,
+        additional_info.get("deferred_multi_modal_data"),
+        additional_info,
+    ):
+        video_tuple = video_tuple_from_deferred_multi_modal(source)
+        if video_tuple is not None:
+            return video_tuple
+    return video_tuple_from_aura_turn_video(additional_info.get("aura_turn_video"))
 
 
 def _copy_aura_tts_fields(additional_info: dict[str, Any]) -> dict[str, Any]:
@@ -764,13 +944,28 @@ def _summarize_vllm_inputs(vllm_inputs: dict[str, Any]) -> str:
     videos = vllm_inputs.get("multi_modal_data", {}).get("video", [])
     video_info: list[dict[str, Any]] = []
     for vt in videos:
-        arr, meta = vt
+        if isinstance(vt, (tuple, list)) and len(vt) == 2 and not isinstance(vt[0], str):
+            arr, meta = vt
+        else:
+            arr, meta = vt, {}
+        if hasattr(arr, "shape"):
+            shape = list(arr.shape)
+            frames = int(arr.shape[0])
+        elif isinstance(arr, list):
+            frames = len(arr)
+            if arr and hasattr(arr[0], "shape"):
+                shape = [frames, *list(arr[0].shape)]
+            else:
+                shape = [frames]
+        else:
+            shape = None
+            frames = 0
         video_info.append(
             {
-                "frames": int(arr.shape[0]),
-                "shape": list(arr.shape),
-                "fps": meta.get("fps"),
-                "duration": meta.get("duration"),
+                "frames": frames,
+                "shape": shape,
+                "fps": (meta or {}).get("fps"),
+                "duration": (meta or {}).get("duration"),
             }
         )
     return json.dumps(

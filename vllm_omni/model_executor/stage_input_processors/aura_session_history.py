@@ -372,6 +372,8 @@ class SessionHistory:
         text: str = "",
         video_tuple: tuple[Any, dict[str, Any]] | None = None,
         images: list[Any] | None = None,
+        *,
+        vision_pad_text: str | None = None,
     ) -> dict[str, Any]:
         """Build prompt/mm inputs for a pending user turn without mutating history."""
         pending_content: list[dict[str, Any]] = []
@@ -381,6 +383,8 @@ class SessionHistory:
             pending_content.extend([{"type": "image", "image": img} for img in images])
         if text:
             pending_content.append({"type": "text", "text": text})
+        elif vision_pad_text and not pending_content:
+            pending_content.append({"type": "text", "text": vision_pad_text})
 
         messages = list(self.history)
         if pending_content:
@@ -744,12 +748,20 @@ def record_stage_pending_turn(
     request_id: str,
     transcript: str,
     video_tuple: tuple[Any, dict[str, Any]] | None,
+    deferred_mm: dict[str, Any] | None = None,
+    aura_turn_video: Any = None,
+    multi_modal_data: dict[str, Any] | None = None,
+    had_vision: bool = False,
 ) -> None:
     with _STAGE_WORKER_LOCK:
         _STAGE_PENDING_TURNS[session_id] = {
             "request_id": request_id,
             "transcript": transcript,
             "video_tuple": video_tuple,
+            "deferred_mm": dict(deferred_mm) if isinstance(deferred_mm, dict) else None,
+            "aura_turn_video": aura_turn_video,
+            "multi_modal_data": dict(multi_modal_data) if isinstance(multi_modal_data, dict) else None,
+            "had_vision": bool(had_vision),
         }
 
 
@@ -763,8 +775,29 @@ def commit_stage_session_turn(session_id: str, response_text: str) -> None:
     if pending:
         transcript = str(pending.get("transcript", ""))
         video_tuple = pending.get("video_tuple")
+        if video_tuple is None:
+            from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+                _resolve_turn_video_tuple,
+                video_tuple_from_multi_modal_data,
+            )
+
+            video_tuple = _resolve_turn_video_tuple(
+                {
+                    "deferred_multi_modal_data": pending.get("deferred_mm"),
+                    "aura_turn_video": pending.get("aura_turn_video"),
+                },
+                pending.get("multi_modal_data") or {},
+            )
+            if video_tuple is None:
+                video_tuple = video_tuple_from_multi_modal_data(pending.get("multi_modal_data"))
         if video_tuple is not None or transcript:
             history.add_user_message(transcript, video_tuple=video_tuple)
+        elif pending.get("had_vision"):
+            from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+                AURA_VISION_PAD_TEXT,
+            )
+
+            history.add_user_message(AURA_VISION_PAD_TEXT)
     history.add_assistant_message(normalize_assistant_text(response_text))
     if _session_history_diag_enabled():
         logger.info(

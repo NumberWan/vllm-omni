@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -534,7 +535,44 @@ def test_build_aura_input_uses_stage_session_history_when_server_registry_misses
     assert "第一輪回答" in next_input["prompt"]
     assert "第二輪問題" in next_input["prompt"]
     assert len(next_input["multi_modal_data"]["video"]) == 1
+    assert next_input["additional_information"]["aura_session_id"] == "aura-stage-test"
 
+
+def test_build_aura_input_commit_rounds_increment_via_aura2tts_async_chunk():
+    clear_all_stage_sessions()
+    video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    metadata = {"fps": 2.0, "duration": 1.0, "total_num_frames": 2}
+    additional_info = {
+        "aura_session_id": "aura-commit-test",
+        "deferred_multi_modal_data": {"video": [(video, metadata)]},
+        "aura_system_prompt": ["system"],
+    }
+    next_input = build_aura_input(
+        transcript="",
+        additional_info=additional_info,
+        multi_modal_data={},
+        request_id="req-1",
+    )
+    assert next_input["additional_information"]["aura_session_id"] == "aura-commit-test"
+
+    history = get_stage_session_history("aura-commit-test")
+    assert history is not None
+    assert history.current_rounds == 0
+
+    transfer_manager = SimpleNamespace(request_payload={})
+    request = SimpleNamespace(
+        request_id="req-1",
+        external_req_id="req-1",
+        additional_information=next_input["additional_information"],
+        output_text=SILENT_TEXT,
+        output_token_ids=[151669],
+        is_finished=lambda: True,
+    )
+    aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+
+    history = get_stage_session_history("aura-commit-test")
+    assert history.current_rounds == 1
+    assert SILENT_TEXT in history.get_vllm_inputs()["prompt"]
 
 def test_resolve_aura_async_chunk_stage_payload_builds_prompt_from_passthrough():
     clear_all_stage_sessions()
@@ -574,3 +612,162 @@ def test_resolve_aura_async_chunk_stage_payload_builds_prompt_from_passthrough()
     assert "你好" in payload["prompt"]
     assert payload["prompt_token_ids"] == [1, 2, 3]
     assert get_stage_session_history("aura-resolve-test") is not None
+
+
+def test_coerce_video_frames_array_handles_inhomogeneous_streaming_shapes():
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        _coerce_video_frames_array,
+        _normalize_video_tuple,
+    )
+
+    frames = [
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        np.zeros((10, 12, 3), dtype=np.uint8),
+        np.zeros((8, 8, 3), dtype=np.uint8),
+    ]
+    with pytest.raises(ValueError):
+        np.asarray(frames, dtype=np.uint8)
+
+    video_array = _coerce_video_frames_array(frames)
+    assert video_array is not None
+    assert video_array.shape == (2, 8, 8, 3)
+
+    normalized = _normalize_video_tuple(frames, {"fps": 2.0})
+    assert normalized is not None
+    array, metadata = normalized
+    assert array.shape[0] >= 2
+    assert metadata["fps"] == 2.0
+
+
+def _video_multimodal_data() -> tuple[dict[str, Any], np.ndarray, dict[str, Any]]:
+    video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    metadata = {"fps": 2.0, "duration": 1.0, "total_num_frames": 2}
+    return {"video": [(video, metadata)]}, video, metadata
+
+
+def _finish_async_chunk_turn(
+    *,
+    session_id: str,
+    transcript: str,
+    multi_modal_data: dict[str, Any],
+    request_id: str,
+    silent: bool = True,
+    response_text: str = "",
+) -> dict[str, Any]:
+    additional_info = {
+        "aura_session_id": session_id,
+        "aura_system_prompt": ["system"],
+    }
+    next_input = build_aura_input(
+        transcript=transcript,
+        additional_info=additional_info,
+        multi_modal_data=multi_modal_data,
+        request_id=request_id,
+    )
+    transfer_manager = SimpleNamespace(request_payload={})
+    if silent:
+        content_ids = [151669]
+        output_text = SILENT_TEXT
+    else:
+        content_ids = [108386, 77091]
+        output_text = response_text or "好的，我會留意。"
+    request = SimpleNamespace(
+        request_id=request_id,
+        external_req_id=request_id,
+        additional_information=next_input["additional_information"],
+        output_text=output_text,
+        output_token_ids=content_ids,
+        is_finished=lambda: True,
+    )
+    aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+    return next_input
+
+
+def test_multi_turn_session_history_smoke_like_0002():
+    clear_all_stage_sessions()
+    session_id = "aura-multi-turn"
+    multi_modal_data, _, _ = _video_multimodal_data()
+
+    for idx in range(3):
+        _finish_async_chunk_turn(
+            session_id=session_id,
+            transcript="",
+            multi_modal_data=multi_modal_data,
+            request_id=f"req-silent-{idx}",
+        )
+    history = get_stage_session_history(session_id)
+    assert history is not None
+    assert history.current_rounds == 3
+
+    spoken_input = _finish_async_chunk_turn(
+        session_id=session_id,
+        transcript="出现《古韵》这本书的时候，提醒我。",
+        multi_modal_data=multi_modal_data,
+        request_id="req-spoken",
+        silent=False,
+        response_text="好的，我會留意，等《古韵》這本書出現時馬上提醒你。",
+    )
+    assert "出现《古韵》这本书的时候，提醒我。" in spoken_input["prompt"]
+    history = get_stage_session_history(session_id)
+    assert history.current_rounds == 4
+
+    for idx in range(2):
+        _finish_async_chunk_turn(
+            session_id=session_id,
+            transcript="",
+            multi_modal_data=multi_modal_data,
+            request_id=f"req-silent-post-{idx}",
+        )
+    history = get_stage_session_history(session_id)
+    assert history.current_rounds == 6
+    final_prompt = history.get_vllm_inputs()["prompt"]
+    assert "出现《古韵》这本书的时候，提醒我。" in final_prompt
+    assert final_prompt.count("<|silent|>") >= 4
+
+
+def test_silent_placeholder_video_commits_vision_pad_text_to_history():
+    clear_all_stage_sessions()
+    multi_modal_data = {"video": ["frame-0", "frame-1", "frame-2"]}
+    _finish_async_chunk_turn(
+        session_id="aura-placeholder-video",
+        transcript="",
+        multi_modal_data=multi_modal_data,
+        request_id="req-placeholder",
+    )
+    history = get_stage_session_history("aura-placeholder-video")
+    assert history is not None
+    assert history.current_rounds == 1
+    prompt = history.get_vllm_inputs()["prompt"]
+    assert "<|vision_start|><|video_pad|><|vision_end|>" in prompt
+    assert SILENT_TEXT in prompt
+
+
+def test_empty_asr_placeholder_video_prompt_includes_current_user_vision_pad():
+    clear_all_stage_sessions()
+    session_id = "aura-prompt-vision-pad"
+    placeholder_mm = {"video": ["frame-0", "frame-1", "frame-2"]}
+    _finish_async_chunk_turn(
+        session_id=session_id,
+        transcript="请简单介绍下这本书讲的是什么。",
+        multi_modal_data=placeholder_mm,
+        request_id="req-q2",
+        silent=False,
+        response_text="好的，我这就简单介绍一下这本书的内容。",
+    )
+    next_input = build_aura_input(
+        transcript="",
+        additional_info={
+            "aura_session_id": session_id,
+            "aura_system_prompt": ["system"],
+        },
+        multi_modal_data=placeholder_mm,
+        request_id="req-empty-video",
+    )
+    prompt = next_input["prompt"]
+    assert prompt.endswith("<|im_start|>assistant")
+    last_user_idx = prompt.rfind("<|im_start|>user")
+    last_assistant_idx = prompt.rfind("<|im_start|>assistant")
+    assert last_user_idx != -1 and last_user_idx < last_assistant_idx
+    current_user_block = prompt[last_user_idx:last_assistant_idx]
+    assert "<|vision_start|><|video_pad|><|vision_end|>" in current_user_block
+    assert "请简单介绍下这本书讲的是什么。" not in current_user_block
