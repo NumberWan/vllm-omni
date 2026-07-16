@@ -12,6 +12,7 @@ Protocol:
         {"type": "session.config", ...}         # Session config (sent once)
         {"type": "video.frame", "data": "..."}  # base64 JPEG/PNG frame
         {"type": "audio.chunk", "data": "..."}  # base64 PCM16 16kHz mono
+        {"type": "audio.done"}                  # End of utterance (alias: audio.commit)
         {"type": "video.query", "text": "..."}  # Submit query about buffered frames
         {"type": "video.done"}                  # End of session
 
@@ -23,6 +24,10 @@ Protocol:
         {"type": "response.audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
+
+    Input audio: clients must send the full utterance as ``audio.chunk`` messages,
+    then ``audio.done`` / ``audio.commit``. Pipelines that enable voice auto-trigger
+    open a turn only after ``audio.done`` (not per chunk), when the turn lock is free.
 """
 
 import asyncio
@@ -69,6 +74,42 @@ ReleaseTurnLockFn = Callable[..., Awaitable[None]]
 
 def _decode_frame_bytes(raw_bytes: bytes) -> Any:
     return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+
+
+def _downscale_frame_max_edge(frame: Any, max_frame_edge: int) -> Any:
+    """Downscale a decoded RGB frame so ``max(H, W) <= max_frame_edge``.
+
+    Matches native AURA client's ``max_frame_edge`` (default 640): shrink pixels
+    kept for VL / deferred video transport. ``max_frame_edge <= 0`` disables.
+    """
+    if max_frame_edge is None or int(max_frame_edge) <= 0:
+        return frame
+    limit = int(max_frame_edge)
+
+    if isinstance(frame, Image.Image):
+        width, height = frame.size
+        long_edge = max(width, height)
+        if long_edge <= limit:
+            return frame
+        scale = limit / float(long_edge)
+        new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return frame.resize(new_size, Image.Resampling.LANCZOS)
+
+    import numpy as np
+
+    array = np.asarray(frame)
+    if array.ndim < 2:
+        return frame
+    height, width = int(array.shape[0]), int(array.shape[1])
+    long_edge = max(height, width)
+    if long_edge <= limit:
+        return array
+    scale = limit / float(long_edge)
+    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    image = Image.fromarray(array.astype("uint8", copy=False)).resize(
+        new_size, Image.Resampling.LANCZOS
+    )
+    return np.asarray(image)
 
 
 @runtime_checkable
@@ -156,6 +197,10 @@ class StreamingVideoSessionConfig(BaseModel):
         default=True,
         description="EVS pixel-similarity pre-filter to drop near-duplicate frames.",
     )
+    return_stage_metrics: bool = Field(
+        default=False,
+        description="Include per-stage engine metrics in WebSocket response events.",
+    )
     frame_filter_threshold: float = Field(
         default=0.95,
         ge=0.0,
@@ -174,6 +219,24 @@ class OmniStreamingVideoHandler:
     def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
         """Auto-trigger after ``video.frame`` when True (default: never)."""
         return False
+
+    def should_trigger_on_audio_done(self, *, has_audio: bool, is_turn_locked: bool) -> bool:
+        """Open a turn after a complete utterance (``audio.done``). Default: never."""
+        del has_audio, is_turn_locked
+        return False
+
+    def ensure_frames_for_audio_turn(
+        self,
+        frame_buffer: list[str],
+        message_history: Any,
+        config: "StreamingVideoSessionConfig",
+    ) -> bool:
+        """Ensure at least one vision frame exists before an audio-triggered turn.
+
+        Default: require a non-empty session ``frame_buffer``.
+        """
+        del message_history, config
+        return bool(frame_buffer)
 
     def auto_trigger_frame_count(
         self,
@@ -502,6 +565,9 @@ class OmniStreamingVideoHandler:
                             query_task is not None and not query_task.done()
                         )
                         trigger_turn_locked = is_turn_locked if self.releases_turn_after_text_done() else is_generating
+                        # Frame auto-trigger stays independent of buffered audio: silent vision
+                        # turns keep running while chunks accumulate; audio.done still opens a
+                        # voice turn when the utterance is complete and unlocked.
                         if self.should_trigger_turn(
                             VideoStreamTurnTrigger(
                                 frame_count=self.auto_trigger_frame_count(
@@ -526,6 +592,33 @@ class OmniStreamingVideoHandler:
                             audio_buffer.clear()
                             continue
                         audio_buffer.extend(pcm_bytes)
+
+                    elif msg_type in ("audio.done", "audio.commit"):
+                        # End of utterance: open a turn only when unlocked and audio present.
+                        # Do not trigger on each audio.chunk.
+                        if self.releases_turn_after_text_done():
+                            audio_locked = is_turn_locked
+                        else:
+                            audio_locked = active_request_id is not None or (
+                                query_task is not None and not query_task.done()
+                            )
+                        has_audio = len(audio_buffer) > 0
+                        if not self.should_trigger_on_audio_done(
+                            has_audio=has_audio,
+                            is_turn_locked=audio_locked,
+                        ):
+                            continue
+                        if not self.ensure_frames_for_audio_turn(
+                            frame_buffer,
+                            message_history,
+                            config,
+                        ):
+                            await self._send_error(
+                                websocket,
+                                "No frames available for audio-triggered turn",
+                            )
+                            continue
+                        await _start_query_turn(query_text="")
 
                     elif msg_type == "video.query":
                         if not self.supports_manual_query_turn():

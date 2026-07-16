@@ -95,6 +95,46 @@ def _turn_aura_metrics(turn: dict[str, Any]) -> dict[str, Any]:
     return aura if isinstance(aura, dict) else {}
 
 
+def _turn_stage_metrics_map(turn: dict[str, Any]) -> dict[str, Any]:
+    metrics = turn.get("metrics")
+    if not isinstance(metrics, dict):
+        return {}
+    stage_metrics = metrics.get("stage_metrics")
+    return stage_metrics if isinstance(stage_metrics, dict) else {}
+
+
+def _turn_asr_gen_ms(turn: dict[str, Any]) -> float:
+    """ASR stage_gen_time_ms for this turn (0 when skip / missing)."""
+    stage_map = _turn_stage_metrics_map(turn)
+    asr = stage_map.get("0") or stage_map.get(0) or {}
+    if not isinstance(asr, dict):
+        return 0.0
+    return float(asr.get(defs.STAGE_GEN_TIME_MS) or 0.0)
+
+
+def _turn_aura_ttft_ms(turn: dict[str, Any]) -> float | None:
+    """Aura-only TTFT (serving first-output or vllm_ttft), excluding ASR."""
+    aura = _turn_aura_metrics(turn)
+    for key in (defs.SERVING_TIME_TO_FIRST_OUTPUT_MS, defs.VLLM_TTFT_MS):
+        if aura.get(key) is None:
+            continue
+        value = float(aura[key])
+        if value > 0:
+            return value
+    return None
+
+
+def _turn_text_ttft_ms(turn: dict[str, Any]) -> float | None:
+    """True text TTFT: ASR gen + Aura TTFT for both spoken and silent turns."""
+    aura_ttft = _turn_aura_ttft_ms(turn)
+    if aura_ttft is None:
+        return None
+    asr_ms = _turn_asr_gen_ms(turn)
+    if asr_ms > 0:
+        return asr_ms + aura_ttft
+    return aura_ttft
+
+
 def _turn_num_tokens_out(turn: dict[str, Any]) -> int:
     """Per-turn output tokens from stage-1 snapshot or top-level WS metrics."""
     aura = _turn_aura_metrics(turn)
@@ -164,7 +204,42 @@ def _repair_stage2_gen_snapshot(stage_metrics: dict[str, Any]) -> None:
         s2[defs.STAGE_GEN_TIME_MS] = s3_gen
 
 
-def _enrich_turn_stage_snapshot(stage_metrics: dict[str, Any], *, tokens: int = 0) -> dict[str, Any]:
+def _clear_silent_audio_pipeline_stages(stage_metrics: dict[str, Any]) -> dict[str, Any]:
+    """Drop TTS/code2wav timings from silent turns.
+
+    Silent AURA turns only emit an empty finish-sentinel to release the
+    prewarmed Talker/Code2Wav wait gate — no synthesis runs. Residual
+    ``stage_gen_time_ms`` / audio counters are wait-gate close latency or
+    cumulative-delta bleed from a prior spoken turn and must not appear in
+    silent aggregates.
+    """
+    cleared = {str(k): (dict(v) if isinstance(v, dict) else v) for k, v in stage_metrics.items()}
+    for sid in ("2", "3"):
+        stage = cleared.get(sid)
+        if not isinstance(stage, dict):
+            continue
+        stage[defs.STAGE_GEN_TIME_MS] = 0.0
+        stage[defs.SERVING_TIME_TO_FIRST_OUTPUT_MS] = 0.0
+        stage[defs.TIME_PER_OUTPUT_UNIT_MS] = 0.0
+        stage[defs.INTER_OUTPUT_LATENCIES_MS] = []
+        stage["inter_output_latency_ms"] = 0.0
+        stage[defs.AUDIO_FRAMES] = 0
+        stage["audio_frames"] = 0
+        stage[f"{defs.AUDIO_DURATION}_s"] = 0.0
+        stage["audio_duration_s"] = 0.0
+        stage[defs.AUDIO_RTF] = 0.0
+        stage["audio_rtf"] = 0.0
+        stage["serving_audio_ttfp_ms"] = 0.0
+        stage["audio_ttfp_ms"] = 0.0
+    return cleared
+
+
+def _enrich_turn_stage_snapshot(
+    stage_metrics: dict[str, Any],
+    *,
+    tokens: int = 0,
+    silent: bool = False,
+) -> dict[str, Any]:
     """Fill missing per-turn stage_gen_time / ITL proxies in a stage_metrics map."""
     enriched = {str(k): dict(v) if isinstance(v, dict) else v for k, v in stage_metrics.items()}
     s0 = enriched.get("0")
@@ -195,6 +270,8 @@ def _enrich_turn_stage_snapshot(stage_metrics: dict[str, Any], *, tokens: int = 
         tpot = float(s1.get(defs.VLLM_TPOT_MS) or 0.0)
         if tpot > 0 and turn_tokens > 1 and (not isinstance(itls, list) or not itls):
             s1[defs.VLLM_ITLS_MS] = [tpot] * (turn_tokens - 1)
+    if silent:
+        return _clear_silent_audio_pipeline_stages(enriched)
     s3 = enriched.get("3")
     if isinstance(s3, dict):
         _repair_stage3_audio_snapshot(s3)
@@ -212,19 +289,21 @@ def _reconcile_streaming_turn_metrics(turns: list[dict[str, Any]]) -> None:
         stage_metrics = metrics.get("stage_metrics")
         if not isinstance(stage_metrics, dict):
             continue
-        s3 = stage_metrics.get("3")
-        if isinstance(s3, dict):
-            frames = int(s3.get(defs.AUDIO_FRAMES) or s3.get("audio_frames") or 0)
-            if frames > 0 and frames == prev_audio_frames:
+        silent = _turn_is_silent(turn)
+        if not silent:
+            s3 = stage_metrics.get("3")
+            if isinstance(s3, dict):
+                frames = int(s3.get(defs.AUDIO_FRAMES) or s3.get("audio_frames") or 0)
                 _repair_stage3_audio_snapshot(s3)
-            else:
-                _repair_stage3_audio_snapshot(s3)
-            prev_audio_frames = int(s3.get(defs.AUDIO_FRAMES) or s3.get("audio_frames") or 0) or prev_audio_frames
+                prev_audio_frames = int(s3.get(defs.AUDIO_FRAMES) or s3.get("audio_frames") or 0) or prev_audio_frames
         tokens = _turn_num_tokens_out(turn)
-        turn["metrics"] = {
-            **metrics,
-            "stage_metrics": _enrich_turn_stage_snapshot(stage_metrics, tokens=tokens),
-        }
+        enriched_sm = _enrich_turn_stage_snapshot(stage_metrics, tokens=tokens, silent=silent)
+        cleaned = {**metrics, "stage_metrics": enriched_sm}
+        if silent:
+            for key in ("audio_duration_s", "audio_frames", "audio_ttfp_ms", "audio_rtf"):
+                if key in cleaned:
+                    cleaned[key] = 0.0 if key != "audio_frames" else 0
+        turn["metrics"] = cleaned
 
 def _turn_audio_stage(stage_metrics: dict[str, Any]) -> dict[str, Any]:
     """Pick the stage snapshot that carries audio duration (code2wav preferred, then TTS)."""
@@ -241,17 +320,30 @@ def _turn_audio_stage(stage_metrics: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _positive_stage_gen_ms(stage_metrics: dict[str, Any], stage_id: int | str) -> float:
+    stage = stage_metrics.get(str(stage_id)) or stage_metrics.get(stage_id) or {}
+    if not isinstance(stage, dict):
+        return 0.0
+    value = float(stage.get(defs.STAGE_GEN_TIME_MS) or 0.0)
+    return value if value > 0 else 0.0
+
+
 def _turn_audio_ttfp_ms(stage_metrics: dict[str, Any]) -> float | None:
+    """Finish-then-start AUDIO_TTFP: first audio only after ASR+Aura full gen.
+
+    AURA ``aura2tts_async_chunk`` waits for Stage-1 finish before Stage-2, so
+    root-relative ``serving_time_to_first_output_ms`` on TTS/code2wav is not a
+    reliable turn timeline. Approximate true TTFP as ASR gen + Aura gen (same
+    lower bound native bench uses when reconstructing ``t_first_audio``).
+    """
+    asr_gen = _positive_stage_gen_ms(stage_metrics, 0)
+    aura_gen = _positive_stage_gen_ms(stage_metrics, 1)
+    if aura_gen > 0:
+        return asr_gen + aura_gen
     audio_stage = _turn_audio_stage(stage_metrics)
     ttfp = audio_stage.get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS)
     if ttfp is not None and float(ttfp) > 0:
         return float(ttfp)
-    aura = stage_metrics.get("1") or stage_metrics.get(1) or {}
-    tts = stage_metrics.get("2") or stage_metrics.get(2) or {}
-    aura_serving = float(aura.get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS) or 0.0)
-    tts_serving = float(tts.get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS) or 0.0)
-    if aura_serving > 0 and tts_serving > 0:
-        return aura_serving + tts_serving
     return None
 
 
@@ -364,10 +456,11 @@ def _build_turn_class_summary(
 
     for turn in turns:
         aura = _turn_aura_metrics(turn)
-        if aura.get("vllm_ttft_ms") is not None:
-            ttft = float(aura["vllm_ttft_ms"])
-            if ttft > 0:
-                ttft_vals.append(ttft)
+        # Top-level Text TTFT = ASR gen + Aura TTFT (spoken and silent).
+        # Stage-1 section still reports aura-only Serving/vllm TTFT from stage snapshots.
+        text_ttft = _turn_text_ttft_ms(turn)
+        if text_ttft is not None and text_ttft > 0:
+            ttft_vals.append(text_ttft)
         if aura.get("vllm_tpot_ms") is not None and float(aura["vllm_tpot_ms"]) > 0:
             tpot_vals.append(float(aura["vllm_tpot_ms"]))
         itls = aura.get("vllm_itls_ms")
@@ -378,6 +471,9 @@ def _build_turn_class_summary(
             if tokens > 1:
                 itl_vals.extend([float(aura["vllm_tpot_ms"])] * (tokens - 1))
         token_total += _turn_num_tokens_out(turn)
+
+        if _turn_is_silent(turn):
+            continue
 
         metrics = turn.get("metrics")
         if isinstance(metrics, dict):
@@ -663,6 +759,10 @@ def _stage_sections_from_snapshots(
         stage_ids = [0, 1, 2, 3]
 
     for stage_id in stage_ids:
+        # Silent turns never synthesize audio; skip Talker/Code2Wav sections so
+        # finish-sentinel / delta-bleed timings are not reported as work.
+        if silent_class and stage_id >= 2:
+            continue
         sid = str(stage_id)
         stage_name = _STAGE_DISPLAY_NAMES.get(stage_id, f"stage_{stage_id}")
         gen_ms = _stage_stats(_collect_stage_values(snapshots, sid, defs.STAGE_GEN_TIME_MS), defs.STAGE_GEN_TIME_MS)
@@ -898,15 +998,44 @@ def format_bench_report(summary: dict[str, Any]) -> str:
 
 
 def _collect_turn_e2el_ms(chunk: dict[str, Any]) -> float | None:
+    """End-to-end latency until text+audio fully done when audio exists.
+
+    Prefer reconstructed ``ASR gen + Aura gen + TTS/code2wav gen`` for spoken
+    turns (Stage-1 finishes before Stage-2). ``wall_e2el_ms`` from older JSON is
+    stamped at ``text.done`` and must not be treated as full spoken E2EL.
+    Silent / text-only turns keep client ``wall_e2el_ms`` (text done).
+    """
+    stage_metrics = _turn_stage_metrics_map(chunk)
+    asr_gen = _positive_stage_gen_ms(stage_metrics, 0)
+    aura_gen = _positive_stage_gen_ms(stage_metrics, 1)
+    audio_stage = _turn_audio_stage(stage_metrics)
+    audio_dur = float(
+        audio_stage.get(f"{defs.AUDIO_DURATION}_s") or audio_stage.get("audio_duration_s") or 0.0
+    )
+    audio_frames = int(audio_stage.get(defs.AUDIO_FRAMES) or audio_stage.get("audio_frames") or 0)
+    audio_gen = max(_positive_stage_gen_ms(stage_metrics, 3), _positive_stage_gen_ms(stage_metrics, 2))
+    # Only treat as full spoken E2EL when this turn actually produced audio.
+    # Silent turns may still carry residual/delta TTS stage_gen_time_ms.
+    if (
+        not _turn_is_silent(chunk)
+        and audio_gen > 0
+        and (audio_dur > 0 or audio_frames > 0)
+        and (asr_gen > 0 or aura_gen > 0)
+    ):
+        return asr_gen + aura_gen + audio_gen
+
+    # Newer clients may stamp wall_e2el at audio.done; accept if clearly past text path.
     raw = chunk.get("wall_e2el_ms")
     if raw is not None:
         value = float(raw)
-        return value if value > 0 else None
+        if value > 0:
+            return value
     raw = chunk.get("e2el_ms")
     if raw is not None:
         value = float(raw)
         return value if value > 0 else None
-    return None
+    text_total = asr_gen + aura_gen
+    return text_total if text_total > 0 else None
 
 
 def _flatten_streaming_turns(per_requests: list[dict[str, Any]]) -> list[dict[str, Any]]:

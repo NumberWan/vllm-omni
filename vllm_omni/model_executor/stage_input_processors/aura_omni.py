@@ -26,14 +26,12 @@ from vllm_omni.model_executor.stage_input_processors.aura_session_history import
     DEFAULT_AURA_SYSTEM_PROMPT,
     SILENT_TEXT,
     SessionHistory,
-    commit_stage_session_turn,
-    get_or_create_stage_session_history,
+    commit_session_turn,
+    get_or_create_session_history,
     get_session_history,
-    get_stage_session_history,
     is_effectively_silent,
     pop_transcript_for_request,
-    record_stage_pending_turn,
-    record_transcript_for_request,
+    record_pending_turn,
 )
 
 QWEN_IM_START_ID = 151644
@@ -148,6 +146,40 @@ def aura_tts_additional_information_from_session(
     return info
 
 
+# Nested ``np.ndarray`` inside ``additional_information.scalar_data`` is msgpack-
+# encoded as ``(dtype, shape, buffer)`` but not decoded back when typed as Any
+# (and large buffers use aux indices that are gone after decode). Pack pixels as
+# plain ``{marker, dtype, shape, data: bytes}`` before EngineCore transport.
+AURA_VIDEO_WIRE_MARKER = "__aura_video_ndarray__"
+
+
+def pack_aura_video_ndarray(video_array: np.ndarray) -> dict[str, Any]:
+    """Pack a video ndarray into a msgspec-safe dict for ``additional_information``."""
+    arr = np.ascontiguousarray(np.asarray(video_array))
+    return {
+        AURA_VIDEO_WIRE_MARKER: True,
+        "dtype": arr.dtype.str,
+        "shape": list(arr.shape),
+        "data": arr.tobytes(),
+    }
+
+
+def unpack_aura_video_ndarray(payload: Any) -> np.ndarray | None:
+    """Restore a video ndarray packed by :func:`pack_aura_video_ndarray`."""
+    if not isinstance(payload, dict) or not payload.get(AURA_VIDEO_WIRE_MARKER):
+        return None
+    shape = payload.get("shape")
+    data = payload.get("data")
+    dtype = payload.get("dtype")
+    if not isinstance(shape, (list, tuple)) or data is None or dtype is None:
+        return None
+    try:
+        buffer = data if isinstance(data, (bytes, bytearray, memoryview)) else bytes(data)
+        return np.frombuffer(buffer, dtype=np.dtype(dtype)).reshape(tuple(int(x) for x in shape)).copy()
+    except (TypeError, ValueError, BufferError):
+        return None
+
+
 def frames_to_video_tuple(
     frames: list[np.ndarray],
     *,
@@ -196,16 +228,44 @@ def build_aura_streaming_turn_additional_information(
     tts_instruct: str | None = None,
     tts_max_new_tokens: int | None = None,
     tts_pass_token_ids: bool | None = None,
+    max_rounds: int | None = None,
+    num_rounds_keep: int | None = None,
+    pruning_enabled: bool | None = None,
+    max_context_qas: int | None = None,
+    max_1qna_rounds: int | None = None,
 ) -> dict[str, Any]:
     """Build ``additional_information`` for one AURA streaming inference turn."""
+    # Pack pixels before EngineCore msgpack: nested ndarray under scalar_data
+    # does not survive decode (see ``pack_aura_video_ndarray``).
+    if os.environ.get("VLLM_AURA_DISABLE_VIDEO_PACK", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        packed_video: Any = video_array
+    else:
+        packed_video = pack_aura_video_ndarray(video_array)
     additional_information: dict[str, Any] = {
         "aura_session_id": session_id,
         "deferred_multi_modal_data": {
-            "video": [(video_array, video_metadata)],
+            "video": [(packed_video, dict(video_metadata))],
         },
         "aura_system_prompt": [system_prompt],
         "omni_skip_stages": [0] if skip_asr else [],
     }
+    # Stage-worker SessionHistory is the prompt truth for sync and async_chunk;
+    # pass client/API knobs so create does not fall back to defaults (max_rounds=20).
+    if max_rounds is not None:
+        additional_information["aura_max_rounds"] = [int(max_rounds)]
+    if num_rounds_keep is not None:
+        additional_information["aura_num_rounds_keep"] = [int(num_rounds_keep)]
+    if pruning_enabled is not None:
+        additional_information["aura_pruning_enabled"] = [bool(pruning_enabled)]
+    if max_context_qas is not None:
+        additional_information["aura_max_context_qas"] = [int(max_context_qas)]
+    if max_1qna_rounds is not None:
+        additional_information["aura_max_1qna_rounds"] = [int(max_1qna_rounds)]
     if include_tts:
         additional_information.update(
             aura_tts_additional_information_from_session(
@@ -476,38 +536,41 @@ def build_aura_input(
     requires_multimodal_data: bool = True,
     mm_processor_kwargs: Any = None,
 ) -> dict[str, Any]:
-    """Build the AURA stage-1 input for both sync and async-chunk ASR output."""
+    """Build the AURA stage-1 input for both sync and async-chunk ASR output.
+
+    Conversation history always comes from the prompt SessionHistory registry
+    (``get_session_history`` / ``get_or_create_session_history``), never the API
+    ``AuraSessionState.history`` store. API state still owns frames / trigger /
+    penalty.
+    """
     session_id = additional_info.get("aura_session_id")
-    history = get_session_history(str(session_id)) if session_id else None
     system_prompt = _first_value(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT)
     transcript = _clean_asr_transcript(transcript)
     vision_data = _vision_multimodal_data(multi_modal_data)
+    mm_uuids: dict[str, Any] | None = None
 
-    if session_id and history is not None:
-        video_tuple = _resolve_turn_video_tuple(additional_info, multi_modal_data)
-        record_transcript_for_request(str(session_id), request_id, transcript)
-        vision_pad_text = _pending_vision_pad_text(transcript, video_tuple, multi_modal_data)
-        vllm_inputs = history.preview_vllm_inputs(
-            transcript,
-            video_tuple=video_tuple,
-            vision_pad_text=vision_pad_text,
-        )
-        prompt = vllm_inputs["prompt"]
-        vision_data = vllm_inputs.get("multi_modal_data", {})
-    elif session_id:
-        history = get_stage_session_history(str(session_id))
+    if session_id:
+        history = get_session_history(str(session_id))
         if history is None:
-            history = get_or_create_stage_session_history(
+            history = get_or_create_session_history(
                 str(session_id),
                 system_prompt=str(system_prompt),
+                max_rounds=int(_first_value(additional_info.get("aura_max_rounds"), 45)),
+                num_rounds_keep=int(_first_value(additional_info.get("aura_num_rounds_keep"), 30)),
+                pruning_enabled=_first_bool(additional_info.get("aura_pruning_enabled"), True),
+                max_context_qas=int(_first_value(additional_info.get("aura_max_context_qas"), 10)),
+                max_1qna_rounds=int(_first_value(additional_info.get("aura_max_1qna_rounds"), 4)),
             )
         video_tuple = _resolve_turn_video_tuple(additional_info, multi_modal_data)
-        pending_kwargs = {
+        pending_kwargs: dict[str, Any] = {
             "deferred_mm": additional_info.get("deferred_multi_modal_data"),
             "aura_turn_video": additional_info.get("aura_turn_video"),
             "multi_modal_data": dict(multi_modal_data) if isinstance(multi_modal_data, dict) else None,
             "had_vision": False,
+            "mm_uuid": None,
         }
+        mm_uuid_only = 0
+        mm_pixel_videos = 0
         if (
             video_tuple is None
             and history.current_rounds == 0
@@ -523,6 +586,10 @@ def build_aura_input(
                 vision_pad_text=vision_pad_text,
             )
             prompt = vllm_inputs["prompt"]
+            mm_uuids = vllm_inputs.get("multi_modal_uuids")
+            mm_uuid_only = int(vllm_inputs.get("mm_uuid_only_videos") or 0)
+            mm_pixel_videos = int(vllm_inputs.get("mm_pixel_videos") or 0)
+            pending_kwargs["mm_uuid"] = history._pending_mm_uuid
             if video_tuple is not None:
                 vision_data = vllm_inputs.get("multi_modal_data", {})
             else:
@@ -535,31 +602,18 @@ def build_aura_input(
             or video_tuple_from_multi_modal_data(vision_data)
             or video_tuple_from_multi_modal_data(multi_modal_data)
         )
-        pending_kwargs["had_vision"] = bool(_vision_multimodal_data(vision_data))
-        record_stage_pending_turn(
+        pending_kwargs["had_vision"] = bool(
+            any(v is not None for v in ((vision_data or {}).get("video") or []) if isinstance(vision_data, dict))
+            or bool(video_tuple)
+            or bool(_vision_multimodal_data(multi_modal_data))
+        )
+        record_pending_turn(
             str(session_id),
             request_id=request_id,
             transcript=transcript,
             video_tuple=commit_video_tuple,
             **pending_kwargs,
         )
-        if os.environ.get("VLLM_AURA_SESSION_HISTORY_DIAG", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            logger.info(
-                "AURA stage_session_history hit pid=%s session_id=%s request_id=%s rounds=%d "
-                "video_tuple=%s commit_video_tuple=%s transcript_len=%d",
-                os.getpid(),
-                session_id,
-                request_id,
-                history.current_rounds,
-                "ok" if video_tuple is not None else "miss",
-                "ok" if commit_video_tuple is not None else "miss",
-                len(transcript),
-            )
     else:
         prompt = _aura_prompt(str(system_prompt), transcript, vision_data)
 
@@ -585,23 +639,192 @@ def build_aura_input(
         next_input["ids"] = {"prompt": prompt_token_ids}
     if requires_multimodal_data:
         next_input["multi_modal_data"] = vision_data
+    if mm_uuids is not None:
+        next_input["multi_modal_uuids"] = mm_uuids
     if mm_processor_kwargs is not None:
         next_input["mm_processor_kwargs"] = mm_processor_kwargs
     return next_input
 
 
-def _commit_stage_session_turn_if_present(additional_info: dict[str, Any], response_text: str) -> None:
+def _commit_session_turn_if_present(additional_info: dict[str, Any], response_text: str) -> None:
     session_id = additional_info.get("aura_session_id")
     if session_id:
-        commit_stage_session_turn(str(_first_value(session_id)), response_text)
+        commit_session_turn(str(_first_value(session_id)), response_text)
+
+
+_AURA_STAGE_INPUT_PROCESSORS: dict[int, Any] = {}
+
+
+def _get_aura_stage_input_processor(vllm_config: Any) -> Any:
+    """Lazy InputProcessor for async_chunk Stage-1 (same as sync orchestrator)."""
+    key = id(vllm_config)
+    processor = _AURA_STAGE_INPUT_PROCESSORS.get(key)
+    if processor is None:
+        from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
+
+        processor = build_stage0_input_processor(vllm_config)
+        _AURA_STAGE_INPUT_PROCESSORS[key] = processor
+    return processor
+
+
+def _expand_aura_async_chunk_with_input_processor(
+    *,
+    vllm_config: Any,
+    request: Any,
+    built: dict[str, Any],
+    request_id: str,
+) -> tuple[list[int], list[Any]]:
+    """Mirror sync Stage-1: expand ``video_pad`` + attach ``mm_features``."""
+    from vllm.sampling_params import SamplingParams
+
+    processor = _get_aura_stage_input_processor(vllm_config)
+    params = getattr(request, "sampling_params", None)
+    if params is None:
+        params = SamplingParams(max_tokens=1)
+    prompt: dict[str, Any] = {
+        "prompt": built["prompt"],
+        "additional_information": built.get("additional_information"),
+    }
+    mm = built.get("multi_modal_data")
+    if mm:
+        prompt["multi_modal_data"] = mm
+    mm_uuids = built.get("multi_modal_uuids")
+    if mm_uuids is not None:
+        prompt["multi_modal_uuids"] = mm_uuids
+    mm_kwargs = built.get("mm_processor_kwargs")
+    if mm_kwargs is not None:
+        prompt["mm_processor_kwargs"] = mm_kwargs
+    processed = processor.process_inputs(
+        request_id=str(request_id),
+        prompt=prompt,
+        params=params,
+        supported_tasks=("generate",),
+        arrival_time=getattr(request, "arrival_time", None),
+        resumable=bool(getattr(request, "resumable", False)),
+    )
+    prompt_token_ids = list(getattr(processed, "prompt_token_ids", None) or [])
+    mm_features = list(getattr(processed, "mm_features", None) or [])
+    return prompt_token_ids, mm_features
+
+
+def _try_splice_pending_video_expand(
+    *,
+    hist: SessionHistory,
+    built: dict[str, Any],
+    transcript: str,
+    vllm_config: Any,
+    request: Any,
+    request_id: str,
+) -> tuple[list[int], list[Any], float] | None:
+    """When committed history is unchanged, only process the pending video.
+
+    History fingerprint stable across consecutive silent turns with the same
+    committed videos. Returns ``(token_ids, mm_features, mini_process_ms)``.
+    """
+    cache = hist.get_expand_cache()
+    if not cache:
+        return None
+    hist_uuids = hist.history_video_uuids()
+    # Empty history + mini prompt (no system) corrupted splices and suppressed
+    # spoken turns in short benches. Only splice with committed history videos.
+    if not hist_uuids:
+        return None
+    if tuple(cache.get("hist_uuids") or ()) != hist_uuids:
+        return None
+    mm = built.get("multi_modal_data") or {}
+    videos = mm.get("video") if isinstance(mm, dict) else None
+    uuids = (built.get("multi_modal_uuids") or {}).get("video") if isinstance(built.get("multi_modal_uuids"), dict) else None
+    if not isinstance(videos, list) or not isinstance(uuids, list):
+        return None
+    if len(videos) != len(uuids) or not videos:
+        return None
+    if tuple(str(u) for u in uuids[:-1]) != hist_uuids:
+        return None
+    pending_uuid = str(uuids[-1]) if uuids[-1] else None
+    if not pending_uuid:
+        return None
+    old_ids = list(cache.get("prompt_token_ids") or [])
+    old_feats = list(cache.get("mm_features") or [])
+    if len(old_feats) != len(uuids) or not old_ids:
+        return None
+    if pending_uuid == cache.get("pending_uuid"):
+        return old_ids, old_feats, 0.0
+
+    from dataclasses import replace
+
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    import time as _time
+
+    text = (transcript or "").strip()
+    mini_prompt = (
+        f"<|im_start|>user<|vision_start|><|video_pad|><|vision_end|>{text}"
+        f"<|im_end|><|im_start|>assistant"
+    )
+    mini_built: dict[str, Any] = {
+        "prompt": mini_prompt,
+        "multi_modal_data": {"video": [videos[-1]]},
+        "multi_modal_uuids": {"video": [pending_uuid]},
+    }
+    if built.get("mm_processor_kwargs") is not None:
+        mini_built["mm_processor_kwargs"] = built.get("mm_processor_kwargs")
+    _t0 = _time.perf_counter()
+    try:
+        new_ids, new_feats = _expand_aura_async_chunk_with_input_processor(
+            vllm_config=vllm_config,
+            request=request,
+            built=mini_built,
+            request_id=f"{request_id}:inc",
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    mini_ms = (_time.perf_counter() - _t0) * 1000.0
+    if not new_feats:
+        return None
+    new_f = new_feats[0]
+    new_pos = getattr(new_f, "mm_position", None)
+    old_last = old_feats[-1]
+    old_pos = getattr(old_last, "mm_position", None)
+    if new_pos is None or old_pos is None:
+        return None
+    new_off = int(new_pos.offset)
+    new_len = int(new_pos.length)
+    old_off = int(old_pos.offset)
+    old_len = int(old_pos.length)
+    if new_off < 0 or new_len <= 0 or old_off < 0 or old_len <= 0:
+        return None
+    if new_off + new_len > len(new_ids) or old_off + old_len > len(old_ids):
+        return None
+    video_toks = new_ids[new_off : new_off + new_len]
+    spliced_ids = old_ids[:old_off] + video_toks + old_ids[old_off + old_len :]
+    try:
+        new_pos_adj = PlaceholderRange(
+            offset=old_off,
+            length=new_len,
+            is_embed=getattr(new_pos, "is_embed", None),
+        )
+        new_f_adj = replace(new_f, mm_position=new_pos_adj)
+    except Exception:  # noqa: BLE001
+        return None
+    spliced_feats = list(old_feats[:-1]) + [new_f_adj]
+    return spliced_ids, spliced_feats, mini_ms
 
 
 def resolve_aura_async_chunk_stage_payload(
     payload_data: dict[str, Any],
     request: Any,
     model_config: Any | None = None,
+    vllm_config: Any | None = None,
 ) -> None:
-    """Build the AURA prompt on the stage-1 worker from an ASR passthrough payload."""
+    """Build the AURA prompt on the stage-1 worker from an ASR passthrough payload.
+
+    When ``vllm_config`` is provided (async_chunk Stage-1 worker), multimodal
+    expansion goes through ``InputProcessor.process_inputs`` — the same path
+    sync uses — so ``prompt_token_ids`` include vision embeds and
+    ``request.mm_features`` is populated. Pixel payloads are then stripped from
+    ``payload_data`` so the scheduler does not re-IPC raw video through
+    ``additional_information``.
+    """
     if "aura_asr_transcript" not in payload_data:
         return
 
@@ -629,7 +852,15 @@ def resolve_aura_async_chunk_stage_payload(
 
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     try:
-        tokenizer = cached_tokenizer_from_config(model_config) if model_config is not None else None
+        import time as _time
+
+        _t0 = _time.perf_counter()
+        # Prefer InputProcessor expansion (sync-aligned). Plain tokenizer.encode
+        # leaves a single <|video_pad|> and never attaches mm_features.
+        use_processor = vllm_config is not None
+        tokenizer = None
+        if not use_processor and model_config is not None:
+            tokenizer = cached_tokenizer_from_config(model_config)
         built = build_aura_input(
             transcript=str(payload_data.get("aura_asr_transcript", "")),
             additional_info=additional_info,
@@ -640,6 +871,100 @@ def resolve_aura_async_chunk_stage_payload(
             mm_processor_kwargs=payload_data.get("mm_processor_kwargs"),
         )
         payload_data.update(built)
+
+        mm = built.get("multi_modal_data") or {}
+        videos = mm.get("video") if isinstance(mm, dict) else None
+        n_vid = len(videos) if isinstance(videos, list) else (1 if videos else 0)
+        n_feat = 0
+        process_ms = 0.0
+        splice_hit = False
+        if use_processor:
+            _t_proc = _time.perf_counter()
+            sid = additional_info.get("aura_session_id")
+            hist = get_session_history(str(sid)) if sid else None
+            transcript_s = str(payload_data.get("aura_asr_transcript", "") or "")
+            spliced = None
+            if hist is not None:
+                spliced = _try_splice_pending_video_expand(
+                    hist=hist,
+                    built=built,
+                    transcript=transcript_s,
+                    vllm_config=vllm_config,
+                    request=request,
+                    request_id=str(request_id),
+                )
+            try:
+                if spliced is not None:
+                    prompt_token_ids, mm_features, mini_ms = spliced
+                    process_ms = mini_ms
+                    splice_hit = True
+                else:
+                    prompt_token_ids, mm_features = _expand_aura_async_chunk_with_input_processor(
+                        vllm_config=vllm_config,
+                        request=request,
+                        built=built,
+                        request_id=str(request_id),
+                    )
+                    process_ms = (_time.perf_counter() - _t_proc) * 1000.0
+            except (ValueError, AssertionError) as exc:
+                # Cache miss / UUID-only path failure — rebuild with cold pixels.
+                err = str(exc)
+                if "Cache miss" not in err and "unreachable" not in err and "None" not in err:
+                    raise
+                if hist is not None:
+                    hist._warm_mm_uuids.clear()
+                    hist.clear_expand_cache()
+                # Drop warm UUIDs and rebuild from SessionHistory pixels.
+                if sid:
+                    rebuilt = build_aura_input(
+                        transcript=transcript_s,
+                        additional_info=additional_info,
+                        multi_modal_data=multi_modal_data,
+                        request_id=str(request_id),
+                        tokenizer=None,
+                        requires_multimodal_data=True,
+                        mm_processor_kwargs=payload_data.get("mm_processor_kwargs"),
+                    )
+                    built = rebuilt
+                    payload_data.update(built)
+                prompt_token_ids, mm_features = _expand_aura_async_chunk_with_input_processor(
+                    vllm_config=vllm_config,
+                    request=request,
+                    built=built,
+                    request_id=str(request_id),
+                )
+                process_ms = (_time.perf_counter() - _t_proc) * 1000.0
+                splice_hit = False
+                logger.warning(
+                    "AURA_MM_CACHE miss fallback to pixels request_id=%s err=%s",
+                    request_id,
+                    exc,
+                )
+            payload_data["prompt_token_ids"] = prompt_token_ids
+            payload_data["ids"] = {"prompt": prompt_token_ids}
+            request.mm_features = mm_features
+            n_feat = len(mm_features)
+            # Processor cache is warm for every UUID submitted this turn.
+            video_uuids = (built.get("multi_modal_uuids") or {}).get("video") or []
+            if hist is not None and video_uuids:
+                hist.mark_mm_uuids_warm([str(u) for u in video_uuids if u])
+                hist.save_expand_cache(
+                    hist_uuids=hist.history_video_uuids(),
+                    pending_uuid=str(video_uuids[-1]) if video_uuids[-1] else None,
+                    prompt_token_ids=prompt_token_ids,
+                    mm_features=mm_features,
+                )
+        else:
+            prompt_token_ids = list(built.get("prompt_token_ids") or [])
+
+        # Pixels live in mm_features after expansion; do not leave them on the
+        # connector payload (it used to become request.additional_information).
+        payload_data.pop("multi_modal_data", None)
+        payload_data.pop("aura_turn_video", None)
+        payload_data.pop("prompt", None)
+
+        # Stage-local TTFT clock is set by chunk_transfer_adapter at chunk-ready
+        # (before this resolve) so process_inputs is included, matching sync.
     except Exception:
         logger.exception(
             "Failed to resolve AURA async-chunk stage payload for request_id=%s session_id=%s",
@@ -785,8 +1110,12 @@ def _attach_aura_turn_video_payload(
         if video_tuple is None:
             return
         frames, metadata = video_tuple
+        # Use pack_aura_video_ndarray (bytes), NOT frames.tolist(). Nested
+        # Python ints from tolist() inflate Stage0→1 connector IPC by ~3× and
+        # were a major contributor to the historic async ~500ms floor when the
+        # payload was also reattached as request.additional_information.
         payload["aura_turn_video"] = {
-            "frames": frames.tolist(),
+            "frames": pack_aura_video_ndarray(np.asarray(frames)),
             "metadata": dict(metadata),
         }
     except Exception:
@@ -802,6 +1131,9 @@ def _normalize_video_tuple(
     metadata: dict[str, Any] | None,
 ) -> tuple[np.ndarray, dict[str, Any]] | None:
     """Return (uint8 ndarray [T,H,W,C], metadata) with at least two frames."""
+    unpacked = unpack_aura_video_ndarray(frames)
+    if unpacked is not None:
+        frames = unpacked
     video_array = _coerce_video_frames_array(frames)
     if video_array is None or video_array.ndim != 4:
         return None
@@ -948,6 +1280,9 @@ def _summarize_vllm_inputs(vllm_inputs: dict[str, Any]) -> str:
             arr, meta = vt
         else:
             arr, meta = vt, {}
+        unpacked = unpack_aura_video_ndarray(arr)
+        if unpacked is not None:
+            arr = unpacked
         if hasattr(arr, "shape"):
             shape = list(arr.shape)
             frames = int(arr.shape[0])
@@ -1203,7 +1538,11 @@ def aura2tts(
     prompt: Any = None,
     requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
-    """Convert AURA text output into Qwen3-TTS Talker requests."""
+    """Convert AURA text output into Qwen3-TTS Talker requests.
+
+    Also commits the Stage-worker SessionHistory turn (sync path). Silent
+    turns skip TTS but still need the history commit.
+    """
     del requires_multimodal_data
     prompt_by_request_id = _source_prompt_by_request_id(source_outputs, prompt)
     next_inputs: list[OmniTokensPrompt] = []
@@ -1211,6 +1550,7 @@ def aura2tts(
         text = _extract_text(source_output).strip()
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
+        _commit_session_turn_if_present(additional_info, text or SILENT_TEXT)
         pass_token_ids = _first_bool(additional_info.get("tts_pass_token_ids"), False)
         tts_input = build_tts_talker_input(
             text,
@@ -1257,7 +1597,7 @@ def aura2tts_async_chunk(
             )
             return None
         logger.info("[aura2tts_async_chunk] req=%s emitting silent finished payload", request_id)
-        _commit_stage_session_turn_if_present(additional_info, SILENT_TEXT)
+        _commit_session_turn_if_present(additional_info, SILENT_TEXT)
         return _aura2tts_empty_finished_payload()
 
     request_payload = getattr(transfer_manager, "request_payload", None)
@@ -1299,7 +1639,7 @@ def aura2tts_async_chunk(
         return None
     if _is_silent_token_prefix(content_ids):
         logger.info("[aura2tts_async_chunk] req=%s final content is silent; emitting finish payload", request_id)
-        _commit_stage_session_turn_if_present(additional_info, SILENT_TEXT)
+        _commit_session_turn_if_present(additional_info, SILENT_TEXT)
         return _aura2tts_empty_finished_payload()
 
     cached_tts_metadata = state.get("aura2tts_tts_metadata")
@@ -1326,7 +1666,7 @@ def aura2tts_async_chunk(
     if tts_input is None:
         if is_effectively_silent(request_text) or _is_silent_token_prefix(content_ids):
             logger.info("[aura2tts_async_chunk] req=%s TTS input is silent; emitting finish payload", request_id)
-            _commit_stage_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
+            _commit_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
             return _aura2tts_empty_finished_payload()
         logger.info(
             "[aura2tts_async_chunk] req=%s build_tts_talker_input returned None text_len=%d content_ids=%d",
@@ -1335,7 +1675,7 @@ def aura2tts_async_chunk(
             len(content_ids),
         )
         return None
-    _commit_stage_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
+    _commit_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
     payload = dict(tts_input["additional_information"])
     payload["prompt_token_ids"] = list(tts_input["prompt_token_ids"])
     assistant_token_ids = QWEN_ASSISTANT_PREFIX_IDS + content_ids + QWEN_ASSISTANT_SUFFIX_IDS

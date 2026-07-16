@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -18,6 +19,22 @@ from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
+
+
+def _mark_async_chunk_stage_ready(request: Any) -> float:
+    """Stamp stage-local ready time once (first usable upstream chunk).
+
+    async_chunk prewarms Stage-1+ at request start. TTFx for those stages must
+    start when the upstream chunk actually arrives, not at prewarm — otherwise
+    idle wait for ASR / prior stages is billed to Stage-N.
+    """
+    existing = getattr(request, "_omni_stage_ready_ts", None)
+    if existing is not None:
+        return float(existing)
+    ready_ts = time.time()
+    request._omni_stage_ready_ts = ready_ts
+    request.arrival_time = ready_ts
+    return ready_ts
 
 
 def _replace_request_prompt_token_ids(request: Any, prompt_token_ids: list[int]) -> bool:
@@ -64,6 +81,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
+        self.vllm_config = vllm_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
@@ -83,6 +101,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         super().__init__(model_config)
         self.model_config = model_config
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
+        # Wired by StageEngineCoreProc after EngineCore builds mm_receiver_cache.
+        # Late-attached async_chunk mm_features must go through this cache so the
+        # GPU worker can rehydrate MultiModalFeatureSpec.data from SHM.
+        self.mm_receiver_cache: Any | None = None
         # State specific to Chunk management
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | dict[str, Any] | None] | None = (
             None
@@ -250,12 +272,27 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             meta = payload_data.get("meta", {})
             payload_finished = self._is_truthy_scalar(meta.get("finished"))
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
+            resolved_aura_payload = False
             if self.model_mode == "ar" and "aura_asr_transcript" in payload_data:
                 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
                     resolve_aura_async_chunk_stage_payload,
                 )
 
-                resolve_aura_async_chunk_stage_payload(payload_data, request, self.model_config)
+                # Stamp before resolve so Stage-1 local TTFT includes
+                # process_inputs / mm expand (sync-aligned).
+                _mark_async_chunk_stage_ready(request)
+                resolve_aura_async_chunk_stage_payload(
+                    payload_data,
+                    request,
+                    self.model_config,
+                    vllm_config=self.vllm_config,
+                )
+                resolved_aura_payload = True
+                mm_features = getattr(request, "mm_features", None)
+                if self.mm_receiver_cache is not None and mm_features:
+                    request.mm_features = self.mm_receiver_cache.get_and_update_features(
+                        list(mm_features)
+                    )
             if self.model_mode == "ar":
                 prompt_token_ids = payload_data.get("prompt_token_ids")
                 if prompt_token_ids is None:
@@ -272,7 +309,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         payload_data = dict(payload_data)
                         payload_data["additional_information"] = {**prev_tts_info, **payload_additional_info}
                 request.omni_stage_payload = payload_data
-                request.additional_information = payload_data
+                if resolved_aura_payload:
+                    # AURA Stage-1 only: keep slim TTS metadata. Puttting the full
+                    # ASR connector dict (raw video ndarrays) onto
+                    # request.additional_information re-IPCs pixels every schedule
+                    # (~500ms floor). Talker/TTS payloads stay flat/full below.
+                    slim_info = payload_data.get("additional_information")
+                    request.additional_information = slim_info if isinstance(slim_info, dict) else {}
+                else:
+                    # Qwen3-TTS Talker payloads are flat dicts with top-level
+                    # ``text`` / ``speaker`` / … — preserve previous behavior.
+                    request.additional_information = payload_data
                 if chunk_id > 0 and request.resumable:
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)
@@ -282,6 +329,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
+                if not resolved_aura_payload:
+                    _mark_async_chunk_stage_ready(request)
             else:
                 if payload_finished:
                     self.finished_requests.add(req_id)
@@ -332,6 +381,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # chunk as ready, otherwise Stage1 can consume before the
                     # first DAC frame arrives.
                     return False
+                _mark_async_chunk_stage_ready(request)
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)

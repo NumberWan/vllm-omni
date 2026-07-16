@@ -578,6 +578,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        stage_ready_ts=getattr(request, "_omni_stage_ready_ts", None),
                     )
                 )
             else:
@@ -705,6 +706,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Update block hashes for the new tokens.
         session.update_block_hashes()
         session.num_prompt_tokens = len(session.prompt_token_ids)
+        # Next usable upstream chunk should re-stamp Stage-N local TTFx.
+        session._omni_stage_ready_ts = None
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:

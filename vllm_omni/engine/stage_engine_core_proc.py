@@ -130,6 +130,21 @@ class StageEngineCoreProc(EngineCoreProc):
                 **kwargs,
             )
 
+            # Late async_chunk AURA payloads attach mm_features after prewarm;
+            # they must share EngineCore's mm_receiver_cache or worker mrope
+            # sees feature.data=None (TypeError on video_grid_thw).
+            scheduler = getattr(engine_core, "scheduler", None)
+            adapter = getattr(scheduler, "chunk_transfer_adapter", None) if scheduler else None
+            mm_cache = getattr(engine_core, "mm_receiver_cache", None)
+            if adapter is not None and mm_cache is not None:
+                adapter.mm_receiver_cache = mm_cache
+                logger.info(
+                    "[StageEngineCoreProc] Wired mm_receiver_cache onto chunk_transfer_adapter "
+                    "(stage=%s replica=%s)",
+                    omni_stage_id,
+                    omni_replica_id,
+                )
+
             # Each subprocess corresponds to exactly one omni replica with
             # its own OmniMasterServer allocation, so the heartbeat client
             # runs unconditionally — there is no dp_rank-based gating.

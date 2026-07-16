@@ -26,10 +26,46 @@ DEFAULT_AURA_SYSTEM_PROMPT = (
 logger = logging.getLogger(__name__)
 
 
+def _env_flag_on(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _session_history_diag_enabled() -> bool:
     """Gate debug logging for diagnosing session_history visibility across stages."""
-    v = os.environ.get("VLLM_AURA_SESSION_HISTORY_DIAG", "").strip().lower()
-    return v in {"1", "true", "yes", "on"}
+    return _env_flag_on("VLLM_AURA_SESSION_HISTORY_DIAG")
+
+
+def _history_video_mode() -> str:
+    """How historical videos are exposed to stage-1 prompts.
+
+    - ``all`` (default): native-like — sliding-window rounds keep video until prune.
+    - ``current_only``: only the pending turn keeps pixels; prior rounds become
+      text-only. Used to measure how much TTFT comes from re-encoding history
+      videos on every new stage request (omni lacks StreamingInput MM cache).
+    """
+    v = os.environ.get("VLLM_AURA_HISTORY_VIDEO_MODE", "all").strip().lower()
+    return "current_only" if v in {"current_only", "current", "pending_only"} else "all"
+
+
+def _count_videos_in_messages(messages: list[dict[str, Any]]) -> tuple[int, int]:
+    """Return ``(n_videos, total_frames)`` for diagnostic logs."""
+    n_videos = 0
+    total_frames = 0
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "video":
+                continue
+            n_videos += 1
+            video = item.get("video")
+            arr = video[0] if isinstance(video, (tuple, list)) and video else video
+            if hasattr(arr, "shape") and len(getattr(arr, "shape", ())) >= 1:
+                total_frames += int(arr.shape[0])
+            elif isinstance(arr, list):
+                total_frames += len(arr)
+    return n_videos, total_frames
 
 
 # Same set used by CrossTurnPenalty to skip non-content tokens; extended with
@@ -54,17 +90,14 @@ __all__ = [
     "register_session",
     "register_session_state",
     "get_session_history",
+    "get_or_create_session_history",
     "get_session_state",
     "unregister_session",
     "clear_all_sessions",
     "record_transcript_for_request",
     "pop_transcript_for_request",
-    "get_or_create_stage_session_history",
-    "get_stage_session_history",
-    "record_stage_pending_turn",
-    "commit_stage_session_turn",
-    "unregister_stage_session",
-    "clear_all_stage_sessions",
+    "record_pending_turn",
+    "commit_session_turn",
 ]
 
 
@@ -138,7 +171,62 @@ class SessionHistory:
         self._context_history: list[list[dict[str, Any]]] = []
         self._sliding_window: list[dict[str, Any]] = []
         self.history: list[dict[str, Any]] = []
+        # UUIDs whose mm processor outputs are known present in Stage-1
+        # ``mm_processor_cache``. History turns with these ids can be submitted
+        # as UUID-only (``multi_modal_data`` entry ``None``) so HF process_inputs
+        # does not re-touch historical pixels.
+        self._warm_mm_uuids: set[str] = set()
+        self._pending_mm_uuid: str | None = None
+        # Last successful Stage-1 expand (for pending-video splice across silent turns).
+        self._expand_cache: dict[str, Any] | None = None
         self._rebuild_history()
+
+    @staticmethod
+    def new_mm_uuid() -> str:
+        return f"aura-mm-{uuid.uuid4().hex}"
+
+    def mark_mm_uuids_warm(self, mm_uuids: list[str] | tuple[str, ...] | set[str]) -> None:
+        for item in mm_uuids:
+            if item:
+                self._warm_mm_uuids.add(str(item))
+
+    def is_mm_uuid_warm(self, mm_uuid: str | None) -> bool:
+        return bool(mm_uuid) and str(mm_uuid) in self._warm_mm_uuids
+
+    def history_video_uuids(self) -> tuple[str, ...]:
+        """Ordered ``aura_mm_uuid`` values already committed into ``history``."""
+        out: list[str] = []
+        for msg in self.history:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "video":
+                    u = item.get("aura_mm_uuid")
+                    if u:
+                        out.append(str(u))
+        return tuple(out)
+
+    def clear_expand_cache(self) -> None:
+        self._expand_cache = None
+
+    def save_expand_cache(
+        self,
+        *,
+        hist_uuids: tuple[str, ...],
+        pending_uuid: str | None,
+        prompt_token_ids: list[int],
+        mm_features: list[Any],
+    ) -> None:
+        self._expand_cache = {
+            "hist_uuids": hist_uuids,
+            "pending_uuid": str(pending_uuid) if pending_uuid else None,
+            "prompt_token_ids": list(prompt_token_ids),
+            "mm_features": list(mm_features),
+        }
+
+    def get_expand_cache(self) -> dict[str, Any] | None:
+        return self._expand_cache
 
     def _rebuild_history(self) -> None:
         self.history = [self._system_msg]
@@ -335,17 +423,40 @@ class SessionHistory:
 
         self.current_rounds = self._sw_round_count()
         self._rebuild_history()
+        self._resync_warm_mm_uuids_from_history()
+        self.clear_expand_cache()
+
+    def _resync_warm_mm_uuids_from_history(self) -> None:
+        """Drop warm UUID entries that no longer appear in the sliding window."""
+        live: set[str] = set()
+        for msg in self._sliding_window:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "video":
+                    uid = item.get("aura_mm_uuid")
+                    if uid:
+                        live.add(str(uid))
+        if self._pending_mm_uuid:
+            live.add(str(self._pending_mm_uuid))
+        self._warm_mm_uuids.intersection_update(live)
 
     def add_user_message(
         self,
         text: str,
         images: list[Any] | None = None,
         video_tuple: tuple[Any, dict[str, Any]] | None = None,
+        *,
+        mm_uuid: str | None = None,
     ) -> None:
         content: list[dict[str, Any]] = []
 
         if video_tuple:
-            content.append({"type": "video", "video": video_tuple})
+            video_item: dict[str, Any] = {"type": "video", "video": video_tuple}
+            if mm_uuid:
+                video_item["aura_mm_uuid"] = str(mm_uuid)
+            content.append(video_item)
         elif images:
             content.extend([{"type": "image", "image": img} for img in images])
 
@@ -367,6 +478,25 @@ class SessionHistory:
         self._sliding_window.append(msg)
         self.history.append(msg)
 
+    @staticmethod
+    def _history_messages_for_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Optionally strip historical videos before building the stage-1 prompt."""
+        if _history_video_mode() != "current_only":
+            return messages
+        stripped: list[dict[str, Any]] = []
+        for msg in messages:
+            content = msg.get("content")
+            if msg.get("role") != "user" or not isinstance(content, list):
+                stripped.append(msg)
+                continue
+            new_content = [item for item in content if not (isinstance(item, dict) and item.get("type") == "video")]
+            if not new_content:
+                # Pure-vision silent observation with no text — drop from prompt
+                # under current_only (pixels already removed).
+                continue
+            stripped.append({**msg, "content": new_content})
+        return stripped
+
     def preview_vllm_inputs(
         self,
         text: str = "",
@@ -374,11 +504,21 @@ class SessionHistory:
         images: list[Any] | None = None,
         *,
         vision_pad_text: str | None = None,
+        mm_uuid: str | None = None,
     ) -> dict[str, Any]:
         """Build prompt/mm inputs for a pending user turn without mutating history."""
         pending_content: list[dict[str, Any]] = []
+        pending_uuid = mm_uuid
         if video_tuple:
-            pending_content.append({"type": "video", "video": video_tuple})
+            if not pending_uuid:
+                pending_uuid = self.new_mm_uuid()
+            pending_content.append(
+                {
+                    "type": "video",
+                    "video": video_tuple,
+                    "aura_mm_uuid": pending_uuid,
+                }
+            )
         elif images:
             pending_content.extend([{"type": "image", "image": img} for img in images])
         if text:
@@ -386,7 +526,8 @@ class SessionHistory:
         elif vision_pad_text and not pending_content:
             pending_content.append({"type": "text", "text": vision_pad_text})
 
-        messages = list(self.history)
+        self._pending_mm_uuid = pending_uuid
+        messages = self._history_messages_for_prompt(list(self.history))
         if pending_content:
             messages.append({"role": "user", "content": pending_content})
         return self._messages_to_vllm_inputs(messages)
@@ -394,11 +535,13 @@ class SessionHistory:
     def get_vllm_inputs(self) -> dict[str, Any]:
         return self._messages_to_vllm_inputs(self.history)
 
-    @staticmethod
-    def _messages_to_vllm_inputs(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    def _messages_to_vllm_inputs(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         full_prompt = ""
         all_images: list[Any] = []
         all_videos: list[Any] = []
+        video_uuids: list[str | None] = []
+        n_uuid_only = 0
+        n_pixel_videos = 0
 
         for msg in messages:
             role = msg["role"]
@@ -416,7 +559,17 @@ class SessionHistory:
                         all_images.append(item.get("image"))
                     elif item.get("type") == "video":
                         full_prompt += "<|vision_start|><|video_pad|><|vision_end|>"
+                        mm_uuid = item.get("aura_mm_uuid")
+                        mm_uuid_s = str(mm_uuid) if mm_uuid else None
+                        # Always keep pixels in multi_modal_data: UUID-only (None)
+                        # entries trip assertion in the HF video processor path.
+                        # Warm UUIDs still skip HF via mm_processor_cache (hash=uuid).
                         all_videos.append(item.get("video"))
+                        video_uuids.append(mm_uuid_s)
+                        if mm_uuid_s and self.is_mm_uuid_warm(mm_uuid_s):
+                            n_uuid_only += 1
+                        else:
+                            n_pixel_videos += 1
 
             full_prompt += "<|im_end|>"
 
@@ -428,10 +581,16 @@ class SessionHistory:
         if all_videos:
             multi_modal_data["video"] = all_videos
 
-        return {
+        out: dict[str, Any] = {
             "prompt": full_prompt,
             "multi_modal_data": multi_modal_data,
+            "mm_uuid_only_videos": n_uuid_only,
+            "mm_pixel_videos": n_pixel_videos,
         }
+        if any(u is not None for u in video_uuids):
+            # Parallel list required by vLLM when mixed None data + uuids.
+            out["multi_modal_uuids"] = {"video": video_uuids}
+        return out
 
     @staticmethod
     def _serialize_video_tuple(video_tuple: Any) -> dict[str, Any] | None:
@@ -469,7 +628,10 @@ class SessionHistory:
             item_type = item.get("type")
             if item_type == "video":
                 video_payload = self._serialize_video_tuple(item.get("video"))
-                serialized.append({"type": "video", "video": video_payload})
+                out_item: dict[str, Any] = {"type": "video", "video": video_payload}
+                if item.get("aura_mm_uuid"):
+                    out_item["aura_mm_uuid"] = item["aura_mm_uuid"]
+                serialized.append(out_item)
             elif item_type == "image":
                 serialized.append({"type": "image", "image": "<image>"})
             else:
@@ -489,7 +651,10 @@ class SessionHistory:
             item_type = item.get("type")
             if item_type == "video":
                 video_tuple = self._deserialize_video_tuple(item.get("video"))
-                deserialized.append({"type": "video", "video": video_tuple})
+                out_item: dict[str, Any] = {"type": "video", "video": video_tuple}
+                if item.get("aura_mm_uuid"):
+                    out_item["aura_mm_uuid"] = item["aura_mm_uuid"]
+                deserialized.append(out_item)
             elif item_type == "image":
                 deserialized.append({"type": "image", "image": None})
             else:
@@ -554,10 +719,19 @@ class AuraSessionState:
     session_id: str = ""
     cross_turn_penalty: Any = None
     pending_turn_video: dict[str, Any] | None = None
+    # Frames present when ``pending_turn_video`` was frozen for the current
+    # engine request. Later appends belong to the *next* turn and must survive
+    # ``commit_turn`` so proactive visuals during TTS are not discarded.
+    frozen_turn_frame_count: int = 0
     pending_transcripts_by_request_id: dict[str, str] = field(default_factory=dict)
 
     def append_turn_frame(self, frame: np.ndarray) -> None:
         self.turn_frame_arrays.append(np.asarray(frame))
+
+    def freeze_turn_video(self, deferred_mm: dict[str, Any] | None) -> None:
+        """Snapshot this turn's video and mark how many frames were included."""
+        self.pending_turn_video = deferred_mm if isinstance(deferred_mm, dict) else None
+        self.frozen_turn_frame_count = len(self.turn_frame_arrays)
 
     @staticmethod
     def _normalize_request_id(request_id: str) -> str:
@@ -588,27 +762,25 @@ class AuraSessionState:
         video_fps: float = 2.0,
         max_frames_per_round: int = 16,
     ) -> None:
-        """Commit the finished turn into SessionHistory and reset per-turn buffers."""
-        from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-            frames_to_video_tuple,
-            video_tuple_from_deferred_multi_modal,
-        )
+        """Finish an API-side turn: frames / penalty only.
 
-        transcript = self.pop_turn_transcript(request_id)
-        video_tuple = video_tuple_from_deferred_multi_modal(self.pending_turn_video)
-        if video_tuple is None and self.turn_frame_arrays:
-            video_tuple = frames_to_video_tuple(
-                list(self.turn_frame_arrays),
-                fps=video_fps,
-                max_frames=max_frames_per_round,
-            )
-        if video_tuple is not None or transcript:
-            self.history.add_user_message(transcript, video_tuple=video_tuple)
+        Dialogue ``SessionHistory`` lives in the stage-worker registry for both
+        sync and async. Prefer ``aura2tts`` / ``aura2tts_async_chunk`` to commit
+        pending turns; this method falls back to ``commit_session_turn`` when
+        pending still exists (e.g. text-only sync that skips the TTS stage).
+        """
+        del video_fps, max_frames_per_round
+        self.pop_turn_transcript(request_id)
+        if self.session_id:
+            commit_session_turn(self.session_id, response_text)
 
         self.pending_turn_video = None
-        normalized = normalize_assistant_text(response_text)
-        self.history.add_assistant_message(normalized)
-        self.turn_frame_arrays.clear()
+        # Drop only frames that belonged to the frozen turn; keep frames that
+        # arrived while generation/TTS was still running for the next trigger.
+        keep_from = min(max(self.frozen_turn_frame_count, 0), len(self.turn_frame_arrays))
+        if keep_from > 0:
+            self.turn_frame_arrays = list(self.turn_frame_arrays[keep_from:])
+        self.frozen_turn_frame_count = 0
         if self.cross_turn_penalty is not None:
             if is_effectively_silent(response_text):
                 self.cross_turn_penalty.record(None)
@@ -625,7 +797,11 @@ def create_streaming_session(
     max_1qna_rounds: int = 4,
     system_prompt: str | None = None,
 ) -> AuraSessionState:
-    """Create server-side SessionHistory state for an AURA streaming WebSocket session."""
+    """Create API-side WebSocket session state (frames / penalty / session_id).
+
+    Prompt conversation history uses ``get_or_create_session_history``; the
+    ``SessionHistory`` attached here is kept for registry compatibility only.
+    """
     session_id = create_session_id()
     history = SessionHistory(
         max_rounds=max_rounds,
@@ -652,6 +828,12 @@ _SESSION_LOCK = threading.Lock()
 _SESSIONS: dict[str, SessionHistory] = {}
 _SESSION_STATES: dict[str, AuraSessionState] = {}
 
+# Prompt SessionHistory registry (stage-worker process for async_chunk; same
+# process as the API for sync). This is the dialogue-history source of truth.
+_STAGE_WORKER_LOCK = threading.Lock()
+_STAGE_WORKER_SESSIONS: dict[str, SessionHistory] = {}
+_STAGE_PENDING_TURNS: dict[str, dict[str, Any]] = {}
+
 
 def create_session_id() -> str:
     return f"aura-{uuid.uuid4().hex}"
@@ -666,11 +848,6 @@ def register_session_state(session_id: str, state: AuraSessionState) -> None:
     with _SESSION_LOCK:
         _SESSION_STATES[session_id] = state
         _SESSIONS[session_id] = state.history
-
-
-def get_session_history(session_id: str) -> SessionHistory | None:
-    with _SESSION_LOCK:
-        return _SESSIONS.get(session_id)
 
 
 def get_session_state(session_id: str) -> AuraSessionState | None:
@@ -702,47 +879,69 @@ def unregister_session(session_id: str) -> None:
     with _SESSION_LOCK:
         _SESSIONS.pop(session_id, None)
         _SESSION_STATES.pop(session_id, None)
+    with _STAGE_WORKER_LOCK:
+        _STAGE_WORKER_SESSIONS.pop(session_id, None)
+        _STAGE_PENDING_TURNS.pop(session_id, None)
 
 
 def clear_all_sessions() -> None:
-    """Clear all registered sessions (for tests)."""
+    """Clear API session state and prompt SessionHistory registries (for tests)."""
     with _SESSION_LOCK:
         _SESSIONS.clear()
         _SESSION_STATES.clear()
+    with _STAGE_WORKER_LOCK:
+        _STAGE_WORKER_SESSIONS.clear()
+        _STAGE_PENDING_TURNS.clear()
 
 
-# Stage-worker registry: owned by the AURA stage process in async_chunk mode.
-_STAGE_WORKER_LOCK = threading.Lock()
-_STAGE_WORKER_SESSIONS: dict[str, SessionHistory] = {}
-_STAGE_PENDING_TURNS: dict[str, dict[str, Any]] = {}
-
-
-def get_or_create_stage_session_history(
+def get_or_create_session_history(
     session_id: str,
     *,
     system_prompt: str | None = None,
+    max_rounds: int = 45,
+    num_rounds_keep: int = 30,
+    pruning_enabled: bool = True,
+    max_context_qas: int = 10,
+    max_1qna_rounds: int = 4,
 ) -> SessionHistory:
-    """Return process-local SessionHistory for an AURA stage worker."""
+    """Return process-local prompt ``SessionHistory`` for this ``session_id``.
+
+    Source of truth for both sync and async_chunk. Knobs must match client
+    ``session.config`` / ``create_streaming_session`` (defaults 45/30, not
+    ``SessionHistory``'s 20/15).
+    """
     with _STAGE_WORKER_LOCK:
         history = _STAGE_WORKER_SESSIONS.get(session_id)
         if history is None:
-            history = SessionHistory(system_prompt=system_prompt or DEFAULT_AURA_SYSTEM_PROMPT)
+            history = SessionHistory(
+                max_rounds=max_rounds,
+                num_rounds_keep=num_rounds_keep,
+                pruning_enabled=pruning_enabled,
+                max_context_qas=max_context_qas,
+                max_1qna_rounds=max_1qna_rounds,
+                system_prompt=system_prompt or DEFAULT_AURA_SYSTEM_PROMPT,
+            )
             _STAGE_WORKER_SESSIONS[session_id] = history
             if _session_history_diag_enabled():
                 logger.info(
-                    "AURA stage_session_history create pid=%s session_id=%s",
+                    "AURA session_history create pid=%s session_id=%s "
+                    "max_rounds=%d num_rounds_keep=%d max_context_qas=%d",
                     os.getpid(),
                     session_id,
+                    max_rounds,
+                    num_rounds_keep,
+                    max_context_qas,
                 )
         return history
 
 
-def get_stage_session_history(session_id: str) -> SessionHistory | None:
+def get_session_history(session_id: str) -> SessionHistory | None:
+    """Return prompt ``SessionHistory`` if it already exists for ``session_id``."""
     with _STAGE_WORKER_LOCK:
         return _STAGE_WORKER_SESSIONS.get(session_id)
 
 
-def record_stage_pending_turn(
+def record_pending_turn(
     session_id: str,
     *,
     request_id: str,
@@ -752,6 +951,7 @@ def record_stage_pending_turn(
     aura_turn_video: Any = None,
     multi_modal_data: dict[str, Any] | None = None,
     had_vision: bool = False,
+    mm_uuid: str | None = None,
 ) -> None:
     with _STAGE_WORKER_LOCK:
         _STAGE_PENDING_TURNS[session_id] = {
@@ -762,60 +962,61 @@ def record_stage_pending_turn(
             "aura_turn_video": aura_turn_video,
             "multi_modal_data": dict(multi_modal_data) if isinstance(multi_modal_data, dict) else None,
             "had_vision": bool(had_vision),
+            "mm_uuid": str(mm_uuid) if mm_uuid else None,
         }
 
 
-def commit_stage_session_turn(session_id: str, response_text: str) -> None:
-    """Commit the finished user/assistant turn into the stage-worker registry."""
+def commit_session_turn(session_id: str, response_text: str) -> None:
+    """Commit the finished user/assistant turn into prompt ``SessionHistory``.
+
+    No-op when there is no pending turn (idempotent if ``aura2tts`` already
+    committed and the API ``commit_turn`` fallback runs later).
+    """
     with _STAGE_WORKER_LOCK:
         history = _STAGE_WORKER_SESSIONS.get(session_id)
         pending = _STAGE_PENDING_TURNS.pop(session_id, None)
-    if history is None:
+    if history is None or pending is None:
         return
-    if pending:
-        transcript = str(pending.get("transcript", ""))
-        video_tuple = pending.get("video_tuple")
+    transcript = str(pending.get("transcript", ""))
+    video_tuple = pending.get("video_tuple")
+    if video_tuple is None:
+        from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+            _resolve_turn_video_tuple,
+            video_tuple_from_multi_modal_data,
+        )
+
+        video_tuple = _resolve_turn_video_tuple(
+            {
+                "deferred_multi_modal_data": pending.get("deferred_mm"),
+                "aura_turn_video": pending.get("aura_turn_video"),
+            },
+            pending.get("multi_modal_data") or {},
+        )
         if video_tuple is None:
-            from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-                _resolve_turn_video_tuple,
-                video_tuple_from_multi_modal_data,
-            )
+            video_tuple = video_tuple_from_multi_modal_data(pending.get("multi_modal_data"))
+    normalized = normalize_assistant_text(response_text)
+    mm_uuid = pending.get("mm_uuid") or history._pending_mm_uuid
+    if video_tuple is not None or transcript:
+        history.add_user_message(transcript, video_tuple=video_tuple, mm_uuid=mm_uuid)
+    elif pending.get("had_vision"):
+        from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+            AURA_VISION_PAD_TEXT,
+        )
 
-            video_tuple = _resolve_turn_video_tuple(
-                {
-                    "deferred_multi_modal_data": pending.get("deferred_mm"),
-                    "aura_turn_video": pending.get("aura_turn_video"),
-                },
-                pending.get("multi_modal_data") or {},
-            )
-            if video_tuple is None:
-                video_tuple = video_tuple_from_multi_modal_data(pending.get("multi_modal_data"))
-        if video_tuple is not None or transcript:
-            history.add_user_message(transcript, video_tuple=video_tuple)
-        elif pending.get("had_vision"):
-            from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-                AURA_VISION_PAD_TEXT,
-            )
-
-            history.add_user_message(AURA_VISION_PAD_TEXT)
-    history.add_assistant_message(normalize_assistant_text(response_text))
+        history.add_user_message(AURA_VISION_PAD_TEXT)
+    history.add_assistant_message(normalized)
+    history._pending_mm_uuid = None
+    # History fingerprint changed — invalidate pending-splice cache.
+    history.clear_expand_cache()
     if _session_history_diag_enabled():
+        n_vid, n_frames = _count_videos_in_messages(history.history)
         logger.info(
-            "AURA stage_session_history commit pid=%s session_id=%s rounds=%d",
+            "AURA session_history commit pid=%s session_id=%s rounds=%d "
+            "history_videos=%d history_frames=%d video_mode=%s",
             os.getpid(),
             session_id,
             history.current_rounds,
+            n_vid,
+            n_frames,
+            _history_video_mode(),
         )
-
-
-def unregister_stage_session(session_id: str) -> None:
-    with _STAGE_WORKER_LOCK:
-        _STAGE_WORKER_SESSIONS.pop(session_id, None)
-        _STAGE_PENDING_TURNS.pop(session_id, None)
-
-
-def clear_all_stage_sessions() -> None:
-    """Clear all stage-worker sessions (for tests)."""
-    with _STAGE_WORKER_LOCK:
-        _STAGE_WORKER_SESSIONS.clear()
-        _STAGE_PENDING_TURNS.clear()

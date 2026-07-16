@@ -1088,6 +1088,20 @@ def _normalize_streaming_chunks(responses: list[dict[str, Any]]) -> list[dict[st
         end = float(response.get("end", start) or start)
         if end < start:
             start, end = end, start
+        metrics = response.get("metrics")
+        if silent and isinstance(metrics, dict):
+            # Avoid attributing Talker/Code2Wav finish-sentinel / delta bleed to silent turns.
+            from vllm_omni.benchmarks.format_bench_report import (
+                _clear_silent_audio_pipeline_stages,
+            )
+
+            metrics = dict(metrics)
+            stage_metrics = metrics.get("stage_metrics")
+            if isinstance(stage_metrics, dict):
+                metrics["stage_metrics"] = _clear_silent_audio_pipeline_stages(stage_metrics)
+            for key in ("audio_duration_s", "audio_frames", "audio_ttfp_ms", "audio_rtf"):
+                if key in metrics:
+                    metrics[key] = 0 if key == "audio_frames" else 0.0
         chunks.append(
             {
                 "timestamp": [start, end],
@@ -1097,7 +1111,7 @@ def _normalize_streaming_chunks(responses: list[dict[str, Any]]) -> list[dict[st
                 "chunk_id": idx,
                 "e2el_ms": response.get("e2el_ms"),
                 "wall_e2el_ms": response.get("wall_e2el_ms"),
-                "metrics": response.get("metrics"),
+                "metrics": metrics,
                 "wav_path": response.get("wav_path"),
             }
         )
@@ -1278,7 +1292,9 @@ async def async_request_openai_video_stream(
                         current_response = {"start": video_time, "end": video_time, "text_parts": []}
                     current_response["text"] = text
                     current_response["end"] = video_time
+                    # Provisional E2EL at text.done; audio.done/delta overwrites for spoken.
                     if turn_wall_start is not None:
+                        current_response["_turn_wall_start"] = turn_wall_start
                         current_response["wall_e2el_ms"] = (timestamp - turn_wall_start) * 1000.0
                     metrics = data.get("metrics")
                     if isinstance(metrics, dict):
@@ -1292,6 +1308,11 @@ async def async_request_openai_video_stream(
                     current_response = None
                     turn_wall_start = None
                 elif msg_type == "response.audio.done":
+                    if responses:
+                        last = responses[-1]
+                        start = last.get("_turn_wall_start")
+                        if start is not None:
+                            last["wall_e2el_ms"] = (timestamp - float(start)) * 1000.0
                     metrics = data.get("metrics")
                     if isinstance(metrics, dict) and responses:
                         audio_metrics = _delta_cumulative_audio_done_metrics(metrics, previous_cumulative_metrics)
@@ -1306,6 +1327,11 @@ async def async_request_openai_video_stream(
                                 last["e2el_ms"] = float(audio_metrics["e2el_ms"])
                         previous_cumulative_metrics = metrics
                 elif msg_type == "response.audio.delta":
+                    if responses:
+                        last = responses[-1]
+                        start = last.get("_turn_wall_start")
+                        if start is not None:
+                            last["wall_e2el_ms"] = (timestamp - float(start)) * 1000.0
                     if output.audio_ttfp == 0.0:
                         output.audio_ttfp = timestamp - st
                     audio_generate_time = timestamp - st
@@ -1366,9 +1392,13 @@ async def async_request_openai_video_stream(
                 for source_time, frame in frames:
                     if stop_sending.is_set():
                         return
-                    for item in scheduled_audio:
-                        if item["sent"] or float(item["at_sec"]) > source_time:
-                            continue
+                    due_audio = [
+                        item
+                        for item in scheduled_audio
+                        if (not item["sent"]) and float(item["at_sec"]) <= float(source_time)
+                    ]
+                    # Buffer full utterance(s) first so frame auto-trigger defers to audio.done.
+                    for item in due_audio:
                         pcm = item["pcm"]
                         for offset in range(0, len(pcm), chunk_size):
                             if stop_sending.is_set():
@@ -1381,7 +1411,6 @@ async def async_request_openai_video_stream(
                                     }
                                 )
                             )
-                        item["sent"] = True
                     await ws.send_str(
                         json.dumps(
                             {
@@ -1390,6 +1419,9 @@ async def async_request_openai_video_stream(
                             }
                         )
                     )
+                    for item in due_audio:
+                        await ws.send_str(json.dumps({"type": "audio.done"}))
+                        item["sent"] = True
                     if frame_interval_s > 0:
                         await asyncio.sleep(frame_interval_s)
                 if not stop_sending.is_set():

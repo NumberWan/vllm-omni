@@ -141,6 +141,12 @@ class OmniRequestState(RequestState):
         super().apply_streaming_update(update)
         self.native_text_stats.arrival_time = update.arrival_time
 
+    def apply_stage_ready_ts(self, stage_ready_ts: float | None) -> None:
+        """Refresh Stage-N local arrival clock from async_chunk ready stamp."""
+        if stage_ready_ts is None:
+            return
+        self.native_text_stats.arrival_time = float(stage_ready_ts)
+
     @staticmethod
     def _to_cpu(x):
         """Try to convert to CPU tensor if needed."""
@@ -506,11 +512,35 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 "vllm_tpot_ms": 0.0,
                 "vllm_itl_ms": 0.0,
                 "vllm_itls_ms": [],
+                "stage_ready_ts": None,
             },
         )
 
     def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
         return self._native_text_metrics_by_request.pop(request_id, {})
+
+    def _maybe_apply_stage_ready(
+        self,
+        req_state: RequestState,
+        engine_core_output: EngineCoreOutput,
+    ) -> None:
+        """Propagate async_chunk stage-ready into OP stats / metrics once.
+
+        Engine request.arrival_time is already reset at chunk-ready, but OP's
+        native_text_stats still holds the prewarm arrival until this runs —
+        before first-token latency is computed.
+        """
+        if not isinstance(req_state, OmniRequestState):
+            return
+        ready = getattr(engine_core_output, "stage_ready_ts", None)
+        if ready is None:
+            return
+        record = self._native_text_metric_record(req_state.external_req_id)
+        if record.get("stage_ready_ts") is not None:
+            return
+        ready_f = float(ready)
+        record["stage_ready_ts"] = ready_f
+        req_state.apply_stage_ready_ts(ready_f)
 
     def abort_requests(self, request_ids, internal: bool) -> list[str]:
         request_ids = list(request_ids)
@@ -605,6 +635,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             if req_state is None:
                 continue
 
+            # async_chunk: refresh Stage-N local clock before any TTFx math.
+            self._maybe_apply_stage_ready(req_state, eco)
+
             # Accumulate multimodal tensors regardless of path.
             if isinstance(req_state, OmniRequestState):
                 mm_output = getattr(eco, "multimodal_output", None)
@@ -672,6 +705,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_timestamp: float | None,
         iteration_stats: IterationStats | None,
     ):
+        # Must run before first-token latency (uses native_text_stats.arrival_time).
+        self._maybe_apply_stage_ready(req_state, engine_core_output)
+
         was_prefilling = req_state.is_prefilling
         native_stats = req_state.native_text_stats if isinstance(req_state, OmniRequestState) else None
         previous_last_token_ts = native_stats.last_token_ts if native_stats is not None else 0.0

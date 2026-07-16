@@ -7,6 +7,7 @@ Shared protocol (see :mod:`video_stream_base`):
         {"type": "session.config", ...}         # Session config (sent once)
         {"type": "video.frame", "data": "..."}  # base64 JPEG/PNG frame
         {"type": "audio.chunk", "data": "..."}  # base64 PCM16 16kHz mono
+        {"type": "audio.done"}                  # End of utterance (alias: audio.commit)
         {"type": "video.query", "text": "..."}  # Submit query about buffered frames
         {"type": "video.done"}                  # End of session
 
@@ -23,11 +24,16 @@ Model-specific handlers:
     :class:`QwenOmniStreamingVideoHandler` — Qwen3-Omni (thinker -> talker -> code2wav);
         turns start on ``video.query`` only.
     :class:`AuraStreamingVideoHandler` — AURA Omni (ASR -> AURA -> TTS -> code2wav);
-        auto-trigger on buffered frames; ``video.query`` is ignored.
+        auto-trigger on buffered frames; ``audio.done`` opens a turn after a full
+        utterance when unlocked; ``video.query`` is ignored.
 """
 
 from __future__ import annotations
 
+import base64
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 from pydantic import Field
@@ -56,6 +62,7 @@ from vllm_omni.entrypoints.openai.video_stream_base import (
     StreamingVideoSessionConfig,
     VideoStreamTurnTrigger,
     _decode_frame_bytes,
+    _downscale_frame_max_edge,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
     OmniStreamingVideoHandler as OmniStreamingVideoHandlerBase,
@@ -193,6 +200,14 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
     auto_trigger: bool = Field(default=True, description="Auto-start a turn after enough frames.")
     auto_trigger_min_frames: int = Field(default=2, ge=1, description="Minimum buffered frames to auto-trigger.")
     max_frames_per_round: int = Field(default=16, ge=2, description="Max frames per video_tuple.")
+    max_frame_edge: int = Field(
+        default=640,
+        description=(
+            "After JPEG decode, downscale so max(H, W) <= this edge before buffering "
+            "(aligned with native AURA client max_frame_edge=640). "
+            "Set <=0 to keep full decoded resolution."
+        ),
+    )
     pruning_enabled: bool = Field(default=True, description="Enable SessionHistory pruning.")
     max_rounds: int = Field(default=45, ge=1, description="Sliding-window round limit before pruning.")
     num_rounds_keep: int = Field(default=30, ge=1, description="Rounds to keep in sliding window after pruning.")
@@ -264,7 +279,7 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
 
 
 class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
-    """AURA pipeline: frame-only auto trigger (no ``video.query`` / interrupt)."""
+    """AURA pipeline: frame auto-trigger + voice turn after complete ``audio.done``."""
 
     def supports_manual_query_turn(self) -> bool:
         return False
@@ -273,7 +288,35 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         return False
 
     def releases_turn_after_text_done(self) -> bool:
-        return False
+        # Allow the next vision turn after assistant text finishes while TTS may
+        # still be draining. Combined with freeze_turn_video / commit_turn frame
+        # retention, proactive "object appeared" frames during spoken TTS are kept.
+        return True
+
+    def should_trigger_on_audio_done(self, *, has_audio: bool, is_turn_locked: bool) -> bool:
+        """Open a turn only after the full utterance is buffered (not per chunk)."""
+        return bool(has_audio) and not is_turn_locked
+
+    def ensure_frames_for_audio_turn(
+        self,
+        frame_buffer: list[str],
+        message_history: Any,
+        config: StreamingVideoSessionConfig,
+    ) -> bool:
+        """Seed turn frames from the most recent session buffer frame if needed."""
+        if isinstance(message_history, AuraSessionState) and message_history.turn_frame_arrays:
+            return True
+        if not frame_buffer:
+            return False
+        last_b64 = frame_buffer[-1]
+        try:
+            raw_bytes = base64.b64decode(last_b64, validate=True)
+        except Exception:
+            return False
+        self.on_frame_buffered(raw_bytes, last_b64, message_history, config)
+        if isinstance(message_history, AuraSessionState):
+            return bool(message_history.turn_frame_arrays)
+        return True
 
     def create_message_history(self, config: StreamingVideoSessionConfig) -> AuraSessionState:
         aura_config = self._as_aura_config(config)
@@ -287,9 +330,12 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         config = self._as_aura_config(trigger.config)
         if not config.auto_trigger:
             return False
-        # Match native AURA: never start a new turn while the prior engine
-        # request is still running (including silent-turn drain after text.done).
-        if trigger.is_generating:
+        # When text.done releases the turn lock, ``is_turn_locked`` is the gate
+        # (TTS may still be draining so ``is_generating`` stays true).
+        if self.releases_turn_after_text_done():
+            if trigger.is_turn_locked:
+                return False
+        elif trigger.is_generating:
             return False
         return trigger.frame_count >= config.auto_trigger_min_frames and not trigger.is_turn_locked
 
@@ -310,10 +356,12 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         message_history: Any,
         config: StreamingVideoSessionConfig,
     ) -> None:
-        del frame_b64, config
+        del frame_b64
         if not isinstance(message_history, AuraSessionState):
             return
         frame = _decode_frame_bytes(raw_bytes)
+        aura_config = self._as_aura_config(config)
+        frame = _downscale_frame_max_edge(frame, aura_config.max_frame_edge)
         message_history.append_turn_frame(frame)
 
     def build_engine_prompt(
@@ -363,6 +411,11 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             system_prompt=system_prompt,
             skip_asr=len(audio_buffer) == 0,
             include_tts="audio" in aura_config.modalities,
+            max_rounds=aura_config.max_rounds,
+            num_rounds_keep=aura_config.num_rounds_keep,
+            pruning_enabled=aura_config.pruning_enabled,
+            max_context_qas=aura_config.max_context_qas,
+            max_1qna_rounds=aura_config.max_1qna_rounds,
             **aura_config.tts_kwargs(),
         )
         user_message[_AURA_ADDITIONAL_INFO_KEY] = additional_information
@@ -465,7 +518,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
         if isinstance(message_history, AuraSessionState) and isinstance(additional_information, dict):
             deferred = additional_information.get("deferred_multi_modal_data")
-            message_history.pending_turn_video = deferred if isinstance(deferred, dict) else None
+            message_history.freeze_turn_video(deferred if isinstance(deferred, dict) else None)
 
         aura_config = self._as_aura_config(config)
         penalty_kwargs: dict[str, Any] = {}
@@ -523,6 +576,19 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         aura_config = self._as_aura_config(config)
         stream_text_deltas = aura_config.stream_text_deltas
         audio_tail_tensors: list[Any] = []
+        last_text_metrics: dict[str, Any] | None = None
+        last_audio_metrics: dict[str, Any] | None = None
+
+        def _event_metrics(output: OmniRequestOutput | None) -> dict[str, Any] | None:
+            if not getattr(config, "return_stage_metrics", False) or output is None:
+                return None
+            metrics = getattr(output, "metrics", None)
+            return metrics if isinstance(metrics, dict) else None
+
+        def _with_metrics(payload: dict[str, Any], metrics: dict[str, Any] | None) -> dict[str, Any]:
+            if metrics:
+                payload["metrics"] = metrics
+            return payload
 
         async def _try_release_turn_lock(full_text: str) -> None:
             nonlocal turn_lock_released
@@ -559,7 +625,9 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             await _finalize_silent_turn()
             if not text_done_sent:
                 full_text = "".join(text_parts)
-                await websocket.send_json({"type": "response.text.done", "text": full_text})
+                await websocket.send_json(
+                    _with_metrics({"type": "response.text.done", "text": full_text}, last_text_metrics)
+                )
                 text_done_sent = True
                 await _try_release_turn_lock(full_text)
 
@@ -581,15 +649,19 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     continue
 
                 out_type = getattr(output, "final_output_type", "text")
+                metrics = _event_metrics(output)
 
                 if out_type == "audio":
                     if streaming and not text_done_sent:
                         full_text = "".join(text_parts)
-                        await websocket.send_json({"type": "response.text.done", "text": full_text})
+                        await websocket.send_json(
+                            _with_metrics({"type": "response.text.done", "text": full_text}, last_text_metrics)
+                        )
                         text_done_sent = True
                         await _try_release_turn_lock(full_text)
 
                     audio_chunk_count += 1
+                    last_audio_metrics = metrics or last_audio_metrics
                     if streaming:
                         b64, audio_chunks_drained = self._extract_audio_delta_b64(
                             output,
@@ -607,17 +679,21 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                                 text_done_sent,
                             )
                             await websocket.send_json(
-                                {
-                                    "type": "response.audio.delta",
-                                    "data": b64,
-                                    "format": "wav",
-                                }
+                                _with_metrics(
+                                    {
+                                        "type": "response.audio.delta",
+                                        "data": b64,
+                                        "format": "wav",
+                                    },
+                                    metrics,
+                                )
                             )
                     else:
                         audio_data = self._get_audio_data(output)
                         if audio_data is not None:
                             audio_tail_tensors = list(audio_data) if isinstance(audio_data, list) else [audio_data]
                 else:
+                    last_text_metrics = metrics or last_text_metrics
                     token_ids = self._output_token_ids(output)
                     if should_stop_aura_silent_generation(token_ids=token_ids):
                         await _maybe_finalize_silent_turn()
@@ -630,11 +706,15 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                             await _maybe_finalize_silent_turn()
                             continue
                         if streaming and stream_text_deltas:
-                            await websocket.send_json({"type": "response.text.delta", "delta": delta_text})
+                            await websocket.send_json(
+                                _with_metrics({"type": "response.text.delta", "delta": delta_text}, metrics)
+                            )
 
             if not text_done_sent:
                 full_text = "".join(text_parts)
-                await websocket.send_json({"type": "response.text.done", "text": full_text})
+                await websocket.send_json(
+                    _with_metrics({"type": "response.text.done", "text": full_text}, last_text_metrics)
+                )
                 text_done_sent = True
                 await _try_release_turn_lock(full_text)
 
@@ -649,11 +729,14 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     b64, _ = self._encode_tail(tail_np, 0, new_drained=len(audio_tail_tensors), is_first=True)
                     if b64:
                         await websocket.send_json(
-                            {
-                                "type": "response.audio.delta",
-                                "data": b64,
-                                "format": "wav",
-                            }
+                            _with_metrics(
+                                {
+                                    "type": "response.audio.delta",
+                                    "data": b64,
+                                    "format": "wav",
+                                },
+                                last_audio_metrics,
+                            )
                         )
                 except Exception:
                     pass
@@ -666,7 +749,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     audio_chunks_drained,
                     len("".join(text_parts)),
                 )
-                await websocket.send_json({"type": "response.audio.done"})
+                await websocket.send_json(_with_metrics({"type": "response.audio.done"}, last_audio_metrics))
 
             if release_turn_lock is None and not turn_lock_released:
                 response_text = "".join(text_parts)
@@ -677,7 +760,9 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
         if not text_done_sent:
             full_text = "".join(text_parts)
-            await websocket.send_json({"type": "response.text.done", "text": full_text})
+            await websocket.send_json(
+                _with_metrics({"type": "response.text.done", "text": full_text}, last_text_metrics)
+            )
 
     @staticmethod
     def _as_aura_config(config: StreamingVideoSessionConfig) -> AuraStreamingVideoSessionConfig:

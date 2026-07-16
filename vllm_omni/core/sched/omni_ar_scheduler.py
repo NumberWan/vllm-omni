@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from time import time
 from typing import Any
 
@@ -34,6 +35,57 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
+
+# Keep only mrope / positional metadata when shipping mm features whose tensors
+# will not be encoded this step (encoder_cache / KV prefix already cover them).
+# Full pixel tensors for N history videos dominate Engine→Worker IPC (~2.7MB/vid).
+_MM_MROPE_KEEP_KEYS = frozenset(
+    {
+        "image_grid_thw",
+        "video_grid_thw",
+        "second_per_grid_ts",
+        "audio_feature_lengths",
+        "use_audio_in_video",
+    }
+)
+
+
+def slim_mm_features_for_worker_ipc(
+    mm_features: list[Any] | None,
+    encode_idxs: set[int] | list[int] | None,
+) -> list[Any] | None:
+    """Drop pixel tensors from mm features that are not scheduled for encoding.
+
+    Worker still needs ``video_grid_thw`` / ``second_per_grid_ts`` on every
+    feature for mrope; encoder only reads ``data`` for ``encode_idxs``.
+    """
+    if not mm_features:
+        return mm_features
+    encode_set = set(encode_idxs or ())
+    try:
+        from vllm.multimodal.inputs import MultiModalKwargsItem
+    except Exception:  # noqa: BLE001
+        return mm_features
+
+    slimmed: list[Any] = []
+    for idx, feat in enumerate(mm_features):
+        data = getattr(feat, "data", None)
+        if data is None or idx in encode_set:
+            slimmed.append(feat)
+            continue
+        try:
+            keep = {k: v for k, v in data.items() if k in _MM_MROPE_KEEP_KEYS}
+        except Exception:  # noqa: BLE001
+            slimmed.append(feat)
+            continue
+        if not keep or len(keep) >= len(data):
+            slimmed.append(feat)
+            continue
+        try:
+            slimmed.append(replace(feat, data=MultiModalKwargsItem(keep)))
+        except Exception:  # noqa: BLE001
+            slimmed.append(feat)
+    return slimmed
 
 
 @dataclass
@@ -282,16 +334,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Rewrap base NewRequestData entries with OmniNewRequestData,
             # enriching with request-level payloads
+            enc_map = getattr(scheduler_output, "scheduled_encoder_inputs", None) or {}
             new_list = []
             for nr in scheduler_output.scheduled_new_reqs:
                 req_id = getattr(nr, "req_id", None)
                 request = self.requests.get(req_id) if req_id else None
+                mm_feats = nr.mm_features
+                if mm_feats:
+                    encode_idxs = set(enc_map.get(req_id, []) or [])
+                    mm_feats = slim_mm_features_for_worker_ipc(mm_feats, encode_idxs)
                 # Build omni entry preserving all base fields
                 omni_nr = OmniNewRequestData(
                     req_id=nr.req_id,
                     external_req_id=(getattr(request, "external_req_id", None) if request else None),
                     prompt_token_ids=nr.prompt_token_ids,
-                    mm_features=nr.mm_features,
+                    mm_features=mm_feats,
                     sampling_params=nr.sampling_params,
                     pooling_params=nr.pooling_params,
                     block_ids=nr.block_ids,
@@ -529,6 +586,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                         is_segment_finished=is_segment_finished,
                         new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id, None),
+                        stage_ready_ts=getattr(request, "_omni_stage_ready_ts", None),
                     )
                 )
             else:
@@ -743,6 +801,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
                 # Do not replace prompt/additional_information here; the next
                 # upstream chunk will populate them in chunk transfer adapter.
+                # Clear stage-ready so the next usable chunk re-stamps local TTFx
+                # for this streaming segment (do not keep the prior segment clock).
+                session._omni_stage_ready_ts = None
                 session.arrival_time = update.arrival_time
                 session.sampling_params = update.sampling_params
                 if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:

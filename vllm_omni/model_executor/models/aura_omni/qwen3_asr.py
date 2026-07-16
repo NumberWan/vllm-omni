@@ -30,6 +30,9 @@ class AuraQwen3ASRForConditionalGeneration(Qwen3ASRForConditionalGeneration):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._runtime_info: list[dict[str, Any]] | None = None
         self._cached_eos_token_id: int | None = None
+        # ASR → AURA only forwards transcript text; skip per-step hidden D2H.
+        self.requires_full_prefix_cached_hidden_states = False
+        self.omni_pooler_payload_include_hidden = False
 
     def forward(
         self,

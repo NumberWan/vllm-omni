@@ -1568,9 +1568,11 @@ class Orchestrator:
                 else:
                     base_input = {}
 
-                if worker_type == "generation" or model_stage == "qwen3_tts":
-                    # Codec and Talker stages must wait for the first upstream chunk.
-                    # Dummy AR-style prompt_token_ids trigger invalid decode work.
+                if worker_type == "generation" or model_stage in {"qwen3_tts", "aura", "code2wav"}:
+                    # Codec / Talker / AURA VL must wait for the first upstream chunk.
+                    # Dummy AR tokens alone are incomplete: AURA still needs a prewarmed
+                    # engine request so the SharedMemoryConnector can deliver ASR→AURA
+                    # payloads (skipping AURA prewarm hangs stage-0 forever).
                     base_input["prompt_token_ids"] = []
                 else:
                     try:

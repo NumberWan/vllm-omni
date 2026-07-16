@@ -56,4 +56,8 @@ class AuraQwen3VLProcessingInfo(Qwen3VLProcessingInfo):
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class AuraQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
-    pass
+    # Stage1 AURA → TTS only needs finished text / token ids (aura2tts_async_chunk).
+    # Skip per-step OmniTensorPrefixCache hidden D2H + pooler ``hidden`` packing
+    # that otherwise dominate ``sample_tokens`` (~12ms sync coerce per decode).
+    requires_full_prefix_cached_hidden_states = False
+    omni_pooler_payload_include_hidden = False
