@@ -16,11 +16,15 @@ from PIL import Image
 from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import (
     merge_penalty_sampling_params,
 )
+from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    frames_to_video_tuple,
+    unpack_aura_video_ndarray,
+)
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
     AuraSessionState,
     SessionHistory,
     clear_all_sessions,
-    get_session_history,
+    get_session_state,
     register_session,
 )
 from vllm_omni.entrypoints.openai.serving_video_stream import (
@@ -61,7 +65,7 @@ def test_aura_disables_manual_query_and_interrupt():
     handler = AuraStreamingVideoHandler(chat_service=object())
     assert handler.supports_manual_query_turn() is False
     assert handler.supports_query_interrupt() is False
-    assert handler.releases_turn_after_text_done() is False
+    assert handler.releases_turn_after_text_done() is True
 
 
 def test_aura_streaming_session_config_native_aligned_defaults():
@@ -92,11 +96,12 @@ def test_should_trigger_turn_respects_auto_trigger_gate():
         )
         is False
     )
+    # After text.done unlock, TTS may still be draining (is_generating=True).
     assert (
         handler.should_trigger_turn(
             VideoStreamTurnTrigger(frame_count=3, is_generating=True, is_turn_locked=False, config=config)
         )
-        is False
+        is True
     )
 
     disabled = AuraStreamingVideoSessionConfig(model="test", auto_trigger=False)
@@ -106,6 +111,33 @@ def test_should_trigger_turn_respects_auto_trigger_gate():
         )
         is False
     )
+
+
+def test_ensure_frames_for_audio_turn_uses_recent_buffer():
+    handler = AuraStreamingVideoHandler(chat_service=object())
+    config = AuraStreamingVideoSessionConfig(model="test")
+    state = _session_state()
+    assert state.turn_frame_arrays == []
+    assert (
+        handler.ensure_frames_for_audio_turn([], state, config) is False
+    ), "empty session buffer cannot seed frames"
+
+    raw = _make_jpeg(10, 20, 30)
+    b64 = _b64(raw)
+    assert handler.ensure_frames_for_audio_turn([b64], state, config) is True
+    assert len(state.turn_frame_arrays) >= 1
+    # Second call is a no-op when turn frames already exist.
+    n = len(state.turn_frame_arrays)
+    assert handler.ensure_frames_for_audio_turn([b64, _b64(_make_jpeg())], state, config) is True
+    assert len(state.turn_frame_arrays) == n
+    # Single seeded frame is enough for frames_to_video_tuple (duplicates to 2).
+    video_array, meta = frames_to_video_tuple(
+        list(state.turn_frame_arrays),
+        fps=2.0,
+        max_frames=16,
+    )
+    assert video_array.shape[0] >= 2
+    assert int(meta["total_num_frames"]) >= 2
 
 
 def test_auto_trigger_frame_count_uses_turn_frame_arrays():
@@ -147,35 +179,24 @@ def test_per_turn_auto_trigger_not_cumulative_session_buffer():
     assert len(session_buffer) == 13
 
 
-def test_on_turn_complete_persists_user_video_and_assistant():
+def test_on_frame_buffered_downscales_to_max_frame_edge():
+    """API ingress should match native long-edge=640 before buffering pixels."""
     handler = AuraStreamingVideoHandler(chat_service=object())
+    config = AuraStreamingVideoSessionConfig(model="test", max_frame_edge=640)
     state = _session_state()
-    frames = np.array(
-        [
-            [[[1, 0, 0], [0, 1, 0]], [[0, 0, 1], [1, 1, 0]]],
-            [[[2, 0, 0], [0, 2, 0]], [[0, 0, 2], [2, 2, 0]]],
-        ],
-        dtype=np.uint8,
-    )
-    metadata = {
-        "fps": 2.0,
-        "duration": 1.0,
-        "total_num_frames": 2,
-        "frames_indices": [0, 1],
-        "video_backend": "opencv",
-        "do_sample_frames": False,
-    }
-    state.pending_turn_video = {"video": [(frames, metadata)]}
-    state.record_turn_transcript("req-1", "画面有什么？")
 
-    handler.on_turn_complete(state, {"role": "user", "content": []}, "好的。", request_id="req-1")
+    img = Image.new("RGB", (1080, 612), (10, 20, 30))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    raw = buf.getvalue()
 
-    inputs = state.history.get_vllm_inputs()
-    assert "画面有什么？" in inputs["prompt"]
-    assert "好的。" in inputs["prompt"]
-    assert "<|video_pad|>" in inputs["prompt"]
-    assert len(inputs["multi_modal_data"]["video"]) == 1
-    assert state.pending_turn_video is None
+    handler.on_frame_buffered(raw, _b64(raw), state, config)
+    assert len(state.turn_frame_arrays) == 1
+    frame = state.turn_frame_arrays[0]
+    assert max(int(frame.shape[0]), int(frame.shape[1])) <= 640
+    # 1080x612 -> scale 640/1080 => ~640x363
+    assert frame.shape[1] == 640
+    assert 350 <= frame.shape[0] <= 370
 
 
 def test_build_engine_prompt_stores_audio_and_session_payload():
@@ -207,7 +228,9 @@ def test_build_engine_prompt_stores_audio_and_session_payload():
     assert additional["aura_system_prompt"] == ["system-a"]
     deferred = additional["deferred_multi_modal_data"]
     assert deferred["video"][0][1]["total_num_frames"] == 2
-    assert deferred["video"][0][0].shape == (2, 8, 8, 3)
+    packed = deferred["video"][0][0]
+    assert isinstance(packed, dict) and packed.get("__aura_video_ndarray__")
+    assert unpack_aura_video_ndarray(packed).shape == (2, 8, 8, 3)
     assert additional["tts_ref_audio"]
     assert additional["tts_ref_text"]
 
@@ -246,7 +269,7 @@ def test_create_message_history_registers_server_side_store():
     state = handler.create_message_history(config)
 
     assert state.session_id
-    assert get_session_history(state.session_id) is state.history
+    assert get_session_state(state.session_id) is state
 
 
 def test_on_session_end_unregisters_server_side_store():
@@ -255,7 +278,7 @@ def test_on_session_end_unregisters_server_side_store():
 
     handler.on_session_end(state)
 
-    assert get_session_history(state.session_id) is None
+    assert get_session_state(state.session_id) is None
 
 
 @pytest.mark.asyncio

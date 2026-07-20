@@ -198,6 +198,7 @@ def aura_streaming_config(
     auto_trigger_min_frames: int = 2,
     send_fps: float = 2.0,
     enable_frame_filter: bool = False,
+    frame_filter_threshold: float = 0.95,
     cross_turn_penalty: float = 1.0,
     cross_turn_lookback: int = 10,
     cross_turn_ngram_sizes: list[int] | None = None,
@@ -219,6 +220,7 @@ def aura_streaming_config(
         "video_fps": float(sample_fps),
         "send_fps": float(send_fps),
         "enable_frame_filter": bool(enable_frame_filter),
+        "frame_filter_threshold": float(frame_filter_threshold),
         "pruning_enabled": bool(pruning_enabled),
         "max_rounds": int(max_rounds),
         "num_rounds_keep": int(num_rounds_keep),
@@ -646,6 +648,9 @@ class OmniInteractDataset(BenchmarkDataset):
         streaming_max_frames: int = 0,
         streaming_auto_trigger_min_frames: int = 2,
         streaming_enable_frame_filter: bool = False,
+        streaming_frame_filter_threshold: float = 0.95,
+        streaming_max_rounds: int = 45,
+        streaming_num_rounds_keep: int = 30,
         streaming_cross_turn_penalty: float = 1.0,
         streaming_cross_turn_lookback: int = 10,
         streaming_video_ids: list[str] | None = None,
@@ -667,6 +672,9 @@ class OmniInteractDataset(BenchmarkDataset):
         self.streaming_max_frames = streaming_max_frames
         self.streaming_auto_trigger_min_frames = streaming_auto_trigger_min_frames
         self.streaming_enable_frame_filter = streaming_enable_frame_filter
+        self.streaming_frame_filter_threshold = float(streaming_frame_filter_threshold)
+        self.streaming_max_rounds = int(streaming_max_rounds)
+        self.streaming_num_rounds_keep = int(streaming_num_rounds_keep)
         self.streaming_cross_turn_penalty = streaming_cross_turn_penalty
         self.streaming_cross_turn_lookback = streaming_cross_turn_lookback
         self.streaming_video_ids = [v.strip() for v in (streaming_video_ids or []) if v and v.strip()]
@@ -1017,8 +1025,11 @@ class OmniInteractDataset(BenchmarkDataset):
                     max_frames=self.streaming_max_frames,
                     auto_trigger_min_frames=self.streaming_auto_trigger_min_frames,
                     enable_frame_filter=self.streaming_enable_frame_filter,
+                    frame_filter_threshold=self.streaming_frame_filter_threshold,
                     cross_turn_penalty=self.streaming_cross_turn_penalty,
                     cross_turn_lookback=self.streaming_cross_turn_lookback,
+                    max_rounds=self.streaming_max_rounds,
+                    num_rounds_keep=self.streaming_num_rounds_keep,
                     aura_system_prompt_mode=self.streaming_aura_system_prompt_mode,
                 )
                 out.append(
@@ -1093,8 +1104,11 @@ class OmniInteractDataset(BenchmarkDataset):
                         max_frames=self.streaming_max_frames,
                         auto_trigger_min_frames=self.streaming_auto_trigger_min_frames,
                         enable_frame_filter=self.streaming_enable_frame_filter,
+                        frame_filter_threshold=self.streaming_frame_filter_threshold,
                         cross_turn_penalty=self.streaming_cross_turn_penalty,
                         cross_turn_lookback=self.streaming_cross_turn_lookback,
+                        max_rounds=self.streaming_max_rounds,
+                        num_rounds_keep=self.streaming_num_rounds_keep,
                         aura_system_prompt_mode=self.streaming_aura_system_prompt_mode,
                     )
                 else:

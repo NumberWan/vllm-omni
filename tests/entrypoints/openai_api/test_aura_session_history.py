@@ -52,11 +52,31 @@ def test_preview_vllm_inputs_matches_committed_turn():
     history.add_assistant_message("reply")
 
     preview = history.preview_vllm_inputs("second", video_tuple=_video_tuple(3))
-    history.add_user_message("second", video_tuple=_video_tuple(3))
+    history.add_user_message("second", video_tuple=_video_tuple(3), mm_uuid=history._pending_mm_uuid)
     committed = history.get_vllm_inputs()
 
     assert preview["prompt"] == committed["prompt"]
     assert len(preview["multi_modal_data"]["video"]) == len(committed["multi_modal_data"]["video"])
+
+
+def test_preview_attaches_stable_uuids_and_marks_warm_history():
+    history = SessionHistory()
+    uid0 = history.new_mm_uuid()
+    history.add_user_message("first", video_tuple=_video_tuple(), mm_uuid=uid0)
+    history.add_assistant_message("reply")
+    history.mark_mm_uuids_warm([uid0])
+
+    preview = history.preview_vllm_inputs("second", video_tuple=_video_tuple(3))
+    videos = preview["multi_modal_data"]["video"]
+    uuids = preview["multi_modal_uuids"]["video"]
+
+    # Pixels always present (HF path cannot take None); warm count is diagnostic.
+    assert videos[0] is not None
+    assert videos[1] is not None
+    assert uuids[0] == uid0
+    assert uuids[1] == history._pending_mm_uuid
+    assert preview["mm_uuid_only_videos"] == 1
+    assert preview["mm_pixel_videos"] == 1
 
 
 def test_to_dict_roundtrip_preserves_history():
@@ -120,29 +140,48 @@ def test_pruning_moves_old_rounds_to_context_history():
             assert content != "<|silent|>"
 
 
-def test_aura_session_state_commit_turn_writes_history():
+def test_aura_session_state_commit_turn_clears_frames_without_api_history():
     from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+        clear_all_sessions,
         create_streaming_session,
+        get_or_create_session_history,
+        get_session_history,
+        record_pending_turn,
     )
 
+    clear_all_sessions()
     state = create_streaming_session(pruning_enabled=False)
     state.turn_frame_arrays = [np.zeros((4, 4, 3), dtype=np.uint8), np.ones((4, 4, 3), dtype=np.uint8)]
+    state.freeze_turn_video(
+        {
+            "video": [
+                (
+                    np.zeros((2, 4, 4, 3), dtype=np.uint8),
+                    {"fps": 2.0, "total_num_frames": 2},
+                )
+            ]
+        }
+    )
     state.record_turn_transcript("req-1", "hello")
-    state.pending_turn_video = {
-        "video": [
-            (
-                np.zeros((2, 4, 4, 3), dtype=np.uint8),
-                {"fps": 2.0, "total_num_frames": 2},
-            )
-        ]
-    }
+    get_or_create_session_history(state.session_id, system_prompt="sys")
+    record_pending_turn(
+        state.session_id,
+        request_id="req-1",
+        transcript="hello",
+        video_tuple=(np.zeros((2, 4, 4, 3), dtype=np.uint8), {"fps": 2.0, "total_num_frames": 2}),
+    )
 
     state.commit_turn(response_text="reply", request_id="req-1")
 
     assert state.turn_frame_arrays == []
     assert state.pending_turn_video is None
-    assert "hello" in state.history.history[-2]["content"]
-    assert state.history.history[-1]["content"] == "reply"
+    assert state.history.current_rounds == 0
+    stage_hist = get_session_history(state.session_id)
+    assert stage_hist is not None
+    prompt = stage_hist.get_vllm_inputs()["prompt"]
+    assert "hello" in prompt
+    assert "reply" in prompt
+    clear_all_sessions()
 
 
 def test_should_stop_aura_silent_generation_on_first_token():

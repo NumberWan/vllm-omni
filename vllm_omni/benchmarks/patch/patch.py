@@ -520,6 +520,11 @@ def get_samples(args, tokenizer):
             streaming_max_frames=getattr(args, "omniinteract_streaming_max_frames", 0),
             streaming_auto_trigger_min_frames=getattr(args, "omniinteract_streaming_auto_trigger_min_frames", 2),
             streaming_enable_frame_filter=getattr(args, "omniinteract_streaming_enable_frame_filter", False),
+            streaming_frame_filter_threshold=getattr(
+                args, "omniinteract_streaming_frame_filter_threshold", 0.95
+            ),
+            streaming_max_rounds=getattr(args, "omniinteract_max_rounds", 45),
+            streaming_num_rounds_keep=getattr(args, "omniinteract_num_rounds_keep", 30),
             streaming_cross_turn_penalty=getattr(args, "omniinteract_cross_turn_penalty", 0.0),
             streaming_cross_turn_lookback=getattr(args, "omniinteract_cross_turn_lookback", 2),
             streaming_video_ids=_parse_csv_list(getattr(args, "omniinteract_video_ids", None)),

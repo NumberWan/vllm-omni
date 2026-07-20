@@ -226,6 +226,34 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         help="For aura_streaming: enable server-side frame similarity filtering.",
     )
     g.add_argument(
+        "--omniinteract-streaming-frame-filter-threshold",
+        type=float,
+        default=0.95,
+        help=(
+            "For aura_streaming: EVS similarity threshold in session.config "
+            "(higher keeps more frames; used when --omniinteract-streaming-enable-frame-filter)."
+        ),
+    )
+    g.add_argument(
+        "--omniinteract-max-rounds",
+        type=int,
+        default=45,
+        help=(
+            "For aura_streaming: sliding-window round limit before pruning "
+            "(written into session.config; native AURA uses 45)."
+        ),
+    )
+    g.add_argument(
+        "--omniinteract-num-rounds-keep",
+        type=int,
+        default=30,
+        help=(
+            "For aura_streaming: rounds kept after sliding-window pruning "
+            "(written into session.config; native AURA uses 30). "
+            "Smaller values cut Stage1 TTFT/TPOT but may hurt proactive GT."
+        ),
+    )
+    g.add_argument(
         "--omniinteract-cross-turn-penalty",
         type=float,
         default=1.0,

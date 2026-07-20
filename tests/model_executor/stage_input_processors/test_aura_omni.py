@@ -17,12 +17,16 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     aura2tts,
     aura2tts_async_chunk,
     build_aura_input,
+    build_aura_streaming_turn_additional_information,
+    pack_aura_video_ndarray,
     resolve_aura_async_chunk_stage_payload,
+    unpack_aura_video_ndarray,
+    video_tuple_from_deferred_multi_modal,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
     SessionHistory,
-    clear_all_stage_sessions,
-    get_stage_session_history,
+    clear_all_sessions,
+    get_session_history,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -499,14 +503,14 @@ def test_aura2tts_streaming_partial_content_enters_tts():
 
 
 def test_build_aura_input_uses_stage_session_history_when_server_registry_misses():
-    clear_all_stage_sessions()
+    clear_all_sessions()
     history = SessionHistory(system_prompt="system")
     history.add_user_message("第一輪問題")
     history.add_assistant_message("第一輪回答")
 
     from vllm_omni.model_executor.stage_input_processors import aura_session_history as ash
 
-    ash.get_or_create_stage_session_history("aura-stage-test", system_prompt="system")
+    ash.get_or_create_session_history("aura-stage-test", system_prompt="system")
     ash._STAGE_WORKER_SESSIONS["aura-stage-test"] = history
 
     video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
@@ -538,8 +542,81 @@ def test_build_aura_input_uses_stage_session_history_when_server_registry_misses
     assert next_input["additional_information"]["aura_session_id"] == "aura-stage-test"
 
 
+def test_build_aura_input_ignores_api_session_registry():
+    """API ``AuraSessionState.history`` / ``register_session`` must not drive prompts."""
+    clear_all_sessions()
+    from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+        SessionHistory as SH,
+        register_session,
+    )
+
+    api_history = SH(system_prompt="system")
+    api_history.add_user_message("API-only turn")
+    api_history.add_assistant_message("should-not-appear")
+    register_session("aura-ignore-api", api_history)
+
+    video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    metadata = {"fps": 2.0, "duration": 1.0, "total_num_frames": 2}
+    next_input = build_aura_input(
+        transcript="stage-first",
+        additional_info={
+            "aura_session_id": "aura-ignore-api",
+            "deferred_multi_modal_data": {"video": [(video, metadata)]},
+            "aura_system_prompt": ["system"],
+        },
+        multi_modal_data={},
+        request_id="req-1",
+    )
+    assert "API-only turn" not in next_input["prompt"]
+    assert "should-not-appear" not in next_input["prompt"]
+    assert "stage-first" in next_input["prompt"]
+    assert get_session_history("aura-ignore-api") is not None
+    clear_all_sessions()
+    clear_all_sessions()
+
+
+def test_aura2tts_commits_stage_session_turn():
+    clear_all_sessions()
+    video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    metadata = {"fps": 2.0, "duration": 1.0, "total_num_frames": 2}
+    additional_info = {
+        "aura_session_id": "aura-sync-commit",
+        "deferred_multi_modal_data": {"video": [(video, metadata)]},
+        "aura_system_prompt": ["system"],
+    }
+    build_aura_input(
+        transcript="你好",
+        additional_info=additional_info,
+        multi_modal_data={},
+        request_id="req-sync",
+    )
+    assert get_session_history("aura-sync-commit").current_rounds == 0
+
+    aura2tts(
+        [_partial_source_output("好的。", token_ids=[151644, 77091, 198, 108386])],
+        prompt=[
+            {
+                "request_id": "0",
+                "additional_information": additional_info,
+            }
+        ],
+    )
+    history = get_session_history("aura-sync-commit")
+    assert history.current_rounds == 1
+    assert "你好" in history.get_vllm_inputs()["prompt"]
+    assert "好的。" in history.get_vllm_inputs()["prompt"]
+    # Idempotent: second commit without pending is a no-op.
+    from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+        commit_session_turn,
+    )
+
+    commit_session_turn("aura-sync-commit", "extra")
+    assert history.current_rounds == 1
+    clear_all_sessions()
+
+
 def test_build_aura_input_commit_rounds_increment_via_aura2tts_async_chunk():
-    clear_all_stage_sessions()
+    clear_all_sessions()
     video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
     metadata = {"fps": 2.0, "duration": 1.0, "total_num_frames": 2}
     additional_info = {
@@ -555,7 +632,7 @@ def test_build_aura_input_commit_rounds_increment_via_aura2tts_async_chunk():
     )
     assert next_input["additional_information"]["aura_session_id"] == "aura-commit-test"
 
-    history = get_stage_session_history("aura-commit-test")
+    history = get_session_history("aura-commit-test")
     assert history is not None
     assert history.current_rounds == 0
 
@@ -570,12 +647,12 @@ def test_build_aura_input_commit_rounds_increment_via_aura2tts_async_chunk():
     )
     aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
 
-    history = get_stage_session_history("aura-commit-test")
+    history = get_session_history("aura-commit-test")
     assert history.current_rounds == 1
     assert SILENT_TEXT in history.get_vllm_inputs()["prompt"]
 
 def test_resolve_aura_async_chunk_stage_payload_builds_prompt_from_passthrough():
-    clear_all_stage_sessions()
+    clear_all_sessions()
     video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
     metadata = {"fps": 2.0, "duration": 1.0, "total_num_frames": 2}
     payload = {
@@ -609,9 +686,12 @@ def test_resolve_aura_async_chunk_stage_payload_builds_prompt_from_passthrough()
     finally:
         aura_omni_mod.cached_tokenizer_from_config = original
 
-    assert "你好" in payload["prompt"]
+    # Raw prompt text is consumed during resolve; pixels are stripped so the
+    # scheduler never IPCs video via additional_information.
+    assert "prompt" not in payload
+    assert "multi_modal_data" not in payload
     assert payload["prompt_token_ids"] == [1, 2, 3]
-    assert get_stage_session_history("aura-resolve-test") is not None
+    assert get_session_history("aura-resolve-test") is not None
 
 
 def test_coerce_video_frames_array_handles_inhomogeneous_streaming_shapes():
@@ -637,6 +717,81 @@ def test_coerce_video_frames_array_handles_inhomogeneous_streaming_shapes():
     array, metadata = normalized
     assert array.shape[0] >= 2
     assert metadata["fps"] == 2.0
+
+
+def test_pack_aura_video_ndarray_roundtrips_pixels():
+    video = np.arange(2 * 4 * 4 * 3, dtype=np.uint8).reshape(2, 4, 4, 3)
+    packed = pack_aura_video_ndarray(video)
+    assert packed["__aura_video_ndarray__"] is True
+    assert packed["shape"] == [2, 4, 4, 3]
+    assert isinstance(packed["data"], (bytes, bytearray))
+    restored = unpack_aura_video_ndarray(packed)
+    assert restored is not None
+    np.testing.assert_array_equal(restored, video)
+
+
+def test_deferred_video_wire_format_survives_additional_information_msgpack():
+    """Regression: nested ndarray under scalar_data must not become ['|u1', shape, buf]."""
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+    from vllm_omni.engine import AdditionalInformationPayload
+    from vllm_omni.engine.serialization import (
+        deserialize_additional_information,
+        serialize_additional_information,
+    )
+
+    video = np.arange(2 * 4 * 4 * 3, dtype=np.uint8).reshape(2, 4, 4, 3)
+    metadata = {"fps": 2.0, "duration": 1.0, "total_num_frames": 2}
+    additional = build_aura_streaming_turn_additional_information(
+        session_id="aura-wire",
+        video_array=video,
+        video_metadata=metadata,
+        system_prompt="system",
+        skip_asr=True,
+        include_tts=False,
+    )
+    packed = additional["deferred_multi_modal_data"]["video"][0][0]
+    assert isinstance(packed, dict) and packed.get("__aura_video_ndarray__")
+
+    payload = serialize_additional_information(additional)
+    encoded = MsgpackEncoder().encode(payload)
+    decoded = MsgpackDecoder(AdditionalInformationPayload).decode(encoded)
+    restored_info = deserialize_additional_information(decoded)
+
+    video_tuple = video_tuple_from_deferred_multi_modal(
+        restored_info.get("deferred_multi_modal_data")
+    )
+    assert video_tuple is not None
+    arr, meta = video_tuple
+    assert arr.shape == (2, 4, 4, 3)
+    np.testing.assert_array_equal(arr, video)
+    assert meta["fps"] == 2.0
+    assert meta["total_num_frames"] == 2
+
+
+def test_build_aura_input_resolves_packed_deferred_video():
+    clear_all_sessions()
+    video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    video[0, 0, 0] = [1, 2, 3]
+    metadata = {"fps": 2.0, "duration": 1.0, "total_num_frames": 2}
+    additional_info = build_aura_streaming_turn_additional_information(
+        session_id="aura-packed-resolve",
+        video_array=video,
+        video_metadata=metadata,
+        system_prompt="system",
+        skip_asr=True,
+        include_tts=False,
+    )
+    next_input = build_aura_input(
+        transcript="",
+        additional_info=additional_info,
+        multi_modal_data={},
+        request_id="req-packed",
+    )
+    videos = next_input["multi_modal_data"]["video"]
+    assert len(videos) == 1
+    arr = videos[0][0] if isinstance(videos[0], (tuple, list)) else videos[0]
+    assert hasattr(arr, "shape") and arr.shape == (2, 4, 4, 3)
+    clear_all_sessions()
 
 
 def _video_multimodal_data() -> tuple[dict[str, Any], np.ndarray, dict[str, Any]]:
@@ -684,7 +839,7 @@ def _finish_async_chunk_turn(
 
 
 def test_multi_turn_session_history_smoke_like_0002():
-    clear_all_stage_sessions()
+    clear_all_sessions()
     session_id = "aura-multi-turn"
     multi_modal_data, _, _ = _video_multimodal_data()
 
@@ -695,7 +850,7 @@ def test_multi_turn_session_history_smoke_like_0002():
             multi_modal_data=multi_modal_data,
             request_id=f"req-silent-{idx}",
         )
-    history = get_stage_session_history(session_id)
+    history = get_session_history(session_id)
     assert history is not None
     assert history.current_rounds == 3
 
@@ -708,7 +863,7 @@ def test_multi_turn_session_history_smoke_like_0002():
         response_text="好的，我會留意，等《古韵》這本書出現時馬上提醒你。",
     )
     assert "出现《古韵》这本书的时候，提醒我。" in spoken_input["prompt"]
-    history = get_stage_session_history(session_id)
+    history = get_session_history(session_id)
     assert history.current_rounds == 4
 
     for idx in range(2):
@@ -718,7 +873,7 @@ def test_multi_turn_session_history_smoke_like_0002():
             multi_modal_data=multi_modal_data,
             request_id=f"req-silent-post-{idx}",
         )
-    history = get_stage_session_history(session_id)
+    history = get_session_history(session_id)
     assert history.current_rounds == 6
     final_prompt = history.get_vllm_inputs()["prompt"]
     assert "出现《古韵》这本书的时候，提醒我。" in final_prompt
@@ -726,7 +881,7 @@ def test_multi_turn_session_history_smoke_like_0002():
 
 
 def test_silent_placeholder_video_commits_vision_pad_text_to_history():
-    clear_all_stage_sessions()
+    clear_all_sessions()
     multi_modal_data = {"video": ["frame-0", "frame-1", "frame-2"]}
     _finish_async_chunk_turn(
         session_id="aura-placeholder-video",
@@ -734,7 +889,7 @@ def test_silent_placeholder_video_commits_vision_pad_text_to_history():
         multi_modal_data=multi_modal_data,
         request_id="req-placeholder",
     )
-    history = get_stage_session_history("aura-placeholder-video")
+    history = get_session_history("aura-placeholder-video")
     assert history is not None
     assert history.current_rounds == 1
     prompt = history.get_vllm_inputs()["prompt"]
@@ -743,7 +898,7 @@ def test_silent_placeholder_video_commits_vision_pad_text_to_history():
 
 
 def test_empty_asr_placeholder_video_prompt_includes_current_user_vision_pad():
-    clear_all_stage_sessions()
+    clear_all_sessions()
     session_id = "aura-prompt-vision-pad"
     placeholder_mm = {"video": ["frame-0", "frame-1", "frame-2"]}
     _finish_async_chunk_turn(

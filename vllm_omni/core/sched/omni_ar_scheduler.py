@@ -37,8 +37,16 @@ from vllm_omni.outputs import OmniConnectorOutput
 logger = init_logger(__name__)
 
 # Keep only mrope / positional metadata when shipping mm features whose tensors
-# will not be encoded this step (encoder_cache / KV prefix already cover them).
-# Full pixel tensors for N history videos dominate Engine→Worker IPC (~2.7MB/vid).
+# will not be encoded this step. Full pixel tensors for N history videos dominate
+# Engine→Worker IPC (~2.7MB/vid).
+#
+# IMPORTANT: this slim is **unsafe by default**. Worker stores the first
+# ``scheduled_new_reqs`` mm_features copy permanently. If we strip pixels for
+# idxs not in *this* step's ``scheduled_encoder_inputs``, later chunked encode
+# steps (or encoder-cache eviction re-encodes) call ``embed_multimodal`` with
+# only grid metadata → Qwen3-VL returns None → Stage1 EngineDeadError.
+# Re-enable only via ``VLLM_OMNI_SLIM_MM_IPC=1`` for experiments that keep
+# encoder cache large enough to never re-encode slimmed features.
 _MM_MROPE_KEEP_KEYS = frozenset(
     {
         "image_grid_thw",
@@ -50,6 +58,15 @@ _MM_MROPE_KEEP_KEYS = frozenset(
 )
 
 
+def _slim_mm_ipc_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_SLIM_MM_IPC", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def slim_mm_features_for_worker_ipc(
     mm_features: list[Any] | None,
     encode_idxs: set[int] | list[int] | None,
@@ -58,8 +75,10 @@ def slim_mm_features_for_worker_ipc(
 
     Worker still needs ``video_grid_thw`` / ``second_per_grid_ts`` on every
     feature for mrope; encoder only reads ``data`` for ``encode_idxs``.
+
+    Disabled unless ``VLLM_OMNI_SLIM_MM_IPC=1`` (see module comment).
     """
-    if not mm_features:
+    if not mm_features or not _slim_mm_ipc_enabled():
         return mm_features
     encode_set = set(encode_idxs or ())
     try:
