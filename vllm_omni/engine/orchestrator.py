@@ -12,6 +12,7 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import os
 import time as _time
 from dataclasses import dataclass, field
 from typing import Any
@@ -46,14 +47,65 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
     serialize_additional_information,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
+from vllm_omni.model_executor.stage_input_processors.stage_bypass import (
+    build_empty_asr_aura_chunk_payload,
+    make_mock_text_stage_output,
+    should_skip_stage,
+    should_skip_stage_from_info,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _resolve_prompt_additional_information(prompt: Any) -> dict[str, Any] | None:
+    """Return a plain dict from ``additional_information`` on a prompt or request."""
+    if isinstance(prompt, dict):
+        info = prompt.get("additional_information")
+        if isinstance(info, dict):
+            return info
+        if info is not None:
+            return deserialize_additional_information(info)
+    info_payload = getattr(prompt, "additional_information", None)
+    if info_payload is not None:
+        return deserialize_additional_information(info_payload)
+    return None
+
+
+def _should_skip_stage_submission(prompt: Any, original_prompt: Any, stage_id: int) -> bool:
+    """Return True when ``omni_skip_stages`` requests bypassing ``stage_id``."""
+    for candidate in (prompt, original_prompt):
+        if should_skip_stage(candidate, stage_id):
+            return True
+        info = _resolve_prompt_additional_information(candidate)
+        if should_skip_stage_from_info(info, stage_id):
+            return True
+    return False
+
+
+def _stage0_hard_bypass_enabled() -> bool:
+    """Hard Stage0 skip (SHM inject). Default on; ``VLLM_AURA_STAGE0_BYPASS=0`` runs Stage0 GPU.
+
+    When disabled we must still *submit* Stage0 — returning early from ``_bypass_stage0``
+    without inject leaves async_chunk Stage1 waiting forever on SharedMemory chunks.
+    """
+    raw = (os.environ.get("VLLM_AURA_STAGE0_BYPASS") or "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _tts_gate_on_voice_asr_enabled() -> bool:
+    """Defer Stage2/3 prewarm while a voice Stage0 ASR is in-flight on shared GPU0.
+
+    Enable with ``VLLM_AURA_TTS_GATE_ON_VOICE_ASR=1``. Default off.
+    """
+    raw = (os.environ.get("VLLM_AURA_TTS_GATE_ON_VOICE_ASR") or "0").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
 
 
 def _build_terminal_empty_output(
@@ -232,6 +284,15 @@ class OrchestratorRequestState:
     # Per-request pipeline timing accumulator (milliseconds)
     pipeline_timings: dict[str, float] = field(default_factory=dict)
 
+    # True when stage-0 GPU submit was skipped and an empty ASR chunk was injected.
+    stage0_bypassed: bool = False
+    # Voice (non-skip) Stage0 GPU in flight — used by TTS admit gate.
+    stage0_is_voice: bool = False
+    # Stage2/3 prewarm deferred until active voice ASR drains.
+    deferred_tts_prewarm: bool = False
+    # Request object needed to resume deferred Stage2/3 prewarm.
+    async_chunk_prewarm_request: Any = None
+
 
 @dataclass
 class StreamingInputState:
@@ -294,6 +355,8 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        # req_ids with non-skip Stage0 GPU in flight (shared GPU0 vs TTS).
+        self._active_voice_asr: set[str] = set()
         self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
 
         self._cfg_tracker = CfgCompanionTracker()
@@ -306,6 +369,9 @@ class Orchestrator:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
+
+        # Lazy SharedMemoryConnector for orchestrator-side Stage0 bypass inject.
+        self._stage0_bypass_connector: Any | None = None
 
     def _init_metrics_state(
         self,
@@ -522,6 +588,25 @@ class Orchestrator:
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
 
+        if _should_skip_stage_submission(prompt, original_prompt, stage_id):
+            if _stage0_hard_bypass_enabled():
+                await self._bypass_stage0(
+                    request_id,
+                    prompt,
+                    req_state,
+                    original_prompt=original_prompt,
+                )
+                return
+            logger.info(
+                "[Orchestrator] Stage0 hard bypass off; submitting Stage0 GPU for req=%s",
+                request_id,
+            )
+
+        # Non-skip Stage0 = voice ASR (empty-audio soft path still has omni_skip).
+        if not _should_skip_stage_submission(prompt, original_prompt, stage_id):
+            req_state.stage0_is_voice = True
+            self._active_voice_asr.add(request_id)
+
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
@@ -565,6 +650,28 @@ class Orchestrator:
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
+
+        if _should_skip_stage_submission(request, msg.original_prompt, stage_id):
+            if _stage0_hard_bypass_enabled():
+                # Stage0 was never submitted (or already bypassed): do not submit_update.
+                await self._bypass_stage0(
+                    request_id,
+                    request,
+                    req_state,
+                    original_prompt=msg.original_prompt,
+                )
+                return
+            logger.info(
+                "[Orchestrator] Stage0 hard bypass off; submit_update Stage0 for req=%s",
+                request_id,
+            )
+
+        if (
+            not req_state.stage0_is_voice
+            and not _should_skip_stage_submission(request, msg.original_prompt, stage_id)
+        ):
+            req_state.stage0_is_voice = True
+            self._active_voice_asr.add(request_id)
 
         await self.stage_pools[stage_id].submit_update(
             request_id,
@@ -872,8 +979,12 @@ class Orchestrator:
         self._release_request_bindings(request_ids)
         for request_id in request_ids:
             self._pd_kv_params.pop(request_id, None)
+            was_voice = request_id in self._active_voice_asr
+            self._active_voice_asr.discard(request_id)
             if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
                 self._running_counter.decrement()
+            if was_voice:
+                await self._flush_deferred_tts_prewarms()
 
     async def _apply_raw_terminal_stage_finish(
         self,
@@ -974,6 +1085,12 @@ class Orchestrator:
             if kv_params is not None:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
+
+        # Voice ASR finished on Stage0: free GPU0 gate so deferred Talker/Code2Wav can admit.
+        if finished and stage_id == 0 and req_id in self._active_voice_asr:
+            self._active_voice_asr.discard(req_id)
+            req_state.stage0_is_voice = False
+            await self._flush_deferred_tts_prewarms()
 
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
@@ -1509,13 +1626,172 @@ class Orchestrator:
             tx_ms=_tx_ms,
         )
 
+    async def _bypass_stage0(
+        self,
+        request_id: str,
+        stage0_request: Any,
+        req_state: OrchestratorRequestState,
+        *,
+        original_prompt: Any = None,
+    ) -> None:
+        """Skip Stage0 GPU work when ``omni_skip_stages`` includes 0.
+
+        Under ``async_chunk``, Stage1+ wait on SharedMemoryConnector chunks, so
+        the order must be: prewarm downstream → inject finished empty ASR
+        payload. Sync (non-async_chunk) uses mock text forward instead.
+
+        Disable with ``VLLM_AURA_STAGE0_BYPASS=0`` (caller must submit Stage0 GPU instead).
+        """
+        if not _stage0_hard_bypass_enabled():
+            logger.info(
+                "[Orchestrator] Stage0 bypass disabled via VLLM_AURA_STAGE0_BYPASS for req=%s",
+                request_id,
+            )
+            return
+
+        if req_state.stage0_bypassed:
+            logger.debug(
+                "[Orchestrator] Stage0 already bypassed for req=%s; skipping re-inject",
+                request_id,
+            )
+            return
+
+        req_state.stage0_bypassed = True
+        logger.info(
+            "[Orchestrator] Bypassing stage-0 GPU for req=%s (omni_skip_stages, async_chunk=%s)",
+            request_id,
+            self.async_chunk,
+        )
+
+        if self.async_chunk:
+            if req_state.final_stage_id > 0:
+                await self._prewarm_async_chunk_stages(request_id, stage0_request, req_state)
+            additional_info = (
+                _resolve_prompt_additional_information(stage0_request)
+                or _resolve_prompt_additional_information(original_prompt)
+                or _resolve_prompt_additional_information(req_state.prompt)
+                or {}
+            )
+            await self._inject_bypassed_stage0_chunk(request_id, additional_info)
+            return
+
+        await self._forward_bypassed_stage_zero(request_id, req_state)
+
+    async def _forward_bypassed_stage_zero(
+        self,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Sync-path Stage0 bypass via mock text output (non-async_chunk only)."""
+        mock_output = make_mock_text_stage_output(request_id, text="")
+        is_streaming = req_state.streaming.enabled
+        if is_streaming:
+            await self._forward_to_next_stage(
+                request_id,
+                0,
+                mock_output,
+                req_state,
+                src_replica_id=0,
+                is_streaming_session=True,
+                is_final_update=False,
+            )
+            if getattr(mock_output, "finished", True):
+                await self._forward_to_next_stage(
+                    request_id,
+                    0,
+                    mock_output,
+                    req_state,
+                    src_replica_id=0,
+                    is_streaming_session=True,
+                    is_final_update=True,
+                )
+        else:
+            await self._forward_to_next_stage(
+                request_id,
+                0,
+                mock_output,
+                req_state,
+                src_replica_id=0,
+                is_streaming_session=False,
+                is_final_update=True,
+            )
+
+    def _get_stage0_bypass_connector(self) -> Any:
+        """Lazy SharedMemoryConnector matching Stage0's connector config."""
+        if self._stage0_bypass_connector is not None:
+            return self._stage0_bypass_connector
+        from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+            OmniChunkTransferAdapter,
+        )
+
+        model_config = getattr(self.stage_pools[0].stage_vllm_config, "model_config", None)
+        self._stage0_bypass_connector = OmniChunkTransferAdapter.create_connector(model_config)
+        return self._stage0_bypass_connector
+
+    async def _inject_bypassed_stage0_chunk(
+        self,
+        request_id: str,
+        additional_info: dict[str, Any],
+    ) -> None:
+        """Put a finished empty ASR→AURA chunk so prewarmed Stage1 can proceed."""
+        payload = build_empty_asr_aura_chunk_payload(additional_info)
+        put_key = f"{request_id}_0_0"
+        connector = self._get_stage0_bypass_connector()
+        success, size, _metadata = connector.put(
+            from_stage="0",
+            to_stage="1",
+            put_key=put_key,
+            data=payload,
+        )
+        if not success:
+            logger.error(
+                "[Orchestrator] Failed to inject bypassed Stage0 chunk for req=%s key=%s",
+                request_id,
+                put_key,
+            )
+            return
+        logger.debug(
+            "[Orchestrator] Injected bypassed Stage0 chunk req=%s key=%s size=%s",
+            request_id,
+            put_key,
+            size,
+        )
+
+    async def _flush_deferred_tts_prewarms(self) -> None:
+        """Admit Stage2/3 prewarm for requests deferred while voice ASR was active."""
+        if not _tts_gate_on_voice_asr_enabled():
+            return
+        if self._active_voice_asr:
+            return
+        deferred_ids = [
+            rid
+            for rid, st in list(self.request_states.items())
+            if st.deferred_tts_prewarm and st.async_chunk_prewarm_request is not None
+        ]
+        for rid in deferred_ids:
+            st = self.request_states.get(rid)
+            if st is None or not st.deferred_tts_prewarm:
+                continue
+            stage0_req = st.async_chunk_prewarm_request
+            st.deferred_tts_prewarm = False
+            logger.info(
+                "[Orchestrator] TTS gate flush: prewarming Stage2/3 for req=%s (active_voice_asr=0)",
+                rid,
+            )
+            await self._prewarm_async_chunk_stages(rid, stage0_req, st)
+
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
         stage0_request: Any,
         req_state: OrchestratorRequestState,
     ) -> None:
-        """Pre-submit downstream stages for async-chunk mode."""
+        """Pre-submit downstream stages for async-chunk mode.
+
+        Stage1 is always admitted immediately (GPU1). Stage2/3 may be deferred
+        while ``_active_voice_asr`` is non-empty when the TTS gate is enabled,
+        so Talker/Code2Wav do not contend with voice ASR on shared GPU0.
+        """
         if req_state.final_stage_id <= 0:
             return
 
@@ -1527,12 +1803,27 @@ class Orchestrator:
             )
             return
 
+        req_state.async_chunk_prewarm_request = stage0_request
+        gate_tts = _tts_gate_on_voice_asr_enabled() and bool(self._active_voice_asr)
+
         for next_stage_id in range(1, req_state.final_stage_id + 1):
             if next_stage_id in req_state.stage_submit_ts:
                 logger.debug(
                     "[Orchestrator] async_chunk prewarm skipped stage-%d for req=%s: already submitted",
                     next_stage_id,
                     request_id,
+                )
+                continue
+
+            # Always prewarm Stage1; defer Talker/Code2Wav while voice ASR holds GPU0.
+            if gate_tts and next_stage_id >= 2:
+                req_state.deferred_tts_prewarm = True
+                logger.info(
+                    "[Orchestrator] TTS gate: deferring stage-%d prewarm for req=%s "
+                    "(active_voice_asr=%d)",
+                    next_stage_id,
+                    request_id,
+                    len(self._active_voice_asr),
                 )
                 continue
 
@@ -1614,6 +1905,13 @@ class Orchestrator:
                 request_id=request_id,
                 tx_ms=_tx_ms,
             )
+
+        # If we only deferred 2/3 and Stage1 was submitted, keep deferred flag.
+        if gate_tts and req_state.deferred_tts_prewarm:
+            return
+        # Cleared all stages (or gate off): ensure flag false.
+        if 2 in req_state.stage_submit_ts or req_state.final_stage_id < 2:
+            req_state.deferred_tts_prewarm = False
 
     def _build_kv_sender_info(
         self,

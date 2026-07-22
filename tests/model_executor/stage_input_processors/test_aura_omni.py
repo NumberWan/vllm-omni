@@ -22,6 +22,7 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     resolve_aura_async_chunk_stage_payload,
     unpack_aura_video_ndarray,
     video_tuple_from_deferred_multi_modal,
+    _pop_native_tts_sentence,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
     SessionHistory,
@@ -479,6 +480,40 @@ def test_aura2tts_async_chunk_emits_finish_payload_when_tts_input_is_silent():
     assert payload is not None
     assert payload["prompt_token_ids"] == []
     assert payload["meta"]["finished"].item() is True
+
+
+def test_pop_native_tts_sentence_matches_native_boundaries():
+    s, rest = _pop_native_tts_sentence("你好世界。下一句")
+    assert s == "你好世界。"
+    assert rest == "下一句"
+    s, rest = _pop_native_tts_sentence("短，")
+    assert s is None and rest == "短，"
+
+
+def test_aura2tts_async_chunk_emits_mid_generation_sentence(monkeypatch):
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    transfer_manager = _transfer_manager()
+    request = SimpleNamespace(
+        request_id="req-sent",
+        external_req_id="req-sent",
+        output_token_ids=[1, 2, 3],
+        output_text="今天天气很好。后面还有",
+        additional_information={
+            "tts_task_type": ["CustomVoice"],
+            "tts_speaker": ["Vivian"],
+            "tts_language": ["Chinese"],
+        },
+        is_finished=lambda: False,
+    )
+    mid = aura2tts_async_chunk(transfer_manager, None, request, is_finished=False)
+    assert mid is not None
+    assert mid["text"] == ["今天天气很好。"]
+    # Finish with more text: remnant after prior sentence emit.
+    request.output_text = "今天天气很好。后面还有内容"
+    request.is_finished = lambda: True
+    fin = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+    assert fin is not None
+    assert "后面还有内容" in (fin.get("text") or [""])[0] or fin.get("prompt_token_ids") == []
 
 
 def test_aura2tts_drops_silent_response():

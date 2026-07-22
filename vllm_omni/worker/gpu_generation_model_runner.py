@@ -83,11 +83,26 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         for req_id in unscheduled_req_ids:
             self.input_batch.remove_request(req_id)
         cached_reqs = scheduler_output.scheduled_cached_reqs
+        mm_patches = getattr(cached_reqs, "mm_feature_patches", None) or {}
         req_states = []
         for req_id in cached_reqs.req_ids:
             req_state = self.requests.get(req_id)
             assert req_state is not None
             req_state.prompt_token_ids = cached_reqs.prompt_token_ids.get(req_id)
+            idx_feats = mm_patches.get(req_id)
+            if idx_feats:
+                mm_list = list(req_state.mm_features or [])
+                changed = False
+                for idx, feat in idx_feats.items():
+                    i = int(idx)
+                    if 0 <= i < len(mm_list):
+                        mm_list[i] = feat
+                        changed = True
+                    elif i == len(mm_list):
+                        mm_list.append(feat)
+                        changed = True
+                if changed:
+                    req_state.mm_features = mm_list
             req_states.append(req_state)
             # Remove the request from the current input batch only if it is still present.
             if req_id in self.input_batch.req_id_to_index:

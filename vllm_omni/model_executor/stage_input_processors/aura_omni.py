@@ -254,7 +254,8 @@ def build_aura_streaming_turn_additional_information(
         "aura_system_prompt": [system_prompt],
         "omni_skip_stages": [0] if skip_asr else [],
     }
-    # Stage-worker SessionHistory is the prompt truth for sync and async_chunk;
+    # Prompt dialogue: independent History service when enabled; ephemeral
+    # Stage-1 SessionHistory is only a hydrate/prune helper for this turn.
     # pass client/API knobs so create does not fall back to defaults (max_rounds=20).
     if max_rounds is not None:
         additional_information["aura_max_rounds"] = [int(max_rounds)]
@@ -538,10 +539,10 @@ def build_aura_input(
 ) -> dict[str, Any]:
     """Build the AURA stage-1 input for both sync and async-chunk ASR output.
 
-    Conversation history always comes from the prompt SessionHistory registry
-    (``get_session_history`` / ``get_or_create_session_history``), never the API
-    ``AuraSessionState.history`` store. API state still owns frames / trigger /
-    penalty.
+    Conversation history comes from ``get_or_create_session_history`` (independent
+    History service when ``VLLM_AURA_HISTORY_SERVICE`` is set; otherwise
+    process-local). Never the API ``AuraSessionState.history`` store. API state
+    still owns frames / trigger / penalty.
     """
     session_id = additional_info.get("aura_session_id")
     system_prompt = _first_value(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT)
@@ -1437,6 +1438,49 @@ def _aura2tts_empty_finished_payload() -> dict[str, Any]:
     }
 
 
+# Native AURA sentence boundaries for incremental Stage1→TTS handoff.
+_NATIVE_TTS_SENT_ENDS = frozenset("。！？；.!?;\n")
+_NATIVE_TTS_COMMA_ENDS = frozenset("，,")
+_NATIVE_TTS_MIN_CHARS = 10
+
+
+def _sentence_tts_enabled() -> bool:
+    """Match Native: emit TTS per sentence while Stage1 still generates.
+
+    Default OFF until mid-gen emit is proven stable under async_chunk c=8
+    (set ``VLLM_AURA_SENTENCE_TTS=1`` to enable). Disable explicitly with ``0``.
+    """
+    raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS") or "0").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _pop_native_tts_sentence(buf: str) -> tuple[str | None, str]:
+    """Pop one Native-aligned sentence from ``buf``; return (sentence_or_None, rest)."""
+    if not buf:
+        return None, buf
+    split_pos = -1
+    for i, ch in enumerate(buf):
+        if ch in _NATIVE_TTS_SENT_ENDS:
+            split_pos = i + 1
+            break
+        if ch in _NATIVE_TTS_COMMA_ENDS and i + 1 >= _NATIVE_TTS_MIN_CHARS:
+            split_pos = i + 1
+            break
+    if split_pos < 0:
+        return None, buf
+    sentence = buf[:split_pos]
+    rest = buf[split_pos:]
+    if not sentence.strip():
+        return _pop_native_tts_sentence(rest)
+    return sentence, rest
+
+
+def _tts_payload_from_talker_input(tts_input: OmniTokensPrompt) -> dict[str, Any]:
+    payload = dict(tts_input["additional_information"])
+    payload["prompt_token_ids"] = list(tts_input["prompt_token_ids"])
+    return payload
+
+
 def build_tts_talker_input(
     text: str,
     content_ids: list[int],
@@ -1570,7 +1614,12 @@ def aura2tts_async_chunk(
     is_finished: bool = False,
     **_: Any,
 ) -> dict[str, Any] | None:
-    """Accumulate AURA output and emit one Qwen3-TTS Talker input at finish."""
+    """Accumulate AURA output; emit TTS per sentence (Native) or once at finish.
+
+    When ``VLLM_AURA_SENTENCE_TTS`` is on (default), complete sentences are
+    handed to Stage2 while Stage1 is still generating. History commits once
+    at Stage1 finish. Silent turns still emit an empty finished payload.
+    """
     del multimodal_output
     if request is None:
         raise ValueError("aura2tts_async_chunk requires request.")
@@ -1617,12 +1666,75 @@ def aura2tts_async_chunk(
         state["aura2tts_text"] = (
             request_text if request_text.startswith(previous_text) else _clean_tts_text(previous_text + request_text)
         )
+    elif content_ids and _sentence_tts_enabled():
+        # Streaming chunks may only expose token ids until finish; decode for
+        # Native-style mid-generation sentence boundaries.
+        try:
+            tokenizer = cached_tokenizer_from_config(transfer_manager.config)
+            decoded = _clean_tts_text(tokenizer.decode(content_ids))
+            if decoded:
+                state["aura2tts_text"] = decoded
+        except Exception:
+            logger.debug(
+                "[aura2tts_async_chunk] req=%s token decode for sentence TTS failed",
+                request_id,
+                exc_info=True,
+            )
 
     tts_metadata = _copy_aura_tts_fields(additional_info)
     if tts_metadata:
         state["aura2tts_tts_metadata"] = dict(tts_metadata)
 
+    cached_tts_metadata = state.get("aura2tts_tts_metadata")
+    if isinstance(cached_tts_metadata, dict):
+        emit_info = {**cached_tts_metadata, **additional_info}
+    else:
+        emit_info = additional_info
+    pass_token_ids = _first_bool(emit_info.get("tts_pass_token_ids"), False)
+    sentence_tts = _sentence_tts_enabled()
+    pending_buf = str(state.get("aura2tts_pending_sentence", ""))
+    full_text = _clean_tts_text(str(state.get("aura2tts_text", ""))) or request_text
+    # Append only newly seen text into the sentence buffer.
+    emitted_prefix = str(state.get("aura2tts_emitted_prefix", ""))
+    if full_text.startswith(emitted_prefix):
+        new_tail = full_text[len(emitted_prefix) :]
+    else:
+        new_tail = full_text
+        pending_buf = ""
+        emitted_prefix = ""
+    if new_tail:
+        pending_buf = _clean_tts_text(pending_buf + new_tail)
+        emitted_prefix = full_text
+        state["aura2tts_emitted_prefix"] = emitted_prefix
+
+    if sentence_tts and not finished:
+        sentence, pending_buf = _pop_native_tts_sentence(pending_buf)
+        state["aura2tts_pending_sentence"] = pending_buf
+        if sentence is None:
+            logger.info(
+                "[aura2tts_async_chunk] req=%s waiting for sentence boundary "
+                "pending_len=%d accumulated_text_len=%d",
+                request_id,
+                len(pending_buf),
+                len(full_text),
+            )
+            return None
+        # Mid-generation: text-mode TTS for the complete sentence only.
+        tts_input = build_tts_talker_input(sentence, [], emit_info, pass_token_ids=False)
+        if tts_input is None:
+            return None
+        state["aura2tts_sentence_emits"] = int(state.get("aura2tts_sentence_emits", 0)) + 1
+        logger.info(
+            "[aura2tts_async_chunk] req=%s emitting mid-gen sentence #%d text_len=%d preview=%r",
+            request_id,
+            state["aura2tts_sentence_emits"],
+            len(sentence),
+            sentence[:80],
+        )
+        return _tts_payload_from_talker_input(tts_input)
+
     if not finished:
+        state["aura2tts_pending_sentence"] = pending_buf
         logger.info(
             "[aura2tts_async_chunk] req=%s waiting for final AURA chunk accumulated_text_len=%d "
             "accumulated_content_ids=%d tts_metadata_keys=%s",
@@ -1633,20 +1745,17 @@ def aura2tts_async_chunk(
         )
         return None
 
+    # Finished: flush any remainder sentence buffer, then commit history once.
     content_ids = list(state.get("aura2tts_content_ids", content_ids) or [])
-    if not content_ids:
+    if not content_ids and not full_text and not pending_buf:
         logger.info("[aura2tts_async_chunk] req=%s finished with no content ids; no TTS input", request_id)
         return None
-    if _is_silent_token_prefix(content_ids):
+    if _is_silent_token_prefix(content_ids) and not pending_buf:
         logger.info("[aura2tts_async_chunk] req=%s final content is silent; emitting finish payload", request_id)
         _commit_session_turn_if_present(additional_info, SILENT_TEXT)
         return _aura2tts_empty_finished_payload()
 
-    cached_tts_metadata = state.get("aura2tts_tts_metadata")
-    if isinstance(cached_tts_metadata, dict):
-        additional_info = {**cached_tts_metadata, **additional_info}
-    pass_token_ids = _first_bool(additional_info.get("tts_pass_token_ids"), False)
-    request_text = _clean_tts_text(str(state.get("aura2tts_text", ""))) or request_text
+    request_text = full_text
     if not request_text and not pass_token_ids:
         try:
             tokenizer = cached_tokenizer_from_config(transfer_manager.config)
@@ -1657,10 +1766,35 @@ def aura2tts_async_chunk(
                 getattr(request, "request_id", None),
             )
 
+    if sentence_tts:
+        n_emitted = int(state.get("aura2tts_sentence_emits", 0))
+        flush_text = pending_buf.strip()
+        state["aura2tts_pending_sentence"] = ""
+        if n_emitted > 0:
+            # Already streamed sentences mid-gen: flush remnant as text, then
+            # optional empty finish if nothing left.
+            _commit_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
+            if flush_text:
+                tts_input = build_tts_talker_input(flush_text, [], emit_info, pass_token_ids=False)
+                if tts_input is not None:
+                    logger.info(
+                        "[aura2tts_async_chunk] req=%s flushing final sentence remnant text_len=%d",
+                        request_id,
+                        len(flush_text),
+                    )
+                    return _tts_payload_from_talker_input(tts_input)
+            logger.info(
+                "[aura2tts_async_chunk] req=%s finish after %d sentence emits; empty finish payload",
+                request_id,
+                n_emitted,
+            )
+            return _aura2tts_empty_finished_payload()
+        # No mid-gen emits: keep classic single-shot finish (supports pass_token_ids).
+
     tts_input = build_tts_talker_input(
         request_text,
         content_ids,
-        additional_info,
+        emit_info,
         pass_token_ids,
     )
     if tts_input is None:
@@ -1676,8 +1810,7 @@ def aura2tts_async_chunk(
         )
         return None
     _commit_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
-    payload = dict(tts_input["additional_information"])
-    payload["prompt_token_ids"] = list(tts_input["prompt_token_ids"])
+    payload = _tts_payload_from_talker_input(tts_input)
     assistant_token_ids = QWEN_ASSISTANT_PREFIX_IDS + content_ids + QWEN_ASSISTANT_SUFFIX_IDS
     if pass_token_ids and assistant_token_ids:
         payload[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids]
