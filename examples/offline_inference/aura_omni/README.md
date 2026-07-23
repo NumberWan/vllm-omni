@@ -34,7 +34,7 @@ you override it:
 ```bash
 python end2end.py \
   --tts-task-type Base \
-  --tts-ref-audio /data/yrr/rein_test/shuhan.mp3 \
+  --tts-ref-audio /path/to/shuhan.mp3 \
   --tts-x-vector-only-mode
 ```
 

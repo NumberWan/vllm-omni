@@ -1,7 +1,7 @@
 # OmniInteract Benchmark
 
 > **Setup & run guide:** [SETUP_AND_RUN.md](./SETUP_AND_RUN.md)  
-> Native AURA alignment notes: `/public/wtk/docs/aura/vllm_omni_benchmark_alignment_backlog.md`
+> Prefer `bash benchmarks/omniinteract/run_streaming_bench.sh` after starting the server.
 
 This benchmark evaluates audio-visual interaction on the
 [OmniInteract](https://github.com/Lucky-Lance/OmniInteract) dataset with
@@ -115,14 +115,14 @@ Start the AURA server first, then run:
 
 ```bash
 OMNIINTERACT_EVAL=1 \
-MODEL=/data/models/AURA \
-DATASET_PATH=/data/models/datasets/OmniInteract \
+MODEL=/models/AURA \
+DATASET_PATH=/models/datasets/OmniInteract \
 HOST=127.0.0.1 \
 PORT=8666 \
 NUM_PROMPTS=250 \
 MAX_CONCURRENCY=1 \
 STREAMING_MAX_FRAMES=16 \
-bash /data/yrr/rein_test/omniinteract_bench.sh
+bash benchmarks/omniinteract/run_streaming_bench.sh
 ```
 
 Equivalent direct command:
@@ -134,9 +134,9 @@ vllm bench serve --omni \
   --trust-remote-code \
   --backend openai-video-stream \
   --endpoint /v1/video/chat/stream \
-  --model /data/models/AURA \
+  --model /models/AURA \
   --dataset-name omniinteract \
-  --dataset-path /data/models/datasets/OmniInteract \
+  --dataset-path /models/datasets/OmniInteract \
   --no-oversample \
   --num-prompts 16 \
   --max-concurrency 1 \
@@ -163,9 +163,9 @@ vllm bench serve --omni \
   --port 8666 \
   --backend openai-video-stream \
   --endpoint /v1/video/chat/stream \
-  --model /data/models/AURA \
+  --model /models/AURA \
   --dataset-name omniinteract \
-  --dataset-path /data/models/datasets/OmniInteract \
+  --dataset-path /models/datasets/OmniInteract \
   --num-prompts 3 \
   --no-oversample \
   --omniinteract-subsets 1qna \
@@ -186,9 +186,9 @@ vllm bench serve --omni \
   --port 8666 \
   --backend openai-chat-omni \
   --endpoint /v1/chat/completions \
-  --model /data/models/AURA \
+  --model /models/AURA \
   --dataset-name omniinteract \
-  --dataset-path /data/models/datasets/OmniInteract \
+  --dataset-path /models/datasets/OmniInteract \
   --num-prompts 32 \
   --omniinteract-subsets 1q1a,1q1a_math \
   --omniinteract-input-mode aura \
@@ -206,9 +206,9 @@ vllm bench serve --omni \
   --port 8666 \
   --backend openai-chat-omni \
   --endpoint /v1/chat/completions \
-  --model /data/models/AURA \
+  --model /models/AURA \
   --dataset-name omniinteract \
-  --dataset-path /data/models/datasets/OmniInteract \
+  --dataset-path /models/datasets/OmniInteract \
   --num-prompts 32 \
   --omniinteract-subsets 1q1a,1qna \
   --omniinteract-input-mode video \

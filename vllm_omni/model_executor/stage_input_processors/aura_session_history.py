@@ -94,7 +94,6 @@ __all__ = [
     "get_session_state",
     "unregister_session",
     "clear_all_sessions",
-    "record_transcript_for_request",
     "pop_transcript_for_request",
     "record_pending_turn",
     "commit_session_turn",
@@ -853,14 +852,6 @@ def register_session_state(session_id: str, state: AuraSessionState) -> None:
 def get_session_state(session_id: str) -> AuraSessionState | None:
     with _SESSION_LOCK:
         return _SESSION_STATES.get(session_id)
-
-
-def record_transcript_for_request(session_id: str | None, request_id: str, transcript: str) -> None:
-    if not session_id:
-        return
-    state = get_session_state(str(session_id))
-    if state is not None:
-        state.record_turn_transcript(request_id, transcript)
 
 
 def pop_transcript_for_request(request_id: str | None) -> str:

@@ -127,7 +127,7 @@ bash benchmarks/omniinteract/run_aura_server.sh
 |----------|---------|-------------|
 | `MODEL` | `/models/AURA` | `--model` and `--served-model-name` |
 | `DEPLOY_CONFIG` | `vllm_omni/deploy/aura_omni.yaml` | Stage / GPU layout |
-| `VLLM_BIN` | `/public/wtk/.venv/bin/vllm` | `vllm` executable |
+| `VLLM_BIN` | `$ROOT/.venv/bin/vllm` or `vllm` on PATH | `vllm` executable |
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8666` | HTTP / WebSocket port |
 | `CUDA_VISIBLE_DEVICES` | `0,1` | Physical GPUs (see deploy yaml) |

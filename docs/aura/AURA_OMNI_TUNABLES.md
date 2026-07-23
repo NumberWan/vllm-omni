@@ -10,11 +10,7 @@ updated: 2026-07-23
 bash scripts/start_aura_omni.sh
 ```
 
-量測（含 `0001` warmup，統計排除 0001）：
-
-```bash
-bash # pack remasure: AURA/20_07_2026/test/run_omni_c8_mm_flashinfer_rerun.sh
-```
+量測前必跑 **`0001` warmup**（同一 server 進程）；報表／精度／latency **排除 `0001`**。
 
 ---
 
@@ -28,17 +24,12 @@ bash # pack remasure: AURA/20_07_2026/test/run_omni_c8_mm_flashinfer_rerun.sh
 | `VLLM_AURA_SILENT_STOP_AT_STAGE1` | **1** | silent 唔喚醒 Stage2/3 TTS |
 | `VLLM_AURA_TTS_GATE_ON_VOICE_ASR` | **1** | voice ASR 期間延遲 TTS prewarm |
 | `VLLM_AURA_SENTENCE_TTS` | **1** | Stage1 按句中途交 TTS（贏 TTFP） |
-| `VLLM_AURA_AUTO_INTERRUPT` | **0** | 自動打斷（仍未穩） |
-| History service | **關** | 見下方 |
-
-預期 c=8 voice（2 卡 skip）：ASR ~136–144、AUDIO_TTFP ~350。  
-詳：[`results/vllm_omni/BEST_SKIP_2CARD.md`](AURA pack: results/vllm_omni/BEST_SKIP_2CARD.md)
 
 ---
 
 ## 2. 常用覆寫（只喺有需要時 set）
 
-### 2.1 優先 ASR ≈ Native（~89 ms @ c=8）
+### 2.1 優先 ASR ≈ Native
 
 ```bash
 VLLM_AURA_STAGE0_BYPASS=0 bash scripts/start_aura_omni.sh
@@ -54,15 +45,13 @@ CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
 
 YAML 內 `devices: '0'|'1'` 係 **相對** `CUDA_VISIBLE_DEVICES` 嘅編號。
 
-### 2.3 4 卡分卡（ASR｜AURA｜Talker｜Code2Wav）
+### 2.3 自訂 deploy / 4 卡分卡
 
 ```bash
-DEPLOY=/public/wtk/AURA/AURA/benchmark_results/aura_mode_matrix_smoke3_20260714/deploy/async_customvoice_s1_c8_mem09_mm_flashinfer_talker_fi_seqs4_4gpu_split.yaml \
+DEPLOY=/path/to/your_4gpu_split.yaml \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 bash scripts/start_aura_omni.sh
 ```
-
-4 卡下真 skip 同 bypass0 Stage0 公平上接近；見 [`results/vllm_omni/C8_4GPU_SPLIT_LOG.md`](AURA pack: results/vllm_omni/C8_4GPU_SPLIT_LOG.md)。
 
 ### 2.4 Port / model / log
 
@@ -80,15 +69,15 @@ PORT=8667 MODEL=/models/AURA LOG_DIR=/tmp/my_aura bash scripts/start_aura_omni.s
 | `VLLM_AURA_SILENT_STOP_AT_STAGE1` | `1` | skip 時 silent 停喺 Stage1 | 關咗 2 卡 ASR 會差好多 |
 | `VLLM_AURA_TTS_GATE_ON_VOICE_ASR` | `1` | voice ASR 時 defer TTS prewarm | 少數實驗可 `0` |
 | `VLLM_AURA_SENTENCE_TTS` | `1` | 按句 mid-gen → TTS | 關咗 TTFP 變差 |
-| `VLLM_AURA_AUTO_INTERRUPT` | `0` | 新 query 打斷舊 generation | **唔建議開**（interrupt 未齊） |
-| `VLLM_AURA_HISTORY_SERVICE` | unset | 獨立 History Unix socket | 進階；配合 `HISTORY_PRIMARY` |
-| `VLLM_AURA_HISTORY_PRIMARY` | unset | History 主寫 | 同上 |
 | `VLLM_AURA_LOG_TURN_PROMPT` | off | debug dump turn prompt | 除錯 |
 | `VLLM_AURA_SESSION_HISTORY_DIAG` | off | history 診斷 log | 除錯 |
 | `VLLM_AURA_HISTORY_VIDEO_MODE` | `all` | history 影片保留策略 | 進階 |
 | `VLLM_AURA_DISABLE_VIDEO_PACK` | off | 關 video pack | 實驗 |
 
-**已移除／唔支援**：`VLLM_AURA_TTS_PREEMPT_ON_VOICE_ASR`（跨 session abort 會 hang；代碼已清）。
+**已移除／唔支援**：
+
+- `VLLM_AURA_TTS_PREEMPT_ON_VOICE_ASR`（跨 session abort 會 hang；代碼已清）
+- `VLLM_AURA_AUTO_INTERRUPT` / `VLLM_AURA_HISTORY_SERVICE` / `VLLM_AURA_HISTORY_PRIMARY`（無實作／無 reader）
 
 ---
 
@@ -113,7 +102,7 @@ PORT=8667 MODEL=/models/AURA LOG_DIR=/tmp/my_aura bash scripts/start_aura_omni.s
 
 1. 量測前必跑 **`0001` warmup**（同 server 進程）。  
 2. 報表／精度／latency **排除 `0001`**。  
-3. Remasure 已內建：`run_omni_c8_mm_flashinfer_rerun.sh`。
+3. 詳見 [`benchmarks/omniinteract/SETUP_AND_RUN.md`](../benchmarks/omniinteract/SETUP_AND_RUN.md)。
 
 ---
 

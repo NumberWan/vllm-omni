@@ -705,7 +705,11 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_chunk_prewarm_preserves_source_resumable_flag(orchestrator_factory) -> None:
+async def test_async_chunk_prewarm_preserves_source_resumable_flag(
+    orchestrator_factory, monkeypatch
+) -> None:
+    # Prewarm asserts Stage2 enqueue; TTS gate would defer that while voice ASR is active.
+    monkeypatch.setenv("VLLM_AURA_TTS_GATE_ON_VOICE_ASR", "0")
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(stage_type="llm", final_output=False)
     stage2 = FakeStageClient(stage_type="llm", final_output=True)
@@ -1018,6 +1022,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
     pool = RecordingPool()
     orchestrator = object.__new__(Orchestrator)
     orchestrator.async_chunk = False
+    orchestrator._active_voice_asr = set()
     orchestrator.request_states = {
         "req-stream": OrchestratorRequestState(
             request_id="req-stream",

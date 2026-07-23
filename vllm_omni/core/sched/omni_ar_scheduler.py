@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from time import time
 from typing import Any
 
@@ -45,77 +45,6 @@ def _aura_sentence_tts_mid_gen_enabled() -> bool:
     """
     raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS") or "1").strip().lower()
     return raw not in {"0", "false", "off", "no"}
-
-
-# Keep only mrope / positional metadata when shipping mm features whose tensors
-# will not be encoded this step. Full pixel tensors for N history videos dominate
-# Engine→Worker IPC (~2.7MB/vid).
-#
-# IMPORTANT: this slim is **unsafe by default**. Worker stores the first
-# ``scheduled_new_reqs`` mm_features copy permanently. If we strip pixels for
-# idxs not in *this* step's ``scheduled_encoder_inputs``, later chunked encode
-# steps (or encoder-cache eviction re-encodes) call ``embed_multimodal`` with
-# only grid metadata → Qwen3-VL returns None → Stage1 EngineDeadError.
-# Re-enable only via ``VLLM_OMNI_SLIM_MM_IPC=1`` for experiments that keep
-# encoder cache large enough to never re-encode slimmed features.
-_MM_MROPE_KEEP_KEYS = frozenset(
-    {
-        "image_grid_thw",
-        "video_grid_thw",
-        "second_per_grid_ts",
-        "audio_feature_lengths",
-        "use_audio_in_video",
-    }
-)
-
-
-def _slim_mm_ipc_enabled() -> bool:
-    return os.environ.get("VLLM_OMNI_SLIM_MM_IPC", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def slim_mm_features_for_worker_ipc(
-    mm_features: list[Any] | None,
-    encode_idxs: set[int] | list[int] | None,
-) -> list[Any] | None:
-    """Drop pixel tensors from mm features that are not scheduled for encoding.
-
-    Worker still needs ``video_grid_thw`` / ``second_per_grid_ts`` on every
-    feature for mrope; encoder only reads ``data`` for ``encode_idxs``.
-
-    Disabled unless ``VLLM_OMNI_SLIM_MM_IPC=1`` (see module comment).
-    """
-    if not mm_features or not _slim_mm_ipc_enabled():
-        return mm_features
-    encode_set = set(encode_idxs or ())
-    try:
-        from vllm.multimodal.inputs import MultiModalKwargsItem
-    except Exception:  # noqa: BLE001
-        return mm_features
-
-    slimmed: list[Any] = []
-    for idx, feat in enumerate(mm_features):
-        data = getattr(feat, "data", None)
-        if data is None or idx in encode_set:
-            slimmed.append(feat)
-            continue
-        try:
-            keep = {k: v for k, v in data.items() if k in _MM_MROPE_KEEP_KEYS}
-        except Exception:  # noqa: BLE001
-            slimmed.append(feat)
-            continue
-        if not keep or len(keep) >= len(data):
-            slimmed.append(feat)
-            continue
-        try:
-            slimmed.append(replace(feat, data=MultiModalKwargsItem(keep)))
-        except Exception:  # noqa: BLE001
-            slimmed.append(feat)
-    return slimmed
 
 
 @dataclass
@@ -364,15 +293,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Rewrap base NewRequestData entries with OmniNewRequestData,
             # enriching with request-level payloads
-            enc_map = getattr(scheduler_output, "scheduled_encoder_inputs", None) or {}
             new_list = []
             for nr in scheduler_output.scheduled_new_reqs:
                 req_id = getattr(nr, "req_id", None)
                 request = self.requests.get(req_id) if req_id else None
                 mm_feats = nr.mm_features
-                if mm_feats:
-                    encode_idxs = set(enc_map.get(req_id, []) or [])
-                    mm_feats = slim_mm_features_for_worker_ipc(mm_feats, encode_idxs)
                 # Build omni entry preserving all base fields
                 omni_nr = OmniNewRequestData(
                     req_id=nr.req_id,

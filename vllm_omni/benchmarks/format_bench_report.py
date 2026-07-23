@@ -1318,11 +1318,10 @@ def write_aura_benchmark_result_exports(
     """Write spoken/silent reports under AURA/benchmark_result/vllm_omni/."""
     import os
 
-    default_root = Path("/public/wtk/AURA/benchmark_result")
     root = Path(
         aura_result_root
         or os.environ.get("AURA_BENCHMARK_RESULT_ROOT", "")
-        or default_root
+        or "./benchmark_results"
     ).resolve()
     out_dir = root / "vllm_omni"
     out_dir.mkdir(parents=True, exist_ok=True)

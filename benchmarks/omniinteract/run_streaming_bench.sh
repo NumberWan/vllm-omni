@@ -27,9 +27,13 @@
 #   videos/<id>/bench_report.md     — per-video report + streaming_chunks.json
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODEL="${MODEL:-/models/AURA}"
 DATASET_PATH="${DATASET_PATH:-/models/datasets/OmniInteract}"
-VLLM_BIN="${VLLM_BIN:-/public/wtk/.venv/bin/vllm}"
+VLLM_BIN="${VLLM_BIN:-$ROOT/.venv/bin/vllm}"
+if [[ ! -x "$VLLM_BIN" ]]; then
+  VLLM_BIN="$(command -v vllm || true)"
+fi
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8666}"
 NUM_PROMPTS="${NUM_PROMPTS:-32}"
@@ -38,10 +42,10 @@ MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
 NATIVE_ALIGNED="${NATIVE_ALIGNED:-0}"
 
 # TTS: match native AURA stack (run_omniinteract_bench.sh → tts_service.py)
-AURA_NATIVE_ROOT="${AURA_NATIVE_ROOT:-/public/wtk/AURA/AURA}"
+AURA_NATIVE_ROOT="${AURA_NATIVE_ROOT:-}"
 OMNIINTERACT_AURA_TTS_TASK_TYPE="${OMNIINTERACT_AURA_TTS_TASK_TYPE:-Base}"
 OMNIINTERACT_AURA_TTS_LANGUAGE="${OMNIINTERACT_AURA_TTS_LANGUAGE:-Chinese}"
-OMNIINTERACT_AURA_TTS_REF_AUDIO="${OMNIINTERACT_AURA_TTS_REF_AUDIO:-${AURA_NATIVE_ROOT}/shuhan.mp3}"
+OMNIINTERACT_AURA_TTS_REF_AUDIO="${OMNIINTERACT_AURA_TTS_REF_AUDIO:-${AURA_NATIVE_ROOT:+$AURA_NATIVE_ROOT/shuhan.mp3}}"
 OMNIINTERACT_AURA_TTS_REF_TEXT="${OMNIINTERACT_AURA_TTS_REF_TEXT:-读书指通过阅读书籍获取知识、交流思想的行为。}"
 
 # Native-aligned streaming defaults (shared by full dataset and smoke3).

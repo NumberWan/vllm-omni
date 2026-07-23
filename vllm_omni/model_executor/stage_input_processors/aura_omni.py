@@ -372,29 +372,6 @@ def _clean_asr_transcript(text: str) -> str:
     return cleaned.strip()
 
 
-def _normalize_request_id_for_transcript(request_id: str) -> str:
-    """Map AsyncOmni internal ids (``{external}-{uuid8}``) to the external id.
-
-    ``AsyncOmni.generate()`` rewrites ``request_id`` to an internal orchestrator id
-    while the streaming handler keeps the external id for ``on_turn_complete``.
-    Transcript storage must use the external id so ``pop_turn_transcript`` works.
-    """
-    rid = str(request_id).strip()
-    if not rid:
-        return rid
-    head, tail = rid.rsplit("-", 1)
-    if len(tail) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in tail):
-        return head
-    return rid
-
-
-def record_turn_transcript(request_id: str, transcript: str) -> None:
-    logger.debug(
-        "record_turn_transcript(request_id=%s) called without session_id; transcript is managed by AuraSessionState",
-        _normalize_request_id_for_transcript(request_id),
-    )
-
-
 def pop_turn_transcript(request_id: str | None) -> str:
     return pop_transcript_for_request(request_id)
 
@@ -539,10 +516,9 @@ def build_aura_input(
 ) -> dict[str, Any]:
     """Build the AURA stage-1 input for both sync and async-chunk ASR output.
 
-    Conversation history comes from ``get_or_create_session_history`` (independent
-    History service when ``VLLM_AURA_HISTORY_SERVICE`` is set; otherwise
-    process-local). Never the API ``AuraSessionState.history`` store. API state
-    still owns frames / trigger / penalty.
+    Conversation history comes from ``get_or_create_session_history``
+    (process-local session store). API ``AuraSessionState`` still owns frames /
+    trigger / penalty.
     """
     session_id = additional_info.get("aura_session_id")
     system_prompt = _first_value(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT)

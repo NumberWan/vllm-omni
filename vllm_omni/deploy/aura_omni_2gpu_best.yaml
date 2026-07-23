@@ -1,8 +1,8 @@
 # AURA Omni — recommended 2-GPU deploy (skip-ON best stack).
 # Layout: Stage0 ASR + Stage2/3 TTS on GPU0; Stage1 AURA on GPU1.
 # Feature flags default in code (STAGE0_BYPASS / SILENT_STOP / TTS_GATE / SENTENCE_TTS).
-# Prefer: bash AURA/20_07_2026/test/start_aura_omni.sh
-# See: AURA/20_07_2026/AURA_OMNI_TUNABLES.md
+# Prefer: bash scripts/start_aura_omni.sh
+# See: docs/aura/AURA_OMNI_TUNABLES.md
 #
 pipeline: aura_omni
 async_chunk: true
