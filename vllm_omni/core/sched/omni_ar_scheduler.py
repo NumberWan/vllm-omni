@@ -36,6 +36,17 @@ from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
 
+
+def _aura_sentence_tts_mid_gen_enabled() -> bool:
+    """Stage1 text→TTS mid-gen handoff (default on; ``VLLM_AURA_SENTENCE_TTS=0`` off).
+
+    When on, Stage1 calls ``save_async`` on new tokens so
+    ``aura2tts_async_chunk`` can emit sentences before request finish.
+    """
+    raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS") or "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
 # Keep only mrope / positional metadata when shipping mm features whose tensors
 # will not be encoded this step. Full pixel tensors for N history videos dominate
 # Engine→Worker IPC (~2.7MB/vid).
@@ -613,8 +624,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 assert not prompt_logprobs_tensors
 
             stage_transfer_payload = inter_stage_output if inter_stage_output is not None else mm_output
+            # Stage1 AURA is engine_output_type=text → mm_output is always None mid-gen.
+            # Without this branch, aura2tts_async_chunk only runs on finish (no Sentence TTS).
+            allow_sentence_tts_mid_gen = (
+                bool(new_token_ids)
+                and not is_segment_finished
+                and stage_transfer_payload is None
+                and getattr(self.vllm_config.model_config, "stage_id", None) == 1
+                and _aura_sentence_tts_mid_gen_enabled()
+            )
             if self.chunk_transfer_adapter is not None and (
-                stage_transfer_payload is not None or is_segment_finished
+                stage_transfer_payload is not None or is_segment_finished or allow_sentence_tts_mid_gen
             ):
                 self.chunk_transfer_adapter.save_async(
                     stage_transfer_payload,

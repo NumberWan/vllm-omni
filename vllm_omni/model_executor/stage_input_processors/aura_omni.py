@@ -1447,10 +1447,9 @@ _NATIVE_TTS_MIN_CHARS = 10
 def _sentence_tts_enabled() -> bool:
     """Match Native: emit TTS per sentence while Stage1 still generates.
 
-    Default OFF until mid-gen emit is proven stable under async_chunk c=8
-    (set ``VLLM_AURA_SENTENCE_TTS=1`` to enable). Disable explicitly with ``0``.
+    Default on (2-card skip best / TTFP). Disable with ``VLLM_AURA_SENTENCE_TTS=0``.
     """
-    raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS") or "0").strip().lower()
+    raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS") or "1").strip().lower()
     return raw not in {"0", "false", "off", "no"}
 
 

@@ -428,6 +428,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Segment/request finish markers must still reach downstream even when
             # the processor has no tensor payload.
             payload_data = OmniPayloadStruct()
+        # Mid-gen Sentence TTS: processor returned a real Talker prompt while Stage1
+        # is still decoding. Downstream Talker must see a complete segment (with
+        # text conditioning); otherwise decode crashes with missing text.
+        if (
+            not is_segment_finished
+            and not is_finished
+            and processor_name == "aura2tts_async_chunk"
+            and payload_data is not None
+        ):
+            is_segment_finished = True
         if isinstance(payload_data, dict):
             meta = payload_data.setdefault("meta", {})
             if not isinstance(meta, dict):
