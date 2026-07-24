@@ -30,21 +30,18 @@ Stage-1 `asr2aura` is session-aware at runtime:
 
 ## Quick Start
 
-### Start the Server
+### Start the production server
 
 ```bash
-vllm serve aurateam/AURA \
-    --deploy-config vllm_omni/deploy/aura_omni.yaml \
-    --omni \
-    --port 8000 \
-    --trust-remote-code
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
+curl http://127.0.0.1:8666/v1/models
 ```
 
 ### Run the Example Client
 
 ```bash
 python examples/online_serving/aura_omni/streaming_video_client.py \
-    --url ws://localhost:8000/v1/video/chat/stream \
+    --url ws://localhost:8666/v1/video/chat/stream \
     --synthetic-frames 8
 ```
 
@@ -52,9 +49,14 @@ With optional microphone audio (PCM16 16 kHz mono):
 
 ```bash
 python examples/online_serving/aura_omni/streaming_video_client.py \
+    --url ws://localhost:8666/v1/video/chat/stream \
     --audio /path/to/audio.pcm \
     --synthetic-frames 8
 ```
+
+Stop the server with `bash scripts/stop_aura_omni.sh`. See the
+[AURA serving guide](../../examples/online_serving/aura_omni/README.md) for
+installation, local model paths, and troubleshooting.
 
 ## AURA-Specific `session.config` Fields
 
@@ -79,7 +81,7 @@ All standard fields from [video_stream_api.md](video_stream_api.md) (`max_frames
 
 ## Text Output
 
-By default AURA does **not** stream `response.text.delta` to clients. Assistant tokens are accumulated server-side; the client receives a single `response.text.done` with the full reply (sent early when TTS audio starts if `VLLM_VIDEO_ASYNC_CHUNK=on`, so the next turn can begin while audio still streams).
+By default AURA does **not** stream `response.text.delta` to clients. Assistant tokens are accumulated server-side; the client receives a single `response.text.done` with the full reply. The production default has async chunking enabled, so the next turn can begin while the TTS tail still streams.
 
 Set `stream_text_deltas: true` in `session.config` if you need incremental text events (e.g. for a live caption UI).
 
@@ -102,7 +104,9 @@ When `modalities` includes `"audio"`, the server emits:
 | `response.audio.delta` | `data` (base64 WAV chunk), `format: "wav"` |
 | `response.audio.done` | (no payload) |
 
-Set `VLLM_VIDEO_ASYNC_CHUNK=on` for incremental audio deltas during generation (same as Qwen-Omni streaming).
+Incremental audio deltas are enabled by default. `VLLM_VIDEO_ASYNC_CHUNK=off`
+is retained only as a compatibility fallback that buffers output until the end
+of the turn.
 
 The example client saves concatenated PCM to `--output-wav` (default `aura_stream_output.wav`). Pass `--text-only` to request text-only modalities.
 

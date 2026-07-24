@@ -12,7 +12,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
@@ -145,9 +144,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._omits_kv_transfer_cache[rid] = result
         return result
 
-    def _should_defer_waiting_admission(self) -> bool:
-        return False
-
     def _finish_empty_prompt_chunk_requests(self) -> None:
         """Finish async_chunk requests whose upstream sent no tokens before done."""
         adapter = self.chunk_transfer_adapter
@@ -265,19 +261,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
             self._finish_empty_prompt_chunk_requests()
 
-        original_waiting = None
-        if self._should_defer_waiting_admission():
-            original_waiting = self.waiting
-            self.waiting = create_request_queue(self.policy)
-
         try:
             scheduler_output = super().schedule()
         finally:
-            if original_waiting is not None:
-                deferred_waiting = list(self.waiting)
-                if deferred_waiting:
-                    original_waiting.prepend_requests(deferred_waiting)
-                self.waiting = original_waiting
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(

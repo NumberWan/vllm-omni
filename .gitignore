@@ -182,6 +182,10 @@ AGENTS.md
 
 # scripts
 /scripts/
+!/scripts/
+/scripts/*
+!/scripts/install_aura_omni.sh
+!/scripts/stop_aura_omni.sh
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

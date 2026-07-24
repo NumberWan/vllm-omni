@@ -1,21 +1,12 @@
 #!/usr/bin/env bash
-# vllm-omni OmniInteract aura_streaming benchmark (multi-turn defaults).
-# Default GPUs: 2,3 (native AURA stack uses 0,1).
+# vllm-omni OmniInteract production streaming benchmark.
 #
 # Full guide: benchmarks/omniinteract/SETUP_AND_RUN.md
 #
-# Prerequisites:
-#   git checkout aura_streaming_video_with_bench && pip install -e .
-#   bash benchmarks/omniinteract/run_aura_server.sh
-#   # or: vllm serve /models/AURA --omni --deploy-config vllm_omni/deploy/aura_omni.yaml ...
+# Prerequisite: bash benchmarks/omniinteract/run_aura_server.sh
 #
 # Native-aligned smoke (same 3 videos / prompt / realtime send as AURA original):
 #   NATIVE_ALIGNED=1 bash benchmarks/omniinteract/run_streaming_bench.sh
-#
-# Legacy quick smoke (16-frame cap, fast send, QA system prompt):
-#   STREAMING_MAX_FRAMES=16 STREAMING_SEND_FPS=0 \
-#   OMNIINTERACT_STREAMING_SYSTEM_PROMPT_MODE=omniinteract_qa \
-#   NUM_PROMPTS=3 bash benchmarks/omniinteract/run_streaming_bench.sh
 #
 # Default streaming client settings match native AURA bench: native system prompt,
 # full video extract (max_frames=0), wall-clock send_fps=2, frame_filter off.
@@ -28,8 +19,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-MODEL="${MODEL:-/models/AURA}"
-DATASET_PATH="${DATASET_PATH:-/models/datasets/OmniInteract}"
+MODEL="${MODEL:-aurateam/AURA}"
+DATASET_PATH="${DATASET_PATH:-lucky-lance/OmniInteract}"
 VLLM_BIN="${VLLM_BIN:-$ROOT/.venv/bin/vllm}"
 if [[ ! -x "$VLLM_BIN" ]]; then
   VLLM_BIN="$(command -v vllm || true)"
@@ -37,9 +28,10 @@ fi
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8666}"
 NUM_PROMPTS="${NUM_PROMPTS:-32}"
-NUM_WARMUPS="${NUM_WARMUPS:-2}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
 NATIVE_ALIGNED="${NATIVE_ALIGNED:-0}"
+OMNIINTERACT_WARMUP_VIDEO_ID="${OMNIINTERACT_WARMUP_VIDEO_ID:-0001}"
+RESULT_DIR="${RESULT_DIR:-./omniinteract_bench}"
 
 # TTS: match native AURA stack (run_omniinteract_bench.sh → tts_service.py)
 AURA_NATIVE_ROOT="${AURA_NATIVE_ROOT:-}"
@@ -52,15 +44,12 @@ OMNIINTERACT_AURA_TTS_REF_TEXT="${OMNIINTERACT_AURA_TTS_REF_TEXT:-读书指通�
 STREAMING_MAX_FRAMES="${STREAMING_MAX_FRAMES:-0}"
 STREAMING_SEND_FPS="${STREAMING_SEND_FPS:-2}"
 STREAMING_AUTO_TRIGGER_MIN_FRAMES="${STREAMING_AUTO_TRIGGER_MIN_FRAMES:-2}"
-OMNIINTERACT_STREAMING_SYSTEM_PROMPT_MODE="${OMNIINTERACT_STREAMING_SYSTEM_PROMPT_MODE:-native}"
 STREAMING_ENABLE_FRAME_FILTER="${STREAMING_ENABLE_FRAME_FILTER:-0}"
 
 if [[ "${NATIVE_ALIGNED}" == "1" || "${NATIVE_ALIGNED}" == "true" ]]; then
   OMNIINTERACT_SUBSETS="${OMNIINTERACT_SUBSETS:-1q1a}"
   OMNIINTERACT_VIDEO_IDS="${OMNIINTERACT_VIDEO_IDS:-0002,0003,0004}"
   NUM_PROMPTS=3
-  NUM_WARMUPS=0
-  OMNIINTERACT_WARMUP_VIDEO_ID="${OMNIINTERACT_WARMUP_VIDEO_ID:-0001}"
   DISABLE_SHUFFLE_FLAG=(--disable-shuffle)
   RESULT_TAG="native_smoke3"
 else
@@ -83,14 +72,19 @@ if [[ "${OMNIINTERACT_EVAL:-1}" == "1" || "${OMNIINTERACT_EVAL:-}" == "true" ]];
   OMNIINTERACT_EVAL_FLAG+=(--omniinteract-eval)
 fi
 
-VIDEO_IDS_FLAG=()
-if [[ -n "${OMNIINTERACT_VIDEO_IDS}" ]]; then
-  VIDEO_IDS_FLAG=(--omniinteract-video-ids "${OMNIINTERACT_VIDEO_IDS}")
-fi
-
 FRAME_FILTER_FLAG=()
 if [[ "${STREAMING_ENABLE_FRAME_FILTER}" == "1" || "${STREAMING_ENABLE_FRAME_FILTER}" == "true" ]]; then
   FRAME_FILTER_FLAG=(--omniinteract-streaming-enable-frame-filter)
+fi
+
+if [[ ! -x "$VLLM_BIN" ]]; then
+  echo "vllm binary not found; install vllm-omni or set VLLM_BIN." >&2
+  exit 1
+fi
+if [[ "$OMNIINTERACT_AURA_TTS_TASK_TYPE" == "Base" ]] \
+  && { [[ -z "$OMNIINTERACT_AURA_TTS_REF_AUDIO" ]] || [[ -z "$OMNIINTERACT_AURA_TTS_REF_TEXT" ]]; }; then
+  echo "Base TTS requires OMNIINTERACT_AURA_TTS_REF_AUDIO and OMNIINTERACT_AURA_TTS_REF_TEXT." >&2
+  exit 1
 fi
 
 echo "Waiting for AURA server at ${HOST}:${PORT} (timeout: ${READY_TIMEOUT_SEC}s)..."
@@ -149,12 +143,10 @@ _run_streaming_bench() {
     --omniinteract-subsets "${OMNIINTERACT_SUBSETS}" \
     "${_video_ids_flag[@]}" \
     "${DISABLE_SHUFFLE_FLAG[@]}" \
-    --omniinteract-input-mode aura_streaming \
     --omniinteract-streaming-sample-fps 2 \
     --omniinteract-streaming-send-fps "${STREAMING_SEND_FPS}" \
     --omniinteract-streaming-max-frames "${STREAMING_MAX_FRAMES}" \
     --omniinteract-streaming-auto-trigger-min-frames "${STREAMING_AUTO_TRIGGER_MIN_FRAMES}" \
-    --omniinteract-streaming-system-prompt-mode "${OMNIINTERACT_STREAMING_SYSTEM_PROMPT_MODE}" \
     "${FRAME_FILTER_FLAG[@]}" \
     --omniinteract-cross-turn-penalty "${CROSS_TURN_PENALTY}" \
     --omniinteract-cross-turn-lookback "${CROSS_TURN_LOOKBACK}" \
@@ -166,13 +158,12 @@ _run_streaming_bench() {
     --save-result \
     --save-detailed \
     --print-stage \
-    --result-dir ./omniinteract_bench \
+    --result-dir "${RESULT_DIR}" \
     --result-filename "${_result_filename}" \
     "${OMNIINTERACT_EVAL_FLAG[@]}"
 }
 
-if [[ "${NATIVE_ALIGNED}" == "1" || "${NATIVE_ALIGNED}" == "true" ]] \
-  && [[ "${OMNIINTERACT_SKIP_WARMUP:-0}" != "1" ]] \
+if [[ "${OMNIINTERACT_SKIP_WARMUP:-0}" != "1" ]] \
   && [[ -n "${OMNIINTERACT_WARMUP_VIDEO_ID:-}" ]]; then
   echo ""
   echo "=== Warmup: video ${OMNIINTERACT_WARMUP_VIDEO_ID} (excluded from scored JSON) ==="

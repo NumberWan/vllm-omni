@@ -162,28 +162,7 @@ def test_resolve_omniinteract_root_extracts_local_tarball(tmp_path: Path):
     assert (resolved / "1q1a" / "video_json_map.json").is_file()
 
 
-def test_omniinteract_dataset_builds_chat_requests(omniinteract_root: Path, mock_tokenizer):
-    ds = OmniInteractDataset(
-        dataset_path=str(omniinteract_root),
-        random_seed=0,
-        disable_shuffle=True,
-    )
-    reqs = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
-    assert len(reqs) == 1
-    req = reqs[0]
-    assert isinstance(req, OmniInteractSampleRequest)
-    assert req.omniinteract_subset == "1q1a"
-    assert req.omniinteract_gold_answer == "red"
-    assert req.omniinteract_scene_type == "multi_turn"
-    assert req.omniinteract_video == "subvideos/0001_0.mp4"
-    assert req.omni_chat_messages is not None
-    user_msg = req.omni_chat_messages[1]["content"]
-    assert user_msg[0]["type"] == "video_url"
-    assert user_msg[1]["type"] == "text"
-    assert req.omni_extra_body == {"mm_processor_kwargs": {"use_audio_in_video": True}}
-
-
-def test_omniinteract_dataset_aura_mode_sends_audio_and_video(omniinteract_root: Path, mock_tokenizer):
+def test_omniinteract_dataset_builds_streaming_request(omniinteract_root: Path, mock_tokenizer):
     audio_dir = omniinteract_root / "1q1a" / "audios"
     audio_dir.mkdir()
     (audio_dir / "0001_0.wav").write_bytes(b"fake-wav")
@@ -193,68 +172,21 @@ def test_omniinteract_dataset_aura_mode_sends_audio_and_video(omniinteract_root:
         dataset_path=str(omniinteract_root),
         random_seed=0,
         disable_shuffle=True,
-        input_mode="aura",
-        aura_tts_language="English",
         aura_tts_ref_audio=str(ref_audio),
         aura_tts_ref_text="reference transcript",
     )
     reqs = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
     assert len(reqs) == 1
     req = reqs[0]
-    assert req.omni_chat_messages is not None
-    user_msg = req.omni_chat_messages[1]["content"]
-    assert user_msg[0]["type"] == "audio_url"
-    assert user_msg[1]["type"] == "video_url"
-    assert len(user_msg) == 2
-    assert req.omniinteract_video == "subvideos/0001_0.mp4"
-    assert req.omni_extra_body is not None
-    assert req.omni_extra_body["modalities"] == ["text", "audio"]
-    assert req.omni_extra_body["mm_processor_kwargs"] == {"use_audio_in_video": False}
-    assert len(req.omni_extra_body["sampling_params_list"]) == 4
-    assert req.omni_extra_body["additional_information"]["tts_task_type"] == "Base"
-    assert req.omni_extra_body["additional_information"]["tts_language"] == "English"
-    assert req.omni_extra_body["additional_information"]["tts_ref_audio"] == str(ref_audio.resolve())
-    assert req.omni_extra_body["additional_information"]["tts_ref_text"] == "reference transcript"
-
-
-def test_omniinteract_dataset_aura_mode_passes_custom_voice_speaker(omniinteract_root: Path, mock_tokenizer):
-    audio_dir = omniinteract_root / "1q1a" / "audios"
-    audio_dir.mkdir()
-    (audio_dir / "0001_0.wav").write_bytes(b"fake-wav")
-    ds = OmniInteractDataset(
-        dataset_path=str(omniinteract_root),
-        random_seed=0,
-        disable_shuffle=True,
-        input_mode="aura",
-        aura_tts_task_type="CustomVoice",
-        aura_tts_language="English",
-        aura_tts_speaker="Ethan",
-    )
-
-    [req] = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
-
-    assert req.omni_extra_body is not None
-    additional_info = req.omni_extra_body["additional_information"]
-    assert additional_info["tts_task_type"] == "CustomVoice"
-    assert additional_info["tts_language"] == "English"
-    assert additional_info["tts_speaker"] == "Ethan"
-    assert "tts_ref_audio" not in additional_info
-    assert "tts_ref_text" not in additional_info
-
-
-def test_omniinteract_dataset_aura_mode_requires_base_tts_refs(omniinteract_root: Path, mock_tokenizer):
-    audio_dir = omniinteract_root / "1q1a" / "audios"
-    audio_dir.mkdir()
-    (audio_dir / "0001_0.wav").write_bytes(b"fake-wav")
-    ds = OmniInteractDataset(
-        dataset_path=str(omniinteract_root),
-        random_seed=0,
-        disable_shuffle=True,
-        input_mode="aura",
-    )
-
-    with pytest.raises(ValueError, match="requires both"):
-        ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
+    assert isinstance(req, OmniInteractSampleRequest)
+    assert req.omniinteract_subset == "1q1a"
+    assert req.omniinteract_gold_answer == "red"
+    assert req.omniinteract_scene_type == "multi_turn"
+    assert req.omniinteract_video == "videos/0001.mp4"
+    assert req.omniinteract_streaming_video_path.endswith("videos/0001.mp4")
+    assert req.omniinteract_streaming_audio_schedule
+    assert req.omniinteract_streaming_audio_schedule[0]["at_sec"] == 1.0
+    assert req.omniinteract_streaming_config["aura_system_prompt"]
 
 
 def test_omniinteract_eval_counts_exact_and_soft_match():
@@ -369,9 +301,12 @@ def test_omniinteract_dataset_infers_nested_roles(tmp_path: Path, mock_tokenizer
     (s1 / "videos").mkdir(parents=True)
     (s1 / "annotations").mkdir(parents=True)
     (s1 / "subvideos").mkdir(parents=True)
+    (s1 / "audios").mkdir(parents=True)
     (s1 / "videos" / "0002.mp4").write_bytes(b"fake-mp4")
     (s1 / "subvideos" / "0002_0.mp4").write_bytes(b"fake-subvideo-0")
     (s1 / "subvideos" / "0002_1.mp4").write_bytes(b"fake-subvideo-1")
+    (s1 / "audios" / "0002_0.wav").write_bytes(b"fake-wav-0")
+    (s1 / "audios" / "0002_1.wav").write_bytes(b"fake-wav-1")
     (s1 / "annotations" / "0002.json").write_text(
         json.dumps(
             [
@@ -416,10 +351,17 @@ def test_omniinteract_dataset_infers_nested_roles(tmp_path: Path, mock_tokenizer
     (root / "1qna" / "videos_bench").mkdir(parents=True)
     (root / "1qna" / "annotations").mkdir(parents=True)
 
-    ds = OmniInteractDataset(dataset_path=str(root), random_seed=0, disable_shuffle=True)
-    reqs = ds.sample(mock_tokenizer, num_requests=2, no_oversample=True)
-    assert len(reqs) == 2
+    ref_audio = root / "ref.wav"
+    ref_audio.write_bytes(b"fake-ref-wav")
+    ds = OmniInteractDataset(
+        dataset_path=str(root),
+        random_seed=0,
+        disable_shuffle=True,
+        aura_tts_ref_audio=str(ref_audio),
+        aura_tts_ref_text="reference transcript",
+    )
+    reqs = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
+    assert len(reqs) == 1
     assert reqs[0].omniinteract_scene_type == "nested"
-    assert reqs[1].omniinteract_scene_type == "nested"
-    roles = {reqs[0].omniinteract_nested_role, reqs[1].omniinteract_nested_role}
+    roles = {slot["nested_role"] for slot in reqs[0].omniinteract_streaming_slots}
     assert roles == {"outer", "inner"}

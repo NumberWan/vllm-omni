@@ -15,6 +15,42 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 ---
 
+## AURA Production 快速开始
+
+本分支专为 **AURA 实时音频／视频流式服务**整理，使用两张 CUDA GPU 运行
+`Qwen3-ASR → AURA → Qwen3-TTS → Code2Wav` pipeline，并使用 FlashInfer
+production 配置。
+
+全新环境只需先安装，再启动：
+
+```bash
+bash scripts/install_aura_omni.sh
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
+```
+
+确认服务及停止：
+
+```bash
+curl http://127.0.0.1:8666/v1/models
+bash scripts/stop_aura_omni.sh
+```
+
+如果本地没有模型权重，首次启动会自动从 Hugging Face 下载三个公开模型，
+合计约 **26 GB**（ASR 约 4.4 GB、AURA 约 17 GB、TTS／Code2Wav 约 4.3 GB）；
+请另外预留安装依赖和缓存空间。
+
+如果本地已有模型权重，可直接指定路径启动，例如：
+
+```bash
+MODEL=/workspace/models/AURA \
+CUDA_VISIBLE_DEVICES=0,1 \
+bash scripts/start_aura_omni.sh
+```
+
+需要 Linux、两张可用 CUDA GPU；自动下载时只需能访问 Hugging Face（通常无需额外登录或 token）。
+完整安装、WebSocket／HTTP 用法、离线模型及故障排查请看
+[`examples/online_serving/aura_omni/README.md`](examples/online_serving/aura_omni/README.md)。
+
 *Latest News* 🔥
 - [2026/06] We released [0.22.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.22.0) - an **omnimodal world-model** release aligned with vLLM 0.22, featuring [Nvidia Cosmos3](recipes/cosmos3/Cosmos3-Nano.md)/DreamZero world model support, expanded quantization coverage across Blackwell/NPU/XPU, TTS production improvements, new models including MiniCPM-o 4.5, MOSS-TTS, and Lance, plus RL integration with [VeRL-Omni](https://github.com/verl-project/verl-omni).
 - [2026/05] We released [0.20.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.20.0) - refreshes the serving/runtime stack for large-scale omni workloads, and improves diffusion model performance, quantization, and hardware readiness across CUDA, ROCm, MUSA, NPU, and XPU backends.

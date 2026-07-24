@@ -3,22 +3,13 @@
 OmniInteract is a streaming audio-visual QA benchmark:
 https://huggingface.co/datasets/lucky-lance/OmniInteract
 
-For non-streaming modes this loader flattens per-QA annotation entries into
-independent benchmark requests. For ``1q1a`` / ``1q1a_math`` each request uses
-the per-QA ``subvideos/{video}_{qa_idx}.mp4`` clip together with the matching
-``audios/{video}_{qa_idx}.wav`` when present. The default ``video`` input mode
-sends one ``video_url`` (native audio in the video stream) plus a text question.
-The ``aura`` input mode sends only ``audio_url`` + ``video_url`` so ASR receives
-the spoken question while AURA receives the subvideo clip.
-
-``aura_streaming`` follows the original OmniInteract online protocol: one
+This production loader follows the original OmniInteract online protocol: one
 request streams the full ``videos/*.mp4`` file and injects the per-QA audio
 question at the annotation ``question_time``.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -31,6 +22,7 @@ from typing import Any, Literal
 from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.hf import get_cached_tokenizer
+
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
     DEFAULT_AURA_SYSTEM_PROMPT,
 )
@@ -38,15 +30,6 @@ from vllm_omni.model_executor.stage_input_processors.aura_session_history import
 logger = logging.getLogger(__name__)
 
 OmniInteractSubset = Literal["1q1a", "1q1a_math", "1qna"]
-OmniInteractInputMode = Literal["video", "aura", "aura_streaming"]
-
-DEFAULT_AURA_SYSTEM_PROMPT_FOR_OMNIINTERACT = (
-    "You are answering OmniInteract audio-visual QA tasks. Use the ASR transcript "
-    "of the user's spoken question together with the video frames. Answer the "
-    "question directly and concisely in the same language as the question. "
-    "Do not output '<|silent|>'."
-)
-
 
 def _is_remote_or_data_url(value: str) -> bool:
     return value.startswith(("http://", "https://", "data:"))
@@ -66,31 +49,11 @@ class OmniInteractSampleRequest(SampleRequest):
     omniinteract_scene_type: str = ""
     omniinteract_nested_group_id: int | None = None
     omniinteract_nested_role: str = ""
-    omni_extra_body: dict[str, Any] | None = None
-    omni_chat_messages: list[dict[str, Any]] | None = None
     omniinteract_streaming_video_path: str = ""
-    omniinteract_streaming_audio_path: str = ""
     omniinteract_streaming_audio_schedule: list[dict[str, Any]] | None = None
     omniinteract_streaming_audio_from_video: bool = False
     omniinteract_streaming_slots: list[dict[str, Any]] | None = None
     omniinteract_streaming_config: dict[str, Any] | None = None
-
-
-@dataclass
-class _OmniInteractEntry:
-    subset: str
-    video_rel: str
-    video_path: Path
-    question_text: str
-    answer_text: str
-    question_time: str
-    answer_time: str
-    question_type: str
-    is_interrupted: bool | None
-    audio_path: Path | None = None
-    scene_type: str = "multi_turn"
-    nested_group_id: int | None = None
-    nested_role: str = ""
 
 
 @dataclass
@@ -135,54 +98,12 @@ def aura_sampling_params_list() -> list[dict[str, Any]]:
     ]
 
 
-def aura_extra_body(
-    *,
-    tts_task_type: str,
-    tts_language: str,
-    tts_speaker: str | None = None,
-    tts_ref_audio: str | None = None,
-    tts_ref_text: str | None = None,
-) -> dict[str, Any]:
-    additional_information: dict[str, Any] = {
-        "aura_system_prompt": DEFAULT_AURA_SYSTEM_PROMPT_FOR_OMNIINTERACT,
-        "tts_task_type": tts_task_type,
-        "tts_language": tts_language,
-    }
-    if tts_task_type == "Base":
-        if not tts_ref_audio or not tts_ref_text:
-            raise ValueError(
-                "OmniInteract AURA Base TTS requires both --omniinteract-aura-tts-ref-audio "
-                "and --omniinteract-aura-tts-ref-text."
-            )
-        additional_information["tts_ref_audio"] = tts_ref_audio
-        additional_information["tts_ref_text"] = tts_ref_text
-        # Match native AURA tts_service: full-sentence ICL synthesis per turn.
-        additional_information["tts_non_streaming_mode"] = True
-    elif tts_speaker:
-        additional_information["tts_speaker"] = tts_speaker
-    return {
-        "modalities": ["text", "audio"],
-        "mm_processor_kwargs": {"use_audio_in_video": False},
-        "sampling_params_list": aura_sampling_params_list(),
-        "additional_information": additional_information,
-    }
-
-
 def resolve_aura_streaming_system_prompt(
     *,
-    mode: Literal["native", "omniinteract_qa"] = "native",
     override: str | None = None,
 ) -> str:
-    """Pick system prompt for aura_streaming ``session.config``.
-
-    ``native`` matches original AURA TCP server (allows ``<|silent|>``).
-    ``omniinteract_qa`` is the legacy bench prompt (forbids silent; QA-style).
-    """
-    if override:
-        return override
-    if mode == "omniinteract_qa":
-        return DEFAULT_AURA_SYSTEM_PROMPT_FOR_OMNIINTERACT
-    return DEFAULT_AURA_SYSTEM_PROMPT
+    """Pick the production AURA prompt for streaming benchmark sessions."""
+    return override or DEFAULT_AURA_SYSTEM_PROMPT
 
 
 def aura_streaming_config(
@@ -206,7 +127,6 @@ def aura_streaming_config(
     max_rounds: int = 45,
     num_rounds_keep: int = 30,
     max_context_qas: int = 10,
-    aura_system_prompt_mode: Literal["native", "omniinteract_qa"] = "native",
     aura_system_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Build ``session.config`` fields for AURA WebSocket streaming benchmark."""
@@ -227,7 +147,6 @@ def aura_streaming_config(
         "max_context_qas": int(max_context_qas),
         "sampling_params_list": aura_sampling_params_list(),
         "aura_system_prompt": resolve_aura_streaming_system_prompt(
-            mode=aura_system_prompt_mode,
             override=aura_system_prompt,
         ),
         "tts_task_type": tts_task_type,
@@ -636,8 +555,6 @@ class OmniInteractDataset(BenchmarkDataset):
         random_seed: int = 0,
         data_root: str | None = None,
         subsets: list[OmniInteractSubset] | None = None,
-        inline_local_video: bool = False,
-        input_mode: OmniInteractInputMode = "video",
         aura_tts_task_type: str = "Base",
         aura_tts_language: str = "Chinese",
         aura_tts_speaker: str | None = None,
@@ -654,14 +571,11 @@ class OmniInteractDataset(BenchmarkDataset):
         streaming_cross_turn_penalty: float = 1.0,
         streaming_cross_turn_lookback: int = 10,
         streaming_video_ids: list[str] | None = None,
-        streaming_aura_system_prompt_mode: Literal["native", "omniinteract_qa"] = "native",
         **kwargs: Any,
     ) -> None:
         self.dataset_path = dataset_path or self.DEFAULT_HF_DATASET_ID
         self.data_root_input = Path(data_root).expanduser().resolve() if data_root else None
         self.subsets = list(subsets or ["1q1a", "1q1a_math", "1qna"])
-        self.inline_local_video = inline_local_video
-        self.input_mode = input_mode
         self.aura_tts_task_type = aura_tts_task_type
         self.aura_tts_language = aura_tts_language
         self.aura_tts_speaker = aura_tts_speaker
@@ -678,9 +592,7 @@ class OmniInteractDataset(BenchmarkDataset):
         self.streaming_cross_turn_penalty = streaming_cross_turn_penalty
         self.streaming_cross_turn_lookback = streaming_cross_turn_lookback
         self.streaming_video_ids = [v.strip() for v in (streaming_video_ids or []) if v and v.strip()]
-        self.streaming_aura_system_prompt_mode = streaming_aura_system_prompt_mode
         self._data_root: Path | None = None
-        self._entries: list[_OmniInteractEntry] = []
         self._streaming_entries: list[_OmniInteractStreamingEntry] = []
 
         super().__init__(
@@ -704,90 +616,6 @@ class OmniInteractDataset(BenchmarkDataset):
     def _read_json(path: Path) -> Any:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-
-    def _iter_subset_entries(self, data_root: Path, subset: OmniInteractSubset) -> list[_OmniInteractEntry]:
-        entries: list[_OmniInteractEntry] = []
-        subset_root = data_root / subset
-        if not subset_root.is_dir():
-            logger.warning("Subset directory does not exist: %s", subset_root)
-            return entries
-
-        if subset in ("1q1a", "1q1a_math"):
-            map_path = subset_root / "video_json_map.json"
-            map_data = self._read_json(map_path) if map_path.is_file() else {"entries": []}
-            for item in map_data.get("entries", []):
-                video_rel = str(item.get("video") or "").strip()
-                ann_rel = str(item.get("annotation") or "").strip()
-                scene_type = str(item.get("scene_type") or "multi_turn").strip().lower() or "multi_turn"
-                if not video_rel or not ann_rel:
-                    continue
-                ann_path = subset_root / ann_rel
-                if not ann_path.is_file():
-                    continue
-                ann = self._read_json(ann_path)
-                if not isinstance(ann, list):
-                    continue
-                nested_meta = _infer_nested_roles(ann) if scene_type == "nested" else {}
-                video_stem = Path(video_rel).stem
-                for qa_idx, qa in enumerate(ann):
-                    q = str(qa.get("question_text") or "").strip()
-                    a = str(qa.get("answer_text") or "").strip()
-                    if not q or not a:
-                        continue
-                    subvideo_rel = f"subvideos/{video_stem}_{qa_idx}.mp4"
-                    subvideo_path = subset_root / subvideo_rel
-                    if not subvideo_path.is_file():
-                        continue
-                    audio_path = subset_root / "audios" / f"{video_stem}_{qa_idx}.wav"
-                    nested_group_id, nested_role = nested_meta.get(qa_idx, (None, ""))
-                    entries.append(
-                        _OmniInteractEntry(
-                            subset=subset,
-                            video_rel=subvideo_rel,
-                            video_path=subvideo_path,
-                            question_text=q,
-                            answer_text=a,
-                            question_time=str(qa.get("question_time") or "").strip(),
-                            answer_time=str(qa.get("answer_time") or "").strip(),
-                            question_type=str(qa.get("question_type") or "").strip(),
-                            is_interrupted=qa.get("is_interrupted"),
-                            audio_path=audio_path,
-                            scene_type=scene_type,
-                            nested_group_id=nested_group_id,
-                            nested_role=nested_role,
-                        )
-                    )
-            return entries
-
-        ann_root = subset_root / "annotations"
-        video_root = subset_root / "videos_bench"
-        if not ann_root.is_dir() or not video_root.is_dir():
-            return entries
-        for ann_path in sorted(ann_root.rglob("*.json")):
-            rel = ann_path.relative_to(ann_root)
-            video_path = (video_root / rel).with_suffix(".mp4")
-            if not video_path.is_file():
-                continue
-            ann = self._read_json(ann_path)
-            video_rel = str(video_path.relative_to(subset_root))
-            rows = _parse_1qna_rows(ann)
-            for row in rows:
-                entries.append(
-                    _OmniInteractEntry(
-                        subset=subset,
-                        video_rel=video_rel,
-                        video_path=video_path,
-                        question_text=str(row.get("question_text") or ""),
-                        answer_text=str(row.get("answer_text") or ""),
-                        question_time=str(row.get("question_time") or "").strip(),
-                        answer_time=str(row.get("answer_time") or "").strip(),
-                        question_type=str(row.get("question_type") or "").strip(),
-                        is_interrupted=bool(row.get("is_interrupted")),
-                        audio_path=None,
-                        scene_type="1QnA",
-                    )
-                )
-        return entries
 
     def _iter_subset_streaming_entries(
         self,
@@ -886,19 +714,12 @@ class OmniInteractDataset(BenchmarkDataset):
 
     def load_data(self) -> None:
         root = self._resolve_data_root()
-        all_entries: list[_OmniInteractEntry] = []
         all_streaming_entries: list[_OmniInteractStreamingEntry] = []
         for subset in self.subsets:
-            if self.input_mode == "aura_streaming":
-                all_streaming_entries.extend(self._iter_subset_streaming_entries(root, subset))
-            else:
-                all_entries.extend(self._iter_subset_entries(root, subset))
-        if self.input_mode == "aura_streaming":
-            if not all_streaming_entries:
-                raise ValueError(f"No OmniInteract streaming videos found under {root} (subsets={self.subsets})")
-        elif not all_entries:
-            raise ValueError(f"No OmniInteract QA entries found under {root} (subsets={self.subsets})")
-        if self.input_mode == "aura_streaming" and self.streaming_video_ids:
+            all_streaming_entries.extend(self._iter_subset_streaming_entries(root, subset))
+        if not all_streaming_entries:
+            raise ValueError(f"No OmniInteract streaming videos found under {root} (subsets={self.subsets})")
+        if self.streaming_video_ids:
             wanted = set(self.streaming_video_ids)
             filtered = [
                 entry
@@ -917,38 +738,10 @@ class OmniInteractDataset(BenchmarkDataset):
             import random
 
             rng = random.Random(self.random_seed)
-            rng.shuffle(all_streaming_entries if self.input_mode == "aura_streaming" else all_entries)
-        self._entries = all_entries
+            rng.shuffle(all_streaming_entries)
         self._streaming_entries = all_streaming_entries
-        self.data = self._streaming_entries if self.input_mode == "aura_streaming" else self._entries
+        self.data = self._streaming_entries
         logger.info("Loaded OmniInteract: root=%s subsets=%s rows=%d", root, self.subsets, len(self.data))
-
-    @staticmethod
-    def _question_prompt(e: _OmniInteractEntry) -> str:
-        return (
-            "You are given a video with its original audio. "
-            "Answer the question concisely based on the observed visual and spoken content.\n"
-            f"Question time: {e.question_time or 'N/A'}\n"
-            f"Expected answer time: {e.answer_time or 'N/A'}\n"
-            f"Question: {e.question_text}\n"
-            "Answer:"
-        )
-
-    def _video_payload(self, video_path: Path) -> dict[str, Any]:
-        p = video_path.expanduser().resolve()
-        if self.inline_local_video:
-            raw = p.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-            return {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64}"}}
-        return {"type": "video_url", "video_url": {"url": p.as_uri()}}
-
-    def _audio_payload(self, audio_path: Path) -> dict[str, Any]:
-        p = audio_path.expanduser().resolve()
-        if self.inline_local_video:
-            raw = p.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-            return {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{b64}"}}
-        return {"type": "audio_url", "audio_url": {"url": p.as_uri()}}
 
     @staticmethod
     def _normalize_aura_ref_audio(ref_audio: str | None) -> str | None:
@@ -964,33 +757,6 @@ class OmniInteractDataset(BenchmarkDataset):
             raise ValueError(f"--omniinteract-aura-tts-ref-audio does not exist: {value}")
         return str(path.resolve())
 
-    def _build_messages(
-        self,
-        e: _OmniInteractEntry,
-        video_payload: dict[str, Any],
-        audio_payload: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        if audio_payload is not None and self.input_mode == "aura":
-            content: list[dict[str, Any]] = [audio_payload, video_payload]
-        else:
-            content = [video_payload, {"type": "text", "text": self._question_prompt(e)}]
-            if audio_payload is not None:
-                content = [audio_payload, *content]
-        return [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "You are a helpful multimodal assistant that understands video and audio.",
-                    }
-                ],
-            },
-            {
-                "role": "user",
-                "content": content,
-            },
-        ]
 
     def sample(
         self,
@@ -1006,144 +772,56 @@ class OmniInteractDataset(BenchmarkDataset):
         out: list[SampleRequest] = []
         tok = get_cached_tokenizer(tokenizer)
 
-        if self.input_mode == "aura_streaming":
-            for i, entry in enumerate(self._streaming_entries):
-                if len(out) >= num_requests:
-                    break
-                slots = _streaming_slots_for_rows(entry.rows, entry.scene_type)
-                if not slots:
-                    continue
-                prompt = "\n".join(row["question_text"] for row in entry.rows)
-                config = aura_streaming_config(
-                    tts_task_type=self.aura_tts_task_type,
-                    tts_language=self.aura_tts_language,
-                    tts_speaker=self.aura_tts_speaker,
-                    tts_ref_audio=self.aura_tts_ref_audio,
-                    tts_ref_text=self.aura_tts_ref_text,
-                    sample_fps=self.streaming_sample_fps,
-                    send_fps=self.streaming_send_fps,
-                    max_frames=self.streaming_max_frames,
-                    auto_trigger_min_frames=self.streaming_auto_trigger_min_frames,
-                    enable_frame_filter=self.streaming_enable_frame_filter,
-                    frame_filter_threshold=self.streaming_frame_filter_threshold,
-                    cross_turn_penalty=self.streaming_cross_turn_penalty,
-                    cross_turn_lookback=self.streaming_cross_turn_lookback,
-                    max_rounds=self.streaming_max_rounds,
-                    num_rounds_keep=self.streaming_num_rounds_keep,
-                    aura_system_prompt_mode=self.streaming_aura_system_prompt_mode,
-                )
-                out.append(
-                    OmniInteractSampleRequest(
-                        prompt=prompt,
-                        prompt_len=len(tok.encode(prompt)),
-                        expected_output_len=output_len,
-                        multi_modal_data=None,
-                        request_id=f"{request_id_prefix}{i}",
-                        omniinteract_gold_answer="\n".join(row["answer_text"] for row in entry.rows),
-                        omniinteract_subset=entry.subset,
-                        omniinteract_question_type="streaming",
-                        omniinteract_video=entry.video_rel,
-                        omniinteract_scene_type=entry.scene_type,
-                        omni_extra_body=None,
-                        omni_chat_messages=None,
-                        omniinteract_streaming_video_path=str(entry.video_path.expanduser().resolve()),
-                        omniinteract_streaming_audio_schedule=[
-                            {
-                                "at_sec": float(row["q_time"]),
-                                "audio_path": row["audio_path"],
-                                "qa_index": int(row["qa_index"]),
-                                "question_text": row["question_text"],
-                            }
-                            for row in entry.rows
-                            if row.get("audio_path")
-                        ],
-                        omniinteract_streaming_audio_from_video=entry.subset == "1qna",
-                        omniinteract_streaming_slots=slots,
-                        omniinteract_streaming_config=config,
-                    )
-                )
-            self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)
-            return out
-
-        for i, entry in enumerate(self._entries):
+        for i, entry in enumerate(self._streaming_entries):
             if len(out) >= num_requests:
                 break
-            if not entry.video_path.is_file():
+            slots = _streaming_slots_for_rows(entry.rows, entry.scene_type)
+            if not slots:
                 continue
-            if self.input_mode in ("aura", "aura_streaming"):
-                prompt = entry.question_text
-            else:
-                prompt = self._question_prompt(entry)
-            payload = self._video_payload(entry.video_path)
-            audio_payload = None
-            extra_body = {"mm_processor_kwargs": {"use_audio_in_video": True}}
-            streaming_config = None
-            streaming_video_path = ""
-            streaming_audio_path = ""
-            if self.input_mode in ("aura", "aura_streaming"):
-                if entry.audio_path is None or not entry.audio_path.is_file():
-                    logger.warning(
-                        "Skipping OmniInteract row without synthesized audio for AURA mode: subset=%s video=%s audio=%s",
-                        entry.subset,
-                        entry.video_rel,
-                        entry.audio_path,
-                    )
-                    continue
-                if self.input_mode == "aura_streaming":
-                    extra_body = None
-                    streaming_video_path = str(entry.video_path.expanduser().resolve())
-                    streaming_audio_path = str(entry.audio_path.expanduser().resolve())
-                    streaming_config = aura_streaming_config(
-                        tts_task_type=self.aura_tts_task_type,
-                        tts_language=self.aura_tts_language,
-                        tts_speaker=self.aura_tts_speaker,
-                        tts_ref_audio=self.aura_tts_ref_audio,
-                        tts_ref_text=self.aura_tts_ref_text,
-                        sample_fps=self.streaming_sample_fps,
-                        send_fps=self.streaming_send_fps,
-                        max_frames=self.streaming_max_frames,
-                        auto_trigger_min_frames=self.streaming_auto_trigger_min_frames,
-                        enable_frame_filter=self.streaming_enable_frame_filter,
-                        frame_filter_threshold=self.streaming_frame_filter_threshold,
-                        cross_turn_penalty=self.streaming_cross_turn_penalty,
-                        cross_turn_lookback=self.streaming_cross_turn_lookback,
-                        max_rounds=self.streaming_max_rounds,
-                        num_rounds_keep=self.streaming_num_rounds_keep,
-                        aura_system_prompt_mode=self.streaming_aura_system_prompt_mode,
-                    )
-                else:
-                    audio_payload = self._audio_payload(entry.audio_path)
-                    extra_body = aura_extra_body(
-                        tts_task_type=self.aura_tts_task_type,
-                        tts_language=self.aura_tts_language,
-                        tts_speaker=self.aura_tts_speaker,
-                        tts_ref_audio=self.aura_tts_ref_audio,
-                        tts_ref_text=self.aura_tts_ref_text,
-                    )
-            messages = self._build_messages(entry, payload, audio_payload)
-            prompt_len = len(tok.encode(prompt))
+            prompt = "\n".join(row["question_text"] for row in entry.rows)
+            config = aura_streaming_config(
+                tts_task_type=self.aura_tts_task_type,
+                tts_language=self.aura_tts_language,
+                tts_speaker=self.aura_tts_speaker,
+                tts_ref_audio=self.aura_tts_ref_audio,
+                tts_ref_text=self.aura_tts_ref_text,
+                sample_fps=self.streaming_sample_fps,
+                send_fps=self.streaming_send_fps,
+                max_frames=self.streaming_max_frames,
+                auto_trigger_min_frames=self.streaming_auto_trigger_min_frames,
+                enable_frame_filter=self.streaming_enable_frame_filter,
+                frame_filter_threshold=self.streaming_frame_filter_threshold,
+                cross_turn_penalty=self.streaming_cross_turn_penalty,
+                cross_turn_lookback=self.streaming_cross_turn_lookback,
+                max_rounds=self.streaming_max_rounds,
+                num_rounds_keep=self.streaming_num_rounds_keep,
+            )
             out.append(
                 OmniInteractSampleRequest(
                     prompt=prompt,
-                    prompt_len=prompt_len,
+                    prompt_len=len(tok.encode(prompt)),
                     expected_output_len=output_len,
                     multi_modal_data=None,
                     request_id=f"{request_id_prefix}{i}",
-                    omniinteract_gold_answer=entry.answer_text,
+                    omniinteract_gold_answer="\n".join(row["answer_text"] for row in entry.rows),
                     omniinteract_subset=entry.subset,
-                    omniinteract_question_type=entry.question_type,
+                    omniinteract_question_type="streaming",
                     omniinteract_video=entry.video_rel,
-                    omniinteract_question_time=entry.question_time,
-                    omniinteract_answer_time=entry.answer_time,
-                    omniinteract_is_interrupted=entry.is_interrupted,
                     omniinteract_scene_type=entry.scene_type,
-                    omniinteract_nested_group_id=entry.nested_group_id,
-                    omniinteract_nested_role=entry.nested_role,
-                    omni_extra_body=extra_body,
-                    omni_chat_messages=None if self.input_mode == "aura_streaming" else messages,
-                    omniinteract_streaming_video_path=streaming_video_path,
-                    omniinteract_streaming_audio_path=streaming_audio_path,
-                    omniinteract_streaming_config=streaming_config,
+                    omniinteract_streaming_video_path=str(entry.video_path.expanduser().resolve()),
+                    omniinteract_streaming_audio_schedule=[
+                        {
+                            "at_sec": float(row["q_time"]),
+                            "audio_path": row["audio_path"],
+                            "qa_index": int(row["qa_index"]),
+                            "question_text": row["question_text"],
+                        }
+                        for row in entry.rows
+                        if row.get("audio_path")
+                    ],
+                    omniinteract_streaming_audio_from_video=entry.subset == "1qna",
+                    omniinteract_streaming_slots=slots,
+                    omniinteract_streaming_config=config,
                 )
             )
 

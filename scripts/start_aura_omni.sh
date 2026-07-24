@@ -8,27 +8,37 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VLLM_BIN="${VLLM_BIN:-$ROOT/.venv/bin/vllm}"
+VENV_DIR="${VENV_DIR:-$ROOT/.venv}"
+VLLM_BIN="${VLLM_BIN:-$VENV_DIR/bin/vllm}"
 if [[ ! -x "$VLLM_BIN" ]]; then
   VLLM_BIN="$(command -v vllm || true)"
 fi
 DEPLOY="${DEPLOY:-$ROOT/vllm_omni/deploy/aura_omni_2gpu_best.yaml}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8666}"
-MODEL="${MODEL:-/models/AURA}"
+MODEL="${MODEL:-aurateam/AURA}"
 LOG_DIR="${LOG_DIR:-/tmp/aura_omni_serve}"
 mkdir -p "$LOG_DIR"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 LOG="${LOG:-$LOG_DIR/server_${STAMP}.log}"
 PID_FILE="${PID_FILE:-$LOG_DIR/server.pid}"
+PYTHON_BIN="${PYTHON_BIN:-$VENV_DIR/bin/python}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  PYTHON_BIN="$(command -v python3 || true)"
+fi
+ALLOWED_LOCAL_MEDIA_PATH="${ALLOWED_LOCAL_MEDIA_PATH:-}"
 
 SERVER_ENV=("CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
+# Avoid leaking a parent-shell PYTHONPATH (e.g. another checkout's site-packages)
+# into the AURA process, which would defeat an isolated VENV_DIR install.
+SERVER_ENV+=("PYTHONPATH=")
 for key in \
   VLLM_AURA_STAGE0_BYPASS \
   VLLM_AURA_SILENT_STOP_AT_STAGE1 \
   VLLM_AURA_TTS_GATE_ON_VOICE_ASR \
-  VLLM_AURA_SENTENCE_TTS
+  VLLM_AURA_SENTENCE_TTS \
+  VLLM_VIDEO_ASYNC_CHUNK
 do
   if [[ -n "${!key:-}" ]]; then
     SERVER_ENV+=("${key}=${!key}")
@@ -42,42 +52,95 @@ echo "PORT=$PORT  MODEL=$MODEL"
 echo "LOG=$LOG"
 echo "tunables: $ROOT/docs/aura/AURA_OMNI_TUNABLES.md"
 
-python3 - <<PY
-import os, glob
-port = int("$PORT")
-target = f"{port:04X}"
-for path in ["/proc/net/tcp", "/proc/net/tcp6"]:
-    if not os.path.exists(path):
-        continue
-    with open(path) as f:
-        next(f)
-        for line in f:
-            parts = line.split()
-            if len(parts) < 10:
-                continue
-            if parts[1].split(":")[-1].upper() != target:
-                continue
-            inode = parts[9]
-            for fd in glob.glob("/proc/[0-9]*/fd/*"):
-                try:
-                    if os.readlink(fd) == f"socket:[{inode}]":
-                        os.kill(int(fd.split("/")[2]), 15)
-                except Exception:
-                    pass
-PY
-sleep 2
-
 cd "$ROOT"
-if [[ ! -x "$VLLM_BIN" ]]; then
-  echo "vllm binary not found; set VLLM_BIN="; exit 1
+if [[ -z "$PYTHON_BIN" ]] || [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "ERROR: Python not found. Run: bash scripts/install_aura_omni.sh" >&2
+  exit 1
 fi
+if [[ ! -x "$VLLM_BIN" ]]; then
+  echo "ERROR: vllm binary not found; install vllm-omni or set VLLM_BIN." >&2
+  exit 1
+fi
+if [[ ! -f "$DEPLOY" ]]; then
+  echo "ERROR: deploy config not found: $DEPLOY" >&2
+  exit 1
+fi
+if [[ -f "$PID_FILE" ]]; then
+  old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+    echo "ERROR: AURA server already running (pid=$old_pid). Run scripts/stop_aura_omni.sh first." >&2
+    exit 1
+  fi
+  rm -f "$PID_FILE"
+fi
+
+"$PYTHON_BIN" - "$HOST" "$PORT" <<'PY'
+import socket
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+probe_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+with socket.socket() as sock:
+    sock.settimeout(0.5)
+    if sock.connect_ex((probe_host, port)) == 0:
+        raise SystemExit(f"ERROR: {probe_host}:{port} is already in use; refusing to terminate another process.")
+PY
+
+"$PYTHON_BIN" - <<'PY'
+import importlib.metadata as md
+
+try:
+    import flashinfer  # noqa: F401
+except Exception as exc:
+    raise SystemExit(
+        "ERROR: FlashInfer is required by the production deploy. "
+        "Run: bash scripts/install_aura_omni.sh\n"
+        f"Original error: {exc}"
+    ) from exc
+
+try:
+    runtime = md.version("flashinfer-python").split("+", 1)[0]
+    jit = md.version("flashinfer-jit-cache").split("+", 1)[0]
+except md.PackageNotFoundError as exc:
+    raise SystemExit(
+        "ERROR: FlashInfer runtime or JIT cache is missing. "
+        "Run: bash scripts/install_aura_omni.sh"
+    ) from exc
+else:
+    if runtime != jit:
+        raise SystemExit(
+            f"ERROR: FlashInfer package mismatch: flashinfer-python={runtime}, "
+            f"flashinfer-jit-cache={jit}."
+        )
+PY
+
+IFS=',' read -r -a gpu_ids <<<"$CUDA_VISIBLE_DEVICES"
+if (( ${#gpu_ids[@]} < 2 )); then
+  echo "ERROR: the production profile requires two visible GPUs; got CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" >&2
+  exit 1
+fi
+
+MEDIA_ARGS=()
+if [[ -n "$ALLOWED_LOCAL_MEDIA_PATH" ]]; then
+  if [[ ! -d "$ALLOWED_LOCAL_MEDIA_PATH" ]]; then
+    echo "ERROR: ALLOWED_LOCAL_MEDIA_PATH is not a directory: $ALLOWED_LOCAL_MEDIA_PATH" >&2
+    exit 1
+  fi
+  MEDIA_ARGS+=(--allowed-local-media-path "$ALLOWED_LOCAL_MEDIA_PATH")
+fi
+
+if [[ "${CHECK_ONLY:-0}" == "1" ]]; then
+  echo "preflight checks passed"
+  exit 0
+fi
+
 nohup env "${SERVER_ENV[@]}" \
   "$VLLM_BIN" serve "$MODEL" --omni \
     --deploy-config "$DEPLOY" \
     --host "$HOST" --port "$PORT" \
     --served-model-name "$MODEL" \
     --trust-remote-code --init-timeout 1200 \
-    --allowed-local-media-path /models \
+    "${MEDIA_ARGS[@]}" "$@" \
   >"$LOG" 2>&1 &
 echo $! >"$PID_FILE"
 echo "pid=$(cat "$PID_FILE")"
@@ -85,12 +148,20 @@ echo "pid=$(cat "$PID_FILE")"
 deadline=$((SECONDS + 1200))
 until curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; do
   if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    echo "server died"; tail -80 "$LOG"; exit 1
+    echo "ERROR: server exited during startup" >&2
+    rm -f "$PID_FILE"
+    tail -80 "$LOG"
+    exit 1
   fi
   if (( SECONDS >= deadline )); then
-    echo "timeout waiting for :$PORT"; tail -80 "$LOG"; exit 1
+    echo "ERROR: timeout waiting for :$PORT; stopping pid=$(cat "$PID_FILE")" >&2
+    kill -TERM "$(cat "$PID_FILE")" 2>/dev/null || true
+    rm -f "$PID_FILE"
+    tail -80 "$LOG"
+    exit 1
   fi
   sleep 5
 done
 echo "ready http://127.0.0.1:${PORT}/v1/models"
 echo "tail -f $LOG"
+echo "stop: bash scripts/stop_aura_omni.sh"

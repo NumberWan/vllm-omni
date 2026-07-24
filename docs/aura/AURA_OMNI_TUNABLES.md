@@ -19,7 +19,7 @@ bash scripts/start_aura_omni.sh
 | 項目 | 預設 | 說明 |
 |--|--|--|
 | Deploy YAML | `vllm_omni/deploy/aura_omni_2gpu_best.yaml` | FI + Talker FI + seqs4 + mem15 + chunk20 |
-| GPU | `CUDA_VISIBLE_DEVICES=2,3` | Stage0/2/3→可見卡0；Stage1→可見卡1 |
+| GPU | `CUDA_VISIBLE_DEVICES=0,1` | Stage0/2/3→可見卡0；Stage1→可見卡1 |
 | `VLLM_AURA_STAGE0_BYPASS` | **1** | silent 真 skip Stage0（SHM inject） |
 | `VLLM_AURA_SILENT_STOP_AT_STAGE1` | **1** | silent 唔喚醒 Stage2/3 TTS |
 | `VLLM_AURA_TTS_GATE_ON_VOICE_ASR` | **1** | voice ASR 期間延遲 TTS prewarm |
@@ -56,7 +56,7 @@ bash scripts/start_aura_omni.sh
 ### 2.4 Port / model / log
 
 ```bash
-PORT=8667 MODEL=/models/AURA LOG_DIR=/tmp/my_aura bash scripts/start_aura_omni.sh
+PORT=8667 MODEL=aurateam/AURA LOG_DIR=/tmp/my_aura bash scripts/start_aura_omni.sh
 ```
 
 ---
@@ -71,8 +71,6 @@ PORT=8667 MODEL=/models/AURA LOG_DIR=/tmp/my_aura bash scripts/start_aura_omni.s
 | `VLLM_AURA_SENTENCE_TTS` | `1` | 按句 mid-gen → TTS | 關咗 TTFP 變差 |
 | `VLLM_AURA_LOG_TURN_PROMPT` | off | debug dump turn prompt | 除錯 |
 | `VLLM_AURA_SESSION_HISTORY_DIAG` | off | history 診斷 log | 除錯 |
-| `VLLM_AURA_HISTORY_VIDEO_MODE` | `all` | history 影片保留策略 | 進階 |
-| `VLLM_AURA_DISABLE_VIDEO_PACK` | off | 關 video pack | 實驗 |
 
 **已移除／唔支援**：
 

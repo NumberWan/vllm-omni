@@ -157,37 +157,6 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     g.add_argument(
-        "--omniinteract-streaming-system-prompt-mode",
-        type=str,
-        choices=["native", "omniinteract_qa"],
-        default="native",
-        help=(
-            "For aura_streaming session.config aura_system_prompt. "
-            "'native' matches original AURA (allows <|silent|>). "
-            "'omniinteract_qa' is the legacy QA prompt (forbids silent)."
-        ),
-    )
-    g.add_argument(
-        "--omniinteract-inline-local-video",
-        action="store_true",
-        default=False,
-        help="Embed local MP4 as data:video URLs instead of file://. Useful when server lacks "
-        "--allowed-local-media-path; increases request body size.",
-    )
-    g.add_argument(
-        "--omniinteract-input-mode",
-        type=str,
-        choices=["video", "aura", "aura_streaming"],
-        default="video",
-        help=(
-            "OmniInteract request protocol. 'video' sends subvideo_url + text question with "
-            "mm_processor_kwargs.use_audio_in_video=true. 'aura' sends paired audio_url + "
-            "subvideo_url and AURA/TTS extra_body fields for the ASR -> AURA -> TTS pipeline. "
-            "'aura_streaming' streams paired local audio/video over /v1/video/chat/stream. "
-            "Generate subvideos/ and audios/ under 1q1a before benchmarking."
-        ),
-    )
-    g.add_argument(
         "--omniinteract-streaming-sample-fps",
         type=float,
         default=2.0,

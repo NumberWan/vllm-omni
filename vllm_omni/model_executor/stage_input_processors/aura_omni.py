@@ -30,7 +30,6 @@ from vllm_omni.model_executor.stage_input_processors.aura_session_history import
     get_or_create_session_history,
     get_session_history,
     is_effectively_silent,
-    pop_transcript_for_request,
     record_pending_turn,
 )
 
@@ -237,15 +236,7 @@ def build_aura_streaming_turn_additional_information(
     """Build ``additional_information`` for one AURA streaming inference turn."""
     # Pack pixels before EngineCore msgpack: nested ndarray under scalar_data
     # does not survive decode (see ``pack_aura_video_ndarray``).
-    if os.environ.get("VLLM_AURA_DISABLE_VIDEO_PACK", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        packed_video: Any = video_array
-    else:
-        packed_video = pack_aura_video_ndarray(video_array)
+    packed_video = pack_aura_video_ndarray(video_array)
     additional_information: dict[str, Any] = {
         "aura_session_id": session_id,
         "deferred_multi_modal_data": {
@@ -254,9 +245,8 @@ def build_aura_streaming_turn_additional_information(
         "aura_system_prompt": [system_prompt],
         "omni_skip_stages": [0] if skip_asr else [],
     }
-    # Prompt dialogue: independent History service when enabled; ephemeral
-    # Stage-1 SessionHistory is only a hydrate/prune helper for this turn.
-    # pass client/API knobs so create does not fall back to defaults (max_rounds=20).
+    # Pass client/API history knobs so Stage-1 does not fall back to its
+    # shorter constructor defaults (max_rounds=20).
     if max_rounds is not None:
         additional_information["aura_max_rounds"] = [int(max_rounds)]
     if num_rounds_keep is not None:
@@ -370,10 +360,6 @@ def _clean_asr_transcript(text: str) -> str:
     cleaned = re.sub(r"<\|im_(?:start|end)\|>", "", cleaned)
     cleaned = re.sub(r"<\|im_start\|>(?:system|user|assistant)", "", cleaned)
     return cleaned.strip()
-
-
-def pop_turn_transcript(request_id: str | None) -> str:
-    return pop_transcript_for_request(request_id)
 
 
 def _extract_token_ids(source_output: Any) -> list[int]:
@@ -546,8 +532,6 @@ def build_aura_input(
             "had_vision": False,
             "mm_uuid": None,
         }
-        mm_uuid_only = 0
-        mm_pixel_videos = 0
         if (
             video_tuple is None
             and history.current_rounds == 0
@@ -564,8 +548,6 @@ def build_aura_input(
             )
             prompt = vllm_inputs["prompt"]
             mm_uuids = vllm_inputs.get("multi_modal_uuids")
-            mm_uuid_only = int(vllm_inputs.get("mm_uuid_only_videos") or 0)
-            mm_pixel_videos = int(vllm_inputs.get("mm_pixel_videos") or 0)
             pending_kwargs["mm_uuid"] = history._pending_mm_uuid
             if video_tuple is not None:
                 vision_data = vllm_inputs.get("multi_modal_data", {})
@@ -710,7 +692,8 @@ def _try_splice_pending_video_expand(
         return None
     mm = built.get("multi_modal_data") or {}
     videos = mm.get("video") if isinstance(mm, dict) else None
-    uuids = (built.get("multi_modal_uuids") or {}).get("video") if isinstance(built.get("multi_modal_uuids"), dict) else None
+    built_uuids = built.get("multi_modal_uuids")
+    uuids = (built_uuids or {}).get("video") if isinstance(built_uuids, dict) else None
     if not isinstance(videos, list) or not isinstance(uuids, list):
         return None
     if len(videos) != len(uuids) or not videos:
@@ -727,11 +710,10 @@ def _try_splice_pending_video_expand(
     if pending_uuid == cache.get("pending_uuid"):
         return old_ids, old_feats, 0.0
 
+    import time as _time
     from dataclasses import replace
 
     from vllm.multimodal.inputs import PlaceholderRange
-
-    import time as _time
 
     text = (transcript or "").strip()
     mini_prompt = (
@@ -829,9 +811,6 @@ def resolve_aura_async_chunk_stage_payload(
 
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     try:
-        import time as _time
-
-        _t0 = _time.perf_counter()
         # Prefer InputProcessor expansion (sync-aligned). Plain tokenizer.encode
         # leaves a single <|video_pad|> and never attaches mm_features.
         use_processor = vllm_config is not None
@@ -849,14 +828,7 @@ def resolve_aura_async_chunk_stage_payload(
         )
         payload_data.update(built)
 
-        mm = built.get("multi_modal_data") or {}
-        videos = mm.get("video") if isinstance(mm, dict) else None
-        n_vid = len(videos) if isinstance(videos, list) else (1 if videos else 0)
-        n_feat = 0
-        process_ms = 0.0
-        splice_hit = False
         if use_processor:
-            _t_proc = _time.perf_counter()
             sid = additional_info.get("aura_session_id")
             hist = get_session_history(str(sid)) if sid else None
             transcript_s = str(payload_data.get("aura_asr_transcript", "") or "")
@@ -872,9 +844,7 @@ def resolve_aura_async_chunk_stage_payload(
                 )
             try:
                 if spliced is not None:
-                    prompt_token_ids, mm_features, mini_ms = spliced
-                    process_ms = mini_ms
-                    splice_hit = True
+                    prompt_token_ids, mm_features, _mini_ms = spliced
                 else:
                     prompt_token_ids, mm_features = _expand_aura_async_chunk_with_input_processor(
                         vllm_config=vllm_config,
@@ -882,7 +852,6 @@ def resolve_aura_async_chunk_stage_payload(
                         built=built,
                         request_id=str(request_id),
                     )
-                    process_ms = (_time.perf_counter() - _t_proc) * 1000.0
             except (ValueError, AssertionError) as exc:
                 # Cache miss / UUID-only path failure — rebuild with cold pixels.
                 err = str(exc)
@@ -910,8 +879,6 @@ def resolve_aura_async_chunk_stage_payload(
                     built=built,
                     request_id=str(request_id),
                 )
-                process_ms = (_time.perf_counter() - _t_proc) * 1000.0
-                splice_hit = False
                 logger.warning(
                     "AURA_MM_CACHE miss fallback to pixels request_id=%s err=%s",
                     request_id,
@@ -920,7 +887,6 @@ def resolve_aura_async_chunk_stage_payload(
             payload_data["prompt_token_ids"] = prompt_token_ids
             payload_data["ids"] = {"prompt": prompt_token_ids}
             request.mm_features = mm_features
-            n_feat = len(mm_features)
             # Processor cache is warm for every UUID submitted this turn.
             video_uuids = (built.get("multi_modal_uuids") or {}).get("video") or []
             if hist is not None and video_uuids:

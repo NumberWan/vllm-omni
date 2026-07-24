@@ -35,18 +35,6 @@ def _session_history_diag_enabled() -> bool:
     return _env_flag_on("VLLM_AURA_SESSION_HISTORY_DIAG")
 
 
-def _history_video_mode() -> str:
-    """How historical videos are exposed to stage-1 prompts.
-
-    - ``all`` (default): native-like — sliding-window rounds keep video until prune.
-    - ``current_only``: only the pending turn keeps pixels; prior rounds become
-      text-only. Used to measure how much TTFT comes from re-encoding history
-      videos on every new stage request (omni lacks StreamingInput MM cache).
-    """
-    v = os.environ.get("VLLM_AURA_HISTORY_VIDEO_MODE", "all").strip().lower()
-    return "current_only" if v in {"current_only", "current", "pending_only"} else "all"
-
-
 def _count_videos_in_messages(messages: list[dict[str, Any]]) -> tuple[int, int]:
     """Return ``(n_videos, total_frames)`` for diagnostic logs."""
     n_videos = 0
@@ -94,7 +82,6 @@ __all__ = [
     "get_session_state",
     "unregister_session",
     "clear_all_sessions",
-    "pop_transcript_for_request",
     "record_pending_turn",
     "commit_session_turn",
 ]
@@ -477,25 +464,6 @@ class SessionHistory:
         self._sliding_window.append(msg)
         self.history.append(msg)
 
-    @staticmethod
-    def _history_messages_for_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Optionally strip historical videos before building the stage-1 prompt."""
-        if _history_video_mode() != "current_only":
-            return messages
-        stripped: list[dict[str, Any]] = []
-        for msg in messages:
-            content = msg.get("content")
-            if msg.get("role") != "user" or not isinstance(content, list):
-                stripped.append(msg)
-                continue
-            new_content = [item for item in content if not (isinstance(item, dict) and item.get("type") == "video")]
-            if not new_content:
-                # Pure-vision silent observation with no text — drop from prompt
-                # under current_only (pixels already removed).
-                continue
-            stripped.append({**msg, "content": new_content})
-        return stripped
-
     def preview_vllm_inputs(
         self,
         text: str = "",
@@ -526,7 +494,7 @@ class SessionHistory:
             pending_content.append({"type": "text", "text": vision_pad_text})
 
         self._pending_mm_uuid = pending_uuid
-        messages = self._history_messages_for_prompt(list(self.history))
+        messages = list(self.history)
         if pending_content:
             messages.append({"role": "user", "content": pending_content})
         return self._messages_to_vllm_inputs(messages)
@@ -722,7 +690,6 @@ class AuraSessionState:
     # engine request. Later appends belong to the *next* turn and must survive
     # ``commit_turn`` so proactive visuals during TTS are not discarded.
     frozen_turn_frame_count: int = 0
-    pending_transcripts_by_request_id: dict[str, str] = field(default_factory=dict)
 
     def append_turn_frame(self, frame: np.ndarray) -> None:
         self.turn_frame_arrays.append(np.asarray(frame))
@@ -731,27 +698,6 @@ class AuraSessionState:
         """Snapshot this turn's video and mark how many frames were included."""
         self.pending_turn_video = deferred_mm if isinstance(deferred_mm, dict) else None
         self.frozen_turn_frame_count = len(self.turn_frame_arrays)
-
-    @staticmethod
-    def _normalize_request_id(request_id: str) -> str:
-        """Map AsyncOmni internal ids (``{external}-{uuid8}``) to the external id."""
-        rid = str(request_id).strip()
-        if not rid:
-            return rid
-        if "-" not in rid:
-            return rid
-        head, tail = rid.rsplit("-", 1)
-        if len(tail) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in tail):
-            return head
-        return rid
-
-    def record_turn_transcript(self, request_id: str, transcript: str) -> None:
-        self.pending_transcripts_by_request_id[self._normalize_request_id(request_id)] = transcript
-
-    def pop_turn_transcript(self, request_id: str | None) -> str:
-        if not request_id:
-            return ""
-        return self.pending_transcripts_by_request_id.pop(self._normalize_request_id(str(request_id)), "")
 
     def commit_turn(
         self,
@@ -769,7 +715,7 @@ class AuraSessionState:
         pending still exists (e.g. text-only sync that skips the TTS stage).
         """
         del video_fps, max_frames_per_round
-        self.pop_turn_transcript(request_id)
+        del request_id
         if self.session_id:
             commit_session_turn(self.session_id, response_text)
 
@@ -852,18 +798,6 @@ def register_session_state(session_id: str, state: AuraSessionState) -> None:
 def get_session_state(session_id: str) -> AuraSessionState | None:
     with _SESSION_LOCK:
         return _SESSION_STATES.get(session_id)
-
-
-def pop_transcript_for_request(request_id: str | None) -> str:
-    if not request_id:
-        return ""
-    with _SESSION_LOCK:
-        states = list(_SESSION_STATES.values())
-    for state in states:
-        transcript = state.pop_turn_transcript(request_id)
-        if transcript:
-            return transcript
-    return ""
 
 
 def unregister_session(session_id: str) -> None:
@@ -1009,5 +943,5 @@ def commit_session_turn(session_id: str, response_text: str) -> None:
             history.current_rounds,
             n_vid,
             n_frames,
-            _history_video_mode(),
+            "all",
         )

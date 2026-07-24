@@ -1,222 +1,110 @@
-# vllm-omni AURA Streaming — Server Setup & OmniInteract Benchmark
+# AURA OmniInteract Streaming Benchmark
 
-> **One-page ops guide (humans / AI agents)**  
-> Branch: `aura_streaming_video_with_bench`  
-> Location: `<vllm-omni>/benchmarks/omniinteract/`
+This benchmark validates the production AURA WebSocket path. It streams each
+full video at 2 FPS and injects annotation audio at the recorded question time.
+Legacy single-request `video` and `aura` modes are intentionally not supported.
 
----
+## Prerequisites
 
-## Quick start: 3-video smoke (native-aligned)
+1. Install vLLM-Omni and matching FlashInfer packages.
+2. Prepare the OmniInteract dataset locally or allow Hugging Face download.
+3. For `1q1a` and `1q1a_math`, provide annotation WAV files at
+   `audios/{video_id}_{qa_index}.wav`.
+4. For Base voice TTS, provide a reference WAV and transcript.
 
-Videos `0002`, `0003`, `0004` — same subset as native AURA OmniInteract smoke.
+See the [AURA serving guide](../../examples/online_serving/aura_omni/README.md)
+for server requirements.
 
-**Terminal 1 — server**
+## Start AURA
 
 ```bash
-cd /path/to/vllm-omni
-git checkout aura_streaming_video_with_bench
-source /path/to/.venv/bin/activate
-pip install -e .
-
-bash benchmarks/omniinteract/run_aura_server.sh
+CUDA_VISIBLE_DEVICES=0,1 bash benchmarks/omniinteract/run_aura_server.sh
 ```
 
-**Terminal 2 — benchmark** (after server is ready)
+The script delegates to the production launcher and waits for the health
+endpoint. Use `MODEL`, `DEPLOY`, `PORT`, and `CUDA_VISIBLE_DEVICES` to override
+the defaults.
+
+## Run the native-aligned smoke benchmark
+
+Always warm the same server process with video `0001`. The scored run starts at
+`0002`; `0001` must not be included in accuracy or latency statistics.
 
 ```bash
-cd /path/to/vllm-omni
-source /path/to/.venv/bin/activate
-
-NATIVE_ALIGNED=1 OMNIINTERACT_EVAL=1 \
-  bash benchmarks/omniinteract/run_streaming_bench.sh
-```
-
-Outputs:
-
-- `omniinteract_bench/omniinteract_streaming_native_smoke3.json`
-- `omniinteract_bench/bench_report.md`
-- `omniinteract_bench/videos/{0002,0003,0004}/bench_report.md`
-
-Runtime: ~8–10 minutes (3 full-length streaming sessions).
-
-Optional export for side-by-side comparison with native AURA:
-
-```bash
-python -m vllm_omni.benchmarks.format_bench_report \
-  omniinteract_bench/omniinteract_streaming_native_smoke3.json \
-  --export-aura-result
-```
-
----
-
-## 1. What this stack does
-
-| Component | Role |
-|-----------|------|
-| **AURA Server** | `vllm serve --omni` — ASR → AURA (VL) → TTS Talker → Code2Wav |
-| **Benchmark client** | `vllm bench serve` over WebSocket `/v1/video/chat/stream` |
-| **Artifacts** | `./omniinteract_bench/omniinteract_streaming_*.json`, `bench_report.md` |
-
-This is **separate** from native AURA (TCP port `12346`). **Do not run both on the same GPUs.**
-
----
-
-## 2. Prerequisites
-
-### Code & branch
-
-```bash
-cd /path/to/vllm-omni
-git checkout aura_streaming_video_with_bench
-source /path/to/.venv/bin/activate
-pip install -e .
-```
-
-After editing `vllm_omni/`, run `pip install -e .` again and **restart the server**.
-
-### Weights & dataset (local defaults)
-
-`vllm_omni/deploy/aura_omni.yaml` uses HuggingFace-style model ids by default. For local weights, override `MODEL` and edit stage `model:` paths in the deploy yaml (or copy it to a private path outside the repo).
-
-Example local layout:
-
-| Asset | Example path |
-|-------|----------------|
-| AURA | `/models/AURA` |
-| Qwen3-ASR | `/models/Qwen3-ASR-1.7B` |
-| Qwen3-TTS CustomVoice | `/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/...` |
-| OmniInteract | `/models/datasets/OmniInteract` |
-
-Override via env vars (see below).
-
-### GPUs
-
-Default `CUDA_VISIBLE_DEVICES=0,1`:
-
-- **GPU 0**: ASR + TTS (stages 0, 2, 3)
-- **GPU 1**: AURA inference (stage 1)
-
-Stop native AURA (`Qwen3_VL_online_streaming`, `tts_service`, etc.) before starting:
-
-```bash
-nvidia-smi
-```
-
----
-
-## 3. Start the server (Terminal 1)
-
-### Recommended script
-
-```bash
-cd /path/to/vllm-omni
-bash benchmarks/omniinteract/run_aura_server.sh
-```
-
-Use **tmux** / **screen** for a long-running session:
-
-```bash
-tmux new -s vllm_aura_server
-bash benchmarks/omniinteract/run_aura_server.sh
-# Ctrl+B D to detach
-```
-
-### Environment variables (`run_aura_server.sh`)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MODEL` | `/models/AURA` | `--model` and `--served-model-name` |
-| `DEPLOY_CONFIG` | `vllm_omni/deploy/aura_omni.yaml` | Stage / GPU layout |
-| `VLLM_BIN` | `$ROOT/.venv/bin/vllm` or `vllm` on PATH | `vllm` executable |
-| `HOST` | `0.0.0.0` | Bind address |
-| `PORT` | `8666` | HTTP / WebSocket port |
-| `CUDA_VISIBLE_DEVICES` | `0,1` | Physical GPUs (see deploy yaml) |
-
-### Equivalent manual command
-
-```bash
-cd /path/to/vllm-omni
-export CUDA_VISIBLE_DEVICES=0,1
-
-vllm serve /models/AURA \
-  --omni \
-  --deploy-config vllm_omni/deploy/aura_omni.yaml \
-  --host 0.0.0.0 \
-  --port 8666 \
-  --served-model-name /models/AURA \
-  --trust-remote-code
-```
-
-### Verify server is up
-
-```bash
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8666/health   # expect 200
-```
-
-Logs should show `Application startup complete` and route `/v1/video/chat/stream`. Model load can take several minutes; the bench script waits up to 900s.
-
----
-
-## 4. Run the benchmark (Terminal 2)
-
-### Full dataset (all subsets, native-aligned streaming defaults)
-
-```bash
-OMNIINTERACT_EVAL=1 \
-NUM_PROMPTS=250 \
-NUM_WARMUPS=0 \
+DATASET_PATH=/path/to/OmniInteract \
+OMNIINTERACT_AURA_TTS_REF_AUDIO=/path/to/reference.wav \
+OMNIINTERACT_AURA_TTS_REF_TEXT='Reference transcript.' \
+NATIVE_ALIGNED=1 \
 bash benchmarks/omniinteract/run_streaming_bench.sh
 ```
 
-Defaults: `1q1a,1q1a_math,1qna`, native system prompt, `max_frames=0` (full extract), `send_fps=2`, EVS frame filter off. Set `NUM_PROMPTS` ≥ total video count (`--no-oversample` is always on).
+`NATIVE_ALIGNED=1` runs:
 
-### `NATIVE_ALIGNED=1` (3-video smoke only)
+- warmup: `0001` in a separate result JSON
+- scored videos: `0002,0003,0004`
+- sample/send FPS: `2`
+- full videos (`max_frames=0`)
+- native AURA system prompt
 
-Pins videos `0002`, `0003`, `0004` and `NUM_PROMPTS=3`. Streaming settings are the same as the default above.
+Results are written to `./omniinteract_bench/`.
+
+## Run c=1 or c=8
+
+Specify video IDs explicitly to keep runs reproducible:
 
 ```bash
-NATIVE_ALIGNED=1 OMNIINTERACT_EVAL=1 \
-  bash benchmarks/omniinteract/run_streaming_bench.sh
+# c=1
+OMNIINTERACT_VIDEO_IDS=0002 \
+MAX_CONCURRENCY=1 NUM_PROMPTS=1 \
+DATASET_PATH=/path/to/OmniInteract \
+OMNIINTERACT_AURA_TTS_TASK_TYPE=CustomVoice \
+OMNIINTERACT_AURA_TTS_SPEAKER=Vivian \
+bash benchmarks/omniinteract/run_streaming_bench.sh
+
+# c=8
+OMNIINTERACT_VIDEO_IDS=0002,0003,0004,0005,0006,0007,0008,0009 \
+MAX_CONCURRENCY=8 NUM_PROMPTS=8 \
+DATASET_PATH=/path/to/OmniInteract \
+OMNIINTERACT_AURA_TTS_TASK_TYPE=CustomVoice \
+OMNIINTERACT_AURA_TTS_SPEAKER=Vivian \
+bash benchmarks/omniinteract/run_streaming_bench.sh
 ```
 
-```bash
-STREAMING_MAX_FRAMES=16 STREAMING_SEND_FPS=0 \
-  OMNIINTERACT_STREAMING_SYSTEM_PROMPT_MODE=omniinteract_qa \
-  NUM_PROMPTS=3 \
-  bash benchmarks/omniinteract/run_streaming_bench.sh
-```
+The script runs `0001` as a separate warmup request against the same server
+before both examples. Set `OMNIINTERACT_SKIP_WARMUP=1` only when that exact
+server process has already completed a `0001` streaming session.
 
-### Bench environment variables
+## Important environment variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
+| Variable | Default | Purpose |
+|---|---:|---|
 | `HOST` | `127.0.0.1` | Server host |
-| `PORT` | `8666` | Must match server |
-| `MODEL` | `/models/AURA` | Must match `--served-model-name` |
-| `DATASET_PATH` | `/models/datasets/OmniInteract` | Dataset root |
-| `NATIVE_ALIGNED` | `0` | `1` = 3-video native-aligned smoke |
-| `OMNIINTERACT_EVAL` | `1` | OmniInteract accuracy metrics |
+| `PORT` | `8666` | Server port |
+| `DATASET_PATH` | `lucky-lance/OmniInteract` | Local dataset root or HF dataset reference |
+| `MAX_CONCURRENCY` | `1` | Maximum concurrent sessions |
+| `NUM_PROMPTS` | `32` | Number of videos |
+| `OMNIINTERACT_VIDEO_IDS` | empty | Ordered comma-separated video IDs |
+| `STREAMING_MAX_FRAMES` | `0` | Frame cap; `0` means full video |
+| `STREAMING_SEND_FPS` | `2` | Wall-clock frame send rate |
+| `OMNIINTERACT_AURA_TTS_TASK_TYPE` | `Base` | `Base` or `CustomVoice` |
+| `OMNIINTERACT_AURA_TTS_REF_AUDIO` | empty | Required for Base voice |
+| `OMNIINTERACT_AURA_TTS_REF_TEXT` | short Chinese text | Required for Base voice |
 
----
+## Outputs
 
-## 5. Troubleshooting
+- `omniinteract_streaming_*.json`: aggregate metrics and per-request records
+- `bench_report.md`: aggregate native-style report
+- `videos/<id>/bench_report.md`: per-video report
+- `videos/<id>/streaming_chunks.json`: per-turn timing and text
 
-| Symptom | Checks |
-|---------|--------|
-| Server OOM | `nvidia-smi`; lower `gpu_memory_utilization` in deploy yaml |
-| Bench `Successful requests: 0` | Server on `:8666`; `pip install -e .` + restart; read `errors` in JSON |
-| TTS `2048 vs 1024` | Ensure P0 TTS `session.config` fix is installed; restart server |
-| Numbers ≠ native AURA | Use `NATIVE_ALIGNED=1`; see `docs/aura/vllm_omni_benchmark_alignment_backlog.md` |
+Set `OMNIINTERACT_SAVE_OUTPUT_WAV=1` only when a full-session output WAV is
+needed for manual inspection.
 
----
+## Stop and clean up
 
-## 6. Related files
-
-```text
-benchmarks/omniinteract/run_aura_server.sh
-benchmarks/omniinteract/run_streaming_bench.sh
-vllm_omni/deploy/aura_omni.yaml
-vllm_omni/entrypoints/openai/serving_video_stream.py
-vllm_omni/benchmarks/format_bench_report.py
-benchmarks/omniinteract/README.md          # dataset layout & metrics
+```bash
+bash scripts/stop_aura_omni.sh
+nvidia-smi
 ```
+
+The stop script only stops the server recorded by the production launcher.

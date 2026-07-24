@@ -162,7 +162,6 @@ def test_aura_session_state_commit_turn_clears_frames_without_api_history():
             ]
         }
     )
-    state.record_turn_transcript("req-1", "hello")
     get_or_create_session_history(state.session_id, system_prompt="sys")
     record_pending_turn(
         state.session_id,

@@ -38,7 +38,6 @@ from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
-from vllm_omni.model_executor.stage_input_processors.aura_session_history import is_effectively_silent
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     OmniInteractDataset,
@@ -59,6 +58,7 @@ from vllm_omni.benchmarks.streaming_metrics_delta import (
     _delta_cumulative_text_done_metrics,
 )
 from vllm_omni.metrics import definitions as defs
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import is_effectively_silent
 
 logger = init_logger(__name__)
 
@@ -230,16 +230,11 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
 
 
 def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
-    """Apply per-request OpenAI fields for OmniInteract."""
+    """Apply production streaming fields for OmniInteract."""
     if not isinstance(sample, OmniInteractSampleRequest):
         return
-    rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
-    if sample.omni_chat_messages is not None:
-        setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
     if sample.omniinteract_streaming_video_path:
         setattr(rfi, "omniinteract_streaming_video_path", sample.omniinteract_streaming_video_path)
-    if sample.omniinteract_streaming_audio_path:
-        setattr(rfi, "omniinteract_streaming_audio_path", sample.omniinteract_streaming_audio_path)
     if sample.omniinteract_streaming_audio_schedule is not None:
         setattr(rfi, "omniinteract_streaming_audio_schedule", sample.omniinteract_streaming_audio_schedule)
     setattr(rfi, "omniinteract_streaming_audio_from_video", sample.omniinteract_streaming_audio_from_video)
@@ -247,34 +242,6 @@ def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: Reque
         setattr(rfi, "omniinteract_streaming_slots", sample.omniinteract_streaming_slots)
     if sample.omniinteract_streaming_config is not None:
         setattr(rfi, "omniinteract_streaming_config", sample.omniinteract_streaming_config)
-#         audio_urls, video_urls = _omniinteract_media_urls(sample.omni_chat_messages)
-#         logger.info(
-#             "OmniInteract request media: request_id=%s video=%s audio=%s",
-#             getattr(rfi, "request_id", None) or getattr(sample, "request_id", None),
-#             ",".join(video_urls) if video_urls else "None",
-#             ",".join(audio_urls) if audio_urls else "None",
-#         )
-
-
-# def _omniinteract_media_urls(messages: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
-#     audio_urls: list[str] = []
-#     video_urls: list[str] = []
-#     for message in messages:
-#         content = message.get("content") if isinstance(message, dict) else None
-#         if not isinstance(content, list):
-#             continue
-#         for part in content:
-#             if not isinstance(part, dict):
-#                 continue
-#             if part.get("type") == "audio_url":
-#                 audio = part.get("audio_url")
-#                 if isinstance(audio, dict) and audio.get("url"):
-#                     audio_urls.append(str(audio["url"]))
-#             elif part.get("type") == "video_url":
-#                 video = part.get("video_url")
-#                 if isinstance(video, dict) and video.get("url"):
-#                     video_urls.append(str(video["url"]))
-#     return audio_urls, video_urls
 
 
 def _daily_omni_repo_from_args(args) -> str | None:
@@ -475,10 +442,10 @@ def get_samples(args, tokenizer):
         )
 
     if is_omniinteract:
-        if args.backend not in ["openai-chat-omni", "daily-omni", "openai-video-stream"]:
+        if args.backend != "openai-video-stream":
             raise ValueError(
-                "OmniInteract requires a multimodal backend that supports video/audio. "
-                f"Got backend={args.backend!r}; use --backend openai-chat-omni or openai-video-stream."
+                "OmniInteract production runs require --backend openai-video-stream. "
+                f"Got backend={args.backend!r}."
             )
 
         dataset_path = getattr(args, "dataset_path", None) or getattr(args, "hf_name", None)
@@ -508,8 +475,6 @@ def get_samples(args, tokenizer):
             data_root=omniinteract_root,
             random_seed=args.seed,
             subsets=subsets,
-            inline_local_video=getattr(args, "omniinteract_inline_local_video", False),
-            input_mode=getattr(args, "omniinteract_input_mode", "video"),
             aura_tts_task_type=getattr(args, "omniinteract_aura_tts_task_type", "Base"),
             aura_tts_language=getattr(args, "omniinteract_aura_tts_language", "Chinese"),
             aura_tts_speaker=getattr(args, "omniinteract_aura_tts_speaker", None),
@@ -528,9 +493,6 @@ def get_samples(args, tokenizer):
             streaming_cross_turn_penalty=getattr(args, "omniinteract_cross_turn_penalty", 0.0),
             streaming_cross_turn_lookback=getattr(args, "omniinteract_cross_turn_lookback", 2),
             streaming_video_ids=_parse_csv_list(getattr(args, "omniinteract_video_ids", None)),
-            streaming_aura_system_prompt_mode=getattr(
-                args, "omniinteract_streaming_system_prompt_mode", "native"
-            ),
             disable_shuffle=getattr(args, "disable_shuffle", False)
             or bool(_parse_csv_list(getattr(args, "omniinteract_video_ids", None))),
         )
@@ -979,10 +941,6 @@ def _omniinteract_save_output_wav_enabled() -> bool:
     return os.environ.get("OMNIINTERACT_SAVE_OUTPUT_WAV", "").lower() in ("1", "true", "yes")
 
 
-def _omniinteract_save_turn_wav_enabled() -> bool:
-    return os.environ.get("OMNIINTERACT_SAVE_TURN_WAV", "").lower() in ("1", "true", "yes")
-
-
 def _save_omniinteract_streaming_output_wav(
     *,
     video_path: str,
@@ -1011,51 +969,6 @@ def _save_omniinteract_streaming_output_wav(
         frame_rate,
     )
     return out_path
-
-
-def _save_omniinteract_streaming_turn_wav(
-    *,
-    video_path: str,
-    turn_index: int,
-    pcm_bytes: bytes,
-    channels: int,
-    sample_width: int,
-    frame_rate: int,
-) -> Path | None:
-    """Optional bench-only artifact: save one WAV per spoken turn."""
-    if not _omniinteract_save_turn_wav_enabled() or not pcm_bytes:
-        return None
-    root = Path(os.environ.get("OMNIINTERACT_BENCH_OUTPUT_DIR", "omniinteract_bench")).expanduser()
-    video_id = Path(video_path).stem or "unknown"
-    out_dir = root / "videos" / video_id / "turn_wavs"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"turn_{turn_index:03d}.wav"
-    with wave.open(str(out_path), "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(sample_width)
-        wf.setframerate(frame_rate)
-        wf.writeframes(pcm_bytes)
-    return out_path
-
-
-def _finalize_turn_wav_artifact(response: dict[str, Any], *, video_path: str, turn_index: int) -> None:
-    """Save a spoken turn WAV without affecting the response path."""
-    pcm_buffer = response.pop("_audio_pcm_buffer", None)
-    audio_params = response.pop("_audio_wav_params", None)
-    if not isinstance(pcm_buffer, bytearray) or not pcm_buffer or not isinstance(audio_params, tuple):
-        return
-    if len(audio_params) != 3:
-        return
-    saved = _save_omniinteract_streaming_turn_wav(
-        video_path=video_path,
-        turn_index=turn_index,
-        pcm_bytes=bytes(pcm_buffer),
-        channels=int(audio_params[0]),
-        sample_width=int(audio_params[1]),
-        frame_rate=int(audio_params[2]),
-    )
-    if saved is not None:
-        response["wav_path"] = str(saved)
 
 
 def _merge_turn_metrics(dest_metrics: dict[str, Any], src_metrics: dict[str, Any]) -> None:
@@ -1138,13 +1051,10 @@ async def async_request_openai_video_stream(
     output.generated_text = ""
 
     video_path = getattr(request_func_input, "omniinteract_streaming_video_path", "")
-    legacy_audio_path = getattr(request_func_input, "omniinteract_streaming_audio_path", "")
     audio_schedule = list(getattr(request_func_input, "omniinteract_streaming_audio_schedule", None) or [])
     audio_from_video = bool(getattr(request_func_input, "omniinteract_streaming_audio_from_video", False))
     streaming_slots = list(getattr(request_func_input, "omniinteract_streaming_slots", None) or [])
     config = dict(getattr(request_func_input, "omniinteract_streaming_config", None) or {})
-    if legacy_audio_path and not audio_schedule:
-        audio_schedule = [{"at_sec": 0.0, "audio_path": legacy_audio_path}]
     if not video_path or (not audio_schedule and not audio_from_video) or not config:
         output.success = False
         output.error = "openai-video-stream requires OmniInteract aura_streaming samples."
@@ -1221,7 +1131,8 @@ async def async_request_openai_video_stream(
     per_round = int(config.get("max_frames_per_round") or 16)
     config["max_frames_per_round"] = max(2, min(per_round, len(frames)))
     logger.info(
-        "OmniInteract streaming request: video=%s frames=%d sample_fps=%.2f send_fps=%.2f audio_items=%d audio_bytes=%d config=%s",
+        "OmniInteract streaming request: video=%s frames=%d sample_fps=%.2f "
+        "send_fps=%.2f audio_items=%d audio_bytes=%d config=%s",
         video_path,
         len(frames),
         sample_fps,
@@ -1355,14 +1266,6 @@ async def async_request_openai_video_stream(
                                 if wav_audio_params == params:
                                     pcm = wav_reader.readframes(wav_reader.getnframes())
                                     wav_pcm_buffer.extend(pcm)
-                                    target_response = current_response if current_response is not None else (
-                                        responses[-1] if responses else None
-                                    )
-                                    if target_response is not None:
-                                        turn_buf = target_response.setdefault("_audio_pcm_buffer", bytearray())
-                                        if isinstance(turn_buf, bytearray):
-                                            turn_buf.extend(pcm)
-                                        target_response.setdefault("_audio_wav_params", params)
                         except Exception as ex:
                             logger.warning("Failed to parse streaming video wav chunk: %s", ex)
                 elif msg_type == "error":
@@ -1444,8 +1347,6 @@ async def async_request_openai_video_stream(
                 raise
 
         output.latency = timestamp - st
-        for idx, response in enumerate(responses, start=1):
-            _finalize_turn_wav_artifact(response, video_path=video_path, turn_index=idx)
         streaming_chunks = _normalize_streaming_chunks(responses)
         response_texts = [str(chunk.get("text") or "") for chunk in streaming_chunks if str(chunk.get("text") or "")]
         output.generated_text = "\n".join(response_texts) if response_texts else "".join(generated_parts)

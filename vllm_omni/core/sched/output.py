@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
@@ -67,14 +66,10 @@ class OmniCachedRequestData(CachedRequestData):
     Args:
         prompt_token_ids: Mapping from request ID to list of prompt token IDs
         additional_information: Per-request additional information payloads
-        mm_feature_patches: Full multimodal features for encoder idxs that may
-            have been pixel-slimmed on a prior Engine→Worker IPC. Worker merges
-            these into ``CachedRequestState.mm_features`` before mm encode.
     """
 
     prompt_token_ids: dict[str, list[int]]
     additional_information: dict[str, dict | None]
-    mm_feature_patches: dict[str, dict[int, Any]] = field(default_factory=dict)
 
 
 @dataclass

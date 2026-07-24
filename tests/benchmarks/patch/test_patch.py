@@ -7,7 +7,6 @@ Unit tests for patch.py
 
 import asyncio
 import json
-from pathlib import Path
 
 import pytest
 from pytest_mock import MockerFixture
@@ -15,46 +14,10 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
-    _finalize_turn_wav_artifact,
-    _normalize_streaming_chunks,
     async_request_openai_chat_omni_completions,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
-
-
-def test_normalize_streaming_chunks_keeps_turn_wav_path() -> None:
-    chunks = _normalize_streaming_chunks(
-        [
-            {
-                "start": 0.0,
-                "end": 1.0,
-                "text": "hello",
-                "wav_path": "/tmp/turn_001.wav",
-                "metrics": {"audio_duration_s": 0.5},
-            }
-        ]
-    )
-
-    assert len(chunks) == 1
-    assert chunks[0]["wav_path"] == "/tmp/turn_001.wav"
-
-
-def test_finalize_turn_wav_artifact_saves_debug_wav(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNIINTERACT_SAVE_TURN_WAV", "1")
-    monkeypatch.setenv("OMNIINTERACT_BENCH_OUTPUT_DIR", str(tmp_path))
-    response = {
-        "_audio_pcm_buffer": bytearray(b"\x00\x00\x01\x00" * 8),
-        "_audio_wav_params": (1, 2, 16000),
-    }
-
-    _finalize_turn_wav_artifact(response, video_path="/tmp/0002.mp4", turn_index=2)
-
-    assert "wav_path" in response
-    assert response["wav_path"].endswith("turn_002.wav")
-    assert Path(response["wav_path"]).exists()
-    assert "_audio_pcm_buffer" not in response
-    assert "_audio_wav_params" not in response
 
 
 class MockResponse:

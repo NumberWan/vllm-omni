@@ -34,7 +34,7 @@ stages:
   max_model_len: 8192
   max_num_batched_tokens: 4096
   devices: '0'
-  model: /models/Qwen3-ASR-1.7B
+  model: Qwen/Qwen3-ASR-1.7B
   default_sampling_params:
     temperature: 0.0
     top_p: 1.0
@@ -50,7 +50,7 @@ stages:
   max_model_len: 262144
   max_num_batched_tokens: 15360
   devices: '1'
-  model: /models/AURA
+  model: aurateam/AURA
   default_sampling_params:
     temperature: 0.5
     top_p: 1.0
@@ -75,7 +75,7 @@ stages:
   attention_backend: FLASHINFER
   output_connectors:
     to_stage_3: connector_of_shared_memory
-  model: /models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe
+  model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
   default_sampling_params:
     temperature: 0.9
     top_k: 50
@@ -99,7 +99,7 @@ stages:
   devices: '0'
   input_connectors:
     from_stage_2: connector_of_shared_memory
-  model: /models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe
+  model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
   default_sampling_params:
     temperature: 0.0
     top_p: 1.0
