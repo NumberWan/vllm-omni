@@ -7,7 +7,7 @@ Use the scripts:
 
 ```bash
 bash benchmarks/omniinteract/run_aura_server.sh
-NATIVE_ALIGNED=1 bash benchmarks/omniinteract/run_streaming_bench.sh
+bash benchmarks/omniinteract/run_streaming_bench.sh
 ```
 
 The benchmark:

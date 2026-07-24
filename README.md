@@ -48,6 +48,20 @@ bash scripts/start_aura_omni.sh
 ```
 
 需要 Linux、两张可用 CUDA GPU；自动下载时只需能访问 Hugging Face（通常无需额外登录或 token）。
+
+### 运行 Smoke3 客户端 Demo
+
+服务启动成功后，打开另一个终端，在仓库根目录运行：
+
+```bash
+bash benchmarks/omniinteract/run_streaming_bench.sh
+```
+
+默认已是 Smoke3：`CustomVoice` + `Vivian`，先用 `0001` 预热，再测
+`0002`、`0003`、`0004`；`0001` 不计入准确率或延迟。结果在
+`./omniinteract_bench/`。本地已有数据集时可加
+`DATASET_PATH=/path/to/OmniInteract`。
+
 完整安装、WebSocket／HTTP 用法、离线模型及故障排查请看
 [`examples/online_serving/aura_omni/README.md`](examples/online_serving/aura_omni/README.md)。
 

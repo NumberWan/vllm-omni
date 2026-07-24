@@ -5,12 +5,14 @@
 #
 # Prerequisite: bash benchmarks/omniinteract/run_aura_server.sh
 #
-# Native-aligned smoke (same 3 videos / prompt / realtime send as AURA original):
-#   NATIVE_ALIGNED=1 bash benchmarks/omniinteract/run_streaming_bench.sh
+# Default is Smoke3 (CustomVoice/Vivian, warmup 0001, scored 0002-0004):
+#   bash benchmarks/omniinteract/run_streaming_bench.sh
 #
-# Default streaming client settings match native AURA bench: native system prompt,
-# full video extract (max_frames=0), wall-clock send_fps=2, frame_filter off.
-# NATIVE_ALIGNED=1 only pins the 3-video smoke subset (0002,0003,0004).
+# Full-dataset mode:
+#   NATIVE_ALIGNED=0 bash benchmarks/omniinteract/run_streaming_bench.sh
+#
+# Streaming defaults: native system prompt, full video (max_frames=0),
+# wall-clock send_fps=2, frame_filter off.
 #
 # Outputs (under ./omniinteract_bench by default):
 #   omniinteract_streaming_*.json   — full metrics + per_requests
@@ -29,14 +31,16 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8666}"
 NUM_PROMPTS="${NUM_PROMPTS:-32}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
-NATIVE_ALIGNED="${NATIVE_ALIGNED:-0}"
+# Default to the beginner Smoke3 client path. Set NATIVE_ALIGNED=0 for full-dataset runs.
+NATIVE_ALIGNED="${NATIVE_ALIGNED:-1}"
 OMNIINTERACT_WARMUP_VIDEO_ID="${OMNIINTERACT_WARMUP_VIDEO_ID:-0001}"
 RESULT_DIR="${RESULT_DIR:-./omniinteract_bench}"
 
-# TTS: match native AURA stack (run_omniinteract_bench.sh → tts_service.py)
+# Production TTS defaults: CustomVoice needs no reference WAV.
 AURA_NATIVE_ROOT="${AURA_NATIVE_ROOT:-}"
-OMNIINTERACT_AURA_TTS_TASK_TYPE="${OMNIINTERACT_AURA_TTS_TASK_TYPE:-Base}"
+OMNIINTERACT_AURA_TTS_TASK_TYPE="${OMNIINTERACT_AURA_TTS_TASK_TYPE:-CustomVoice}"
 OMNIINTERACT_AURA_TTS_LANGUAGE="${OMNIINTERACT_AURA_TTS_LANGUAGE:-Chinese}"
+OMNIINTERACT_AURA_TTS_SPEAKER="${OMNIINTERACT_AURA_TTS_SPEAKER:-Vivian}"
 OMNIINTERACT_AURA_TTS_REF_AUDIO="${OMNIINTERACT_AURA_TTS_REF_AUDIO:-${AURA_NATIVE_ROOT:+$AURA_NATIVE_ROOT/shuhan.mp3}}"
 OMNIINTERACT_AURA_TTS_REF_TEXT="${OMNIINTERACT_AURA_TTS_REF_TEXT:-读书指通过阅读书籍获取知识、交流思想的行为。}"
 
@@ -152,6 +156,7 @@ _run_streaming_bench() {
     --omniinteract-cross-turn-lookback "${CROSS_TURN_LOOKBACK}" \
     --omniinteract-aura-tts-task-type "${OMNIINTERACT_AURA_TTS_TASK_TYPE}" \
     --omniinteract-aura-tts-language "${OMNIINTERACT_AURA_TTS_LANGUAGE}" \
+    --omniinteract-aura-tts-speaker "${OMNIINTERACT_AURA_TTS_SPEAKER}" \
     --omniinteract-aura-tts-ref-audio "${OMNIINTERACT_AURA_TTS_REF_AUDIO}" \
     --omniinteract-aura-tts-ref-text "${OMNIINTERACT_AURA_TTS_REF_TEXT}" \
     --percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration,ttfc,tpoc,icl \

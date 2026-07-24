@@ -27,23 +27,28 @@ the defaults.
 
 ## Run the native-aligned smoke benchmark
 
+Defaults are already Smoke3-ready (`NATIVE_ALIGNED=1`, CustomVoice/`Vivian`).
 Always warm the same server process with video `0001`. The scored run starts at
 `0002`; `0001` must not be included in accuracy or latency statistics.
 
 ```bash
-DATASET_PATH=/path/to/OmniInteract \
-OMNIINTERACT_AURA_TTS_REF_AUDIO=/path/to/reference.wav \
-OMNIINTERACT_AURA_TTS_REF_TEXT='Reference transcript.' \
-NATIVE_ALIGNED=1 \
 bash benchmarks/omniinteract/run_streaming_bench.sh
 ```
 
-`NATIVE_ALIGNED=1` runs:
+Optional local dataset override:
+
+```bash
+DATASET_PATH=/path/to/OmniInteract \
+bash benchmarks/omniinteract/run_streaming_bench.sh
+```
+
+Default Smoke3 behavior:
 
 - warmup: `0001` in a separate result JSON
 - scored videos: `0002,0003,0004`
 - sample/send FPS: `2`
 - full videos (`max_frames=0`)
+- CustomVoice TTS speaker `Vivian`
 - native AURA system prompt
 
 Results are written to `./omniinteract_bench/`.
@@ -54,19 +59,17 @@ Specify video IDs explicitly to keep runs reproducible:
 
 ```bash
 # c=1
+NATIVE_ALIGNED=0 \
 OMNIINTERACT_VIDEO_IDS=0002 \
 MAX_CONCURRENCY=1 NUM_PROMPTS=1 \
 DATASET_PATH=/path/to/OmniInteract \
-OMNIINTERACT_AURA_TTS_TASK_TYPE=CustomVoice \
-OMNIINTERACT_AURA_TTS_SPEAKER=Vivian \
 bash benchmarks/omniinteract/run_streaming_bench.sh
 
 # c=8
+NATIVE_ALIGNED=0 \
 OMNIINTERACT_VIDEO_IDS=0002,0003,0004,0005,0006,0007,0008,0009 \
 MAX_CONCURRENCY=8 NUM_PROMPTS=8 \
 DATASET_PATH=/path/to/OmniInteract \
-OMNIINTERACT_AURA_TTS_TASK_TYPE=CustomVoice \
-OMNIINTERACT_AURA_TTS_SPEAKER=Vivian \
 bash benchmarks/omniinteract/run_streaming_bench.sh
 ```
 
@@ -86,7 +89,9 @@ server process has already completed a `0001` streaming session.
 | `OMNIINTERACT_VIDEO_IDS` | empty | Ordered comma-separated video IDs |
 | `STREAMING_MAX_FRAMES` | `0` | Frame cap; `0` means full video |
 | `STREAMING_SEND_FPS` | `2` | Wall-clock frame send rate |
-| `OMNIINTERACT_AURA_TTS_TASK_TYPE` | `Base` | `Base` or `CustomVoice` |
+| `NATIVE_ALIGNED` | `1` | Smoke3 (`0002–0004`); set `0` for full-dataset mode |
+| `OMNIINTERACT_AURA_TTS_TASK_TYPE` | `CustomVoice` | `CustomVoice` or `Base` |
+| `OMNIINTERACT_AURA_TTS_SPEAKER` | `Vivian` | CustomVoice speaker |
 | `OMNIINTERACT_AURA_TTS_REF_AUDIO` | empty | Required for Base voice |
 | `OMNIINTERACT_AURA_TTS_REF_TEXT` | short Chinese text | Required for Base voice |
 
