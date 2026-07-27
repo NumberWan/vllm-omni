@@ -107,16 +107,6 @@ def _tts_gate_on_voice_asr_enabled() -> bool:
     return raw not in {"0", "false", "off", "no"}
 
 
-def _silent_bypass_stop_at_stage1_enabled() -> bool:
-    """On Stage0 hard bypass (silent), end at Stage1 — do not prewarm Talker/Code2Wav.
-
-    Under c=8 skip ON, ~1k silent turns otherwise still wake Stage2/3 on GPU0.
-    Default on (2-card skip best). Disable with ``VLLM_AURA_SILENT_STOP_AT_STAGE1=0``.
-    """
-    raw = (os.environ.get("VLLM_AURA_SILENT_STOP_AT_STAGE1") or "1").strip().lower()
-    return raw not in {"0", "false", "off", "no"}
-
-
 def _build_terminal_empty_output(
     request_id: str,
     *,
@@ -1669,15 +1659,10 @@ class Orchestrator:
         )
 
         if self.async_chunk:
-            # Silent vision turns: stop at AURA text — keep GPU0 free of empty TTS wakeups.
-            if _silent_bypass_stop_at_stage1_enabled() and req_state.final_stage_id > 1:
-                logger.info(
-                    "[Orchestrator] Silent stop-at-stage1: final_stage_id %d→1 for req=%s",
-                    req_state.final_stage_id,
-                    request_id,
-                )
-                req_state.final_stage_id = 1
-                req_state.final_output_stage_ids = {1}
+            # Keep final_stage_id as requested (typically 3). Stage0 bypass only skips
+            # ASR GPU — vision-only turns may still speak. Stage1→TTS emits an empty
+            # finish on <|silent|> so Talker does not synthesize; do not clamp to
+            # Stage1 here based on "no mic".
             if req_state.final_stage_id > 0:
                 await self._prewarm_async_chunk_stages(request_id, stage0_request, req_state)
             additional_info = (

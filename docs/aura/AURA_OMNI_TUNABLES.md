@@ -1,7 +1,7 @@
 # AURA Omni 可調參數（Tunables）
 
 repo: vllm-omni (`scripts/start_aura_omni.sh`, `vllm_omni/deploy/aura_omni_2gpu_best.yaml`)
-updated: 2026-07-23
+updated: 2026-07-27
 
 **預設已係最佳 2 卡 skip stack**——多數情況唔使 set 任何 feature flag。  
 一鍵拉起：
@@ -20,10 +20,11 @@ bash scripts/start_aura_omni.sh
 |--|--|--|
 | Deploy YAML | `vllm_omni/deploy/aura_omni_2gpu_best.yaml` | FI + Talker FI + seqs4 + mem15 + chunk20 |
 | GPU | `CUDA_VISIBLE_DEVICES=0,1` | Stage0/2/3→可見卡0；Stage1→可見卡1 |
-| `VLLM_AURA_STAGE0_BYPASS` | **1** | silent 真 skip Stage0（SHM inject） |
-| `VLLM_AURA_SILENT_STOP_AT_STAGE1` | **1** | silent 唔喚醒 Stage2/3 TTS |
+| `VLLM_AURA_STAGE0_BYPASS` | **1** | silent／無咪真 skip Stage0（SHM inject） |
 | `VLLM_AURA_TTS_GATE_ON_VOICE_ASR` | **1** | voice ASR 期間延遲 TTS prewarm |
 | `VLLM_AURA_SENTENCE_TTS` | **1** | Stage1 按句中途交 TTS（贏 TTFP） |
+
+Stage0 bypass **唔會**把 turn 截斷喺 Stage1。有聲（非 `<|silent|>`）一定去 Stage2/3；`<|silent|>` 由 Stage1→TTS 發 empty finish，唔做真合成。
 
 ---
 
@@ -35,7 +36,7 @@ bash scripts/start_aura_omni.sh
 VLLM_AURA_STAGE0_BYPASS=0 bash scripts/start_aura_omni.sh
 ```
 
-會跑齊 silent Stage0；2 卡下 ASR 最好。`SILENT_STOP` 對 bypass0 無影響，可留預設。
+會跑齊 silent Stage0；2 卡下 ASR 最好。
 
 ### 2.2 換 GPU
 
@@ -65,8 +66,7 @@ PORT=8667 MODEL=aurateam/AURA LOG_DIR=/tmp/my_aura bash scripts/start_aura_omni.
 
 | Env | 預設 | 作用 | 何時改 |
 |--|--|--|--|
-| `VLLM_AURA_STAGE0_BYPASS` | `1` | silent 硬 skip Stage0 | 要 ASR 最優 → `0` |
-| `VLLM_AURA_SILENT_STOP_AT_STAGE1` | `1` | skip 時 silent 停喺 Stage1 | 關咗 2 卡 ASR 會差好多 |
+| `VLLM_AURA_STAGE0_BYPASS` | `1` | silent／無咪硬 skip Stage0 | 要 ASR 最優 → `0` |
 | `VLLM_AURA_TTS_GATE_ON_VOICE_ASR` | `1` | voice ASR 時 defer TTS prewarm | 少數實驗可 `0` |
 | `VLLM_AURA_SENTENCE_TTS` | `1` | 按句 mid-gen → TTS | 關咗 TTFP 變差 |
 | `VLLM_AURA_LOG_TURN_PROMPT` | off | debug dump turn prompt | 除錯 |
@@ -74,6 +74,7 @@ PORT=8667 MODEL=aurateam/AURA LOG_DIR=/tmp/my_aura bash scripts/start_aura_omni.
 
 **已移除／唔支援**：
 
+- `VLLM_AURA_SILENT_STOP_AT_STAGE1`（曾用 Stage0 bypass 提早 `final_stage_id→1`，會砍掉 vision-only 出聲；silent skip TTS 改只跟 Stage1 `<|silent|>`）
 - `VLLM_AURA_TTS_PREEMPT_ON_VOICE_ASR`（跨 session abort 會 hang；代碼已清）
 - `VLLM_AURA_AUTO_INTERRUPT` / `VLLM_AURA_HISTORY_SERVICE` / `VLLM_AURA_HISTORY_PRIMARY`（無實作／無 reader）
 
