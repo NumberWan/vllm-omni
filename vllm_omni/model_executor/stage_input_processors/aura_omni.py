@@ -307,9 +307,12 @@ def _estimate_tts_max_new_tokens(text: str, content_ids: list[int], explicit: An
     # Qwen3-TTS emits one layer-0 codec token per 12 Hz audio frame. Keep the
     # default cap proportional to spoken text so bad EOS or degenerate AURA
     # text does not run to the deploy-wide upper bound.
+    #
+    # Avoid a flat 48-token (~4s) floor: short sentence emits like "有。" were
+    # getting multi-second filler/cough headroom under CustomVoice.
     spoken_chars = sum(1 for ch in text if not ch.isspace())
     basis = max(spoken_chars, len(content_ids))
-    return min(1024, max(48, int(math.ceil(basis * 7 + 32))))
+    return min(1024, max(12, int(math.ceil(basis * 6 + 8))))
 
 
 def _normalize_qwen3_tts_speaker(speaker: Any) -> Any:
@@ -1384,6 +1387,10 @@ def _aura2tts_empty_finished_payload() -> dict[str, Any]:
 _NATIVE_TTS_SENT_ENDS = frozenset("。！？；.!?;\n")
 _NATIVE_TTS_COMMA_ENDS = frozenset("，,")
 _NATIVE_TTS_MIN_CHARS = 10
+# Hold mid-gen emits shorter than this (content chars) and merge into the next
+# sentence. Prevents solo TTS of "有。" / "好的。" / "收到。" which over-generate
+# filler, while still allowing normal short sentences like "今天天气很好。" to stream.
+_NATIVE_TTS_MIN_EMIT_CHARS = 4
 
 
 def _sentence_tts_enabled() -> bool:
@@ -1393,6 +1400,11 @@ def _sentence_tts_enabled() -> bool:
     """
     raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS") or "1").strip().lower()
     return raw not in {"0", "false", "off", "no"}
+
+
+def _tts_content_char_count(text: str) -> int:
+    """Count alphanumeric / CJK content chars (ignore punctuation/whitespace)."""
+    return sum(1 for ch in text if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
 
 
 def _pop_native_tts_sentence(buf: str) -> tuple[str | None, str]:
@@ -1414,6 +1426,30 @@ def _pop_native_tts_sentence(buf: str) -> tuple[str | None, str]:
     if not sentence.strip():
         return _pop_native_tts_sentence(rest)
     return sentence, rest
+
+
+def _pop_emit_ready_tts_text(
+    buf: str,
+    min_chars: int = _NATIVE_TTS_MIN_EMIT_CHARS,
+) -> tuple[str | None, str]:
+    """Pop one or more sentences until content length >= ``min_chars``.
+
+    Short fragments such as ``有。`` stay buffered and merge into the next
+    completed sentence. Final flush (Stage1 finished) bypasses this helper.
+    """
+    parts: list[str] = []
+    rest = buf
+    while True:
+        sentence, rest = _pop_native_tts_sentence(rest)
+        if sentence is None:
+            break
+        parts.append(sentence)
+        if _tts_content_char_count("".join(parts)) >= min_chars:
+            return "".join(parts), rest
+    if not parts:
+        return None, buf
+    # Not enough content yet: put complete-but-short sentences back and wait.
+    return None, "".join(parts) + rest
 
 
 def _tts_payload_from_talker_input(tts_input: OmniTokensPrompt) -> dict[str, Any]:
@@ -1649,7 +1685,7 @@ def aura2tts_async_chunk(
         state["aura2tts_emitted_prefix"] = emitted_prefix
 
     if sentence_tts and not finished:
-        sentence, pending_buf = _pop_native_tts_sentence(pending_buf)
+        sentence, pending_buf = _pop_emit_ready_tts_text(pending_buf)
         state["aura2tts_pending_sentence"] = pending_buf
         if sentence is None:
             logger.info(

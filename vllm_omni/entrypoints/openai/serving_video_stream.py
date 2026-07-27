@@ -12,11 +12,14 @@ Shared protocol (see :mod:`video_stream_base`):
         {"type": "video.done"}                  # End of session
 
     Server -> Client:
-        {"type": "response.start"}
-        {"type": "response.text.delta", "delta": "..."}
-        {"type": "response.text.done", "text": "..."}
-        {"type": "response.audio.delta", "data": "...", "format": "wav"}
-        {"type": "response.audio.done"}
+        Response events include ``request_id`` so overlapping AURA turns can be
+        attributed correctly.
+        {"type": "response.start", "request_id": "..."}
+        {"type": "user.transcript.done", "text": "...", "request_id": "..."}
+        {"type": "response.text.delta", "delta": "...", "request_id": "..."}
+        {"type": "response.text.done", "text": "...", "request_id": "..."}
+        {"type": "response.audio.delta", "data": "...", "format": "wav", "request_id": "..."}
+        {"type": "response.audio.done", "request_id": "..."}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 
@@ -43,6 +46,8 @@ from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty imp
     merge_penalty_sampling_params,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    _clean_asr_transcript,
+    _extract_text,
     build_aura_streaming_turn_additional_information,
     frames_to_video_tuple,
 )
@@ -561,14 +566,24 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         from vllm_omni.entrypoints.openai import video_stream_envs
         from vllm_omni.outputs import OmniRequestOutput
 
-        await websocket.send_json({"type": "response.start"})
+        def _response_event(payload: dict[str, Any]) -> dict[str, Any]:
+            payload["request_id"] = request_id
+            return payload
+
+        await websocket.send_json(_response_event({"type": "response.start"}))
         text_parts: list[str] = []
         text_done_sent = False
         turn_lock_released = False
         audio_chunk_count = 0
         audio_chunks_drained = 0
         previous_text = ""
+        previous_transcript = ""
+        transcript_done_sent = False
         interrupted = False
+        user_content = user_message.get("content", [])
+        voice_turn = isinstance(user_content, list) and any(
+            isinstance(item, dict) and item.get("type") == "input_audio" for item in user_content
+        )
 
         async_chunk_mode = video_stream_envs.VLLM_VIDEO_ASYNC_CHUNK
         streaming = async_chunk_mode == "on"
@@ -625,7 +640,10 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             if not text_done_sent:
                 full_text = "".join(text_parts)
                 await websocket.send_json(
-                    _with_metrics({"type": "response.text.done", "text": full_text}, last_text_metrics)
+                    _with_metrics(
+                        _response_event({"type": "response.text.done", "text": full_text}),
+                        last_text_metrics,
+                    )
                 )
                 text_done_sent = True
                 await _try_release_turn_lock(full_text)
@@ -650,11 +668,32 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 out_type = getattr(output, "final_output_type", "text")
                 metrics = _event_metrics(output)
 
+                if out_type == "transcript":
+                    if not voice_turn or transcript_done_sent:
+                        continue
+                    current_transcript = _extract_text(output.request_output)
+                    if current_transcript:
+                        previous_transcript = current_transcript
+                    if output.finished:
+                        transcript = _clean_asr_transcript(previous_transcript)
+                        if transcript:
+                            await websocket.send_json(
+                                _with_metrics(
+                                    _response_event({"type": "user.transcript.done", "text": transcript}),
+                                    metrics,
+                                )
+                            )
+                        transcript_done_sent = True
+                    continue
+
                 if out_type == "audio":
                     if streaming and not text_done_sent:
                         full_text = "".join(text_parts)
                         await websocket.send_json(
-                            _with_metrics({"type": "response.text.done", "text": full_text}, last_text_metrics)
+                            _with_metrics(
+                                _response_event({"type": "response.text.done", "text": full_text}),
+                                last_text_metrics,
+                            )
                         )
                         text_done_sent = True
                         await _try_release_turn_lock(full_text)
@@ -679,11 +718,13 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                             )
                             await websocket.send_json(
                                 _with_metrics(
-                                    {
-                                        "type": "response.audio.delta",
-                                        "data": b64,
-                                        "format": "wav",
-                                    },
+                                    _response_event(
+                                        {
+                                            "type": "response.audio.delta",
+                                            "data": b64,
+                                            "format": "wav",
+                                        }
+                                    ),
                                     metrics,
                                 )
                             )
@@ -706,13 +747,19 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                             continue
                         if streaming and stream_text_deltas:
                             await websocket.send_json(
-                                _with_metrics({"type": "response.text.delta", "delta": delta_text}, metrics)
+                                _with_metrics(
+                                    _response_event({"type": "response.text.delta", "delta": delta_text}),
+                                    metrics,
+                                )
                             )
 
             if not text_done_sent:
                 full_text = "".join(text_parts)
                 await websocket.send_json(
-                    _with_metrics({"type": "response.text.done", "text": full_text}, last_text_metrics)
+                    _with_metrics(
+                        _response_event({"type": "response.text.done", "text": full_text}),
+                        last_text_metrics,
+                    )
                 )
                 text_done_sent = True
                 await _try_release_turn_lock(full_text)
@@ -729,11 +776,13 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     if b64:
                         await websocket.send_json(
                             _with_metrics(
-                                {
-                                    "type": "response.audio.delta",
-                                    "data": b64,
-                                    "format": "wav",
-                                },
+                                _response_event(
+                                    {
+                                        "type": "response.audio.delta",
+                                        "data": b64,
+                                        "format": "wav",
+                                    }
+                                ),
                                 last_audio_metrics,
                             )
                         )
@@ -748,7 +797,9 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     audio_chunks_drained,
                     len("".join(text_parts)),
                 )
-                await websocket.send_json(_with_metrics({"type": "response.audio.done"}, last_audio_metrics))
+                await websocket.send_json(
+                    _with_metrics(_response_event({"type": "response.audio.done"}), last_audio_metrics)
+                )
 
             if release_turn_lock is None and not turn_lock_released:
                 response_text = "".join(text_parts)
@@ -760,7 +811,10 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         if not text_done_sent:
             full_text = "".join(text_parts)
             await websocket.send_json(
-                _with_metrics({"type": "response.text.done", "text": full_text}, last_text_metrics)
+                _with_metrics(
+                    _response_event({"type": "response.text.done", "text": full_text}),
+                    last_text_metrics,
+                )
             )
 
     @staticmethod

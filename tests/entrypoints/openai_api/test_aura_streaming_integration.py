@@ -54,6 +54,13 @@ def _text_result(text: str) -> OmniRequestOutput:
     return OmniRequestOutput(final_output_type="text", request_output=request_output)
 
 
+def _transcript_result(text: str) -> OmniRequestOutput:
+    result = _text_result(text)
+    result.stage_id = 0
+    result.final_output_type = "transcript"
+    return result
+
+
 def _audio_result_with_b64(b64_audio: str) -> OmniRequestOutput:
     class Output:
         pass
@@ -306,6 +313,7 @@ async def test_aura_websocket_streams_text_and_audio(monkeypatch):
     class TextAudioEngine:
         def generate(self, **_kwargs):
             async def _gen():
+                yield _transcript_result("language zh 你好嗎")
                 yield _text_result("你好")
                 yield _audio_result_with_b64("unused")
 
@@ -335,7 +343,7 @@ async def test_aura_websocket_streams_text_and_audio(monkeypatch):
         ws,
         config,
         [_b64(_make_jpeg())],
-        bytearray(),
+        bytearray(b"\0\0"),
         state,
         "",
         "req-aura-audio",
@@ -345,12 +353,28 @@ async def test_aura_websocket_streams_text_and_audio(monkeypatch):
 
     types = ws.sent_types()
     assert "response.start" in types
+    assert "user.transcript.done" in types
     assert "response.text.delta" not in types
     assert "response.text.done" in types
     assert "response.audio.delta" in types
     assert "response.audio.done" in types
     audio_msgs = [m for m in ws.sent if m.get("type") == "response.audio.delta"]
     assert audio_msgs and audio_msgs[0].get("format") == "wav"
+    transcript_msgs = [m for m in ws.sent if m.get("type") == "user.transcript.done"]
+    assert transcript_msgs == [
+        {
+            "type": "user.transcript.done",
+            "text": "你好嗎",
+            "request_id": "req-aura-audio",
+        }
+    ]
+    turn_events = [
+        message
+        for message in ws.sent
+        if message.get("type", "").startswith(("response.", "user.transcript."))
+    ]
+    assert turn_events
+    assert {message.get("request_id") for message in turn_events} == {"req-aura-audio"}
 
 
 @pytest.mark.asyncio
@@ -366,6 +390,10 @@ async def test_aura_multi_turn_accumulates_session_history():
             websocket = kwargs.get("websocket", args[0])
             response_text = f"reply-{turns_completed}"
             if release_turn_lock is not None:
+                if isinstance(message_history, AuraSessionState):
+                    # Match production: freeze before commit so only post-turn
+                    # frames remain eligible for the next auto-trigger.
+                    message_history.freeze_turn_video(None)
                 await release_turn_lock(
                     message_history=message_history,
                     user_message={"role": "user", "content": f"user-{turns_completed}"},

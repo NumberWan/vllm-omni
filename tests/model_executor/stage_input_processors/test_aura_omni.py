@@ -22,6 +22,8 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     resolve_aura_async_chunk_stage_payload,
     unpack_aura_video_ndarray,
     video_tuple_from_deferred_multi_modal,
+    _estimate_tts_max_new_tokens,
+    _pop_emit_ready_tts_text,
     _pop_native_tts_sentence,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
@@ -490,6 +492,25 @@ def test_pop_native_tts_sentence_matches_native_boundaries():
     assert s is None and rest == "短，"
 
 
+def test_pop_emit_ready_tts_text_holds_short_sentence_until_merge():
+    held, rest = _pop_emit_ready_tts_text("有。")
+    assert held is None
+    assert rest == "有。"
+
+    merged, rest = _pop_emit_ready_tts_text("有。画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，")
+    assert merged == "有。画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，"
+    assert rest == ""
+
+
+def test_estimate_tts_max_new_tokens_scales_without_flat_48_floor():
+    # Solo "有。" must not keep the old ~4s (48-token) filler budget.
+    assert _estimate_tts_max_new_tokens("有。", []) < 48
+    assert _estimate_tts_max_new_tokens("有。", []) >= 12
+    longer = _estimate_tts_max_new_tokens("画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，", [])
+    assert longer > _estimate_tts_max_new_tokens("有。", [])
+    assert _estimate_tts_max_new_tokens("x", [], explicit=96) == 96
+
+
 def test_aura2tts_async_chunk_emits_mid_generation_sentence(monkeypatch):
     monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
     transfer_manager = _transfer_manager()
@@ -514,6 +535,32 @@ def test_aura2tts_async_chunk_emits_mid_generation_sentence(monkeypatch):
     fin = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
     assert fin is not None
     assert "后面还有内容" in (fin.get("text") or [""])[0] or fin.get("prompt_token_ids") == []
+
+
+def test_aura2tts_async_chunk_merges_short_leading_sentence(monkeypatch):
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    transfer_manager = _transfer_manager()
+    request = SimpleNamespace(
+        request_id="req-short",
+        external_req_id="req-short",
+        output_token_ids=[1, 2, 3],
+        output_text="有。",
+        additional_information={
+            "tts_task_type": ["CustomVoice"],
+            "tts_speaker": ["Serena"],
+            "tts_language": ["Chinese"],
+        },
+        is_finished=lambda: False,
+    )
+    assert aura2tts_async_chunk(transfer_manager, None, request, is_finished=False) is None
+
+    request.output_text = "有。画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，他正面对着"
+    mid = aura2tts_async_chunk(transfer_manager, None, request, is_finished=False)
+    assert mid is not None
+    assert mid["text"] == ["有。画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，"]
+    # Merged emit uses proportional budget; solo "有。" would have been < 48.
+    assert mid["max_new_tokens"][0] == _estimate_tts_max_new_tokens(mid["text"][0], [])
+    assert _estimate_tts_max_new_tokens("有。", []) < 48
 
 
 def test_aura2tts_drops_silent_response():

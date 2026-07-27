@@ -86,6 +86,24 @@ python examples/online_serving/aura_omni/openai_chat_completion_client.py \
   --modalities text,audio
 ```
 
+## MiniCPM-style browser demo
+
+A browser UI modeled after the MiniCPM-o realtime demo is isolated under
+`examples/online_serving/aura_omni/minicpm_style_web_demo/`. The single-GPU
+demo profile can start AURA and the UI with one command:
+
+```bash
+bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_1gpu_demo_stack.sh
+```
+
+It uses a bundled speech sample and a generated frame for startup warmup, so
+normal browser use does not require the OmniInteract dataset. Smoke3 remains a
+separate, optional regression benchmark for measured accuracy and latency.
+
+See the demo's own
+[`README.md`](minicpm_style_web_demo/README.md) for controls, options, and the
+intentional non-full-duplex boundary.
+
 ## Stop the server
 
 ```bash

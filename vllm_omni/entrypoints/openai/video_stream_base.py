@@ -28,6 +28,8 @@ Protocol:
     Input audio: clients must send the full utterance as ``audio.chunk`` messages,
     then ``audio.done`` / ``audio.commit``. Pipelines that enable voice auto-trigger
     open a turn only after ``audio.done`` (not per chunk), when the turn lock is free.
+    If ``audio.done`` arrives while locked, the buffered utterance is retained and the
+    voice turn starts automatically once the lock clears.
 """
 
 import asyncio
@@ -330,6 +332,7 @@ class OmniStreamingVideoHandler:
             prev_request_id: str | None = None  # abort target iff prev was interrupted
             prev_was_interrupted: bool = False
             is_turn_locked: bool = False
+            pending_audio_done: bool = False
             interrupt_event = asyncio.Event()
             prewarm_tasks: set[asyncio.Task[Any]] = set()
             query_task: asyncio.Task[Any] | None = None
@@ -362,6 +365,38 @@ class OmniStreamingVideoHandler:
                 if active_request_id == request_id:
                     prev_request_id = request_id
                     active_request_id = None
+                await _flush_pending_audio_done()
+
+            async def _flush_pending_audio_done() -> None:
+                """Start a voice turn that arrived while the previous turn was locked."""
+                nonlocal pending_audio_done
+                if not pending_audio_done or len(audio_buffer) == 0:
+                    if len(audio_buffer) == 0:
+                        pending_audio_done = False
+                    return
+                if self.releases_turn_after_text_done():
+                    if is_turn_locked:
+                        return
+                elif active_request_id is not None or (query_task is not None and not query_task.done()):
+                    return
+                if not self.should_trigger_on_audio_done(
+                    has_audio=True,
+                    is_turn_locked=False,
+                ):
+                    pending_audio_done = False
+                    return
+                if not self.ensure_frames_for_audio_turn(
+                    frame_buffer,
+                    message_history,
+                    config,
+                ):
+                    await self._send_error(
+                        websocket,
+                        "No frames available for audio-triggered turn",
+                    )
+                    return
+                pending_audio_done = False
+                await _start_query_turn(query_text="")
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
 
@@ -487,6 +522,7 @@ class OmniStreamingVideoHandler:
                             is_turn_locked = False
                             prev_request_id = request_id
                             active_request_id = None
+                        await _flush_pending_audio_done()
 
                 query_task = asyncio.create_task(_run_query())
                 _register_query_task(query_task)
@@ -494,6 +530,7 @@ class OmniStreamingVideoHandler:
             async def _processor() -> None:
                 """Process enqueued messages."""
                 nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
+                nonlocal pending_audio_done
 
                 while True:
                     msg = await msg_queue.get()
@@ -603,9 +640,18 @@ class OmniStreamingVideoHandler:
                                 query_task is not None and not query_task.done()
                             )
                         has_audio = len(audio_buffer) > 0
+                        if not has_audio:
+                            pending_audio_done = False
+                            continue
+                        if audio_locked:
+                            # Keep the utterance and open a voice turn after unlock.
+                            # Dropping here would lose push-to-talk while silent/vision
+                            # turns hold the lock under continuous video.frame streaming.
+                            pending_audio_done = True
+                            continue
                         if not self.should_trigger_on_audio_done(
-                            has_audio=has_audio,
-                            is_turn_locked=audio_locked,
+                            has_audio=True,
+                            is_turn_locked=False,
                         ):
                             continue
                         if not self.ensure_frames_for_audio_turn(
@@ -618,6 +664,7 @@ class OmniStreamingVideoHandler:
                                 "No frames available for audio-triggered turn",
                             )
                             continue
+                        pending_audio_done = False
                         await _start_query_turn(query_text="")
 
                     elif msg_type == "video.query":

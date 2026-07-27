@@ -15,52 +15,55 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 ---
 
-## AURA Production 快速开始
+## AURA Web Demo 快速開始
 
-本分支专为 **AURA 实时音频／视频流式服务**整理，使用两张 CUDA GPU 运行
-`Qwen3-ASR → AURA → Qwen3-TTS → Code2Wav` pipeline，并使用 FlashInfer
-production 配置。
+本分支預設以瀏覽器 Web Demo 使用 AURA 即時音訊／視訊 pipeline：
+`Qwen3-ASR → AURA → Qwen3-TTS → Code2Wav`。
 
-全新环境只需先安装，再启动：
+全新環境先安裝，之後用一條指令同時啟動 AURA server、warmup 及
+瀏覽器 UI：
 
 ```bash
 bash scripts/install_aura_omni.sh
-CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
+bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_1gpu_demo_stack.sh
 ```
 
-确认服务及停止：
+終端顯示 `Demo ready` 後開啟當中 URL。停止 1-GPU Web Demo server：
 
 ```bash
-curl http://127.0.0.1:8666/v1/models
-bash scripts/stop_aura_omni.sh
+bash examples/online_serving/aura_omni/minicpm_style_web_demo/stop_1gpu_demo_stack.sh
 ```
 
-如果本地没有模型权重，首次启动会自动从 Hugging Face 下载三个公开模型，
-合计约 **26 GB**（ASR 约 4.4 GB、AURA 约 17 GB、TTS／Code2Wav 约 4.3 GB）；
-请另外预留安装依赖和缓存空间。
+如果本地沒有模型權重，首次啟動會自動從 Hugging Face 下載三個公開模型，
+合計約 **26 GB**（ASR 約 4.4 GB、AURA 約 17 GB、TTS／Code2Wav 約
+4.3 GB）；請另外預留安裝依賴和 cache 空間。
 
-如果本地已有模型权重，可直接指定路径启动，例如：
+如果本地已有 AURA 模型權重，可直接指定路徑：
 
 ```bash
 MODEL=/workspace/models/AURA \
-CUDA_VISIBLE_DEVICES=0,1 \
-bash scripts/start_aura_omni.sh
+bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_1gpu_demo_stack.sh
 ```
 
-需要 Linux、两张可用 CUDA GPU；自动下载时只需能访问 Hugging Face（通常无需额外登录或 token）。
+腳本會等待模型載入、執行一次內建 warmup，然後印出可開啟的 URL。
+warmup 使用 repo 已有的短語音及程式生成的影像，**毋須下載
+OmniInteract dataset**。介面會持續串流 camera frame，支援 proactive
+vision、push-to-talk、ASR 使用者文字、模型回覆及串流語音播放；目前是
+放開按鈕後送出整段語音，並非 full-duplex barge-in。
 
-### 运行 Smoke3 客户端 Demo
+### 執行 OmniInteract Smoke3 benchmark（可選）
 
-服务启动成功后，打开另一个终端，在仓库根目录运行：
+互動試用不需要 Smoke3。只有要量度準確度、TTFT／TPOT 或做 regression
+comparison 時，才需下載 OmniInteract 並執行：
 
 ```bash
 bash benchmarks/omniinteract/run_streaming_bench.sh
 ```
 
-默认已是 Smoke3：`CustomVoice` + `Vivian`，先用 `0001` 预热，再测
-`0002`、`0003`、`0004`；`0001` 不计入准确率或延迟。结果在
-`./omniinteract_bench/`。本地已有数据集时可加
-`DATASET_PATH=/path/to/OmniInteract`。
+benchmark 會先以 `0001` 完成整條 streaming session 作 warmup，再測
+`0002`、`0003`、`0004`；報表的準確率與 latency 統計排除 `0001`。
+結果寫入 `./omniinteract_bench/`，亦可用
+`DATASET_PATH=/path/to/OmniInteract` 指定現有 dataset。
 
 完整安装、WebSocket／HTTP 用法、离线模型及故障排查请看
 [`examples/online_serving/aura_omni/README.md`](examples/online_serving/aura_omni/README.md)。
