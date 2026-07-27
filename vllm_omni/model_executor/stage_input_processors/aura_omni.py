@@ -304,15 +304,18 @@ def _estimate_tts_max_new_tokens(text: str, content_ids: list[int], explicit: An
         except (TypeError, ValueError):
             pass
 
-    # Qwen3-TTS emits one layer-0 codec token per 12 Hz audio frame. Keep the
-    # default cap proportional to spoken text so bad EOS or degenerate AURA
-    # text does not run to the deploy-wide upper bound.
+    # Qwen3-TTS emits one layer-0 codec token per 12 Hz audio frame. Cap must
+    # stay close to real speech length: when CustomVoice EOS is late, the model
+    # fills until this budget (e.g. 8-char「好，我在这儿呢。」hit 61/62 → ~5s babble).
     #
-    # Avoid a flat 48-token (~4s) floor: short sentence emits like "有。" were
-    # getting multi-second filler/cough headroom under CustomVoice.
+    # Observed healthy rate ≈ 3–3.5 frames/char. Prefer spoken char count over
+    # AURA content_ids (subword count can inflate text-mode caps).
     spoken_chars = sum(1 for ch in text if not ch.isspace())
-    basis = max(spoken_chars, len(content_ids))
-    return min(1024, max(12, int(math.ceil(basis * 6 + 8))))
+    if spoken_chars > 0:
+        basis = spoken_chars
+    else:
+        basis = max(1, len(content_ids))
+    return min(1024, max(16, int(math.ceil(basis * 3.5 + 10))))
 
 
 def _normalize_qwen3_tts_speaker(speaker: Any) -> Any:
@@ -1310,6 +1313,61 @@ def _estimate_ref_code_len_from_ref_audio(ref_audio: Any) -> int | None:
     return None
 
 
+def _approx_qwen_token_count(text: str) -> int:
+    """Rough Qwen BPE length without loading a tokenizer.
+
+    CJK / CJK punctuation ≈ 1 token each; contiguous non-CJK (incl. spaces)
+    ≈ 1 token per 4 chars. Do **not** count spaces as their own tokens — that
+    inflated English ``tts_instruct`` (~144 chars) from real ~35 to ~62 and
+    zero-padded Talker prefill by ~100 (leading garbage / early cut).
+    """
+    if not text:
+        return 0
+    n = 0
+    i = 0
+    while i < len(text):
+        code = ord(text[i])
+        if (
+            0x4E00 <= code <= 0x9FFF
+            or 0x3400 <= code <= 0x4DBF
+            or 0x3000 <= code <= 0x303F
+            or 0xFF00 <= code <= 0xFFEF
+        ):
+            n += 1
+            i += 1
+            continue
+        j = i + 1
+        while j < len(text):
+            cj = ord(text[j])
+            if (
+                0x4E00 <= cj <= 0x9FFF
+                or 0x3400 <= cj <= 0x4DBF
+                or 0x3000 <= cj <= 0x303F
+                or 0xFF00 <= cj <= 0xFFEF
+            ):
+                break
+            j += 1
+        n += max(1, (j - i + 3) // 4)
+        i = j
+    return n
+
+
+def _estimate_instruct_prompt_tokens(instruct: str) -> int:
+    """Token length of ``build_instruct_text(instruct)`` without a tokenizer."""
+    body = instruct.strip() if isinstance(instruct, str) else ""
+    if not body:
+        return 0
+    # <|im_start|>user\n ... <|im_end|>\n ≈ 5 special/template tokens + body.
+    return 5 + _approx_qwen_token_count(body)
+
+
+def _estimate_assistant_prompt_tokens(text: str) -> int:
+    """Token length of ``build_assistant_text(text)`` without a tokenizer."""
+    body = text if isinstance(text, str) else ""
+    # Chat-template overhead (im_start/assistant/newlines/im_end) ≈ 8 tokens.
+    return max(8, 8 + _approx_qwen_token_count(body))
+
+
 def _estimate_tts_prompt_len_from_token_ids(
     token_ids: list[int],
     *,
@@ -1324,14 +1382,17 @@ def _estimate_tts_prompt_len_from_token_ids(
 
     This mirrors Qwen3-TTS prompt assembly at length level:
       prompt_len = instruct_len + role_len + codec_prefix_len + text/icl term
+
+    ``instruct_len`` must be a *token* estimate. Using ``len(instruct)`` chars
+    (e.g. 144 for the demo style string vs real ~40 tokens) zero-pads Talker
+    prefill by ~100 and causes leading garbage / truncated speech.
     """
 
     # Official defaults: Base -> streaming, others -> non-streaming.
     if non_streaming_mode is None:
         non_streaming_mode = task_type in ("CustomVoice", "VoiceDesign")
 
-    # We do not have tokenizer here; use char length as a monotonic proxy.
-    instruct_len = len(instruct.strip()) if isinstance(instruct, str) else 0
+    instruct_len = _estimate_instruct_prompt_tokens(instruct) if isinstance(instruct, str) else 0
     assistant_len = max(0, len(token_ids))
 
     # role_len = 3; codec_prefix_len = (prefill_len + speaker_len + 2) - 1
@@ -1501,13 +1562,18 @@ def build_tts_talker_input(
     }
     if pass_token_ids and assistant_token_ids:
         tts_info[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids]
+        length_token_ids = assistant_token_ids
     else:
         tts_info["text"] = [text]
+        # Text-mode TTS uses the Qwen3-TTS tokenizer on ``text``, not AURA
+        # content_ids. Prefer a text-length placeholder so prompt_len matches
+        # build_prompt_embeds (mismatched zeros → leading garbage / early cut).
+        length_token_ids = [0] * _estimate_assistant_prompt_tokens(text)
     if ref_code_len is not None:
         tts_info["ref_code_length"] = [int(ref_code_len)]
 
     prompt_len = _estimate_tts_prompt_len_from_token_ids(
-        assistant_token_ids if assistant_token_ids else [0] * max(0, len(text)),
+        length_token_ids,
         task_type=str(task_type),
         language=str(language),
         instruct=str(instruct),

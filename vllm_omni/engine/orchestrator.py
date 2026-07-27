@@ -180,7 +180,16 @@ def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) 
 
 
 def _extract_max_new_tokens_override(next_input: Any) -> int:
+    """Read TTS ``max_new_tokens`` from nested or flat stage payloads.
+
+    Nested OmniTokensPrompt uses ``additional_information.max_new_tokens``.
+    Flat async_chunk Talker payloads put ``max_new_tokens`` at the top level
+    (see ``_tts_payload_from_talker_input``).
+    """
     if isinstance(next_input, dict):
+        top = _coerce_int_scalar(next_input.get("max_new_tokens") or next_input.get("tts_max_new_tokens"))
+        if top > 0:
+            return top
         additional = next_input.get("additional_information")
     else:
         additional = getattr(next_input, "additional_information", None)
@@ -223,26 +232,32 @@ def build_engine_core_request_from_tokens(
         sampling_params = params.clone()
         if sampling_params.max_tokens is None and model_config is not None:
             sampling_params.max_tokens = model_config.max_model_len - len(prompt_token_ids)
+        requested_max_new_tokens = 0
         if isinstance(additional_info, dict):
             requested_max_new_tokens = _coerce_int_scalar(
                 additional_info.get("max_new_tokens") or additional_info.get("tts_max_new_tokens")
             )
-            if requested_max_new_tokens > 0:
-                sampling_params.max_tokens = (
-                    requested_max_new_tokens
-                    if sampling_params.max_tokens is None
-                    else min(int(sampling_params.max_tokens), requested_max_new_tokens)
-                )
-                logger.info(
-                    "[Orchestrator][TTS max_tokens] req=%s prompt_len=%d resumable=%s "
-                    "requested_max_new_tokens=%d effective_sampling_max_tokens=%s model_max_len=%s",
-                    request_id,
-                    len(prompt_token_ids),
-                    resumable,
-                    requested_max_new_tokens,
-                    sampling_params.max_tokens,
-                    getattr(model_config, "max_model_len", None),
-                )
+        if requested_max_new_tokens <= 0:
+            # Flat async_chunk Talker payload (max_new_tokens at top level).
+            requested_max_new_tokens = _coerce_int_scalar(
+                prompt.get("max_new_tokens") or prompt.get("tts_max_new_tokens")
+            )
+        if requested_max_new_tokens > 0:
+            sampling_params.max_tokens = (
+                requested_max_new_tokens
+                if sampling_params.max_tokens is None
+                else min(int(sampling_params.max_tokens), requested_max_new_tokens)
+            )
+            logger.info(
+                "[Orchestrator][TTS max_tokens] req=%s prompt_len=%d resumable=%s "
+                "requested_max_new_tokens=%d effective_sampling_max_tokens=%s model_max_len=%s",
+                request_id,
+                len(prompt_token_ids),
+                resumable,
+                requested_max_new_tokens,
+                sampling_params.max_tokens,
+                getattr(model_config, "max_model_len", None),
+            )
     else:
         pooling_params = params.clone()
 

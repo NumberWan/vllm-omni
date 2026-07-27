@@ -22,7 +22,10 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     resolve_aura_async_chunk_stage_payload,
     unpack_aura_video_ndarray,
     video_tuple_from_deferred_multi_modal,
+    _estimate_assistant_prompt_tokens,
+    _estimate_instruct_prompt_tokens,
     _estimate_tts_max_new_tokens,
+    _estimate_tts_prompt_len_from_token_ids,
     _pop_emit_ready_tts_text,
     _pop_native_tts_sentence,
 )
@@ -245,7 +248,9 @@ def test_aura2tts_supports_custom_voice_mode():
     assert tts_input["additional_information"]["task_type"] == ["CustomVoice"]
     assert tts_input["additional_information"]["speaker"] == ["Vivian"]
     assert "ref_audio" not in tts_input["additional_information"]
-    assert len(tts_input["prompt_token_ids"]) == 14
+    # Placeholder length ≈ real CustomVoice prefill for short English (was hardcoded
+    # 14 under AURA content_ids; text-mode estimate is intentionally nearby).
+    assert 10 <= len(tts_input["prompt_token_ids"]) <= 24
 
 
 def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
@@ -503,12 +508,71 @@ def test_pop_emit_ready_tts_text_holds_short_sentence_until_merge():
 
 
 def test_estimate_tts_max_new_tokens_scales_without_flat_48_floor():
-    # Solo "有。" must not keep the old ~4s (48-token) filler budget.
+    # Solo "有。" must not keep a multi-second filler budget.
     assert _estimate_tts_max_new_tokens("有。", []) < 48
-    assert _estimate_tts_max_new_tokens("有。", []) >= 12
+    assert _estimate_tts_max_new_tokens("有。", []) >= 16
     longer = _estimate_tts_max_new_tokens("画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，", [])
     assert longer > _estimate_tts_max_new_tokens("有。", [])
     assert _estimate_tts_max_new_tokens("x", [], explicit=96) == 96
+
+
+def test_estimate_tts_max_new_tokens_tight_for_short_chinese():
+    """Failed-EOS babble must not get a ~5s budget for an 8-char reply."""
+    text = "好，我在这儿呢。"
+    cap = _estimate_tts_max_new_tokens(text, [])
+    assert cap <= 40  # ~3.3s @ 12Hz; old chars*6+8 was ~56
+    # Text length wins over longer AURA content_ids in text-mode.
+    assert _estimate_tts_max_new_tokens(text, [0] * 20) == cap
+
+
+def test_estimate_tts_prompt_len_does_not_use_instruct_char_count():
+    """Long English instruct must not inflate prompt_len by ~100 zero pads."""
+    long_instruct = (
+        "Speak clearly and briskly. Start with the first word immediately. "
+        "Do not cough, clear your throat, sigh, moan, hum, laugh, or add filler sounds."
+    )
+    assert len(long_instruct) > 100
+    # Token estimate should be far below naive char length (~144) and near real ~40.
+    assert 30 <= _estimate_instruct_prompt_tokens(long_instruct) <= 50
+
+    text = "当然可以，我正看着你呢。"
+    length_ids = [0] * _estimate_assistant_prompt_tokens(text)
+    with_instruct = _estimate_tts_prompt_len_from_token_ids(
+        length_ids,
+        task_type="CustomVoice",
+        language="Chinese",
+        instruct=long_instruct,
+    )
+    without = _estimate_tts_prompt_len_from_token_ids(
+        length_ids,
+        task_type="CustomVoice",
+        language="Chinese",
+        instruct="",
+    )
+    # Old bug: instruct added +144; real TTS tokenizer adds ~40.
+    assert with_instruct - without < 55
+    # Absolute size near real tokenizer (~60 with instruct, ~20 without).
+    assert 45 <= with_instruct <= 80
+    assert 12 <= without <= 35
+
+
+def test_aura2tts_customvoice_prompt_len_stays_near_text_size():
+    long_instruct = (
+        "Speak clearly and briskly. Start with the first word immediately. "
+        "Do not cough, clear your throat, sigh, moan, hum, laugh, or add filler sounds."
+    )
+    prompt = {
+        "additional_information": {
+            "tts_task_type": ["CustomVoice"],
+            "tts_speaker": ["Serena"],
+            "tts_language": ["Chinese"],
+            "tts_instruct": [long_instruct],
+        }
+    }
+    [tts_input] = aura2tts([_source_output("当然可以，我正看着你呢。")], prompt=[prompt])
+    # Pre-fix this was ~164 (char-length instruct). Real tokenizer ≈ 60.
+    assert len(tts_input["prompt_token_ids"]) < 100
+    assert len(tts_input["prompt_token_ids"]) > 30
 
 
 def test_aura2tts_async_chunk_emits_mid_generation_sentence(monkeypatch):

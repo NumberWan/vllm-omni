@@ -521,9 +521,10 @@
           tts_task_type: config.ttsTaskType || 'CustomVoice',
           tts_language: config.ttsLanguage || 'Chinese',
           tts_speaker: config.ttsSpeaker || 'Vivian',
-          tts_instruct: config.ttsInstruct
-            || 'Speak clearly and briskly. Start with the first word immediately. '
-              + 'Do not cough, clear your throat, sigh, moan, hum, laugh, or add filler sounds.',
+          // Empty string is intentional (Native-aligned, no style instruct).
+          // Do not use `||` — falsy "" would re-inject a long English instruct
+          // and inflate Talker prompt_len by ~100 zero pads.
+          tts_instruct: (typeof config.ttsInstruct === 'string') ? config.ttsInstruct : '',
         };
         socket.send(JSON.stringify(session));
         runtimeDetail.textContent = `${captureRate} Hz capture / ${playbackRate} Hz playback`;

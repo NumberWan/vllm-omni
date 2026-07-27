@@ -16,10 +16,26 @@ from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, Omni
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
+    _apply_max_new_tokens_from_payload,
 )
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_apply_max_new_tokens_from_flat_talker_payload_clamps_request():
+    """async_chunk Talker prewarm keeps deploy max_tokens until payload arrives."""
+    sampling = SimpleNamespace(max_tokens=4096)
+    request = SimpleNamespace(request_id="video-x", sampling_params=sampling, max_tokens=4096)
+
+    effective = _apply_max_new_tokens_from_payload(
+        request,
+        {"prompt_token_ids": [0] * 14, "max_new_tokens": [26], "text": ["你好。"]},
+    )
+
+    assert effective == 26
+    assert request.max_tokens == 26
+    assert sampling.max_tokens == 26
 
 
 class DummyWaitingQueue(list):

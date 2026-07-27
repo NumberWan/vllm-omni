@@ -4,8 +4,8 @@
 #   bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_1gpu_demo_stack.sh
 #
 # Env overrides (optional): MODEL, CUDA_VISIBLE_DEVICES, AURA_PORT, DEMO_PORT,
-#   TTS_SPEAKER, VENV_DIR / VLLM_BIN / PYTHON_BIN (AURA), DEMO_PYTHON_BIN (UI),
-#   AURA_HF_HOME (writable HF cache; default ~/.cache/huggingface).
+#   TTS_SPEAKER, VLLM_AURA_SENTENCE_TTS, VENV_DIR / VLLM_BIN / PYTHON_BIN (AURA),
+#   DEMO_PYTHON_BIN (UI), AURA_HF_HOME (writable HF cache; default ~/.cache/huggingface).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,6 +16,10 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 export ALLOW_ONE_GPU="${ALLOW_ONE_GPU:-1}"
 export LOG_DIR="${LOG_DIR:-/tmp/aura_omni_1gpu_demo}"
 export DEPLOY="${DEPLOY:-$SCRIPT_DIR/aura_omni_1gpu_demo.yaml}"
+# Wait for full AURA text before TTS (CustomVoice one-shot cannot yet chain
+# mid-gen sentence payloads on the same request_id — later clauses get dropped).
+# Set VLLM_AURA_SENTENCE_TTS=1 to try per-sentence handoff / lower TTFP.
+export VLLM_AURA_SENTENCE_TTS="${VLLM_AURA_SENTENCE_TTS:-0}"
 
 export VENV_DIR="${VENV_DIR:-/home/wtk/test/.venv}"
 export VLLM_BIN="${VLLM_BIN:-$VENV_DIR/bin/vllm}"
@@ -41,7 +45,7 @@ mkdir -p "$HF_HOME" "$HF_MODULES_CACHE" "$HUGGINGFACE_HUB_CACHE"
 
 AURA_PORT_PREF="${AURA_PORT:-8666}"
 DEMO_PORT_PREF="${DEMO_PORT:-7862}"
-TTS_SPEAKER="${TTS_SPEAKER:-Serena}"
+TTS_SPEAKER="${TTS_SPEAKER:-Vivian}"
 PORT_SCAN_SPAN="${PORT_SCAN_SPAN:-40}"
 
 mkdir -p "$LOG_DIR"
@@ -112,6 +116,7 @@ WS_BACKEND="${WS_BACKEND:-ws://127.0.0.1:${PORT}}"
 
 echo "HF_HOME=$HF_HOME  (modules → $HF_MODULES_CACHE)"
 echo "AURA port=$PORT  demo port=$DEMO_PORT"
+
 
 if aura_ready_on "$PORT"; then
   echo "AURA already ready on :${PORT} — skipping start"

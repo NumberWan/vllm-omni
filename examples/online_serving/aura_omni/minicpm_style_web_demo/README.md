@@ -29,12 +29,17 @@ bash examples/online_serving/aura_omni/minicpm_style_web_demo/stop_1gpu_demo_sta
 ```
 
 Defaults match the single-GPU pack (`CUDA_VISIBLE_DEVICES=3`,
-`aura_omni_1gpu_demo.yaml`, Serena). If `:8666` / `:7862` are busy, the
+`aura_omni_1gpu_demo.yaml`, Vivian, empty TTS instruct). If `:8666` / `:7862` are busy, the
 script picks the next free ports. It forces a writable `HF_HOME` under
 `~/.cache/huggingface` so a parent-shell `HF_HOME=/workspace/model` does
 not hit PermissionError. Override with env vars if needed
 (`MODEL`, `CUDA_VISIBLE_DEVICES`, `TTS_SPEAKER`, `AURA_PORT`, `DEMO_PORT`,
-`AURA_HF_HOME`, …).
+`AURA_HF_HOME`, `VLLM_AURA_SENTENCE_TTS`, …).
+
+By default the 1-GPU demo sets `VLLM_AURA_SENTENCE_TTS=0` so AURA finishes the
+full reply before TTS (CustomVoice cannot yet chain mid-gen sentence payloads
+on one request). Set `VLLM_AURA_SENTENCE_TTS=1` for lower TTFP (requires AURA
+restart).
 
 Open `http://127.0.0.1:7862/` after startup (the launcher prints a clickable
 `>>> Demo ready — click to open: ...` line). In Cursor Remote SSH,

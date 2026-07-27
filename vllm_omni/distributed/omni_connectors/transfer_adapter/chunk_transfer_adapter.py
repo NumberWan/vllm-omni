@@ -61,6 +61,71 @@ def _replace_request_prompt_token_ids(request: Any, prompt_token_ids: list[int])
     return True
 
 
+def _coerce_positive_int(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            coerced = _coerce_positive_int(item)
+            if coerced > 0:
+                return coerced
+        return 0
+    if hasattr(value, "item"):
+        value = value.item()
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return coerced if coerced > 0 else 0
+
+
+def _extract_max_new_tokens_from_payload(payload_data: Any) -> int:
+    """Read Talker length cap from flat or nested async_chunk payloads."""
+    if not isinstance(payload_data, dict):
+        return 0
+    top = _coerce_positive_int(payload_data.get("max_new_tokens") or payload_data.get("tts_max_new_tokens"))
+    if top > 0:
+        return top
+    additional = payload_data.get("additional_information")
+    if isinstance(additional, dict):
+        return _coerce_positive_int(additional.get("max_new_tokens") or additional.get("tts_max_new_tokens"))
+    return 0
+
+
+def _apply_max_new_tokens_from_payload(request: Any, payload_data: Any) -> int:
+    """Clamp prewarmed Talker ``max_tokens`` using payload ``max_new_tokens``.
+
+    async_chunk prewarms Stage2 with deploy default ``max_tokens`` (often 4096).
+    The real TTS payload later arrives over SharedMemory with a text-proportional
+    ``max_new_tokens`` cap, but without this clamp the Talker can babble for many
+    seconds when EOS is late (e.g. ``你好。`` → 200 frames / ~16s).
+    """
+    max_new_tokens = _extract_max_new_tokens_from_payload(payload_data)
+    if max_new_tokens <= 0:
+        return 0
+
+    sampling_params = getattr(request, "sampling_params", None)
+    if sampling_params is not None and getattr(sampling_params, "max_tokens", None) is not None:
+        sampling_params.max_tokens = min(int(sampling_params.max_tokens), max_new_tokens)
+
+    current = getattr(request, "max_tokens", None)
+    if current is None:
+        request.max_tokens = max_new_tokens
+        effective = max_new_tokens
+    else:
+        effective = min(int(current), max_new_tokens)
+        request.max_tokens = effective
+
+    if effective != current:
+        logger.info(
+            "[async_chunk] req=%s applied max_new_tokens=%d (was max_tokens=%s)",
+            getattr(request, "request_id", None),
+            effective,
+            current,
+        )
+    return effective
+
+
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     """Chunk-level transfer adapter for Omni connector pipelines.
 
@@ -320,6 +385,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # Qwen3-TTS Talker payloads are flat dicts with top-level
                     # ``text`` / ``speaker`` / … — preserve previous behavior.
                     request.additional_information = payload_data
+                    # Prewarm used deploy default max_tokens; clamp from payload.
+                    _apply_max_new_tokens_from_payload(request, payload_data)
                 if chunk_id > 0 and request.resumable:
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)

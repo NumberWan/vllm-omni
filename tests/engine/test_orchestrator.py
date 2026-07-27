@@ -169,6 +169,21 @@ def test_tts_max_new_tokens_overrides_token_request_sampling_params() -> None:
     assert request.sampling_params.max_tokens == 96
 
 
+def test_tts_max_new_tokens_flat_payload_overrides_sampling_params() -> None:
+    """async_chunk Talker payloads put max_new_tokens at the top level."""
+    request = build_engine_core_request_from_tokens(
+        "req-tts-flat",
+        {
+            "prompt_token_ids": [0, 0],
+            "max_new_tokens": [26],
+            "text": ["你好。"],
+        },
+        SamplingParams(max_tokens=4096),
+    )
+
+    assert request.sampling_params.max_tokens == 26
+
+
 def test_next_input_max_new_tokens_overrides_sampling_params_clone() -> None:
     params = SamplingParams(max_tokens=4096)
     next_input = {
@@ -181,6 +196,19 @@ def test_next_input_max_new_tokens_overrides_sampling_params_clone() -> None:
     assert overridden is not params
     assert overridden.max_tokens == 96
     assert params.max_tokens == 4096
+
+
+def test_next_input_flat_max_new_tokens_overrides_sampling_params_clone() -> None:
+    params = SamplingParams(max_tokens=4096)
+    next_input = {
+        "prompt_token_ids": [0, 0],
+        "max_new_tokens": [26],
+        "text": ["你好。"],
+    }
+
+    overridden = _apply_next_input_max_tokens_override(params, next_input)
+
+    assert overridden.max_tokens == 26
 
 
 class FakeCollectiveRpcStageClient(FakeStageClient):

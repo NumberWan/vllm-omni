@@ -34,10 +34,7 @@ STREAM_PATH = "/v1/video/chat/stream"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_WARMUP_AUDIO = REPO_ROOT / "tests/assets/glm_tts/jiayan_zh.wav"
 TTS_DUMP_DIR = Path(os.environ.get("AURA_TTS_DUMP_DIR", "/tmp/aura_web_demo_tts"))
-DEFAULT_TTS_INSTRUCT = (
-    "Speak clearly and briskly. Start with the first word immediately. "
-    "Do not cough, clear your throat, sigh, moan, hum, laugh, or add filler sounds."
-)
+DEFAULT_TTS_INSTRUCT = ""
 
 
 def join_ws_url(base: str, path: str, query: str = "") -> str:
@@ -414,7 +411,7 @@ def main() -> None:
     parser.add_argument(
         "--tts-instruct",
         default="",
-        help="CustomVoice style instruction (default: clean/brisk speech, no coughs).",
+        help="CustomVoice style instruction (default: empty, matches Native).",
     )
     parser.add_argument(
         "--warmup-audio",
