@@ -35,16 +35,18 @@ different environment.
 
 ### API-only quick start
 
-Two GPUs; auto-loads the default deploy yaml
-(`vllm_omni/deploy/aura_omni.yaml`):
+Auto-loads the default deploy yaml (`vllm_omni/deploy/aura_omni.yaml`).
+Stages pin visible devices `0`/`1`, so without `CUDA_VISIBLE_DEVICES` this
+uses physical GPUs 0 and 1:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 vllm serve aurateam/AURA --omni
+vllm serve aurateam/AURA --omni
 ```
 
 Use a local checkpoint path instead of the Hub id when weights are already
 on disk (`vllm serve /path/to/AURA --omni`). Add `--port 8666` if you need a
-fixed port (vLLM defaults to `8000`).
+fixed port (vLLM defaults to `8000`). Set `CUDA_VISIBLE_DEVICES` only when
+you need other cards (for example `2,3`).
 
 ### Helper script (background + checks)
 

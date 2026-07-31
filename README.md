@@ -28,10 +28,10 @@ bash scripts/install_aura_omni.sh
 
 ### 只需 API／WebSocket 接口
 
-兩張 GPU、自動載入預設 deploy yaml（`vllm_omni/deploy/aura_omni.yaml`）：
+自動載入預設 deploy yaml（`vllm_omni/deploy/aura_omni.yaml`）；預設用實體 GPU 0、1：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 vllm serve aurateam/AURA --omni
+vllm serve aurateam/AURA --omni
 ```
 
 健康檢查：
@@ -42,7 +42,8 @@ curl http://127.0.0.1:8000/v1/models
 
 本地已有權重時，把模型路徑換成本地目錄即可，例如
 `vllm serve /workspace/models/AURA --omni`。預設 HTTP 埠為 `8000`；
-需要固定埠時加 `--port 8666`。
+需要固定埠時加 `--port 8666`。要用其他卡時再設
+`CUDA_VISIBLE_DEVICES`（例如 `2,3`）。
 
 ### 需要瀏覽器 Web Demo
 
