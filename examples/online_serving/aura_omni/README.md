@@ -33,6 +33,21 @@ different environment.
 
 ## Start the server
 
+### API-only quick start
+
+Two GPUs; auto-loads the default deploy yaml
+(`vllm_omni/deploy/aura_omni.yaml`):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 vllm serve aurateam/AURA --omni
+```
+
+Use a local checkpoint path instead of the Hub id when weights are already
+on disk (`vllm serve /path/to/AURA --omni`). Add `--port 8666` if you need a
+fixed port (vLLM defaults to `8000`).
+
+### Helper script (background + checks)
+
 From the repository root:
 
 ```bash

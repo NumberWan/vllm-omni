@@ -15,35 +15,59 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 ---
 
-## AURA Web Demo 快速開始
+## AURA 快速開始
 
-本分支預設以瀏覽器 Web Demo 使用 AURA 即時音訊／視訊 pipeline：
+本分支提供 AURA 即時音訊／視訊 pipeline：
 `Qwen3-ASR → AURA → Qwen3-TTS → Code2Wav`。
 
-全新環境先安裝，之後用一條指令同時啟動 AURA server、warmup 及
-瀏覽器 UI：
+全新環境先安裝：
 
 ```bash
 bash scripts/install_aura_omni.sh
+```
+
+### 只需 API／WebSocket 接口
+
+兩張 GPU、自動載入預設 deploy yaml（`vllm_omni/deploy/aura_omni.yaml`）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 vllm serve aurateam/AURA --omni
+```
+
+健康檢查：
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+```
+
+本地已有權重時，把模型路徑換成本地目錄即可，例如
+`vllm serve /workspace/models/AURA --omni`。預設 HTTP 埠為 `8000`；
+需要固定埠時加 `--port 8666`。
+
+### 需要瀏覽器 Web Demo
+
+一條指令同時啟動 AURA server、warmup 及瀏覽器 UI（1-GPU demo profile）：
+
+```bash
 bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_1gpu_demo_stack.sh
 ```
 
-終端顯示 `Demo ready` 後開啟當中 URL。停止 1-GPU Web Demo server：
+終端顯示 `Demo ready` 後開啟當中 URL。停止：
 
 ```bash
 bash examples/online_serving/aura_omni/minicpm_style_web_demo/stop_1gpu_demo_stack.sh
 ```
 
-如果本地沒有模型權重，首次啟動會自動從 Hugging Face 下載三個公開模型，
-合計約 **26 GB**（ASR 約 4.4 GB、AURA 約 17 GB、TTS／Code2Wav 約
-4.3 GB）；請另外預留安裝依賴和 cache 空間。
-
-如果本地已有 AURA 模型權重，可直接指定路徑：
+本地已有 AURA 權重時：
 
 ```bash
 MODEL=/workspace/models/AURA \
 bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_1gpu_demo_stack.sh
 ```
+
+如果本地沒有模型權重，首次啟動會自動從 Hugging Face 下載三個公開模型，
+合計約 **26 GB**（ASR 約 4.4 GB、AURA 約 17 GB、TTS／Code2Wav 約
+4.3 GB）；請另外預留安裝依賴和 cache 空間。
 
 腳本會等待模型載入、執行一次內建 warmup，然後印出可開啟的 URL。
 warmup 使用 repo 已有的短語音及程式生成的影像，**毋須下載

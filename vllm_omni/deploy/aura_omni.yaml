@@ -1,6 +1,5 @@
-# Recommended 2-GPU production profile: aura_omni_2gpu_best.yaml (FI + seqs4 + mem15 + chunk20).
-# This file remains a generic template (model paths may differ).
-# AURA Omni deploy profile: Qwen3-ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Code2Wav.
+# Default 2-GPU streaming profile: Qwen3-ASR -> AURA/Qwen3-VL ->
+# Qwen3-TTS Talker -> Code2Wav.
 #
 # Pass `--deploy-config vllm_omni/deploy/aura_omni.yaml` and point the parent
 # `--model` at any local placeholder repo if needed; each stage overrides its
@@ -19,9 +18,10 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: 25
+      codec_chunk_frames: 20
       codec_left_context_frames: 72
-      initial_codec_chunk_frames: 1
+      # A 1-frame first emit is too short for a stable spoken onset.
+      initial_codec_chunk_frames: 8
       decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
 
 stages:
@@ -81,14 +81,14 @@ stages:
     model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
     # model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
     default_sampling_params:
-      temperature: 0.9
+      temperature: 0.65
       top_k: 50
       max_tokens: 4096
-      seed: 42
+      min_tokens: 8
       repetition_penalty: 1.05
     subtalker_sampling_params:
       do_sample: true
-      temperature: 0.9
+      temperature: 0.65
       top_k: 50
       top_p: 1.0
 
