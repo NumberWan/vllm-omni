@@ -20,6 +20,8 @@ export DEPLOY="${DEPLOY:-$SCRIPT_DIR/aura_omni_1gpu_demo.yaml}"
 # mid-gen sentence payloads on the same request_id — later clauses get dropped).
 # Set VLLM_AURA_SENTENCE_TTS=1 to try per-sentence handoff / lower TTFP.
 export VLLM_AURA_SENTENCE_TTS="${VLLM_AURA_SENTENCE_TTS:-0}"
+# Stage1 aura2tts prompt_len uses this tokenizer (must match Stage2 Talker embeds).
+export VLLM_AURA_TTS_TOKENIZER="${VLLM_AURA_TTS_TOKENIZER:-/workspace/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe}"
 
 export VENV_DIR="${VENV_DIR:-/home/wtk/test/.venv}"
 export VLLM_BIN="${VLLM_BIN:-$VENV_DIR/bin/vllm}"
@@ -46,6 +48,9 @@ mkdir -p "$HF_HOME" "$HF_MODULES_CACHE" "$HUGGINGFACE_HUB_CACHE"
 AURA_PORT_PREF="${AURA_PORT:-8666}"
 DEMO_PORT_PREF="${DEMO_PORT:-7862}"
 TTS_SPEAKER="${TTS_SPEAKER:-Vivian}"
+# Empty instruct. Uncle_fu/Ryan often OK on short confirms but long vision
+# descriptions dump as cough/「嗯」on Omni CustomVoice — keep Vivian for demo.
+TTS_INSTRUCT="${TTS_INSTRUCT:-}"
 PORT_SCAN_SPAN="${PORT_SCAN_SPAN:-40}"
 
 mkdir -p "$LOG_DIR"
@@ -147,5 +152,6 @@ exec env \
   MODEL="$MODEL" \
   WS_BACKEND="$WS_BACKEND" \
   TTS_SPEAKER="$TTS_SPEAKER" \
+  TTS_INSTRUCT="$TTS_INSTRUCT" \
   PORT="$DEMO_PORT" \
   bash "$SCRIPT_DIR/run_demo.sh"

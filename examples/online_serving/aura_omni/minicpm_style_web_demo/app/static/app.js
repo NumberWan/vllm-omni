@@ -23,7 +23,9 @@
 
   const INPUT_RATE = 16000;
   const OUTPUT_RATE = 24000;
-  const INITIAL_PLAYBACK_BUFFER_MS = 400;
+  // Client-only speed. Default 1.0 = bit-identical to dump (WSOLA 1.5x was unstable).
+  const PLAYBACK_SPEED = Number(config.playbackSpeed) > 0 ? Number(config.playbackSpeed) : 1.0;
+  const INITIAL_PLAYBACK_BUFFER_MS = 500;
   const ECHO_GUARD_MS = 300;
   const AUDIO_CHUNK_BYTES = 16000 * 2;
   const SILENT_TOKEN = '<|silent|>';
@@ -57,14 +59,19 @@
   let playbackRate = OUTPUT_RATE;
   let pendingCapture = [];
   let responseHasAudio = false;
+  // Pause camera while a spoken TTS turn is in flight so silent vision turns
+  // do not hit Stage2 (max_num_seqs=1) and corrupt Talker output.
+  let holdCameraForSpeech = false;
   let logCount = 0;
   let liveAssistantTurn = null;
   let assistantRawText = '';
   let pendingUserTurns = [];
   let framesSent = 0;
   let turnsSeen = 0;
-  let spokenPlaybackTurn = 0;
+  let activePlaybackRequestId = null;
   let lastCameraFrame = null;
+  // Serialize decode→enqueue so parallel decodeAudioData cannot reorder chunks.
+  let playbackChain = Promise.resolve();
 
   function staticAssetUrl(path) {
     const version = String(config.appVersion || '').trim();
@@ -343,6 +350,7 @@
   function sendCameraFrame(frameB64) {
     if (!frameB64) return;
     lastCameraFrame = frameB64;
+    if (holdCameraForSpeech || responseHasAudio || activePlaybackRequestId) return;
     if (sendJson({ type: 'video.frame', data: frameB64 })) {
       framesSent += 1;
       if (framesSent === 1 || framesSent % 10 === 0) {
@@ -360,26 +368,64 @@
     playbackNode.port.postMessage({
       type: 'audio',
       pcm,
-      responseId: `turn-${turnsSeen}`,
+      responseId: activePlaybackRequestId || `turn-${turnsSeen}`,
       initialBufferMs: INITIAL_PLAYBACK_BUFFER_MS,
     }, [pcm.buffer]);
   }
 
   function requestPlaybackDrain() {
     if (!playbackNode) return;
-    playbackNode.port.postMessage({ type: 'drain', responseId: `turn-${turnsSeen}` });
+    playbackNode.port.postMessage({
+      type: 'drain',
+      responseId: activePlaybackRequestId || `turn-${turnsSeen}`,
+    });
   }
 
   function clearPlayback() {
     // Drop queued spoken audio. Never call this for <|silent|> turns.
+    playbackChain = Promise.resolve();
+    activePlaybackRequestId = null;
+    holdCameraForSpeech = false;
     if (!playbackNode) return;
     playbackNode.port.postMessage({ type: 'clear' });
     responseHasAudio = false;
     setPlayback('Idle');
   }
 
+  function bindPlaybackRequest(rid) {
+    // Switch spoken request without transiently nulling activePlaybackRequestId
+    // (that race dropped in-flight decode chunks for the new rid).
+    if (activePlaybackRequestId === rid) return;
+    playbackChain = Promise.resolve();
+    if (playbackNode) playbackNode.port.postMessage({ type: 'clear' });
+    responseHasAudio = false;
+    activePlaybackRequestId = rid;
+    holdCameraForSpeech = true;
+    setPlayback('Buffering');
+  }
+
+  function enqueuePlaybackDelta(event) {
+    const rid = eventRequestId(event) || `legacy-${turnsSeen}`;
+    playbackChain = playbackChain
+      .then(async () => {
+        // Skip stale chunks after clearPlayback / request switch.
+        if (activePlaybackRequestId !== rid) return;
+        const decoded = await decodeAudioDelta(event);
+        if (activePlaybackRequestId !== rid) return;
+        feedPlayback(decoded);
+      })
+      .catch((error) => appendLog(`audio decode failed: ${error.message || error}`, true));
+  }
+
+  function eventRequestId(event) {
+    const rid = event && event.request_id;
+    return rid ? String(rid) : null;
+  }
+
   function playbackDrained(message) {
     setPlayback('Idle');
+    holdCameraForSpeech = false;
+    activePlaybackRequestId = null;
     if (message.underrunMs > 0) appendLog(`playback underrun ${message.underrunMs} ms`);
     window.setTimeout(() => {
       assistantActive = false;
@@ -411,28 +457,36 @@
         const text = event.text || '';
         finishTranscript(text);
         if (text.includes(SILENT_TOKEN)) {
+          holdCameraForSpeech = false;
           setModel(muted ? 'Idle' : 'Listening');
           assistantActive = false;
         } else if (!responseHasAudio) {
+          holdCameraForSpeech = true;
           setModel('Speaking');
         }
         break;
       }
-      case 'response.audio.delta':
-        // Only clear when a new spoken turn begins — silent turns never reach here.
-        if (spokenPlaybackTurn !== turnsSeen) {
-          clearPlayback();
-          spokenPlaybackTurn = turnsSeen;
-        }
+      case 'response.audio.delta': {
+        // Bind playback to request_id. Silent vision turns also bump turnsSeen via
+        // response.start; clearing on turnsSeen would wipe in-flight spoken audio
+        // while dump (grouped by request_id) stays complete.
+        const rid = eventRequestId(event) || `legacy-${turnsSeen}`;
+        bindPlaybackRequest(rid);
         assistantActive = true;
         setModel('Speaking');
-        decodeAudioDelta(event)
-          .then((decoded) => feedPlayback(decoded))
-          .catch((error) => appendLog(`audio decode failed: ${error.message || error}`, true));
+        enqueuePlaybackDelta(event);
         break;
-      case 'response.audio.done':
-        requestPlaybackDrain();
+      }
+      case 'response.audio.done': {
+        const rid = eventRequestId(event);
+        // Ignore done from a non-active request (overlapping silent / stale turns).
+        if (rid && activePlaybackRequestId && rid !== activePlaybackRequestId) break;
+        // Drain only after in-flight ordered decodes finish.
+        playbackChain = playbackChain
+          .then(() => { requestPlaybackDrain(); })
+          .catch(() => { requestPlaybackDrain(); });
         break;
+      }
       case 'session.done':
         appendLog('session.done');
         if (running) stopSession({ terminal: false });
@@ -453,6 +507,7 @@
     playbackRate = playbackContext.sampleRate;
     await playbackContext.audioWorklet.addModule(staticAssetUrl('static/playback_worklet.js'));
     playbackNode = new AudioWorkletNode(playbackContext, 'fullduplex-pcm-playback');
+    playbackNode.port.postMessage({ type: 'config', playbackSpeed: PLAYBACK_SPEED });
     playbackNode.port.onmessage = (message) => {
       if (message.data.type === 'playback-started') setPlayback('Playing');
       else if (message.data.type === 'playback-drained') playbackDrained(message.data);
@@ -462,6 +517,7 @@
     };
     playbackNode.connect(playbackContext.destination);
     await playbackContext.resume();
+    appendLog(`playback speed ${PLAYBACK_SPEED}x (1.0 = dump-identical; dump unchanged)`);
   }
 
   function audioConstraints() {
@@ -583,7 +639,7 @@
       assistantActive = false;
       framesSent = 0;
       turnsSeen = 0;
-      spokenPlaybackTurn = 0;
+      activePlaybackRequestId = null;
       startClock();
       callButton.textContent = 'End session';
       callButton.classList.add('is-active');
@@ -727,6 +783,7 @@
       }
       closingSocket.close(1000, 'client stop');
     }
+    playbackChain = Promise.resolve();
     if (playbackNode) playbackNode.port.postMessage({ type: 'clear' });
     if (mediaStream) {
       for (const track of mediaStream.getTracks()) track.stop();
@@ -745,7 +802,7 @@
     pendingUserTurns = [];
     framesSent = 0;
     turnsSeen = 0;
-    spokenPlaybackTurn = 0;
+    activePlaybackRequestId = null;
     lastCameraFrame = null;
     meterFill.style.width = '0%';
     sessionTimer.textContent = '00:00';

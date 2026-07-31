@@ -9,7 +9,7 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import soundfile as sf
@@ -70,6 +70,8 @@ DEFAULT_QWEN3_TTS_REF_AUDIO = "vllm-omni/tests/assets/qwen3_tts/clone_2.wav"
 DEFAULT_QWEN3_TTS_REF_TEXT = (
     "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 )
+# Used only to size Talker prompt_token_ids placeholders (must match build_prompt_embeds).
+DEFAULT_QWEN3_TTS_TOKENIZER = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
 _AURA_TTS_INFO_KEYS = (
     "tts_task_type",
@@ -84,6 +86,119 @@ _AURA_TTS_INFO_KEYS = (
     "tts_ref_code_length",
     "tts_pass_token_ids",
 )
+
+# Lazy cache: (path, tokenizer, codec_language_id, spk_is_dialect)
+_qwen3_tts_prompt_len_cache: dict[str, Any] | None = None
+
+
+def _resolve_qwen3_tts_tokenizer_path(additional_info: dict[str, Any] | None = None) -> str:
+    """Resolve Qwen3-TTS tokenizer / config path for prompt_len parity."""
+    if additional_info:
+        for key in ("tts_tokenizer", "tts_model", "qwen3_tts_model"):
+            raw = _first_value(additional_info.get(key), None)
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+    for env_key in ("VLLM_AURA_TTS_TOKENIZER", "VLLM_AURA_TTS_MODEL"):
+        env = os.environ.get(env_key, "").strip()
+        if env:
+            return env
+    # Prefer a local CustomVoice snapshot when present (demo / shared model cache).
+    for candidate in (
+        "/workspace/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe",
+        str(Path.home() / ".cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice"),
+    ):
+        if Path(candidate).is_dir() and (Path(candidate) / "tokenizer_config.json").is_file():
+            return candidate
+        # Hub layout may be snapshots/<hash>/
+        snaps = Path(candidate) / "snapshots"
+        if snaps.is_dir():
+            for snap in sorted(snaps.iterdir()):
+                if (snap / "tokenizer_config.json").is_file():
+                    return str(snap)
+    return DEFAULT_QWEN3_TTS_TOKENIZER
+
+
+def _load_qwen3_tts_prompt_len_tools(
+    additional_info: dict[str, Any] | None = None,
+) -> tuple[Any, Mapping[str, int] | None, Mapping[str, object] | None] | None:
+    """Load tokenizer + talker dialect maps for official prompt_len estimate."""
+    global _qwen3_tts_prompt_len_cache
+    path = _resolve_qwen3_tts_tokenizer_path(additional_info)
+    if (
+        isinstance(_qwen3_tts_prompt_len_cache, dict)
+        and _qwen3_tts_prompt_len_cache.get("path") == path
+        and _qwen3_tts_prompt_len_cache.get("tokenizer") is not None
+    ):
+        return (
+            _qwen3_tts_prompt_len_cache["tokenizer"],
+            _qwen3_tts_prompt_len_cache.get("codec_language_id"),
+            _qwen3_tts_prompt_len_cache.get("spk_is_dialect"),
+        )
+    try:
+        from transformers import AutoConfig, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            path,
+            trust_remote_code=True,
+            padding_side="left",
+        )
+        codec_language_id = None
+        spk_is_dialect = None
+        try:
+            hf_config = AutoConfig.from_pretrained(path, trust_remote_code=True)
+            talker_config = getattr(hf_config, "talker_config", None) or hf_config
+            codec_language_id = getattr(talker_config, "codec_language_id", None)
+            spk_is_dialect = getattr(talker_config, "spk_is_dialect", None)
+        except Exception as cfg_err:
+            # Snapshot JSON fallback when Transformers rejects qwen3_tts arch.
+            cfg_path = Path(path) / "config.json"
+            if cfg_path.is_file():
+                raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+                talker = raw.get("talker_config") if isinstance(raw.get("talker_config"), dict) else raw
+                codec_language_id = talker.get("codec_language_id")
+                spk_is_dialect = talker.get("spk_is_dialect")
+            else:
+                logger.warning("Qwen3-TTS talker_config unavailable for prompt_len (%s): %s", path, cfg_err)
+        _qwen3_tts_prompt_len_cache = {
+            "path": path,
+            "tokenizer": tokenizer,
+            "codec_language_id": codec_language_id,
+            "spk_is_dialect": spk_is_dialect,
+        }
+        return tokenizer, codec_language_id, spk_is_dialect
+    except Exception as e:
+        logger.warning("Failed to load Qwen3-TTS tokenizer for prompt_len (%s): %s", path, e)
+        return None
+
+
+def _estimate_tts_prompt_len_official(
+    tts_info: dict[str, Any],
+    *,
+    task_type: str,
+    additional_info: dict[str, Any] | None = None,
+) -> int | None:
+    """Match standalone speech API: real BPE + estimate_prompt_len_from_additional_information."""
+    tools = _load_qwen3_tts_prompt_len_tools(additional_info)
+    if tools is None:
+        return None
+    tokenizer, codec_language_id, spk_is_dialect = tools
+    try:
+        from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+            Qwen3TTSPromptEmbedsBuilder,
+        )
+
+        return int(
+            Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+                additional_information=tts_info,
+                task_type=task_type,
+                tokenize_prompt=lambda t: tokenizer(t, padding=False)["input_ids"],
+                codec_language_id=codec_language_id if isinstance(codec_language_id, dict) else None,
+                spk_is_dialect=spk_is_dialect if isinstance(spk_is_dialect, dict) else None,
+            )
+        )
+    except Exception as e:
+        logger.warning("Official Qwen3-TTS prompt_len estimate failed; falling back to heuristic: %s", e)
+        return None
 
 
 def default_qwen3_tts_ref_audio_path() -> str:
@@ -1571,16 +1686,8 @@ def build_tts_talker_input(
         length_token_ids = [0] * _estimate_assistant_prompt_tokens(text)
     if ref_code_len is not None:
         tts_info["ref_code_length"] = [int(ref_code_len)]
-
-    prompt_len = _estimate_tts_prompt_len_from_token_ids(
-        length_token_ids,
-        task_type=str(task_type),
-        language=str(language),
-        instruct=str(instruct),
-        x_vector_only_mode=x_vector_only_mode,
-        non_streaming_mode=non_streaming_mode,
-        ref_code_len=ref_code_len,
-    )
+    if isinstance(non_streaming_mode, bool):
+        tts_info["non_streaming_mode"] = [non_streaming_mode]
 
     if task_type == "Base":
         ref_audio = ref_audio or _first_value(additional_info.get("tts_ref_audio"), None)
@@ -1594,6 +1701,26 @@ def build_tts_talker_input(
         tts_info["x_vector_only_mode"] = [x_vector_only_mode]
     elif task_type == "CustomVoice":
         tts_info["speaker"] = [_normalize_qwen3_tts_speaker(_first_value(additional_info.get("tts_speaker"), "Vivian"))]
+
+    # Prefer official BPE prompt_len (same as serving_speech) so placeholder
+    # length matches Talker build_prompt_embeds. Heuristic only as fallback.
+    prompt_len = None
+    if not (pass_token_ids and assistant_token_ids):
+        prompt_len = _estimate_tts_prompt_len_official(
+            tts_info,
+            task_type=str(task_type),
+            additional_info=additional_info,
+        )
+    if prompt_len is None:
+        prompt_len = _estimate_tts_prompt_len_from_token_ids(
+            length_token_ids,
+            task_type=str(task_type),
+            language=str(language),
+            instruct=str(instruct),
+            x_vector_only_mode=x_vector_only_mode,
+            non_streaming_mode=non_streaming_mode,
+            ref_code_len=ref_code_len,
+        )
 
     logger.info(
         "[aura2tts] build talker input task=%s language=%s speaker=%s text_len=%d "

@@ -348,9 +348,18 @@ def talker2code2wav_async_chunk(
         meta.ref_context_included = ref_context_included
 
     emitted_frames_by_req[request_id] = length
+    # RCA: layer0 stats on newly emitted frames (not left-context). Low uniq +
+    # full-duration filler ASR points at Talker codes, not Code2Wav decode.
+    new_layer0 = [
+        int(frame[0])
+        for frame in transfer_manager.code_prompt_token_ids[request_id][emitted_frames:length]
+        if isinstance(frame, (list, tuple)) and frame
+    ]
+    layer0_uniq = len(set(new_layer0)) if new_layer0 else 0
     logger.info(
         "[talker2code2wav_async_chunk] req=%s emitting chunk new_frames=%d emitted_frames=%d/%d "
-        "target_new_frames=%d finished=%s left_context=%d ref_context=%d",
+        "target_new_frames=%d finished=%s left_context=%d ref_context=%d "
+        "layer0_uniq=%d layer0_head=%s layer0_tail=%s",
         request_id,
         new_frames,
         emitted_frames_by_req[request_id],
@@ -359,6 +368,9 @@ def talker2code2wav_async_chunk(
         finished,
         left_context_size,
         ref_context_size,
+        layer0_uniq,
+        new_layer0[:8],
+        new_layer0[-8:],
     )
 
     return OmniPayloadStruct(

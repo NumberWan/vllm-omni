@@ -37,7 +37,8 @@ for key in \
   VLLM_AURA_STAGE0_BYPASS \
   VLLM_AURA_TTS_GATE_ON_VOICE_ASR \
   VLLM_AURA_SENTENCE_TTS \
-  VLLM_VIDEO_ASYNC_CHUNK
+  VLLM_VIDEO_ASYNC_CHUNK \
+  VLLM_LOGGING_LEVEL
 do
   if [[ -n "${!key:-}" ]]; then
     SERVER_ENV+=("${key}=${!key}")

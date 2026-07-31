@@ -250,7 +250,7 @@ class _TtsTurnDumper:
             merged,
             turn.chunk_idx,
             turn.request_id,
-            turn.text[:40],
+            turn.text,
         )
 
 
