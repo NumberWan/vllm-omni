@@ -613,6 +613,9 @@ class OmniDiffusionConfig:
 
     # Attention
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
+    # Opt-in FlashAttention deterministic kernel (slower). Default False keeps
+    # serving on the fast library path; enable via --fa-deterministic.
+    fa_deterministic: bool = False
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE

@@ -188,6 +188,8 @@ class OmniEngineArgs(EngineArgs):
     omni: bool = False
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
     request_batch_max_wait_ms: float = 0.0
+    # Opt-in FlashAttention deterministic kernel for diffusion (CLI --fa-deterministic).
+    fa_deterministic: bool = False
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
