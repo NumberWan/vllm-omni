@@ -1164,12 +1164,28 @@ def get_stage_connector_spec(
     stage_id: int,
     async_chunk: bool,
 ) -> dict[str, Any]:
-    """Return the first connector spec for a stage data-plane edge."""
+    """Return a connector spec for a stage data-plane edge.
+
+    Prefer a spec whose ``extra`` carries codec streaming knobs
+    (``codec_chunk_frames`` / ``initial_codec_chunk_frames``). Talker Stage2
+    reads these from ``transfer_manager.connector``; picking a bare auto-SHM
+    incoming edge would ignore deploy yaml IC/chunk settings.
+    """
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
+    fallback: dict[str, Any] = {}
     for cfg in stage_connectors_cfg.values():
-        return dict(cfg.get("spec", {}))
+        spec = dict(cfg.get("spec", {}) or {})
+        if not spec:
+            continue
+        if not fallback:
+            fallback = spec
+        extra = spec.get("extra") or {}
+        if "codec_chunk_frames" in extra or "initial_codec_chunk_frames" in extra:
+            return spec
+    if fallback:
+        return fallback
 
     # A producer does not consume connector data itself. Keep its connector
     # for both async-chunk and terminal full-payload sends, but mark it

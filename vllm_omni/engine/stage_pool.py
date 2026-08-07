@@ -592,7 +592,6 @@ class StagePool:
     ) -> StageRequestMetrics:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
-        stage_gen_time_ms = (now - submit_ts) * 1000.0
 
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
         output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
@@ -616,6 +615,13 @@ class StagePool:
             unit_type=output_unit_type,
             fallback_token_count=num_tokens_out,
         )
+        # async_chunk prewarms Stage-1+ at client t0; when stage_ready_ts is
+        # present, Stage-N gen / serving TTFx start at chunk-ready instead of
+        # prewarm submit / root request_timestamp. Client E2E still uses t0.
+        stage_ready_ts = native_text_metrics.get("stage_ready_ts")
+        stage_local_t0 = float(stage_ready_ts) if stage_ready_ts is not None else float(submit_ts)
+        serving_local_t0 = float(stage_ready_ts) if stage_ready_ts is not None else float(request_timestamp)
+        stage_gen_time_ms = max((now - stage_local_t0) * 1000.0, 0.0)
         current_audio_frames, current_audio_sample_rate, _ = self._collect_audio_metrics(request_outputs)
         accumulated_audio_frames = self._audio_frames_by_request.pop(request_id, 0) if request_id else 0
         accumulated_audio_sample_rate = self._audio_sample_rate_by_request.pop(request_id, 0) if request_id else 0
@@ -636,7 +642,7 @@ class StagePool:
         has_output_timestamps = bool(output_timestamps)
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
-            max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)
+            max((non_empty_first_output_ts - serving_local_t0) * 1000.0, 0.0)
             if non_empty_first_output_ts is not None
             else 0.0
         )

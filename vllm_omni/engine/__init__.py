@@ -133,6 +133,10 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     is_segment_finished: bool | None = False
     # Streaming update prompt length
     new_prompt_len_snapshot: int | None = None
+    # async_chunk: wall time when this stage first received a usable upstream
+    # payload (chunk ready). Used to reset Stage-N local TTFx so prewarm idle
+    # waiting for ASR / prior stages is not charged to this stage.
+    stage_ready_ts: float | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

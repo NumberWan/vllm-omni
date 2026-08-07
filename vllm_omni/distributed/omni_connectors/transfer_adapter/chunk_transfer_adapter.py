@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -19,6 +20,111 @@ from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
+
+
+def _mark_async_chunk_stage_ready(request: Any) -> float:
+    """Stamp stage-local ready time once (first usable upstream chunk).
+
+    async_chunk prewarms Stage-1+ at request start. TTFx for those stages must
+    start when the upstream chunk actually arrives, not at prewarm — otherwise
+    idle wait for ASR / prior stages is billed to Stage-N.
+    """
+    existing = getattr(request, "_omni_stage_ready_ts", None)
+    if existing is not None:
+        return float(existing)
+    ready_ts = time.time()
+    request._omni_stage_ready_ts = ready_ts
+    request.arrival_time = ready_ts
+    return ready_ts
+
+
+def _replace_request_prompt_token_ids(request: Any, prompt_token_ids: list[int]) -> bool:
+    if not prompt_token_ids:
+        return False
+    if int(getattr(request, "num_computed_tokens", 0) or 0) > 0:
+        logger.warning(
+            "Received prompt_token_ids for req=%s after prefill started; keeping existing prompt_len=%s",
+            getattr(request, "request_id", None),
+            len(getattr(request, "prompt_token_ids", []) or []),
+        )
+        return False
+    request.prompt_token_ids = list(prompt_token_ids)
+    request.num_prompt_tokens = len(prompt_token_ids)
+    if hasattr(request, "_output_token_ids"):
+        request._output_token_ids.clear()
+    if hasattr(request, "_all_token_ids"):
+        request._all_token_ids.clear()
+        request._all_token_ids.extend(prompt_token_ids)
+    if hasattr(request, "block_hashes"):
+        request.block_hashes.clear()
+    if hasattr(request, "update_block_hashes"):
+        request.update_block_hashes()
+    return True
+
+
+def _coerce_positive_int(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            coerced = _coerce_positive_int(item)
+            if coerced > 0:
+                return coerced
+        return 0
+    if hasattr(value, "item"):
+        value = value.item()
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return coerced if coerced > 0 else 0
+
+
+def _extract_max_new_tokens_from_payload(payload_data: Any) -> int:
+    """Read Talker length cap from flat or nested async_chunk payloads."""
+    if not isinstance(payload_data, dict):
+        return 0
+    top = _coerce_positive_int(payload_data.get("max_new_tokens") or payload_data.get("tts_max_new_tokens"))
+    if top > 0:
+        return top
+    additional = payload_data.get("additional_information")
+    if isinstance(additional, dict):
+        return _coerce_positive_int(additional.get("max_new_tokens") or additional.get("tts_max_new_tokens"))
+    return 0
+
+
+def _apply_max_new_tokens_from_payload(request: Any, payload_data: Any) -> int:
+    """Clamp prewarmed Talker ``max_tokens`` using payload ``max_new_tokens``.
+
+    async_chunk prewarms Stage2 with deploy default ``max_tokens`` (often 4096).
+    The real TTS payload later arrives over SharedMemory with a text-proportional
+    ``max_new_tokens`` cap, but without this clamp the Talker can babble for many
+    seconds when EOS is late (e.g. ``你好。`` → 200 frames / ~16s).
+    """
+    max_new_tokens = _extract_max_new_tokens_from_payload(payload_data)
+    if max_new_tokens <= 0:
+        return 0
+
+    sampling_params = getattr(request, "sampling_params", None)
+    if sampling_params is not None and getattr(sampling_params, "max_tokens", None) is not None:
+        sampling_params.max_tokens = min(int(sampling_params.max_tokens), max_new_tokens)
+
+    current = getattr(request, "max_tokens", None)
+    if current is None:
+        request.max_tokens = max_new_tokens
+        effective = max_new_tokens
+    else:
+        effective = min(int(current), max_new_tokens)
+        request.max_tokens = effective
+
+    if effective != current:
+        logger.info(
+            "[async_chunk] req=%s applied max_new_tokens=%d (was max_tokens=%s)",
+            getattr(request, "request_id", None),
+            effective,
+            current,
+        )
+    return effective
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -41,6 +147,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
+        self.vllm_config = vllm_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
@@ -59,9 +166,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.connector = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
+        self.model_config = model_config
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
+        # Wired by StageEngineCoreProc after EngineCore builds mm_receiver_cache.
+        # Late-attached async_chunk mm_features must go through this cache so the
+        # GPU worker can rehydrate MultiModalFeatureSpec.data from SHM.
+        self.mm_receiver_cache: Any | None = None
         # State specific to Chunk management
-        self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
+        self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | dict[str, Any] | None] | None = (
+            None
+        )
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
         if custom_process_next_stage_input_func:
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
@@ -200,6 +314,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
         }
+        stage_id = self.connector.stage_id
         self._pending_save_reqs.append(task)
         with self._save_cond:
             self._save_cond.notify()
@@ -234,8 +349,56 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             meta = payload_data.get("meta", {})
             payload_finished = self._is_truthy_scalar(meta.get("finished"))
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
+            resolved_aura_payload = False
+            if self.model_mode == "ar" and "aura_asr_transcript" in payload_data:
+                from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+                    resolve_aura_async_chunk_stage_payload,
+                )
+
+                # Stamp before resolve so Stage-1 local TTFT includes
+                # process_inputs / mm expand (sync-aligned).
+                _mark_async_chunk_stage_ready(request)
+                resolve_aura_async_chunk_stage_payload(
+                    payload_data,
+                    request,
+                    self.model_config,
+                    vllm_config=self.vllm_config,
+                )
+                resolved_aura_payload = True
+                mm_features = getattr(request, "mm_features", None)
+                if self.mm_receiver_cache is not None and mm_features:
+                    request.mm_features = self.mm_receiver_cache.get_and_update_features(
+                        list(mm_features)
+                    )
             if self.model_mode == "ar":
-                request.additional_information = payload_data
+                prompt_token_ids = payload_data.get("prompt_token_ids")
+                if prompt_token_ids is None:
+                    prompt_token_ids = payload_data.get("ids", {}).get("prompt")
+                if isinstance(prompt_token_ids, list) and all(
+                    isinstance(token_id, int) for token_id in prompt_token_ids
+                ):
+                    _replace_request_prompt_token_ids(request, prompt_token_ids)
+                prev_info = getattr(request, "additional_information", None)
+                if isinstance(prev_info, dict):
+                    prev_tts_info = {key: value for key, value in prev_info.items() if str(key).startswith("tts_")}
+                    payload_additional_info = payload_data.get("additional_information")
+                    if prev_tts_info and isinstance(payload_additional_info, dict):
+                        payload_data = dict(payload_data)
+                        payload_data["additional_information"] = {**prev_tts_info, **payload_additional_info}
+                request.omni_stage_payload = payload_data
+                if resolved_aura_payload:
+                    # AURA Stage-1 only: keep slim TTS metadata. Putting the full
+                    # ASR connector dict (raw video ndarrays) onto
+                    # request.additional_information re-IPCs pixels every schedule
+                    # (~500ms floor). Talker/TTS payloads stay flat/full below.
+                    slim_info = payload_data.get("additional_information")
+                    request.additional_information = slim_info if isinstance(slim_info, dict) else {}
+                else:
+                    # Qwen3-TTS Talker payloads are flat dicts with top-level
+                    # ``text`` / ``speaker`` / … — preserve previous behavior.
+                    request.additional_information = payload_data
+                    # Prewarm used deploy default max_tokens; clamp from payload.
+                    _apply_max_new_tokens_from_payload(request, payload_data)
                 replace_prompt = meta.get("replace_streaming_prompt") is True
                 if getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt):
                     # For new streaming input segment, we should update prompt from payload
@@ -246,6 +409,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
+                if not resolved_aura_payload:
+                    _mark_async_chunk_stage_ready(request)
             else:
                 if payload_finished:
                     self.upstream_exhausted_requests.add(req_id)
@@ -304,10 +469,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # first DAC frame arrives.
                     return False
                 self._refresh_generation_chunk_prefill_state(request)
+                _mark_async_chunk_stage_ready(request)
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
-            logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
             return True
 
         return False
@@ -324,7 +489,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
-        payload_data: OmniPayloadStruct | None = None
+        payload_data: OmniPayloadStruct | dict[str, Any] | None = None
+        processor_name = getattr(self.custom_process_next_stage_input_func, "__name__", None)
         if self.custom_process_next_stage_input_func:
             try:
                 payload_data = self.custom_process_next_stage_input_func(
@@ -342,7 +508,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 )
 
             except Exception as e:
-                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+                logger.error(
+                    "Chunk transfer processor failed at stage=%s processor=%s ext_req=%s: %s",
+                    stage_id,
+                    processor_name,
+                    external_req_id,
+                    e,
+                )
 
         if payload_data is None:
             if not (is_segment_finished or is_finished):
@@ -350,11 +522,36 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Segment/request finish markers must still reach downstream even when
             # the processor has no tensor payload.
             payload_data = OmniPayloadStruct()
-        if payload_data.meta is None:
-            payload_data.meta = MetaStruct()
-        payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
-        if payload_data.meta.is_segment_finished is None:
-            payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
+        # Mid-gen Sentence TTS: processor returned a real Talker prompt while Stage1
+        # is still decoding. Downstream Talker must see a complete segment (with
+        # text conditioning); otherwise decode crashes with missing text.
+        force_segment_finished = False
+        if (
+            not is_segment_finished
+            and not is_finished
+            and processor_name == "aura2tts_async_chunk"
+            and payload_data is not None
+        ):
+            is_segment_finished = True
+            force_segment_finished = True
+        if isinstance(payload_data, dict):
+            meta = payload_data.setdefault("meta", {})
+            if not isinstance(meta, dict):
+                meta = {}
+                payload_data["meta"] = meta
+            meta["finished"] = torch.tensor(is_finished, dtype=torch.bool)
+            # Respect processor-set segment boundary (#5383) unless AURA mid-gen
+            # Sentence TTS forced a complete Talker segment above.
+            if force_segment_finished or meta.get("is_segment_finished") is None:
+                meta["is_segment_finished"] = torch.tensor(is_segment_finished, dtype=torch.bool)
+        else:
+            if payload_data.meta is None:
+                payload_data.meta = MetaStruct()
+            payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
+            if force_segment_finished or payload_data.meta.is_segment_finished is None:
+                payload_data.meta.is_segment_finished = torch.tensor(
+                    is_segment_finished, dtype=torch.bool
+                )
 
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
@@ -372,7 +569,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # That asymmetry is intentional: `OmniMsgpackDecoder` is type-erased
             # (no target type), so the wire round-trips struct -> dict. If you
             # change the schema, update both ends — see test_wire_round_trip.
-            finished_flag = payload_data.meta.finished if payload_data.meta is not None else None
+            if isinstance(payload_data, dict):
+                meta = payload_data.get("meta", {})
+                finished_flag = meta.get("finished") if isinstance(meta, dict) else None
+            else:
+                finished_flag = payload_data.meta.finished if payload_data.meta is not None else None
             is_payload_finished = False
             if isinstance(finished_flag, torch.Tensor):
                 is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())

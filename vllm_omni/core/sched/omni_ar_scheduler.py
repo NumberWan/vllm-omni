@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
@@ -27,6 +28,16 @@ logger = init_logger(__name__)
 
 class SampledLogprobContractError(RuntimeError):
     """The model runner returned unusable sampled-token logprobs."""
+
+
+def _aura_sentence_tts_mid_gen_enabled() -> bool:
+    """Stage1 text→TTS mid-gen handoff (default on; ``VLLM_AURA_SENTENCE_TTS=0`` off).
+
+    When on, Stage1 calls ``save_async`` on new tokens so
+    ``aura2tts_async_chunk`` can emit sentences before request finish.
+    """
+    raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS") or "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
 
 
 def _slice_sampled_logprobs(logprobs: Any, req_index: int, sampled_token_ids: list[int]) -> Any:
@@ -148,6 +159,33 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _should_defer_waiting_admission(self) -> bool:
         return False
 
+    def _finish_empty_prompt_chunk_requests(self) -> None:
+        """Finish async_chunk requests whose upstream sent no tokens before done."""
+        adapter = self.chunk_transfer_adapter
+        if adapter is None:
+            return
+
+        to_finish: list[Request] = []
+        for queue in (self.waiting, self.running):
+            for req in list(queue):
+                if not adapter.is_done_receiving_chunks(req.request_id):
+                    continue
+                if req.prompt_token_ids:
+                    continue
+                queue.remove(req)
+                to_finish.append(req)
+        for req in to_finish:
+            adapter._send_single_request(
+                {
+                    "multimodal_output": None,
+                    "request": req,
+                    "is_finished": True,
+                    "is_segment_finished": True,
+                }
+            )
+        if to_finish:
+            self.finish_requests([req.request_id for req in to_finish], RequestStatus.FINISHED_STOPPED)
+
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
         Check triggers and process side effects (marking transfer).
@@ -228,6 +266,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
         self._process_pending_omni_inputs(model_mode="ar")
+
+        self._finish_empty_prompt_chunk_requests()
 
         original_waiting = None
         if self._should_defer_waiting_admission():
@@ -496,15 +536,31 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     is_segment_finished=is_segment_finished,
                     new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id),
                 )
+                outputs[request.client_index][-1].stage_ready_ts = getattr(
+                    request, "_omni_stage_ready_ts", None
+                )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
+            stage_transfer_payload = inter_stage_output if inter_stage_output is not None else mm_output
+            # Stage1 AURA is engine_output_type=text → mm_output is always None mid-gen.
+            # Without this branch, aura2tts_async_chunk only runs on finish (no Sentence TTS).
+            allow_sentence_tts_mid_gen = (
+                bool(new_token_ids)
+                and not is_segment_finished
+                and stage_transfer_payload is None
+                and getattr(self.vllm_config.model_config, "stage_id", None) == 1
+                and _aura_sentence_tts_mid_gen_enabled()
+            )
             if self.chunk_transfer_adapter is not None and (
-                inter_stage_output is not None or is_segment_finished or finished
+                stage_transfer_payload is not None
+                or is_segment_finished
+                or finished
+                or allow_sentence_tts_mid_gen
             ):
                 self.chunk_transfer_adapter.save_async(
-                    inter_stage_output,
+                    stage_transfer_payload,
                     request,
                     is_segment_finished,
                 )
@@ -599,6 +655,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
                 # Do not replace prompt/additional_information here; the next
                 # upstream chunk will populate them in chunk transfer adapter.
+                # Clear stage-ready so the next usable chunk re-stamps local TTFx
+                # for this streaming segment (do not keep the prior segment clock).
+                session._omni_stage_ready_ts = None
                 session.arrival_time = update.arrival_time
                 session.sampling_params = update.sampling_params
                 if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:

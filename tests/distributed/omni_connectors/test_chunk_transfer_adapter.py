@@ -19,6 +19,7 @@ from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_s
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
+    _apply_max_new_tokens_from_payload,
 )
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
@@ -1623,3 +1624,89 @@ def test_purge_is_noop_on_empty_deques(build_adapter):
     adapter.restore_queues(waiting_queue, running_queue, scheduler_requests={})
     assert running_queue == []
     assert waiting_queue == []
+
+# --- AURA port: test_apply_max_new_tokens_from_flat_talker_payload_clamps_request ---
+def test_apply_max_new_tokens_from_flat_talker_payload_clamps_request():
+    """async_chunk Talker prewarm keeps deploy max_tokens until payload arrives."""
+    sampling = SimpleNamespace(max_tokens=4096)
+    request = SimpleNamespace(request_id="video-x", sampling_params=sampling, max_tokens=4096)
+
+    effective = _apply_max_new_tokens_from_payload(
+        request,
+        {"prompt_token_ids": [0] * 14, "max_new_tokens": [26], "text": ["你好。"]},
+    )
+
+    assert effective == 26
+    assert request.max_tokens == 26
+    assert sampling.max_tokens == 26
+
+# --- AURA port: test_load_poll_ar_replaces_prewarm_prompt_from_full_payload ---
+def test_load_poll_ar_replaces_prewarm_prompt_from_full_payload(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-aura", RequestStatus.WAITING, external_req_id="external-aura")
+    request.prompt_token_ids = [0, 0, 0]
+    request.num_prompt_tokens = 3
+    request._all_token_ids = [0, 0, 0]
+    request._output_token_ids = []
+    request.block_hashes = []
+    request.update_block_hashes = lambda: None
+
+    payload: OmniPayload = {
+        "prompt_token_ids": [10, 20, 30, 40],
+        "ids": {"prompt": [10, 20, 30, 40]},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    connector.get.return_value = (payload, 16)
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [10, 20, 30, 40]
+    assert request.num_prompt_tokens == 4
+    assert request._all_token_ids == [10, 20, 30, 40]
+    assert request.additional_information == payload
+
+# --- AURA port: test_load_poll_ar_preserves_prewarm_tts_metadata ---
+def test_load_poll_ar_preserves_prewarm_tts_metadata(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-aura-meta", RequestStatus.WAITING, external_req_id="external-aura-meta")
+    request.additional_information = {
+        "tts_task_type": "CustomVoice",
+        "tts_speaker": "Vivian",
+        "tts_language": "Chinese",
+    }
+
+    payload: OmniPayload = {
+        "prompt_token_ids": [10, 20],
+        "ids": {"prompt": [10, 20]},
+        "additional_information": {"tts_language": "English"},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    connector.get.return_value = (payload, 16)
+
+    assert adapter._poll_single_request(request) is True
+
+    nested_info = request.additional_information["additional_information"]
+    assert nested_info["tts_task_type"] == "CustomVoice"
+    assert nested_info["tts_speaker"] == "Vivian"
+    assert nested_info["tts_language"] == "English"
+
+# --- AURA port: test_send_single_request_dict_payload_adds_meta_and_goes_on_wire ---
+def test_send_single_request_dict_payload_adds_meta_and_goes_on_wire(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-dict", RequestStatus.WAITING, external_req_id="ext-dict")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: {
+        "prompt_token_ids": [1, 2, 3],
+        "ids": {"prompt": [1, 2, 3]},
+    }
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": True}
+    )
+
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload["prompt_token_ids"] == [1, 2, 3]
+    assert sent_payload["meta"]["finished"].item() is False
+    assert sent_payload["meta"]["is_segment_finished"].item() is True
+

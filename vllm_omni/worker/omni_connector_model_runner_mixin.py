@@ -1875,11 +1875,20 @@ class OmniConnectorModelRunnerMixin:
         if self._custom_process_func is None:
             return None
 
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "transfer_manager": self,
-            "pooling_output": pooling_output,
             "request": request,
         }
+        try:
+            signature = inspect.signature(self._custom_process_func)
+            params = signature.parameters
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            if has_var_kw or "multimodal_output" in params:
+                kwargs["multimodal_output"] = pooling_output
+            else:
+                kwargs["pooling_output"] = pooling_output
+        except (TypeError, ValueError):
+            kwargs["pooling_output"] = pooling_output
         supports_is_finished = getattr(
             self,
             "_custom_process_supports_is_finished",
@@ -2176,7 +2185,7 @@ class OmniConnectorModelRunnerMixin:
         if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
             return True
 
-        required = {"transfer_manager", "pooling_output", "request"}
+        required = {"transfer_manager", "request"}
         supported = {
             name
             for name, param in params.items()
@@ -2186,7 +2195,9 @@ class OmniConnectorModelRunnerMixin:
                 inspect.Parameter.KEYWORD_ONLY,
             )
         }
-        return required.issubset(supported)
+        has_var_kw = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
+        has_payload_param = has_var_kw or "pooling_output" in supported or "multimodal_output" in supported
+        return required.issubset(supported) and has_payload_param
 
     def _resolve_external_req_id(self, request: Any, fallback_req_id: str) -> str:
         """Resolve the external request ID consistently.

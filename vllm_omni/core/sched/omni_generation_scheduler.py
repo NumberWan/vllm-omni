@@ -499,6 +499,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_nans_in_logits=request.num_nans_in_logits,
                     is_segment_finished=is_segment_finished,
                 )
+                outputs[request.client_index][-1].stage_ready_ts = getattr(
+                    request, "_omni_stage_ready_ts", None
+                )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
@@ -584,3 +587,5 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         Do not expend prompt id using update.
         """
         self._replace_streaming_session(session, update)
+        # Next usable upstream chunk should re-stamp Stage-N local TTFx.
+        session._omni_stage_ready_ts = None

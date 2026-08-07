@@ -461,8 +461,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return needs_payload
 
     def _resolve_pooler_payload_req_ids(self, req_ids_output_copy: list[str]) -> tuple[str, list[str]]:
-        downstream_req_ids = [rid for rid in req_ids_output_copy if self._request_needs_downstream_stage_payload(rid)]
         engine_output_type = (self.vllm_config.model_config.engine_output_type or "").lower()
+        # Text stages discard multimodal wire payloads (_build_multimodal_outputs
+        # returns None). When full-payload accumulation is also off (typical
+        # async_chunk AURA / ASR handoff), skip per-step pooler materialization
+        # — including the ~12ms sync hidden D2H that formerly sat under
+        # sample_tokens via _prepare_prefix_cache_pooler_payload_sources.
+        if engine_output_type == "text" and not self._should_accumulate_full_payload_output():
+            return engine_output_type, []
+        downstream_req_ids = [rid for rid in req_ids_output_copy if self._request_needs_downstream_stage_payload(rid)]
         # Single-stage AR TTS models (e.g. VoxCPM2) finish on this stage but still
         # need multimodal payloads for final audio postprocess/output.
         if engine_output_type == "audio" and not downstream_req_ids:
@@ -800,7 +807,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 and not self.omni_prefix_cache.has_prefix_cached_new_req_ids()
             ):
                 return None, None
-            if self._model_needs_full_prefix_hidden_states():
+            # Merge full cached hidden only when the model both caches them and
+            # still ships them in pooler payloads. Opting out of pooler hidden
+            # (AURA / TTS talker) must not pay sync _coerce_to_cpu_tensor here.
+            if self._model_needs_full_prefix_hidden_states() and self._model_omni_pooler_payload_include_hidden():
                 combined_hidden_states = self.omni_prefix_cache.get_merged_hidden_states(
                     query_start_loc=self.query_start_loc.cpu,
                     input_batch=self.input_batch,
@@ -1360,7 +1370,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Some models (e.g. qwen3-tts-talker) opt out of full-hidden-state
                 # prefix caching but the downstream pooler payload path still
                 # needs a CPU hidden-states view. Materialize it synchronously
-                # in that case; the legacy behavior is preserved.
+                # only when pooler still includes hidden; otherwise this D2H is
+                # pure overhead under sample_tokens.
                 if hs_for_cache is None and self._model_omni_pooler_payload_include_hidden():
                     hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
                 slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
