@@ -82,16 +82,16 @@ stages:
   model: /workspace/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe
   # Step1 fix (Talker RCA): raise from T=0.4/top_k=30/seed=42 (layer0 collapse).
   # Step2: min_tokens=8 blocks empty first-step EOS (HF has min_new_tokens=2).
-  # Step3: T=0.65 — cooler than HF 0.9 for less emotion; keep top_k=50/min_tokens.
+  # Step3: T=0.5 — cooler than 0.65 for less emotive delivery; keep top_k/min_tokens.
   default_sampling_params:
-    temperature: 0.65
+    temperature: 0.5
     top_k: 50
     max_tokens: 4096
     min_tokens: 8
     repetition_penalty: 1.05
   subtalker_sampling_params:
     do_sample: true
-    temperature: 0.65
+    temperature: 0.5
     top_k: 50
     top_p: 1.0
 - stage_id: 3

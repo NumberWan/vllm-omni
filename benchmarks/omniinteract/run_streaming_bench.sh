@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# vllm-omni OmniInteract production streaming benchmark.
+#
+# Full guide: benchmarks/omniinteract/SETUP_AND_RUN.md
+#
+# Prerequisite: bash benchmarks/omniinteract/run_aura_server.sh
+#
+# Default is Smoke3 (CustomVoice/Vivian, warmup 0001, scored 0002-0004):
+#   bash benchmarks/omniinteract/run_streaming_bench.sh
+#
+# Full-dataset mode:
+#   NATIVE_ALIGNED=0 bash benchmarks/omniinteract/run_streaming_bench.sh
+#
+# Streaming defaults: native system prompt, full video (max_frames=0),
+# wall-clock send_fps=2, frame_filter off.
+#
+# Outputs (under ./omniinteract_bench by default):
+#   omniinteract_streaming_*.json   — full metrics + per_requests
+#   bench_report.md                 — native AURA-style summary
+#   videos/<id>/bench_report.md     — per-video report + streaming_chunks.json
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MODEL="${MODEL:-aurateam/AURA}"
+DATASET_PATH="${DATASET_PATH:-lucky-lance/OmniInteract}"
+VLLM_BIN="${VLLM_BIN:-$ROOT/.venv/bin/vllm}"
+if [[ ! -x "$VLLM_BIN" ]]; then
+  VLLM_BIN="$(command -v vllm || true)"
+fi
+HOST="${HOST:-127.0.0.1}"
+PORT="${PORT:-8666}"
+NUM_PROMPTS="${NUM_PROMPTS:-32}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
+# Default to the beginner Smoke3 client path. Set NATIVE_ALIGNED=0 for full-dataset runs.
+NATIVE_ALIGNED="${NATIVE_ALIGNED:-1}"
+OMNIINTERACT_WARMUP_VIDEO_ID="${OMNIINTERACT_WARMUP_VIDEO_ID:-0001}"
+RESULT_DIR="${RESULT_DIR:-./omniinteract_bench}"
+
+# Production TTS defaults: CustomVoice needs no reference WAV.
+AURA_NATIVE_ROOT="${AURA_NATIVE_ROOT:-}"
+OMNIINTERACT_AURA_TTS_TASK_TYPE="${OMNIINTERACT_AURA_TTS_TASK_TYPE:-CustomVoice}"
+OMNIINTERACT_AURA_TTS_LANGUAGE="${OMNIINTERACT_AURA_TTS_LANGUAGE:-Chinese}"
+OMNIINTERACT_AURA_TTS_SPEAKER="${OMNIINTERACT_AURA_TTS_SPEAKER:-Vivian}"
+OMNIINTERACT_AURA_TTS_REF_AUDIO="${OMNIINTERACT_AURA_TTS_REF_AUDIO:-${AURA_NATIVE_ROOT:+$AURA_NATIVE_ROOT/shuhan.mp3}}"
+OMNIINTERACT_AURA_TTS_REF_TEXT="${OMNIINTERACT_AURA_TTS_REF_TEXT:-读书指通过阅读书籍获取知识、交流思想的行为。}"
+
+# Native-aligned streaming defaults (shared by full dataset and smoke3).
+STREAMING_MAX_FRAMES="${STREAMING_MAX_FRAMES:-0}"
+STREAMING_SEND_FPS="${STREAMING_SEND_FPS:-2}"
+STREAMING_AUTO_TRIGGER_MIN_FRAMES="${STREAMING_AUTO_TRIGGER_MIN_FRAMES:-2}"
+STREAMING_ENABLE_FRAME_FILTER="${STREAMING_ENABLE_FRAME_FILTER:-0}"
+
+if [[ "${NATIVE_ALIGNED}" == "1" || "${NATIVE_ALIGNED}" == "true" ]]; then
+  OMNIINTERACT_SUBSETS="${OMNIINTERACT_SUBSETS:-1q1a}"
+  OMNIINTERACT_VIDEO_IDS="${OMNIINTERACT_VIDEO_IDS:-0002,0003,0004}"
+  NUM_PROMPTS=3
+  DISABLE_SHUFFLE_FLAG=(--disable-shuffle)
+  RESULT_TAG="native_smoke3"
+else
+  OMNIINTERACT_SUBSETS="${OMNIINTERACT_SUBSETS:-1q1a,1q1a_math,1qna}"
+  OMNIINTERACT_VIDEO_IDS="${OMNIINTERACT_VIDEO_IDS:-}"
+  DISABLE_SHUFFLE_FLAG=()
+  if [[ -n "${OMNIINTERACT_VIDEO_IDS}" ]]; then
+    DISABLE_SHUFFLE_FLAG=(--disable-shuffle)
+    RESULT_TAG="ids_${OMNIINTERACT_VIDEO_IDS//,/_}"
+  else
+    RESULT_TAG="c${MAX_CONCURRENCY}_${NUM_PROMPTS}_f${STREAMING_MAX_FRAMES}_t${STREAMING_AUTO_TRIGGER_MIN_FRAMES}"
+  fi
+fi
+
+CROSS_TURN_PENALTY="${CROSS_TURN_PENALTY:-1}"
+CROSS_TURN_LOOKBACK="${CROSS_TURN_LOOKBACK:-10}"
+READY_TIMEOUT_SEC="${READY_TIMEOUT_SEC:-900}"
+OMNIINTERACT_EVAL_FLAG=()
+if [[ "${OMNIINTERACT_EVAL:-1}" == "1" || "${OMNIINTERACT_EVAL:-}" == "true" ]]; then
+  OMNIINTERACT_EVAL_FLAG+=(--omniinteract-eval)
+fi
+
+FRAME_FILTER_FLAG=()
+if [[ "${STREAMING_ENABLE_FRAME_FILTER}" == "1" || "${STREAMING_ENABLE_FRAME_FILTER}" == "true" ]]; then
+  FRAME_FILTER_FLAG=(--omniinteract-streaming-enable-frame-filter)
+fi
+
+if [[ ! -x "$VLLM_BIN" ]]; then
+  echo "vllm binary not found; install vllm-omni or set VLLM_BIN." >&2
+  exit 1
+fi
+if [[ "$OMNIINTERACT_AURA_TTS_TASK_TYPE" == "Base" ]] \
+  && { [[ -z "$OMNIINTERACT_AURA_TTS_REF_AUDIO" ]] || [[ -z "$OMNIINTERACT_AURA_TTS_REF_TEXT" ]]; }; then
+  echo "Base TTS requires OMNIINTERACT_AURA_TTS_REF_AUDIO and OMNIINTERACT_AURA_TTS_REF_TEXT." >&2
+  exit 1
+fi
+
+echo "Waiting for AURA server at ${HOST}:${PORT} (timeout: ${READY_TIMEOUT_SEC}s)..."
+deadline=$((SECONDS + READY_TIMEOUT_SEC))
+until ${PYTHON:-python3} - "${HOST}" "${PORT}" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+sock = socket.socket()
+sock.settimeout(2)
+try:
+    sock.connect((host, port))
+except OSError:
+    raise SystemExit(1)
+finally:
+    sock.close()
+PY
+do
+  if (( SECONDS >= deadline )); then
+    echo "AURA server is not ready at ${HOST}:${PORT} after ${READY_TIMEOUT_SEC}s." >&2
+    exit 1
+  fi
+  sleep 5
+done
+echo "AURA server is accepting connections."
+
+echo "OmniInteract streaming bench: subsets=${OMNIINTERACT_SUBSETS} video_ids=${OMNIINTERACT_VIDEO_IDS:-all} native_aligned=${NATIVE_ALIGNED}"
+echo "TTS (native-aligned): task=${OMNIINTERACT_AURA_TTS_TASK_TYPE} lang=${OMNIINTERACT_AURA_TTS_LANGUAGE} ref=${OMNIINTERACT_AURA_TTS_REF_AUDIO}"
+
+_run_streaming_bench() {
+  local _num_prompts="$1"
+  local _result_filename="$2"
+  local _video_ids="${3:-}"
+  local -a _video_ids_flag=()
+  if [[ -n "${_video_ids}" ]]; then
+    _video_ids_flag=(--omniinteract-video-ids "${_video_ids}")
+  elif [[ -n "${OMNIINTERACT_VIDEO_IDS}" ]]; then
+    _video_ids_flag=(--omniinteract-video-ids "${OMNIINTERACT_VIDEO_IDS}")
+  fi
+
+  "${VLLM_BIN}" bench serve --omni \
+    --host "${HOST}" \
+    --port "${PORT}" \
+    --trust-remote-code \
+    --backend openai-video-stream \
+    --endpoint /v1/video/chat/stream \
+    --model "${MODEL}" \
+    --no-oversample \
+    --dataset-name omniinteract \
+    --dataset-path "${DATASET_PATH}" \
+    --max-concurrency "${MAX_CONCURRENCY}" \
+    --num-warmups 0 \
+    --num-prompts "${_num_prompts}" \
+    --omniinteract-subsets "${OMNIINTERACT_SUBSETS}" \
+    "${_video_ids_flag[@]}" \
+    "${DISABLE_SHUFFLE_FLAG[@]}" \
+    --omniinteract-streaming-sample-fps 2 \
+    --omniinteract-streaming-send-fps "${STREAMING_SEND_FPS}" \
+    --omniinteract-streaming-max-frames "${STREAMING_MAX_FRAMES}" \
+    --omniinteract-streaming-auto-trigger-min-frames "${STREAMING_AUTO_TRIGGER_MIN_FRAMES}" \
+    "${FRAME_FILTER_FLAG[@]}" \
+    --omniinteract-cross-turn-penalty "${CROSS_TURN_PENALTY}" \
+    --omniinteract-cross-turn-lookback "${CROSS_TURN_LOOKBACK}" \
+    --omniinteract-aura-tts-task-type "${OMNIINTERACT_AURA_TTS_TASK_TYPE}" \
+    --omniinteract-aura-tts-language "${OMNIINTERACT_AURA_TTS_LANGUAGE}" \
+    --omniinteract-aura-tts-speaker "${OMNIINTERACT_AURA_TTS_SPEAKER}" \
+    --omniinteract-aura-tts-ref-audio "${OMNIINTERACT_AURA_TTS_REF_AUDIO}" \
+    --omniinteract-aura-tts-ref-text "${OMNIINTERACT_AURA_TTS_REF_TEXT}" \
+    --percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration,ttfc,tpoc,icl \
+    --save-result \
+    --save-detailed \
+    --print-stage \
+    --result-dir "${RESULT_DIR}" \
+    --result-filename "${_result_filename}" \
+    "${OMNIINTERACT_EVAL_FLAG[@]}"
+}
+
+if [[ "${OMNIINTERACT_SKIP_WARMUP:-0}" != "1" ]] \
+  && [[ -n "${OMNIINTERACT_WARMUP_VIDEO_ID:-}" ]]; then
+  echo ""
+  echo "=== Warmup: video ${OMNIINTERACT_WARMUP_VIDEO_ID} (excluded from scored JSON) ==="
+  _run_streaming_bench 1 "omniinteract_streaming_${RESULT_TAG}_warmup.json" "${OMNIINTERACT_WARMUP_VIDEO_ID}"
+fi
+
+echo ""
+echo "=== Scored run: videos ${OMNIINTERACT_VIDEO_IDS:-all} ==="
+_run_streaming_bench "${NUM_PROMPTS}" "omniinteract_streaming_${RESULT_TAG}.json"

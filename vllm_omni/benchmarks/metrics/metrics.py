@@ -63,9 +63,11 @@ _STAGE_BENCHMARK_FIELDS = [
     (defs.VLLM_TPOTS, _FLOAT_LIST_TYPE, field(default_factory=list)),
     (defs.VLLM_ITLS, _FLOAT_LIST_TYPE, field(default_factory=list)),
     (defs.AUDIO_TTFPS, _FLOAT_LIST_TYPE, field(default_factory=list)),
+    (defs.AUDIO_RTFS, _FLOAT_LIST_TYPE, field(default_factory=list)),
     (defs.AUDIO_DURATIONS, _FLOAT_LIST_TYPE, field(default_factory=list)),
     (defs.AUDIO_FRAMES, _INT_LIST_TYPE, field(default_factory=list)),
     (defs.MISSING_AUDIO_DURATION_COUNT, int, field(default=0)),
+    (defs.MISSING_AUDIO_RTF_COUNT, int, field(default=0)),
     (defs.STAGE_GEN_TIMES_MS, _FLOAT_LIST_TYPE, field(default_factory=list)),
     (defs.POSTPROCESS_TIMES_MS, _FLOAT_LIST_TYPE, field(default_factory=list)),
     ("output_unit_type", str, field(default="")),
@@ -247,7 +249,9 @@ def print_text_metrics(task_type, selected_percentile_metrics, metrics: MultiMod
 
 def _has_audio_output(metrics: MultiModalsBenchmarkMetrics) -> bool:
     return bool(
-        getattr(metrics, defs.TOTAL_AUDIO_DURATION_S, 0.0) > 0 or getattr(metrics, defs.TOTAL_AUDIO_FRAMES, 0) > 0
+        getattr(metrics, defs.TOTAL_AUDIO_DURATION_S, 0.0) > 0
+        or getattr(metrics, defs.TOTAL_AUDIO_FRAMES, 0) > 0
+        or getattr(metrics, defs.MEAN_AUDIO_TTFP_MS, 0.0) > 0
     )
 
 
@@ -441,6 +445,12 @@ def _print_audio_stage_metrics(
             getattr(sm, defs.AUDIO_TTFPS),
             selected_percentiles,
         )
+    if defs.AUDIO_RTF in selected_percentile_metrics:
+        audio_rtfs = getattr(sm, defs.AUDIO_RTFS)
+        if audio_rtfs:
+            _print_percentile_metric("Real Time Factor", "AUDIO_RTF", audio_rtfs, selected_percentiles, to_ms=False)
+        elif getattr(sm, defs.MISSING_AUDIO_RTF_COUNT) > 0:
+            print("{:<40} {:<10}".format("AUDIO_RTF skipped:", "missing stage-local audio duration/sample rate"))
     if defs.AUDIO_DURATION in selected_percentile_metrics:
         audio_durations = getattr(sm, defs.AUDIO_DURATIONS)
         if audio_durations:
@@ -635,9 +645,11 @@ def _build_stage_metrics_from_outputs(
             total_output = sum(int((info or {}).get(defs.NUM_TOKENS_OUT) or 0) for _, info in rows)
 
         audio_ttfps: list[float] = []
+        audio_rtfs: list[float] = []
         audio_durations: list[float] = []
         audio_frames: list[int] = []
         missing_audio_duration_count = 0
+        missing_audio_rtf_count = 0
         if is_audio_stage:
             for _, info in rows:
                 audio_ttfp_ms = float((info or {}).get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS) or 0.0)
@@ -655,6 +667,12 @@ def _build_stage_metrics_from_outputs(
                 else:
                     missing_audio_duration_count += 1
 
+                rtf = float((info or {}).get(defs.AUDIO_RTF) or 0.0)
+                if rtf > 0:
+                    audio_rtfs.append(rtf)
+                else:
+                    missing_audio_rtf_count += 1
+
         result.append(
             StageBenchmarkMetrics(
                 **{
@@ -669,9 +687,11 @@ def _build_stage_metrics_from_outputs(
                     defs.VLLM_TPOTS: vllm_tpots,
                     defs.VLLM_ITLS: vllm_itls,
                     defs.AUDIO_TTFPS: audio_ttfps,
+                    defs.AUDIO_RTFS: audio_rtfs,
                     defs.AUDIO_DURATIONS: audio_durations,
                     defs.AUDIO_FRAMES: audio_frames,
                     defs.MISSING_AUDIO_DURATION_COUNT: missing_audio_duration_count,
+                    defs.MISSING_AUDIO_RTF_COUNT: missing_audio_rtf_count,
                     defs.STAGE_GEN_TIMES_MS: stage_gen_times_ms,
                     defs.POSTPROCESS_TIMES_MS: postprocess_times_ms,
                     "output_unit_type": output_unit_type,

@@ -64,6 +64,11 @@ stages:
       top_k: -1
       max_tokens: 256
       repetition_penalty: 1.0
+      # Native AURA defaults: <|silent|> then <|im_end|> (see generation /
+      # eval stop lists). Without these, silent turns pad to max_tokens.
+      stop_token_ids:
+        - 151669
+        - 151645
 
   - stage_id: 2
     max_num_seqs: 8
@@ -81,14 +86,14 @@ stages:
     model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
     # model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
     default_sampling_params:
-      temperature: 0.65
+      temperature: 0.5
       top_k: 50
       max_tokens: 4096
       min_tokens: 8
       repetition_penalty: 1.05
     subtalker_sampling_params:
       do_sample: true
-      temperature: 0.65
+      temperature: 0.5
       top_k: 50
       top_p: 1.0
 

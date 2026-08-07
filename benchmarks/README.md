@@ -28,14 +28,6 @@ Benchmarks for GLM-Image performance across HuggingFace baseline, vLLM-Omni offl
 - **Tasks**: text-to-image and image-to-image
 - **Key metrics**: request/image throughput, latency percentiles, optional per-stage pipeline timings
 
-### [LingBot-Video](lingbot_video/README.md) — Dense and MoE Parity
-
-Manual cross-runtime validation for the dense LingBot-Video pipeline and the
-LingBot-Video MoE transformer.
-
-- **Dense pipeline**: decoded-video MAE, MSE, PSNR, latency, and optional steady-state timings
-- **MoE transformer**: bitwise router, sparse-block, shared-expert, and full-transformer parity
-
 ### [Distributed](distributed/omni_connectors/README.md) — RDMA Connector Testing
 
 RDMA environment setup and transfer tests for `MooncakeTransferEngineConnector`, including pytest-based single-node checks and manual cross-node benchmarks.
@@ -57,6 +49,12 @@ Accuracy benchmarks for image generation/editing models, adapting external suite
 - **Text output**: TTFT (time to first token), TPOT (time per output token), ITL (inter-token latency)
 - **Audio output**: TTFP (time to first audio packet), E2E latency, RTF (real-time factor)
 - **Throughput**: request throughput, output token throughput, total token throughput, audio throughput
+
+Omni-specific benchmark datasets currently include:
+
+- `daily-omni` (audio-visual MCQ)
+- [`omniinteract`](omniinteract/README.md) (streaming speech-QA + video, including AURA streaming and 1QnA)
+- `seed-tts` / `seed-tts-text` / `seed-tts-design` / `ttsd` / `sound-effect`
 
 See `vllm_omni/benchmarks/serve.py` for the `vllm bench serve --omni` runner wrapper and `vllm_omni/benchmarks/metrics/` for Omni metric definitions.
 

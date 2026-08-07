@@ -2,7 +2,9 @@
 The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
-vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, and `daily-omni` serving benchmark backends.
+The Omni benchmark runner extends the upstream `vllm bench serve` backends with
+Omni-specific adapters such as `openai-chat-omni`, `openai-image-edits-omni`, and
+`openai-video-stream`.
 
 ## Basic Parameter Description
 You can use `vllm bench serve --omni --help=all` to get descriptions of all parameters. The commonly used parameters are described below:
@@ -10,7 +12,7 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   Enable Omni (multimodal) mode, supporting multimodal inputs and outputs such as images, videos, and audio.
 
 - `--backend`
-  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, and `daily-omni` to the upstream vLLM backend choices.
+  Specify the backend adapter as openai-chat-omni, using OpenAI Chat compatible API behavior as the protocol. Currently only openai-chat-omni is supported.
 
 - `--model`
   The model identifier to load, filled according to the models supported by vLLM-Omni.
@@ -20,6 +22,10 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
 
 - `--dataset-name`
   The name of the dataset used; random-mm indicates generating random multimodal inputs (images, videos, audio).
+  Omni dataset extensions include `daily-omni`, `omniinteract`, `seed-tts`,
+  `seed-tts-text`, `seed-tts-design`, `ttsd`, and `sound-effect`.
+  For OmniInteract streaming and non-streaming examples, see
+  `benchmarks/omniinteract/README.md`.
 
 - `--num-prompts`
   The total number of requests to send, an integer.
@@ -55,7 +61,7 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
                     'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
                     '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
 
-- `--print-stage`
+- `-print-stage`
 Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. Disabled by default.
 
 - `--save-result`
@@ -312,7 +318,7 @@ vllm bench serve \
   --ignore-eos \
   --percentile-metrics ttft,tpot,itl \
   --random-output-len 2 \
-  --extra-body '{"modalities": ["text"]}'
+  --extra_body '{"modalities": ["text"]}'
 ```
 
 If successful, you will see the following output:
@@ -390,7 +396,7 @@ vllm bench serve --omni \
   --ignore-eos \
   --percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,ttfc,tpoc,icl \
   --random-output-len 900 \
-  --extra-body '{"modalities": ["text","audio"]}' \
+  --extra_body '{"modalities": ["text","audio"]}' \
   --print-stage
 ```
 

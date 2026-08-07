@@ -17,7 +17,8 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 20
       codec_left_context_frames: 72
-      initial_codec_chunk_frames: 1
+      # Align with verified 1-GPU demo: IC=1 first chunk is too short (~0.16s).
+      initial_codec_chunk_frames: 8
       decode_cudagraph_capture_sizes:
       - 25
       - 73
@@ -73,18 +74,22 @@ stages:
   max_model_len: 8192
   devices: '0'
   attention_backend: FLASHINFER
+  # Required so Talker sees codec IC/chunk knobs (1-GPU verified path).
+  input_connectors:
+    from_stage_1: connector_of_shared_memory
   output_connectors:
     to_stage_3: connector_of_shared_memory
   model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+  # Talker sampling: cooler than HF 0.9; 0.5 less emotive than prior 0.65.
   default_sampling_params:
-    temperature: 0.9
+    temperature: 0.5
     top_k: 50
     max_tokens: 4096
-    seed: 42
+    min_tokens: 8
     repetition_penalty: 1.05
   subtalker_sampling_params:
     do_sample: true
-    temperature: 0.9
+    temperature: 0.5
     top_k: 50
     top_p: 1.0
 - stage_id: 3

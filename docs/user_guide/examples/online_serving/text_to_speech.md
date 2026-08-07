@@ -79,7 +79,7 @@ response = client.audio.speech.create(
 response.stream_to_file("output.wav")
 ```
 
-Streaming PCM output (where supported) — set `stream=true`, `stream_format="audio"`, and `response_format="pcm"`:
+Streaming PCM output (where supported) — set `stream=true` with `response_format="pcm"`:
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -88,7 +88,6 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "input": "Hello, how are you?",
         "voice": "default",
         "stream": true,
-        "stream_format": "audio",
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
@@ -415,24 +414,17 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "voice": "vivian",
         "language": "English",
         "stream": true,
-        "stream_format": "audio",
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
-Raw PCM streaming requires `stream_format="audio"`, `response_format="pcm"`, and `async_chunk: true` on the stage config (default in `qwen3_tts.yaml`). `speed` is not supported when streaming.
+Streaming requires `response_format="pcm"` and `async_chunk: true` on the stage config (default in `qwen3_tts.yaml`). `speed` is not supported when streaming.
 
 ### Streaming WebSocket
-The `/v1/audio/speech/stream` endpoint accepts text incrementally and synthesizes the buffered text as one continuous request on `input.done`:
+The `/v1/audio/speech/stream` endpoint accepts text incrementally. By default it
+buffers text until `input.done`, then emits one PCM stream for the buffered text:
 ```bash
 python qwen3_tts/streaming_speech_client.py --text "Hello world. How are you? I am fine."
 python qwen3_tts/streaming_speech_client.py --text "..." --simulate-stt --stt-delay 0.1
-```
-
-`input.done` flushes without closing, so repeating `--text` synthesizes several utterances over one connection:
-```bash
-python qwen3_tts/streaming_speech_client.py \
-    --text "First utterance." \
-    --text "Second utterance, same connection."
 ```
 
 ### Gradio demos
@@ -505,7 +497,7 @@ After startup, `/v1/audio/voices` lists `alice`, and `/v1/audio/speech` can use 
 ```bash
 python voxcpm2/gradio_demo.py
 ```
-Uses an AudioWorklet-based player adapted from the Qwen3-TTS demo for gap-free playback. Raw PCM audio is streamed from the OpenAI Speech endpoint with `stream=true` and `stream_format="audio"`.
+Uses an AudioWorklet-based player adapted from the Qwen3-TTS demo for gap-free playback. Audio is streamed from the OpenAI Speech endpoint with `stream=true`.
 
 ---
 
