@@ -57,6 +57,11 @@ def test_aura_qwen3_vl_model_arch_registered():
     assert model_cls is AuraQwen3VLForConditionalGeneration
 
 
+def test_aura_qwen3_vl_opts_out_of_per_step_hidden_d2h():
+    assert AuraQwen3VLForConditionalGeneration.requires_full_prefix_cached_hidden_states is False
+    assert AuraQwen3VLForConditionalGeneration.omni_pooler_payload_include_hidden is False
+
+
 def test_aura_qwen3_vl_processing_forces_upstream_processor_class():
     info = object.__new__(AuraQwen3VLProcessingInfo)
     ctx = _FakeCtx(SimpleNamespace(model_type="qwen3_vl"))

@@ -420,6 +420,18 @@ class Qwen3TTSCode2Wav(nn.Module):
                 },
             )
 
+        logger.info(
+            "[Qwen3TTS Code2Wav decode] batch_requests=%d valid_requests=%d q=%d "
+            "frames=%s left_context=%s ref_context=%s finished=%s",
+            num_req,
+            len(valid_codes_qf),
+            q,
+            [int(c.shape[1]) for c in valid_codes_qf],
+            left_context_size,
+            ref_context_size,
+            finished_flags,
+        )
+
         if not self._logged_codec_stats:
             self._logged_codec_stats = True
             try:
@@ -547,6 +559,18 @@ class Qwen3TTSCode2Wav(nn.Module):
             if wav.shape[0] > 0:
                 # Decoder already runs in fp32, so the .to(float32) is a redundant dispatch.
                 audios[idx] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)
+            logger.info(
+                "[Qwen3TTS Code2Wav output] request_index=%d ctx_frames=%d actual_frames=%d "
+                "trim_start=%d trim_end=%d output_samples=%d duration_s=%.3f finished=%s",
+                idx,
+                ctx_frames,
+                actual_frames,
+                start,
+                min(end, wav_tensors[j].shape[0]),
+                int(audios[idx].shape[0]) if hasattr(audios[idx], "shape") else 0,
+                (int(audios[idx].shape[0]) / float(sr_val)) if hasattr(audios[idx], "shape") else 0.0,
+                finished_flags[idx] if idx < len(finished_flags) else None,
+            )
 
         for req_id, finished in zip(ref_context_request_ids, finished_flags, strict=False):
             if req_id is not None and finished:
