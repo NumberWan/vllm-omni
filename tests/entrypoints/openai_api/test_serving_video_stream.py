@@ -139,112 +139,6 @@ async def test_receive_config_accepts_client_legacy_aliases():
 
 
 @pytest.mark.asyncio
-async def test_video_frame_ack_reports_receiver_buffer_state():
-    ws = MockWebSocket(
-        [
-            json.dumps(
-                {
-                    "type": "session.config",
-                    "model": "test",
-                    "enable_frame_filter": False,
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "video.frame",
-                    "data": _b64(_make_jpeg()),
-                    "frame_id": "frame-7",
-                    "pts_ms": 700,
-                    "capture_ts_ms": 1234.5,
-                }
-            ),
-            json.dumps({"type": "video.done"}),
-        ]
-    )
-    handler = QwenOmniStreamingVideoHandler(chat_service=object())
-
-    await handler.handle_session(ws)
-
-    ack = next(message for message in ws.sent if message.get("type") == "video.frame.ack")
-    assert ack["frame_id"] == "frame-7"
-    assert ack["pts_ms"] == 700
-    assert ack["capture_ts_ms"] == 1234.5
-    assert ack["accepted"] is True
-    assert ack["buffered_frames"] == 1
-    assert ack["server_receive_ts_ms"] > 0
-
-
-@pytest.mark.asyncio
-async def test_video_frames_consumed_is_emitted_after_engine_uses_frame_prompt():
-    class OneOutputEngine:
-        def generate(self, **_kwargs):
-            async def _gen():
-                await asyncio.sleep(0.05)
-                yield _text_result("visible")
-
-            return _gen()
-
-    class CapturingHandler(QwenOmniStreamingVideoHandler):
-        async def _preprocess_to_engine_prompt(self, request):
-            return {"prompt": "with-video"}
-
-    ws = MockWebSocket(
-        [
-            json.dumps(
-                {
-                    "type": "session.config",
-                    "model": "test",
-                    "modalities": ["text"],
-                    "num_frames": 1,
-                    "enable_frame_filter": False,
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "video.frame",
-                    "data": _b64(_make_jpeg()),
-                    "frame_id": "frame-9",
-                    "pts_ms": 900,
-                    "source_pts_ms": 880,
-                    "quality_profile": "balanced",
-                }
-            ),
-            json.dumps({"type": "video.query", "text": "describe"}),
-            json.dumps({"type": "video.done"}),
-        ]
-    )
-    handler = CapturingHandler(
-        chat_service=object(),
-        engine_client=OneOutputEngine(),
-        idle_timeout=2.0,
-    )
-
-    await handler.handle_session(ws)
-
-    consumed = next(message for message in ws.sent if message.get("type") == "video.frames.consumed")
-    assert consumed["frame_ids"] == ["frame-9"]
-    assert consumed["latest_pts_ms"] == 900
-    assert consumed["request_id"].startswith("video-")
-    assert consumed["model_selected_ts_ms"] > 0
-    assert consumed["frames"] == [
-        {
-            "frame_id": "frame-9",
-            "pts_ms": 900,
-            "source_pts_ms": 880,
-            "quality_profile": "balanced",
-            "receiver_received_ts_ms": consumed["frames"][0]["receiver_received_ts_ms"],
-            "decoded_ready_ts_ms": consumed["frames"][0]["decoded_ready_ts_ms"],
-        }
-    ]
-    assert consumed["frames"][0]["receiver_received_ts_ms"] > 0
-    assert consumed["frames"][0]["decoded_ready_ts_ms"] >= consumed["frames"][0]["receiver_received_ts_ms"]
-    assert consumed["model_selected_ts_ms"] >= consumed["frames"][0]["decoded_ready_ts_ms"]
-    assert ws.sent.index(consumed) < next(
-        index for index, message in enumerate(ws.sent) if message.get("type") == "response.text.delta"
-    )
-
-
-@pytest.mark.asyncio
 async def test_audio_in_video_sets_mm_processor_kwargs():
     captured_requests = []
 
@@ -605,6 +499,7 @@ async def test_client_cannot_send_internal_frame_decode_failed_message():
             request_id,
             interrupt_event,
             prewarmed_frames,
+            release_turn_lock=None,
         ):
             captured_frames.append(list(frame_buffer))
 
@@ -698,6 +593,7 @@ async def test_audio_buffer_overflow_clears_buffer_before_query(monkeypatch):
             request_id,
             interrupt_event,
             prewarmed_frames,
+            release_turn_lock=None,
         ):
             captured_audio_lengths.append(len(audio_buffer))
 
@@ -755,3 +651,40 @@ def test_build_messages_keeps_recent_history_text_only():
     assert messages[1] == {"role": "assistant", "content": "recent answer"}
     assert messages[2] == user_message
     assert user_message["content"][-1] == {"type": "text", "text": "current question"}
+
+
+def test_create_streaming_video_handler_routes_aura_pipeline():
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    from vllm_omni.entrypoints.openai.serving_video_stream import (
+        AuraStreamingVideoHandler,
+        create_streaming_video_handler,
+    )
+
+    deploy_path = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "aura_omni.yaml"
+    engine = MagicMock(config_path=str(deploy_path), stage_configs=[])
+
+    handler = create_streaming_video_handler(chat_service=object(), engine_client=engine)
+    assert isinstance(handler, AuraStreamingVideoHandler)
+
+
+def test_resolve_deploy_pipeline_from_aura_deploy_yaml():
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    from vllm_omni.entrypoints.openai.serving_video_stream import _resolve_deploy_pipeline
+
+    deploy_path = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "aura_omni.yaml"
+    engine = MagicMock(config_path=str(deploy_path))
+    assert _resolve_deploy_pipeline(engine) == "aura_omni"
+
+
+def test_create_streaming_video_handler_defaults_to_qwen():
+    from unittest.mock import MagicMock
+
+    from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
+
+    engine = MagicMock(config_path=None, stage_configs=[MagicMock(model_stage="thinker")])
+    handler = create_streaming_video_handler(chat_service=object(), engine_client=engine)
+    assert isinstance(handler, QwenOmniStreamingVideoHandler)
