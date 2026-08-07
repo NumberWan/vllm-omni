@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL="aurateam/AURA"
-SERVER_MODEL="aurateam/AURA"
-DEPLOY_CONFIG="/data/yrr/vllm-omni/vllm_omni/deploy/aura_omni.yaml"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
+MODEL="${MODEL:-aurateam/AURA}"
+SERVER_MODEL="${SERVER_MODEL:-aurateam/AURA}"
+DEPLOY_CONFIG="${DEPLOY_CONFIG:-$REPO_ROOT/vllm_omni/deploy/aura_omni.yaml}"
 SERVER_PORT=8091
 GRADIO_PORT=7862
 SERVER_HOST="0.0.0.0"
@@ -29,7 +32,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 API_BASE="http://localhost:${SERVER_PORT}/v1"
 LOG_FILE="/tmp/aura_omni_vllm_${SERVER_PORT}.log"
 
@@ -62,7 +64,7 @@ for _ in $(seq 1 600); do
   sleep 1
 done
 
-# cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR"
 GRADIO_CMD=(python gradio_demo.py --model "$MODEL" --api-base "$API_BASE" --ip "$GRADIO_IP" --port "$GRADIO_PORT")
 if [[ "$GRADIO_SHARE" == "true" ]]; then
   GRADIO_CMD+=(--share)
@@ -72,8 +74,4 @@ GRADIO_PID=$!
 
 echo "vLLM server: http://${SERVER_HOST}:${SERVER_PORT}"
 echo "Gradio demo: http://${GRADIO_IP}:${GRADIO_PORT}"
-if [[ -n "${SERVER_PID:-}" ]]; then
-  wait "$SERVER_PID" "$GRADIO_PID"
-else
-  wait "$GRADIO_PID"
-fi
+wait "$SERVER_PID" "$GRADIO_PID"

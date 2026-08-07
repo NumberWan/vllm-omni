@@ -1,4 +1,4 @@
-# AURA Omni: Offline inference
+# AURA Omni
 
 This example runs the native AURA Omni pipeline offline:
 
@@ -6,7 +6,11 @@ This example runs the native AURA Omni pipeline offline:
 Qwen3-ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Qwen3-TTS Code2Wav
 ```
 
-The first stage consumes speech and produces a transcript. The AURA stage then combines the transcript with the video frames from the original request and returns text or `<|silent|>`. Non-silent responses are passed to Qwen3-TTS as AURA-generated token ids.
+The first stage consumes speech and produces a transcript. The AURA stage then
+combines the transcript with the video frames from the original request and
+returns text or `<|silent|>`. Non-silent responses are passed to Qwen3-TTS as
+text by default; set `tts_pass_token_ids=true` to pass AURA-generated assistant
+token ids directly.
 
 ## Run
 
@@ -30,7 +34,7 @@ you override it:
 ```bash
 python end2end.py \
   --tts-task-type Base \
-  --tts-ref-audio /data/yrr/rein_test/shuhan.mp3 \
+  --tts-ref-audio /path/to/shuhan.mp3 \
   --tts-x-vector-only-mode
 ```
 

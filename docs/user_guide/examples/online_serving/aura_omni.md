@@ -1,4 +1,4 @@
-# AURA Omni: Online serving
+# AURA Omni Pipeline
 
 `aura_omni` wires ASR, AURA, and Qwen3-TTS into one vLLM-Omni pipeline:
 
@@ -10,17 +10,18 @@ Qwen3-TTS remains two engine stages so the pipeline reuses the existing native
 Talker and Code2Wav implementation.
 
 ```bash
-vllm serve aurateam/AURA \
-  --omni \
-  --deploy-config vllm_omni/deploy/aura_omni.yaml \
-  --served-model-name aurateam/AURA \
-  --trust-remote-code
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
+curl http://127.0.0.1:8666/v1/models
 ```
 
 Configure local checkpoints by editing per-stage `model` values in
-`vllm_omni/deploy/aura_omni.yaml`. The deploy file sets
+`vllm_omni/deploy/aura_omni_2gpu_best.yaml` and pass the copy through
+`DEPLOY=/path/to/local.yaml`. The deploy file sets
 `pipeline: aura_omni`, so the four-stage topology is used even if the
 command-line `--model` points at one of the component checkpoints.
+
+See the [complete serving guide](../../../../examples/online_serving/aura_omni/README.md)
+for installation, WebSocket examples, troubleshooting, and shutdown.
 
 Send requests with `"model": "aurateam/AURA"`. The ASR, AURA, and Qwen3-TTS
 checkpoint paths are internal stage models from the deploy YAML, not the
@@ -32,13 +33,9 @@ turn.
 
 ## GPU Utilization Recommendation
 
-`gpu_memory_utilization` in `vllm_omni/deploy/aura_omni.yaml` controls how much
-VRAM each stage can reserve. Start with this split for a single GPU:
-
-- Stage 0 (ASR): `0.10`
-- Stage 1 (AURA): `0.40`
-- Stage 2 (Qwen3-TTS Talker): `0.20`
-- Stage 3 (Qwen3-TTS Code2Wav): `0.20`
+The production profile uses two visible GPUs. Stage 0/2/3 share visible GPU 0;
+Stage 1 uses visible GPU 1. Device numbers in the YAML are relative to
+`CUDA_VISIBLE_DEVICES`.
 
 ## TTS Modes
 

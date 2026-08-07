@@ -1,0 +1,114 @@
+# AURA Omni — recommended 2-GPU deploy (skip-ON best stack).
+# Layout: Stage0 ASR + Stage2/3 TTS on GPU0; Stage1 AURA on GPU1.
+# Feature flags default in code (STAGE0_BYPASS / TTS_GATE / SENTENCE_TTS).
+# Prefer: bash scripts/start_aura_omni.sh
+# See: docs/aura/AURA_OMNI_TUNABLES.md
+#
+pipeline: aura_omni
+async_chunk: true
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 20
+      codec_left_context_frames: 72
+      initial_codec_chunk_frames: 1
+      decode_cudagraph_capture_sizes:
+      - 25
+      - 73
+      - 97
+      - 169
+      - 325
+stages:
+- stage_id: 0
+  max_num_seqs: 4
+  gpu_memory_utilization: 0.1
+  trust_remote_code: true
+  enable_prefix_caching: true
+  async_scheduling: true
+  max_model_len: 8192
+  max_num_batched_tokens: 4096
+  devices: '0'
+  model: Qwen/Qwen3-ASR-1.7B
+  default_sampling_params:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 256
+- stage_id: 1
+  max_num_seqs: 8
+  gpu_memory_utilization: 0.9
+  trust_remote_code: true
+  enable_prefix_caching: true
+  mm_processor_cache_gb: 4
+  async_scheduling: true
+  max_model_len: 262144
+  max_num_batched_tokens: 15360
+  devices: '1'
+  model: aurateam/AURA
+  default_sampling_params:
+    temperature: 0.5
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 256
+    repetition_penalty: 1.0
+    stop_token_ids:
+    - 151669
+    - 151645
+  attention_backend: FLASHINFER
+  mm_encoder_attn_backend: FLASHINFER
+- stage_id: 2
+  max_num_seqs: 4
+  gpu_memory_utilization: 0.15
+  enforce_eager: false
+  trust_remote_code: true
+  enable_prefix_caching: false
+  async_scheduling: true
+  max_num_batched_tokens: 8192
+  max_model_len: 8192
+  devices: '0'
+  attention_backend: FLASHINFER
+  output_connectors:
+    to_stage_3: connector_of_shared_memory
+  model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+  default_sampling_params:
+    temperature: 0.9
+    top_k: 50
+    max_tokens: 4096
+    seed: 42
+    repetition_penalty: 1.05
+  subtalker_sampling_params:
+    do_sample: true
+    temperature: 0.9
+    top_k: 50
+    top_p: 1.0
+- stage_id: 3
+  max_num_seqs: 4
+  gpu_memory_utilization: 0.15
+  enforce_eager: false
+  trust_remote_code: true
+  enable_prefix_caching: false
+  async_scheduling: true
+  max_num_batched_tokens: 65536
+  max_model_len: 65536
+  devices: '0'
+  input_connectors:
+    from_stage_2: connector_of_shared_memory
+  model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+  default_sampling_params:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 65536
+    seed: 42
+    repetition_penalty: 1.0
+platforms:
+  npu:
+    stages:
+    - stage_id: 2
+      enforce_eager: true

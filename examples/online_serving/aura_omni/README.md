@@ -1,146 +1,189 @@
-# AURA Omni: Online serving
+# Serve AURA with vLLM-Omni
 
-`aura_omni` serves AURA as a native multi-stage vLLM-Omni pipeline:
+AURA is served as a four-stage streaming pipeline:
 
 ```text
-Qwen3-ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Qwen3-TTS Code2Wav
+Qwen3-ASR -> AURA -> Qwen3-TTS Talker -> Code2Wav
 ```
 
-The pipeline has three semantic modules, but four engine stages because the
-existing Qwen3-TTS implementation is natively split into Talker and Code2Wav.
+The production profile uses two GPUs, FlashInfer, streaming session history,
+silent-turn Stage-0 bypass, and sentence-level TTS handoff.
 
-Start the server with the deploy profile:
+## Prerequisites
+
+- Linux with two CUDA GPUs that can hold the four models
+- Python 3.10–3.13
+- A working vLLM-Omni installation
+- Access to:
+  - `Qwen/Qwen3-ASR-1.7B`
+  - `aurateam/AURA`
+  - `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
+- Matching `flashinfer-python` and `flashinfer-jit-cache` versions
+
+From the repository root, run the AURA installer:
 
 ```bash
-vllm serve aurateam/AURA \
-  --omni \
-  --port 8091 \
-  --deploy-config vllm_omni/deploy/aura_omni.yaml \
-  --served-model-name aurateam/AURA \
-  --trust-remote-code
+bash scripts/install_aura_omni.sh
 ```
 
-The deploy file sets per-stage model repos:
+It creates `.venv`, installs this checkout, detects the CUDA version used by
+PyTorch, installs the matching `flashinfer-jit-cache`, and verifies that its
+version matches `flashinfer-python`. Set `VENV_DIR=/path/to/venv` to use a
+different environment.
 
-- Stage 0 ASR: `Qwen/Qwen3-ASR-1.7B`
-- Stage 1 AURA: `aurateam/AURA`
-- Stage 2/3 TTS: `Qwen/Qwen3-TTS-12Hz-1.7B-Base`
+## Start the server
 
-For local weights, edit the `model` value on each stage in
-`vllm_omni/deploy/aura_omni.yaml`. The deploy profile includes
-`pipeline: aura_omni`, so the server uses this four-stage topology even when
-the command-line model path points at one component checkpoint.
+### API-only quick start
 
-Expected request shape:
+Auto-loads the default deploy yaml (`vllm_omni/deploy/aura_omni.yaml`).
+Stages pin visible devices `0`/`1`, so without `CUDA_VISIBLE_DEVICES` this
+uses physical GPUs 0 and 1:
 
-- Send microphone audio as the Stage 0 multimodal audio input.
-- Include video frames in the original request `multi_modal_data`; the
-  `asr2aura` processor carries them forward to AURA.
-- Optional `additional_information` keys:
-  - `aura_system_prompt`
-  - `tts_task_type`
-  - `tts_language`
-  - `tts_speaker`
-  - `tts_instruct`
-  - `tts_ref_audio`
-  - `tts_ref_text`
-  - `tts_x_vector_only_mode`
-  - `tts_pass_token_ids`
+```bash
+vllm serve aurateam/AURA --omni
+```
 
-If AURA emits `<|silent|>`, the `aura2tts` processor returns no TTS request, so
-the TTS stages are skipped for that turn.
+Use a local checkpoint path instead of the Hub id when weights are already
+on disk (`vllm serve /path/to/AURA --omni`). Add `--port 8666` if you need a
+fixed port (vLLM defaults to `8000`). Set `CUDA_VISIBLE_DEVICES` only when
+you need other cards (for example `2,3`).
 
-## GPU Utilization Recommendation
+### Helper script (background + checks)
 
-Tune `gpu_memory_utilization` per stage in `vllm_omni/deploy/aura_omni.yaml`.
-Recommended baseline on one GPU for H200
+From the repository root:
 
-- Stage 0 (ASR): `0.10`
-- Stage 1 (AURA): `0.4`
-- Stage 2 (Qwen3-TTS Talker): `0.20`
-- Stage 3 (Qwen3-TTS Code2Wav): `0.20`
+```bash
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
+```
 
-## Python Client
+The script validates the deploy file, port, GPU count, and FlashInfer packages,
+then starts the server in the background. Models are downloaded from
+Hugging Face on first use. Startup can take several minutes.
+
+Check health and logs:
+
+```bash
+curl http://127.0.0.1:8666/v1/models
+tail -f /tmp/aura_omni_serve/server_*.log
+```
+
+The script never terminates an unrelated process occupying the configured port.
+Use another port when necessary:
+
+```bash
+PORT=8667 CUDA_VISIBLE_DEVICES=2,3 bash scripts/start_aura_omni.sh
+```
+
+## Send a streaming request
+
+The production endpoint is a WebSocket:
+
+```text
+ws://127.0.0.1:8666/v1/video/chat/stream
+```
+
+Run the included smoke client with generated frames:
+
+```bash
+python examples/online_serving/aura_omni/streaming_video_client.py \
+  --url ws://127.0.0.1:8666/v1/video/chat/stream \
+  --synthetic-frames 8
+```
+
+Use `--audio /path/to/question.pcm` for PCM16, 16 kHz, mono microphone audio.
+Use `--text-only` when synthesized speech is not required.
+
+For a single HTTP multimodal request:
 
 ```bash
 python examples/online_serving/aura_omni/openai_chat_completion_client.py \
-  --host localhost \
-  --port 8091 \
+  --host 127.0.0.1 \
+  --port 8666 \
   --model aurateam/AURA \
   --modalities text,audio
 ```
 
-Use local media:
+## MiniCPM-style browser demo
+
+A browser UI modeled after the MiniCPM-o realtime demo is isolated under
+`examples/online_serving/aura_omni/minicpm_style_web_demo/`. The single-GPU
+demo profile can start AURA and the UI with one command:
 
 ```bash
-python examples/online_serving/aura_omni/openai_chat_completion_client.py \
-  --audio-path /path/to/input.wav \
-  --video-path /path/to/video.mp4 \
-  --output-dir output_aura_omni_online
+bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_1gpu_demo_stack.sh
 ```
 
-Base voice clone mode (default, recommended as x-vector while debugging ICL):
+It uses a bundled speech sample and a generated frame for startup warmup, so
+normal browser use does not require the OmniInteract dataset. Smoke3 remains a
+separate, optional regression benchmark for measured accuracy and latency.
+
+See the demo's own
+[`README.md`](minicpm_style_web_demo/README.md) for controls, options, and the
+intentional non-full-duplex boundary.
+
+## Stop the server
 
 ```bash
-python examples/online_serving/aura_omni/openai_chat_completion_client.py \
-  --tts-task-type Base \
-  --tts-ref-audio vllm-omni/tests/assets/qwen3_tts/clone_2.wav \
-  --tts-ref-text "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+bash scripts/stop_aura_omni.sh
 ```
 
-Enable AURA token-id passthrough explicitly:
+The stop script only signals the PID recorded by the start script and refuses
+to terminate a process that is not `vllm serve`.
+
+## Local or offline model weights
+
+Copy the production deploy and replace its four `model:` values with local
+paths:
 
 ```bash
-python examples/online_serving/aura_omni/openai_chat_completion_client.py \
-  --tts-pass-token-ids
+cp vllm_omni/deploy/aura_omni_2gpu_best.yaml /tmp/aura_local.yaml
+# Edit /tmp/aura_local.yaml, then:
+DEPLOY=/tmp/aura_local.yaml \
+MODEL=/models/AURA \
+ALLOWED_LOCAL_MEDIA_PATH=/models \
+CUDA_VISIBLE_DEVICES=0,1 \
+bash scripts/start_aura_omni.sh
 ```
 
-CustomVoice mode requires stages 2 and 3 in `aura_omni.yaml` to point at a
-Qwen3-TTS CustomVoice checkpoint:
+`devices: "0"` and `devices: "1"` in the deploy file are relative to
+`CUDA_VISIBLE_DEVICES`.
+
+## Common failures
+
+### FlashInfer argument or ABI errors
+
+Check the installed versions:
 
 ```bash
-python examples/online_serving/aura_omni/openai_chat_completion_client.py \
-  --tts-task-type CustomVoice \
-  --tts-speaker Vivian
+python - <<'PY'
+import importlib.metadata as md
+print("flashinfer-python:", md.version("flashinfer-python"))
+print("flashinfer-jit-cache:", md.version("flashinfer-jit-cache"))
+PY
 ```
 
-By default, AURA responses are passed to Qwen3-TTS as text. Set
-`tts_pass_token_ids=true` to pass AURA-generated assistant token ids directly
-to Qwen3-TTS instead. The processor still uses AURA token ids, when available,
-to estimate the Talker prompt length in the default text path.
+Their base versions must match. Reinstall both from the wheel index for the
+machine's CUDA version.
 
-## Curl
+### Port already in use
 
-```bash
-cd examples/online_serving/aura_omni
-bash run_curl_multimodal_generation.sh
-```
+The start script exits without killing the existing process. Set `PORT` to a
+free value or stop the owner of that port yourself.
 
-Set `PORT`, `MODEL`, or `OUTPUT_DIR` to override defaults:
+### Out of memory
 
-```bash
-PORT=8666 MODEL=aurateam/AURA bash run_curl_multimodal_generation.sh
-TTS_PASS_TOKEN_IDS=true PORT=8666 MODEL=aurateam/AURA bash run_curl_multimodal_generation.sh
-```
+Confirm that exactly two free GPUs are exposed. Do not share them with another
+server. For a custom placement or memory budget, copy the deploy YAML and pass
+it through `DEPLOY=`.
 
-## Gradio
+### Local media is rejected
 
-Launch the server and Gradio UI together:
+Set `ALLOWED_LOCAL_MEDIA_PATH` to the directory containing request media. This
+is not required by the WebSocket client because it sends frames and audio over
+the connection.
 
-```bash
-cd examples/online_serving/aura_omni
-bash run_gradio_demo.sh
-```
+## Advanced configuration
 
-If the server is already running:
-
-```bash
-python examples/online_serving/aura_omni/gradio_demo.py \
-  --model aurateam/AURA \
-  --api-base http://localhost:8091/v1
-```
-
-## Offline
-
-For offline inference, see
-[`examples/offline_inference/aura_omni`](../../offline_inference/aura_omni/).
+- API protocol: [`docs/serving/aura_video_stream_api.md`](../../../docs/serving/aura_video_stream_api.md)
+- Performance and feature flags: [`docs/aura/AURA_OMNI_TUNABLES.md`](../../../docs/aura/AURA_OMNI_TUNABLES.md)
+- OmniInteract regression benchmark: [`benchmarks/omniinteract/SETUP_AND_RUN.md`](../../../benchmarks/omniinteract/SETUP_AND_RUN.md)

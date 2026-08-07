@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>AURA Streaming Voice</title>
+    <link rel="stylesheet" href="static/styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">MiniCPM-style UI over AURA video stream</p>
+        <h1>AURA Streaming Voice</h1>
+      </div>
+      <span id="connectionState" class="status status-offline">Offline</span>
+    </header>
+
+    <main>
+      <section class="call-bar" aria-label="Session controls">
+        <div class="call-bar-row">
+          <div class="call-actions">
+            <button id="callButton" class="primary" type="button">Start session</button>
+            <button id="cameraButton" class="secondary" type="button" disabled>Camera</button>
+          </div>
+          <div class="meter" aria-label="Microphone level">
+            <span>Mic</span>
+            <div class="meter-track"><div id="meterFill" class="meter-fill"></div></div>
+          </div>
+          <dl class="runtime-status">
+            <div><dt>Model</dt><dd id="modelState">Idle</dd></div>
+            <div><dt>Playback</dt><dd id="playbackState">Idle</dd></div>
+            <div><dt>Session</dt><dd id="sessionTimer">00:00</dd></div>
+          </dl>
+        </div>
+        <div class="prompt-row">
+          <label>
+            Prompt preset
+            <select id="promptPreset">
+              <option value="chinese_live" selected>中文直播观察</option>
+              <option value="english_live">English live observe</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <textarea id="systemPrompt" rows="2" placeholder="AURA system prompt">You are receiving a live video stream where the final frame is the present moment. Respond only when a response is needed based on the user's message or the visual context. Otherwise, output '&lt;|silent|&gt;' to signify silence. Respond in Chinese.</textarea>
+        </div>
+      </section>
+
+      <div class="live-workspace">
+        <section class="video-section" aria-labelledby="videoTitle">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Live camera</p>
+              <h2 id="videoTitle">What AURA sees</h2>
+            </div>
+          </div>
+          <div class="camera-stage">
+            <video id="cameraPreview" class="camera-preview" muted playsinline></video>
+            <p id="cameraPlaceholder" class="camera-placeholder">Allow camera access to show the live preview.</p>
+          </div>
+        </section>
+
+        <section class="conversation-section" aria-labelledby="conversationTitle">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Live transcript</p>
+              <h2 id="conversationTitle">Conversation</h2>
+            </div>
+            <span class="policy-label">Hold to talk · continuous video frames</span>
+          </div>
+          <div id="conversation" class="conversation" aria-live="polite">
+            <p id="emptyConversation" class="empty-state">Start a session, hold the talk button while speaking, then release to send. Camera frames stream while the session is active.</p>
+          </div>
+          <div class="conversation-controls">
+            <button id="muteButton" class="push-to-talk" type="button" aria-pressed="false" disabled>
+              Hold to talk
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <details class="diagnostics" open>
+        <summary>
+          <span>Event log</span>
+          <span id="eventCount" class="event-count">0 events</span>
+        </summary>
+        <div class="log-toolbar">
+          <span id="runtimeDetail">No active connection</span>
+          <button id="clearLogButton" class="icon-button" type="button" title="Clear event log">Clear</button>
+        </div>
+        <pre id="eventLog" class="event-log" aria-live="polite"></pre>
+      </details>
+    </main>
+
+    <script>window.AURA_WEB_CONFIG = __AURA_WEB_CONFIG__;</script>
+    <script src="static/app.js?v=__AURA_WEB_APP_VERSION__"></script>
+  </body>
+</html>
