@@ -33,6 +33,7 @@ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesPropose
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_model_runner import (
     AsyncGPUModelRunnerOutput,
 )
@@ -435,6 +436,49 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         helper = getattr(self, "_duplex_sampling_helper", None)
         if helper is not None:
             helper.update_states(self, scheduler_output)
+        return deferred_state_corrections_fn
+
+    def _maybe_preprocess_mamba_align(
+        self,
+        scheduler_output: SchedulerOutput,
+        deferred_state_corrections_fn: Callable | None,
+        num_reqs: int,
+    ) -> Callable | None:
+        """Copy Mamba/GDN state onto the running block before hybrid prefix hits.
+
+        Stock ``GPUModelRunner.execute_model`` does this when
+        ``mamba_cache_mode == "align"``. Omni overrides ``execute_model`` and
+        previously skipped it, so Qwen3.5 prefix hits restored attention KV
+        without aligning Mamba state.
+        """
+        if getattr(self.cache_config, "mamba_cache_mode", "none") != "align":
+            return deferred_state_corrections_fn
+        if deferred_state_corrections_fn:
+            deferred_state_corrections_fn()
+            deferred_state_corrections_fn = None
+        mamba_bufs = self._get_mamba_bufs()
+        mamba_utils.preprocess_mamba(
+            scheduler_output,
+            self.kv_cache_config,
+            self.cache_config,
+            self.mamba_state_idx,
+            self.input_batch,
+            self.requests,
+            self.compilation_config.static_forward_context,
+            self.model.get_mamba_state_copy_func(),
+            mamba_bufs.preprocess,
+        )
+        self.num_accepted_tokens.np[:num_reqs] = self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+        self.num_accepted_tokens.copy_to_gpu(num_reqs)
+        if mamba_bufs.postprocess_align is not None:
+            mamba_utils.stage_postprocess_inputs_to_gpu(
+                mamba_bufs.postprocess_align,
+                scheduler_output,
+                self.input_batch.req_ids,
+                num_reqs,
+                self.requests,
+                self.mamba_state_idx,
+            )
         return deferred_state_corrections_fn
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
@@ -1224,6 +1268,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
                 for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
                 if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+            )
+
+            deferred_state_corrections_fn = self._maybe_preprocess_mamba_align(
+                scheduler_output,
+                deferred_state_corrections_fn,
+                num_reqs,
             )
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(

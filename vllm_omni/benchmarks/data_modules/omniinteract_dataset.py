@@ -67,16 +67,19 @@ class _OmniInteractStreamingEntry:
 
 
 def aura_sampling_params_list() -> list[dict[str, Any]]:
+    silent_id = int(os.environ.get("VLLM_AURA_SILENT_TOKEN_ID", "151669") or "151669")
+    im_end_id = int(os.environ.get("VLLM_AURA_IM_END_TOKEN_ID", "151645") or "151645")
+    stage1_temperature = 0.0 if silent_id == 248070 else 0.5
     return [
         {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "max_tokens": 256, "seed": 42},
         {
-            "temperature": 0.5,
+            "temperature": stage1_temperature,
             "top_p": 1.0,
             "top_k": -1,
             "max_tokens": 256,
             "seed": 42,
             "repetition_penalty": 1.0,
-            "stop_token_ids": [151669, 151645],
+            "stop_token_ids": [silent_id, im_end_id],
         },
         {
             "temperature": 0.9,

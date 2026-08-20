@@ -897,3 +897,87 @@ def test_build_omni_output_splits_client_mm_from_inter_stage_keys(monkeypatch):
     assert output.inter_stage_outputs is not None
     assert "hidden" in output.inter_stage_outputs[0]
     assert "audio" not in output.inter_stage_outputs[0]
+
+
+def _make_mamba_align_runner(*, mode: str) -> GPUARModelRunner:
+    runner = object.__new__(GPUARModelRunner)
+    runner.cache_config = SimpleNamespace(mamba_cache_mode=mode)
+    runner.kv_cache_config = object()
+    runner.mamba_state_idx = {}
+    runner.input_batch = SimpleNamespace(
+        num_accepted_tokens_cpu=np.array([3, 4], dtype=np.int32),
+        req_ids=["r0", "r1"],
+    )
+    runner.requests = {}
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.model = SimpleNamespace(get_mamba_state_copy_func=lambda: object())
+    runner.num_accepted_tokens = SimpleNamespace(np=np.zeros(4, dtype=np.int32))
+    runner._copied_gpu = None
+
+    def copy_to_gpu(num_reqs):
+        runner._copied_gpu = num_reqs
+
+    runner.num_accepted_tokens.copy_to_gpu = copy_to_gpu
+    runner._mamba_bufs = SimpleNamespace(preprocess=object(), postprocess_align=object())
+    runner._get_mamba_bufs = lambda: runner._mamba_bufs
+    return runner
+
+
+def test_maybe_preprocess_mamba_align_skips_non_align_mode():
+    runner = _make_mamba_align_runner(mode="none")
+    called = []
+
+    def deferred():
+        called.append("deferred")
+
+    leftover = runner._maybe_preprocess_mamba_align(
+        scheduler_output=SimpleNamespace(scheduled_new_reqs=[]),
+        deferred_state_corrections_fn=deferred,
+        num_reqs=2,
+    )
+    assert leftover is deferred
+    assert called == []
+    assert runner._copied_gpu is None
+
+
+def test_maybe_preprocess_mamba_align_runs_before_forward(monkeypatch):
+    runner = _make_mamba_align_runner(mode="align")
+    order: list[str] = []
+
+    def deferred():
+        order.append("deferred")
+
+    def fake_preprocess(*args, **kwargs):
+        order.append("preprocess_mamba")
+
+    def fake_stage(*args, **kwargs):
+        order.append("stage_postprocess")
+
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_ar_model_runner.mamba_utils.preprocess_mamba",
+        fake_preprocess,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_ar_model_runner.mamba_utils.stage_postprocess_inputs_to_gpu",
+        fake_stage,
+    )
+
+    leftover = runner._maybe_preprocess_mamba_align(
+        scheduler_output=SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(req_id="r0", num_computed_tokens=128)]
+        ),
+        deferred_state_corrections_fn=deferred,
+        num_reqs=2,
+    )
+    assert leftover is None
+    assert order == ["deferred", "preprocess_mamba", "stage_postprocess"]
+    assert runner.num_accepted_tokens.np[:2].tolist() == [3, 4]
+    assert runner._copied_gpu == 2
+
+
+def test_execute_model_calls_mamba_align_preprocess():
+    import inspect
+
+    source = inspect.getsource(GPUARModelRunner.execute_model)
+    assert "_maybe_preprocess_mamba_align" in source
+    assert source.index("_maybe_preprocess_mamba_align") < source.index("_get_slot_mappings")
