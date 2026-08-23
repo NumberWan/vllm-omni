@@ -2,24 +2,27 @@
 
 給新開 Cursor Agent 的最短上手路徑。先讀本檔，再按任務深潛。
 
+**本機文件入口（目錄 + 現況對照）：** [`/home/wtk/AURA_docs/README.md`](/home/wtk/AURA_docs/README.md)
+
 ## 兩個 codebase（唔好撈亂）
 
 | | **vLLM-Omni（production serve）** | **Native（官方 demo / 對照）** |
 |---|---|---|
-| 根目錄 | `/home/wtk/v0.23.0`（worktree；同 inode 常有 `/workspace/wtk/v0.23.0`） | `/home/wtk/AURA/AURA` |
+| 根目錄 | `/home/wtk/vllm-omni-AURA_026` | `/home/wtk/AURA/AURA` |
 | 入口 | `vllm serve … --omni` / `scripts/start_aura_omni.sh` | `start_all.sh`、README Demo Deployment |
 | Pipeline | Stage0 ASR → Stage1 AURA → Stage2 Talker → Stage3 Code2Wav | 分開 ASR / VL / TTS 服務 + context manage |
 | Deploy | `vllm_omni/deploy/aura_omni_2gpu_best.yaml`（預設 2 卡） | Native 腳本內 GPU 分配 |
-| 1-GPU Web Demo | `examples/online_serving/aura_omni/minicpm_style_web_demo/` | — |
+| 1-GPU Web Demo | `native_gateway_web_demo/`（原版 Native UI）＋ `minicpm_style_web_demo/` | — |
 | 模型權重（本機） | `/workspace/models/AURA`、`Qwen3-ASR-1.7B`、hub TTS CustomVoice snapshot | 通常同 HF / 本地 cache |
 
 ## 必讀（按順序）
 
-1. Omni serve：`examples/online_serving/aura_omni/README.md`
-2. Tunables：`docs/aura/AURA_OMNI_TUNABLES.md`
-3. Web demo：`examples/online_serving/aura_omni/minicpm_style_web_demo/README.md`
-4. Streaming API：`docs/serving/aura_video_stream_api.md`
-5. Native：`/home/wtk/AURA/AURA/README.md`（尤其 Demo Deployment、context management）
+1. 文件入口：`/home/wtk/AURA_docs/README.md`
+2. Omni serve：`examples/online_serving/aura_omni/README.md`
+3. Tunables：`docs/aura/AURA_OMNI_TUNABLES.md`
+4. 正式 Native-UI demo：`examples/online_serving/aura_omni/native_gateway_web_demo/README.md`
+5. Streaming API：`docs/serving/aura_video_stream_api.md`
+6. Native Gateway：`/home/wtk/AURA_demo-main/NATIVE_AURA_V2_DEMO_ONBOARDING.md`
 
 ## 一鍵命令（Omni）
 
@@ -33,11 +36,16 @@ bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_2gpu_dual_demo
 # stop:
 bash examples/online_serving/aura_omni/minicpm_style_web_demo/stop_2gpu_dual_demo_stack.sh
 
-# 1-GPU demo（測穩 TTS 起點；單併發）
+# 1-GPU Native-UI demo（原版前端）
+bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
+# stop:
+bash examples/online_serving/aura_omni/native_gateway_web_demo/stop_1gpu_stack.sh
+
+# 1-GPU MiniCPM 風格 demo（測穩 TTS 起點；單併發）
 bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_1gpu_demo_stack.sh
 ```
 
-Demo：`:7862` / `:7863`；AURA：`:8666`。LAN：`http://192.168.0.180:7862/`。
+Demo：Native-UI `:9999`；MiniCPM `:7862`／`:7863`；AURA：`:8666`。
 
 ## 架構要點（Omni）
 
@@ -67,9 +75,9 @@ Agent transcripts 喺 `/home/wtk/.cursor/projects/home-wtk/agent-transcripts/`�
 複製到新 chat：
 
 ```text
-請先讀 /home/wtk/v0.23.0/docs/aura/AURA_AGENT_ONBOARDING.md，
-再按任務讀 Omni README + TUNABLES，以及 /home/wtk/AURA/AURA/README.md。
-工作區：Omni=/home/wtk/v0.23.0；Native=/home/wtk/AURA/AURA。
+請先讀 /home/wtk/AURA_docs/README.md，
+再按任務讀 Omni README + TUNABLES，以及 Native Gateway 上手。
+工作區：Omni=/home/wtk/vllm-omni-AURA_026；Native Gateway=/home/wtk/AURA_demo-main。
 遵守 Karpathy guidelines；回覆用繁中。
 任務：<在此寫你的具體問題>
 ```

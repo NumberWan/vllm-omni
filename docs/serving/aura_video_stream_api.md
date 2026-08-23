@@ -76,6 +76,8 @@ installation, local model paths, and troubleshooting.
 | `aura_system_prompt` | string | AURA default | Override the AURA system prompt. |
 | `video_fps` | float | `2.0` | FPS metadata attached to each `video_tuple`. |
 | `stream_text_deltas` | bool | `false` | When `false`, the server buffers assistant text and only sends `response.text.done` (no per-token `response.text.delta`). Set `true` for incremental text streaming. |
+| `tool_mode` | `"none"` or `"auto"` | `"none"` | Enable the bounded server-side AURA tool loop. The server must also start with an allowlist executor and Qwen3 XML parser. |
+| `max_tool_depth` | int | `2` | Maximum tool-call passes in one logical turn (range 1–2). |
 
 All standard fields from [video_stream_api.md](video_stream_api.md) (`max_frames`, EVS, `sampling_params_list`, etc.) still apply.
 
@@ -84,6 +86,58 @@ All standard fields from [video_stream_api.md](video_stream_api.md) (`max_frames
 By default AURA does **not** stream `response.text.delta` to clients. Assistant tokens are accumulated server-side; the client receives a single `response.text.done` with the full reply. The production default has async chunking enabled, so the next turn can begin while the TTS tail still streams.
 
 Set `stream_text_deltas: true` in `session.config` if you need incremental text events (e.g. for a live caption UI).
+
+## Safe Tool Mode
+
+Tool execution is disabled by default. The built-in safe allowlist exposes:
+
+- `calculator` — bounded AST arithmetic; never uses `eval`
+- `get_current_datetime` — local `Asia/Shanghai` time
+- `get_city_weather` — fixed Open-Meteo endpoints
+- `convert_currency` — fixed Frankfurter endpoint
+- `DeepSeek` — Native-aligned `query` / `enable_search` schema; **fixed mock, no live API**
+- `get_current_location` — Native-like ipwho.is → ipapi.co fallback
+- `WebSearch` — Native Serper schema `query` / `max_results`; key only from `SERPER_API_KEY`
+
+Brave / DuckDuckGo / WebFetch stay out of this allowlist. The executor never
+logs or writes the Serper key.
+
+It does not expose arbitrary URLs, shell commands, files, or side-effecting actions.
+
+Start the server and browser demo with:
+
+```bash
+VLLM_AURA_TOOL_EXECUTOR=safe \
+  bash scripts/start_aura_omni.sh
+
+TOOL_MODE=auto \
+  bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_demo.sh
+```
+
+`start_aura_omni.sh` adds `--enable-auto-tool-choice --tool-call-parser qwen3_xml`
+when `VLLM_AURA_TOOL_EXECUTOR` is `safe` or `mock`. Direct WebSocket clients must
+send `"tool_mode": "auto"` themselves.
+
+### Tool speech timing
+
+If pass-1 natural text appears *before* the first `<tool_call>`, the server emits
+that prefix as a separate segment and may synthesize it while tools run:
+
+| Event | Meaning |
+|-------|---------|
+| `response.tool.preamble.text` | Safe pre-tool spoken/shown prefix only |
+| `response.tool.preamble.audio.delta` / `.done` | Audio for that prefix (not the whole turn) |
+| `response.tool.started` / `response.tool.done` | Allowlisted execution; `content` is bounded JSON |
+| `response.text.done` / `response.audio.*` | **Final** pass only; same semantics as a no-tool turn |
+
+XML, thinking, and malformed tool output never go to TTS. Pure tool calls do
+not invent a filler sentence. Pass-1 still does not commit history; pass-2
+commits once.
+
+`VLLM_VIDEO_ASYNC_CHUNK=on` is required for Native-style overlap (preamble
+audio while tools run). `off` remains completion-safe and does not claim that
+overlap. Omni does not cancel an in-flight preamble the way Native cancels a
+detached TTS task; see the alignment report under `/home/wtk/aura_tool_probe/`.
 
 ## Trigger Semantics
 
