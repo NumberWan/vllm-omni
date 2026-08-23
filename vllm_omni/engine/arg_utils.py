@@ -24,6 +24,8 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "AuraQwen3_5ForConditionalGeneration": "qwen3_5",
+    "AuraQwen3VLForConditionalGeneration": "qwen3_vl",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
