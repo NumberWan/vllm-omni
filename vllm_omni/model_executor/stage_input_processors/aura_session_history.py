@@ -40,7 +40,7 @@ AURA_IM_END_TOKEN_ID = _env_token_id("VLLM_AURA_IM_END_TOKEN_ID", 151645)
 DEFAULT_AURA_SYSTEM_PROMPT = (
     "You are receiving a live video stream where the final frame is the present moment. "
     "Respond only when a response is needed based on the user's message or the visual context. "
-    "Otherwise, output '<|silent|>' to signify silence. Respond in Chinese."
+    "Otherwise, output `<|silent|>` to signify silence."
 )
 
 logger = logging.getLogger(__name__)

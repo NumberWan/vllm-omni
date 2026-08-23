@@ -186,13 +186,14 @@ def test_v2_response_instruction_is_user_turn_local(monkeypatch):
         },
     ]
     monkeypatch.setenv("VLLM_AURA_SILENT_TOKEN_ID", "248070")
+    monkeypatch.delenv("VLLM_AURA_CHINESE_ONLY", raising=False)
 
+    assert aura_response_instruction() == ""
+    assert with_aura_response_instruction(original) is original
+
+    monkeypatch.setenv("VLLM_AURA_CHINESE_ONLY", "1")
     rendered = with_aura_response_instruction(original)
-
     assert aura_response_instruction() == AURA_CHINESE_RESPONSE_INSTRUCTION
     assert rendered is not original
     assert rendered[-1]["content"][-1]["text"] == AURA_CHINESE_RESPONSE_INSTRUCTION
     assert original[-1]["content"][-1]["text"] == "Solve this question."
-
-    monkeypatch.setenv("VLLM_AURA_CHINESE_ONLY", "0")
-    assert with_aura_response_instruction(original) is original

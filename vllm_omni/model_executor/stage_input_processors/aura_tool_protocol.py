@@ -53,17 +53,17 @@ def aura_enable_thinking() -> bool:
 
 
 def aura_response_instruction() -> str:
-    """Return the per-turn response constraint for AURA_v2.
+    """Return the optional per-turn response constraint for AURA_v2.
 
-    The checkpoint follows the current user turn's language more strongly than
-    a system-only ``Respond in Chinese`` instruction. Keep this constraint out
-    of persisted history and append it only to the turn being generated.
+    Native Gateway does not inject a Chinese-only user-turn instruction.
+    Keep the opt-in path for experiments; default off to preserve silent
+    vision-only turns. When enabled, keep the constraint out of persisted
+    history and append it only to the turn being generated.
     """
 
     if not is_aura_v2_runtime():
         return ""
-    raw = os.environ.get("VLLM_AURA_CHINESE_ONLY", "1").strip().lower()
-    if raw in {"0", "false", "no", "off"}:
+    if not _env_flag_on("VLLM_AURA_CHINESE_ONLY"):
         return ""
     return AURA_CHINESE_RESPONSE_INSTRUCTION
 
