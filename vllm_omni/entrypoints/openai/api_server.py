@@ -95,6 +95,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.aura_tool_executor import AuraToolExecutor
 from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -1110,6 +1111,7 @@ async def omni_init_app_state(
         create_streaming_video_handler(
             chat_service=state.openai_serving_chat,
             engine_client=engine_client,
+            tool_executor=AuraToolExecutor.from_env(),
         )
         if state.openai_serving_chat is not None
         else None

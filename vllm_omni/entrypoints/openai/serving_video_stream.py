@@ -20,6 +20,11 @@ Shared protocol (see :mod:`video_stream_base`):
         {"type": "response.text.done", "text": "...", "request_id": "..."}
         {"type": "response.audio.delta", "data": "...", "format": "wav", "request_id": "..."}
         {"type": "response.audio.done", "request_id": "..."}
+        {"type": "response.tool.preamble.text", "text": "...", "request_id": "..."}
+        {"type": "response.tool.preamble.audio.delta", "data": "...", "format": "wav", "request_id": "..."}
+        {"type": "response.tool.preamble.audio.done", "request_id": "..."}
+        {"type": "response.tool.started", "call_id": "...", "name": "...", "request_id": "..."}
+        {"type": "response.tool.done", "call_id": "...", "name": "...", "status": "...", "content": "...", "request_id": "..."}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 
@@ -33,31 +38,20 @@ Model-specific handlers:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 from vllm.logger import init_logger
 
-from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import (
-    CrossTurnPenalty,
-    merge_penalty_sampling_params,
-)
-from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-    _clean_asr_transcript,
-    _extract_text,
-    build_aura_streaming_turn_additional_information,
-    frames_to_video_tuple,
-)
-from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
-    AuraSessionState,
-    DEFAULT_AURA_SYSTEM_PROMPT,
-    SILENT_TEXT,
-    create_streaming_session,
-    should_stop_aura_silent_generation,
-    unregister_session,
+from vllm_omni.entrypoints.openai.aura_tool_executor import (
+    AuraToolCall,
+    AuraToolResult,
+    ParsedAuraToolTurn,
+    parse_aura_tool_output,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
     _BAD_FRAME,
@@ -70,6 +64,30 @@ from vllm_omni.entrypoints.openai.video_stream_base import (
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
     OmniStreamingVideoHandler as OmniStreamingVideoHandlerBase,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import (
+    CrossTurnPenalty,
+    merge_penalty_sampling_params,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    _clean_asr_transcript,
+    _extract_text,
+    _trim_aura_response_token_ids,
+    build_aura_streaming_turn_additional_information,
+    frames_to_video_tuple,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    DEFAULT_AURA_SYSTEM_PROMPT,
+    SILENT_TEXT,
+    AuraSessionState,
+    create_streaming_session,
+    has_pending_turn,
+    record_pending_turn,
+    should_stop_aura_silent_generation,
+    unregister_session,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_tool_protocol import (
+    extract_aura_tool_preamble,
 )
 
 __all__ = [
@@ -92,7 +110,6 @@ def _resolve_deploy_pipeline(engine_client: Any) -> str | None:
     config_path = getattr(engine_client, "config_path", None)
     if config_path is None:
         return None
-    from pathlib import Path
 
     from vllm_omni.config.stage_config import _DEPLOY_DIR, load_deploy_config
 
@@ -107,6 +124,51 @@ def _resolve_deploy_pipeline(engine_client: Any) -> str | None:
         path = candidate
     pipeline = load_deploy_config(path).pipeline
     return str(pipeline) if pipeline else None
+
+
+def _resolve_aura_stage1_model(engine_client: Any) -> str | None:
+    """Resolve the server-owned Stage1 tokenizer path; never trust client input."""
+
+    def _stage_model(stage: Any) -> str | None:
+        if isinstance(stage, dict):
+            model = stage.get("model")
+            engine_values = stage.get("engine_extras") or stage.get("yaml_engine_args") or {}
+        else:
+            model = getattr(stage, "model", None)
+            engine_values = (
+                getattr(stage, "engine_extras", None)
+                or getattr(stage, "yaml_engine_args", None)
+                or {}
+            )
+        if not model and isinstance(engine_values, dict):
+            model = engine_values.get("model")
+        return str(model) if model else None
+
+    stages = getattr(engine_client, "stage_configs", None)
+    if stages:
+        for stage in stages:
+            stage_id = stage.get("stage_id") if isinstance(stage, dict) else getattr(stage, "stage_id", None)
+            if stage_id == 1:
+                model = _stage_model(stage)
+                if model:
+                    return model
+
+    config_path = getattr(engine_client, "config_path", None)
+    if config_path is None:
+        return None
+    from vllm_omni.config.stage_config import _DEPLOY_DIR, load_deploy_config
+
+    path = Path(config_path)
+    if not path.exists():
+        bare_name = path.name if path.name.endswith(".yaml") else f"{path.name}.yaml"
+        path = _DEPLOY_DIR / bare_name
+    if not path.exists():
+        return None
+    deploy = load_deploy_config(path)
+    for stage in deploy.stages:
+        if stage.stage_id == 1:
+            return _stage_model(stage)
+    return None
 
 
 class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
@@ -246,10 +308,24 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
     tts_ref_audio: str | None = Field(default=None, description="Base TTS reference audio path.")
     tts_ref_text: str | None = Field(default=None, description="Base TTS reference transcript.")
     tts_instruct: str | None = Field(default=None, description="VoiceDesign / style instruct text.")
-    tts_max_new_tokens: int | None = Field(default=None, ge=1, description="Max Qwen3-TTS codec tokens per spoken turn.")
+    tts_max_new_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description="Max Qwen3-TTS codec tokens per spoken turn.",
+    )
     tts_pass_token_ids: bool | None = Field(
         default=None,
         description="Pass AURA assistant token ids directly to Qwen3-TTS.",
+    )
+    tool_mode: Literal["none", "auto"] = Field(
+        default="none",
+        description="Server-side AURA_v2 tool loop; disabled unless the server has an allowlist executor.",
+    )
+    max_tool_depth: int = Field(
+        default=2,
+        ge=1,
+        le=2,
+        description="Maximum tool-call passes in one logical turn.",
     )
 
     def session_history_kwargs(self) -> dict[str, Any]:
@@ -284,6 +360,17 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
 
 class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     """AURA pipeline: frame auto-trigger + voice turn after complete ``audio.done``."""
+
+    def __init__(
+        self,
+        *args: Any,
+        tool_executor: Any | None = None,
+        tool_tokenizer_path: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._tool_executor = tool_executor
+        self._tool_tokenizer_path = tool_tokenizer_path
 
     def supports_manual_query_turn(self) -> bool:
         return False
@@ -328,6 +415,8 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
     def on_session_end(self, message_history: Any) -> None:
         if isinstance(message_history, AuraSessionState) and message_history.session_id:
+            if self._tool_executor is not None:
+                self._tool_executor.clear_session(message_history.session_id)
             unregister_session(message_history.session_id)
 
     def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
@@ -420,6 +509,9 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             pruning_enabled=aura_config.pruning_enabled,
             max_context_qas=aura_config.max_context_qas,
             max_1qna_rounds=aura_config.max_1qna_rounds,
+            tool_enabled=aura_config.tool_mode == "auto",
+            tools=self._tool_executor.tool_schemas if aura_config.tool_mode == "auto" else None,
+            tool_tokenizer_path=self._tool_tokenizer_path,
             **aura_config.tts_kwargs(),
         )
         user_message[_AURA_ADDITIONAL_INFO_KEY] = additional_information
@@ -496,10 +588,23 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 config_data[new_key] = config_data[old_key]
 
         try:
-            return AuraStreamingVideoSessionConfig(**config_data)
+            config = AuraStreamingVideoSessionConfig(**config_data)
         except ValidationError as e:
             await self._send_error(websocket, f"Invalid session config: {e}")
             return None
+        if config.tool_mode == "auto":
+            parser_ready = bool(
+                getattr(self._chat_service, "enable_auto_tools", False)
+                and getattr(self._chat_service, "parser_cls", None) is not None
+            )
+            if self._tool_executor is None or not self._tool_tokenizer_path or not parser_ready:
+                await self._send_error(
+                    websocket,
+                    "AURA tool mode is unavailable; server must enable the mock executor, "
+                    "--enable-auto-tool-choice and --tool-call-parser qwen3_xml",
+                )
+                return None
+        return config
 
     async def prepare_chat_request_kwargs(
         self,
@@ -550,6 +655,554 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         if isinstance(additional_information, dict):
             extra_attrs["additional_information"] = additional_information
         return request_kwargs, user_message, extra_attrs
+
+    async def _process_query_engine(
+        self,
+        websocket,
+        config: StreamingVideoSessionConfig,
+        frame_buffer: list[str],
+        audio_buffer: bytearray,
+        message_history: Any,
+        query_text: str,
+        request_id: str,
+        interrupt_event,
+        prewarmed_frames: dict[str, tuple[Any, str]],
+        release_turn_lock=None,
+    ) -> None:
+        """Run a bounded pass1 -> execute -> resume transaction for tool mode."""
+
+        aura_config = self._as_aura_config(config)
+        if aura_config.tool_mode != "auto":
+            return await super()._process_query_engine(
+                websocket,
+                config,
+                frame_buffer,
+                audio_buffer,
+                message_history,
+                query_text,
+                request_id,
+                interrupt_event,
+                prewarmed_frames,
+                release_turn_lock=release_turn_lock,
+            )
+        if self._tool_executor is None or not isinstance(message_history, AuraSessionState):
+            await self._send_error(websocket, "AURA tool executor is unavailable")
+            return
+
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+        )
+
+        request_kwargs, user_message, extra_attrs = await self.prepare_chat_request_kwargs(
+            config,
+            frame_buffer,
+            audio_buffer,
+            message_history,
+            query_text,
+            prewarmed_frames,
+        )
+        base_additional = extra_attrs.get("additional_information")
+        if not isinstance(base_additional, dict):
+            await self._send_error(websocket, "AURA tool transaction metadata is missing")
+            return
+
+        try:
+            tokenizer = await self._engine_client.get_tokenizer()
+        except Exception:
+            await self._send_error(websocket, "Unable to initialize AURA tool parser")
+            return
+
+        await websocket.send_json({"type": "response.start", "request_id": request_id})
+        transient_messages: list[dict[str, Any]] = []
+        transcript = ""
+        transcript_done_sent = False
+        pass_number = 1
+        tool_depth = 1
+        depth_error_returned = False
+        current_kwargs = request_kwargs
+        current_additional = base_additional
+
+        while True:
+            internal_request_id = f"{request_id}-tool-p{pass_number}"
+            try:
+                chat_request = ChatCompletionRequest(**current_kwargs)
+                setattr(chat_request, "additional_information", current_additional)
+                engine_prompt = await self._preprocess_to_engine_prompt(chat_request)
+            except Exception as exc:
+                logger.exception("AURA tool pass preprocessing failed")
+                await self._send_error(websocket, f"Tool pass preprocessing failed: {exc}")
+                return
+
+            parsed: ParsedAuraToolTurn | None = None
+            tool_task: asyncio.Task[list[AuraToolResult]] | None = None
+            tool_results: list[AuraToolResult] | None = None
+            transaction_calls: list[AuraToolCall] = []
+
+            async def on_stage1_text(raw_text: str) -> bool:
+                nonlocal parsed, tool_task, tool_results, transaction_calls, depth_error_returned
+                if parsed is not None:
+                    return bool(transaction_calls)
+                parsed = parse_aura_tool_output(
+                    tokenizer,
+                    raw_text,
+                    request_id=internal_request_id,
+                    tool_schemas=self._tool_executor.tool_schemas,
+                )
+                if not parsed.calls and parsed.error is None:
+                    return False
+                preamble = extract_aura_tool_preamble(raw_text)
+                if preamble:
+                    await websocket.send_json(
+                        {
+                            "type": "response.tool.preamble.text",
+                            "request_id": request_id,
+                            "text": preamble,
+                        }
+                    )
+                transaction_calls = list(parsed.calls)
+                if parsed.error:
+                    transaction_calls = [
+                        AuraToolCall(
+                            id=f"{internal_request_id}-invalid",
+                            name="invalid_tool_call",
+                            arguments={},
+                        )
+                    ]
+                if tool_depth > aura_config.max_tool_depth:
+                    depth_error_returned = True
+                    tool_results = [
+                        self._tool_error_result(call, "tool_depth_exceeded")
+                        for call in transaction_calls
+                    ]
+                    for result in tool_results:
+                        await websocket.send_json(
+                            {
+                                "type": "response.tool.done",
+                                "request_id": request_id,
+                                "call_id": result.call_id,
+                                "name": result.name,
+                                "status": result.status,
+                                "content": result.content,
+                            }
+                        )
+                    return True
+                if parsed.error:
+                    tool_results = [
+                        self._tool_error_result(call, parsed.error) for call in transaction_calls
+                    ]
+                    for result in tool_results:
+                        await websocket.send_json(
+                            {
+                                "type": "response.tool.done",
+                                "request_id": request_id,
+                                "call_id": result.call_id,
+                                "name": result.name,
+                                "status": result.status,
+                                "content": result.content,
+                            }
+                        )
+                    return True
+
+                for call in transaction_calls:
+                    await websocket.send_json(
+                        {
+                            "type": "response.tool.started",
+                            "request_id": request_id,
+                            "call_id": call.id,
+                            "name": call.name,
+                            "status": "started",
+                        }
+                    )
+
+                async def _execute_calls() -> list[AuraToolResult]:
+                    results = list(
+                        await asyncio.gather(
+                            *[
+                                self._tool_executor.execute(
+                                    session_id=message_history.session_id,
+                                    request_id=internal_request_id,
+                                    call=call,
+                                    depth=tool_depth,
+                                )
+                                for call in transaction_calls
+                            ]
+                        )
+                    )
+                    for result in results:
+                        await websocket.send_json(
+                            {
+                                "type": "response.tool.done",
+                                "request_id": request_id,
+                                "call_id": result.call_id,
+                                "name": result.name,
+                                "status": result.status,
+                                "content": result.content,
+                            }
+                        )
+                    return results
+
+                tool_task = asyncio.create_task(_execute_calls())
+                return True
+
+            async def on_preamble_audio(b64: str) -> None:
+                await websocket.send_json(
+                    {
+                        "type": "response.tool.preamble.audio.delta",
+                        "request_id": request_id,
+                        "data": b64,
+                        "format": "wav",
+                    }
+                )
+
+            async def on_transcript(text: str) -> None:
+                nonlocal transcript, transcript_done_sent
+                transcript = text
+                if transcript_done_sent:
+                    return
+                await websocket.send_json(
+                    {
+                        "type": "user.transcript.done",
+                        "text": transcript,
+                        "request_id": request_id,
+                    }
+                )
+                transcript_done_sent = True
+
+            collected = await self._collect_aura_tool_pass(
+                config=aura_config,
+                request_id=internal_request_id,
+                interrupt_event=interrupt_event,
+                engine_prompt=engine_prompt,
+                on_text_ready=on_stage1_text,
+                on_preamble_audio=on_preamble_audio,
+                on_transcript=on_transcript,
+            )
+            if collected["interrupted"]:
+                if tool_task is not None and not tool_task.done():
+                    tool_task.cancel()
+                return
+            if collected["transcript"] and not transcript_done_sent:
+                transcript = collected["transcript"]
+                await websocket.send_json(
+                    {
+                        "type": "user.transcript.done",
+                        "text": transcript,
+                        "request_id": request_id,
+                    }
+                )
+                transcript_done_sent = True
+
+            if parsed is None:
+                parsed = parse_aura_tool_output(
+                    tokenizer,
+                    collected["text"],
+                    request_id=internal_request_id,
+                    tool_schemas=self._tool_executor.tool_schemas,
+                )
+            if collected["preamble_audio_count"]:
+                await websocket.send_json(
+                    {
+                        "type": "response.tool.preamble.audio.done",
+                        "request_id": request_id,
+                    }
+                )
+            if not parsed.calls and parsed.error is None:
+                final_text = (parsed.content or "").strip()
+                await self._emit_aura_tool_final(
+                    websocket=websocket,
+                    config=aura_config,
+                    message_history=message_history,
+                    user_message=user_message,
+                    request_id=request_id,
+                    response_text=final_text,
+                    audio_deltas=collected["audio_deltas"],
+                    release_turn_lock=release_turn_lock,
+                    tool_chain=transient_messages or None,
+                    transcript=transcript,
+                )
+                return
+
+            calls = transaction_calls or list(parsed.calls)
+            if parsed.error and not calls:
+                calls = [AuraToolCall(id=f"{internal_request_id}-invalid", name="invalid_tool_call", arguments={})]
+            if tool_task is not None:
+                tool_results = await tool_task
+            results = tool_results or []
+
+            transient_messages.append(
+                {
+                    "role": "assistant",
+                    "content": parsed.content or "",
+                    "reasoning_content": parsed.reasoning or "",
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.arguments,
+                            },
+                        }
+                        for call in calls
+                    ],
+                }
+            )
+            transient_messages.extend(
+                {
+                    "role": "tool",
+                    "tool_call_id": result.call_id,
+                    "content": result.content,
+                }
+                for result in results
+            )
+            force_final_answer = bool(
+                getattr(self._tool_executor, "force_final_after_success", False)
+                and results
+                and all(result.status == "completed" for result in results)
+            )
+
+            if depth_error_returned:
+                # Give the model one final error-response pass. A repeated tool
+                # call cannot execute and is converted to a safe text fallback.
+                if pass_number > aura_config.max_tool_depth + 1:
+                    await self._emit_aura_tool_final(
+                        websocket=websocket,
+                        config=aura_config,
+                        message_history=message_history,
+                        user_message=user_message,
+                        request_id=request_id,
+                        response_text="抱歉，工具呼叫未能完成，請稍後再試。",
+                        audio_deltas=[],
+                        release_turn_lock=release_turn_lock,
+                        tool_chain=transient_messages or None,
+                        transcript=transcript,
+                        rearm_pending=True,
+                    )
+                    return
+
+            pass_number += 1
+            tool_depth += 1
+            current_additional = {
+                **base_additional,
+                "aura_tool_pass": [pass_number],
+                "aura_tool_resume": [
+                    {
+                        "transcript": transcript,
+                        "transient_messages": transient_messages,
+                        "force_final_answer": force_final_answer,
+                    }
+                ],
+                "omni_skip_stages": [0],
+            }
+            current_kwargs = {
+                **request_kwargs,
+                "messages": [{"role": "user", "content": []}],
+            }
+
+    async def _collect_aura_tool_pass(
+        self,
+        *,
+        config: AuraStreamingVideoSessionConfig,
+        request_id: str,
+        interrupt_event,
+        engine_prompt: Any,
+        on_text_ready=None,
+        on_preamble_audio=None,
+        on_transcript=None,
+    ) -> dict[str, Any]:
+        """Drain one engine pass; start tools when Stage-1 text is complete."""
+
+        from vllm_omni.entrypoints.openai import video_stream_envs
+
+        text_parts: list[str] = []
+        previous_text = ""
+        transcript = ""
+        audio_deltas: list[str] = []
+        audio_chunks_drained = 0
+        audio_tail_tensors: list[Any] = []
+        interrupted = False
+        streaming = video_stream_envs.VLLM_VIDEO_ASYNC_CHUNK == "on"
+        text_ready = False
+        tool_transaction = False
+        preamble_audio_count = 0
+
+        async def notify_text_ready() -> None:
+            nonlocal text_ready, tool_transaction
+            if text_ready:
+                return
+            text_ready = True
+            if on_text_ready is not None:
+                tool_transaction = bool(await on_text_ready("".join(text_parts)))
+
+        async def take_audio_b64(b64: str) -> None:
+            nonlocal preamble_audio_count
+            if not b64:
+                return
+            if tool_transaction and on_preamble_audio is not None:
+                preamble_audio_count += 1
+                await on_preamble_audio(b64)
+            else:
+                audio_deltas.append(b64)
+
+        result_gen = self._engine_client.generate(
+            prompt=engine_prompt,
+            request_id=request_id,
+            output_modalities=config.modalities,
+        )
+        async for output in result_gen:
+            if interrupt_event.is_set():
+                interrupted = True
+            if interrupted:
+                continue
+            out_type = getattr(output, "final_output_type", "text")
+            if out_type == "transcript":
+                current = _extract_text(getattr(output, "request_output", None))
+                if current:
+                    transcript = _clean_asr_transcript(current)
+                    if (
+                        on_transcript is not None
+                        and transcript
+                        and getattr(output, "finished", False)
+                    ):
+                        await on_transcript(transcript)
+                continue
+            if out_type == "audio":
+                await notify_text_ready()
+                if streaming:
+                    b64, audio_chunks_drained = self._extract_audio_delta_b64(
+                        output,
+                        audio_chunks_drained,
+                    )
+                    await take_audio_b64(b64)
+                else:
+                    audio_data = self._get_audio_data(output)
+                    if audio_data is not None:
+                        audio_tail_tensors = list(audio_data) if isinstance(audio_data, list) else [audio_data]
+                continue
+            delta_text, previous_text = self._extract_text_delta(output, previous_text)
+            if delta_text:
+                text_parts.append(delta_text)
+            if getattr(output, "finished", False):
+                await notify_text_ready()
+
+        if not streaming and audio_tail_tensors:
+            import torch
+
+            coalesced = (
+                audio_tail_tensors[0]
+                if len(audio_tail_tensors) == 1
+                else torch.cat(audio_tail_tensors, dim=-1)
+            )
+            tail_np = self._tensor_to_1d_np(coalesced)
+            b64, _ = self._encode_tail(
+                tail_np,
+                0,
+                new_drained=len(audio_tail_tensors),
+                is_first=True,
+            )
+            await notify_text_ready()
+            await take_audio_b64(b64)
+        await notify_text_ready()
+        return {
+            "text": "".join(text_parts),
+            "transcript": transcript,
+            "audio_deltas": audio_deltas,
+            "preamble_audio_count": preamble_audio_count,
+            "interrupted": interrupted,
+        }
+
+    async def _emit_aura_tool_final(
+        self,
+        *,
+        websocket,
+        config: AuraStreamingVideoSessionConfig,
+        message_history: AuraSessionState,
+        user_message: dict[str, Any],
+        request_id: str,
+        response_text: str,
+        audio_deltas: list[str],
+        release_turn_lock=None,
+        tool_chain: list[dict[str, Any]] | None = None,
+        transcript: str = "",
+        rearm_pending: bool = False,
+    ) -> None:
+        """Emit only parser-classified natural content and its buffered audio."""
+
+        if tool_chain:
+            message_history.pending_commit_tool_chain = list(tool_chain)
+            # Depth-error finals may run after Stage1 discarded pending on tool
+            # XML. Do not re-arm after a successful pass2: Stage1 already
+            # committed, and a new pending would double-write the turn.
+            if (
+                rearm_pending
+                and message_history.session_id
+                and not has_pending_turn(message_history.session_id)
+            ):
+                record_pending_turn(
+                    message_history.session_id,
+                    request_id=request_id,
+                    transcript=transcript,
+                    video_tuple=None,
+                    deferred_mm=message_history.pending_turn_video,
+                    tool_chain=tool_chain,
+                    had_vision=bool(message_history.pending_turn_video),
+                )
+
+        if config.stream_text_deltas and response_text:
+            await websocket.send_json(
+                {
+                    "type": "response.text.delta",
+                    "request_id": request_id,
+                    "delta": response_text,
+                }
+            )
+        await websocket.send_json(
+            {
+                "type": "response.text.done",
+                "request_id": request_id,
+                "text": response_text,
+            }
+        )
+        if release_turn_lock is not None:
+            await release_turn_lock(
+                message_history=message_history,
+                user_message=user_message,
+                response_text=response_text,
+                request_id=request_id,
+            )
+        else:
+            self.on_turn_complete(message_history, user_message, response_text, request_id)
+        for data in audio_deltas:
+            await websocket.send_json(
+                {
+                    "type": "response.audio.delta",
+                    "request_id": request_id,
+                    "data": data,
+                    "format": "wav",
+                }
+            )
+        if audio_deltas or "audio" in config.modalities:
+            await websocket.send_json(
+                {
+                    "type": "response.audio.done",
+                    "request_id": request_id,
+                }
+            )
+
+    @staticmethod
+    def _tool_error_result(call: AuraToolCall, code: str) -> AuraToolResult:
+        content = json.dumps(
+            {"ok": False, "error": {"code": code}},
+            separators=(",", ":"),
+        )
+        return AuraToolResult(
+            call_id=call.id,
+            name=call.name,
+            status="error",
+            content=content,
+            latency_ms=0.0,
+            output_bytes=len(content.encode()),
+        )
 
     async def _run_engine_generation(
         self,
@@ -735,14 +1388,19 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 else:
                     last_text_metrics = metrics or last_text_metrics
                     token_ids = self._output_token_ids(output)
-                    if should_stop_aura_silent_generation(token_ids=token_ids):
+                    content_ids = _trim_aura_response_token_ids(token_ids)
+                    # Classify silent on trimmed content ids (not chat-template prefix).
+                    if content_ids and should_stop_aura_silent_generation(token_ids=content_ids):
                         await _maybe_finalize_silent_turn()
                         continue
                     delta_text, previous_text = self._extract_text_delta(output, previous_text)
                     if delta_text:
                         text_parts.append(delta_text)
                         full_text = "".join(text_parts)
-                        if should_stop_aura_silent_generation(text=full_text):
+                        # Only judge text-silent after Stage1 finishes — partial
+                        # whitespace/punctuation deltas (e.g. leading " ") must
+                        # not drop a later Chinese spoken turn's audio.
+                        if output.finished and should_stop_aura_silent_generation(text=full_text):
                             await _maybe_finalize_silent_turn()
                             continue
                         if streaming and stream_text_deltas:
@@ -845,6 +1503,7 @@ def create_streaming_video_handler(
     idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
     config_timeout: float = _DEFAULT_CONFIG_TIMEOUT,
     engine_client: Any | None = None,
+    tool_executor: Any | None = None,
 ) -> OmniStreamingVideoHandlerBase:
     """Create the handler for ``/v1/video/chat/stream``.
 
@@ -858,6 +1517,8 @@ def create_streaming_video_handler(
             idle_timeout=idle_timeout,
             config_timeout=config_timeout,
             engine_client=engine_client,
+            tool_executor=tool_executor,
+            tool_tokenizer_path=_resolve_aura_stage1_model(engine_client),
         )
 
     return QwenOmniStreamingVideoHandler(

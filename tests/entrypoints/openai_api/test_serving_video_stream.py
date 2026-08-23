@@ -667,6 +667,8 @@ def test_create_streaming_video_handler_routes_aura_pipeline():
 
     handler = create_streaming_video_handler(chat_service=object(), engine_client=engine)
     assert isinstance(handler, AuraStreamingVideoHandler)
+    assert handler._tool_tokenizer_path
+    assert handler._tool_tokenizer_path.endswith("/AURA")
 
 
 def test_resolve_deploy_pipeline_from_aura_deploy_yaml():
