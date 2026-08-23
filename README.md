@@ -15,6 +15,124 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 ---
 
+## AURA 快速開始
+
+本分支（`AURA_production_v026`）提供 AURA 即時音訊／視訊 pipeline：
+`Qwen3-ASR → AURA_v2 → Qwen3-TTS → Code2Wav`。
+
+全新環境先安裝：
+
+```bash
+bash scripts/install_aura_omni.sh
+```
+
+### 只需 API／WebSocket 接口
+
+兩卡生產向 helper（預設 `:8666`、`aura_omni_2gpu_best`）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
+curl http://127.0.0.1:8666/v1/models
+```
+
+本地 AURA_v2 權重：
+
+```bash
+MODEL=/workspace/models/AURA_v2 \
+CUDA_VISIBLE_DEVICES=0,1 \
+bash scripts/start_aura_omni.sh
+```
+
+亦可用 `vllm serve /workspace/models/AURA_v2 --omni`（預設埠 `8000`；固定埠加
+`--port 8666`）。WebSocket：`/v1/video/chat/stream`。
+
+開 safe 工具時：
+
+```bash
+export VLLM_AURA_TOOL_EXECUTOR=safe
+# 可選 API key（唔好寫入檔／git；改 key 後要重啟 server）
+export DEEPSEEK_API_KEY='sk-...'   # 無 → DeepSeek mock
+export SERPER_API_KEY='...'        # 無 → WebSearch 唔係真搜
+# 可選（預設關）：VLLM_AURA_TOOL_BRAVE / _DDG / _WEBFETCH
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
+```
+
+計算機、上海時間、天氣、匯率、IP 定位唔使 key。`start_aura_omni.sh` 會把上列
+env 傳入 server 進程。Session 要設 `"tool_mode": "auto"`（Web demo 腳本已設）。
+
+### 需要瀏覽器 Web Demo（正式：Native 外觀）
+
+一條指令啟動 AURA_v2（1-GPU）+ 原版 Native 前端 bridge（自動揀 <2 GiB 空卡，
+唔殺其他人進程；指定卡：`AURA_GPU=N`）：
+
+```bash
+# 同上，可選先 export DEEPSEEK_API_KEY / SERPER_API_KEY
+bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
+```
+
+開啟：
+
+- 本地：`http://127.0.0.1:9999/`
+- LAN：`http://<host-ip>:9999/`
+- AURA backend：`:8666`
+
+停止：
+
+```bash
+bash examples/online_serving/aura_omni/native_gateway_web_demo/stop_1gpu_stack.sh
+```
+
+預設：`VLLM_AURA_TOOL_EXECUTOR=safe`、`TOOL_MODE=auto`、`max_tool_depth=3`、
+鏡頭 `AUTO_TRIGGER=1`（至少 2 幅可開輪）、Base voice clone、單 session。
+介面支援 camera、PTT、ASR 文字、工具氣泡與串流 TTS；PTT 會停耳邊舊播放
+（frontend barge-in，唔 cancel GPU 上已跑緊嘅 TTS）。未接打字發話／`/eval`。
+
+本地已有權重時：
+
+```bash
+MODEL=/workspace/models/AURA_v2 \
+bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
+```
+
+### 另一套 UI：MiniCPM 風格（可選）
+
+1-GPU MiniCPM demo stack：
+
+```bash
+bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_1gpu_demo_stack.sh
+bash examples/online_serving/aura_omni/minicpm_style_web_demo/stop_1gpu_demo_stack.sh
+```
+
+2-GPU + 兩個 demo 埠（`:7862` + `:7863`，共用同一個 AURA）：
+
+```bash
+bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_2gpu_dual_demo_stack.sh
+bash examples/online_serving/aura_omni/minicpm_style_web_demo/stop_2gpu_dual_demo_stack.sh
+```
+
+呢條線預設唔開 safe tools；要工具先 `export VLLM_AURA_TOOL_EXECUTOR=safe`
+同上面嘅 key。
+
+### 執行 OmniInteract Smoke3 benchmark（可選）
+
+互動試用不需要 Smoke3。只有要量度準確度、TTFT／TPOT 或做 regression
+comparison 時，才需下載 OmniInteract 並執行：
+
+```bash
+bash benchmarks/omniinteract/run_streaming_bench.sh
+```
+
+benchmark 會先以 `0001` 完成整條 streaming session 作 warmup，再測
+`0002`、`0003`、`0004`；報表的準確率與 latency 統計排除 `0001`。
+結果寫入 `./omniinteract_bench/`，亦可用
+`DATASET_PATH=/path/to/OmniInteract` 指定現有 dataset。
+
+完整安装、WebSocket／HTTP、工具協議、離線模型及故障排查請看：
+
+- [`examples/online_serving/aura_omni/README.md`](examples/online_serving/aura_omni/README.md)
+- [`examples/online_serving/aura_omni/native_gateway_web_demo/README.md`](examples/online_serving/aura_omni/native_gateway_web_demo/README.md)
+- [`docs/serving/aura_video_stream_api.md`](docs/serving/aura_video_stream_api.md)
+
 *Latest News* 🔥
 - [2026/08] We released [0.26.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.26.0) - aligned with the vLLM 0.26 release line, featuring [MiniMax H3](recipes/MiniMaxAI/MiniMax-H3.md) joint video/audio generation, an experimental full-duplex realtime runtime for [MiniCPM-o 4.5](recipes/OpenBMB/MiniCPM-o-4_5.md), distributed layerwise diffusion offload, and broader model, hardware, streaming, TTS, and quantization support.
 - [2026/07] We released [0.24.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.24.0) - aligned with the vLLM 0.24 release line, expanding production-ready coverage across TTS, speech, diffusion, image/video generation, and robot-policy serving, with major Omni stage runtime refactoring, diffusion request-level batching, async output materialization, quantization/cache/memory improvements, and broad CUDA/ROCm/XPU/NPU support.
