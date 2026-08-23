@@ -94,24 +94,7 @@ MODEL=/workspace/models/AURA_v2 \
 bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
 ```
 
-### 另一套 UI：MiniCPM 風格（可選）
-
-1-GPU MiniCPM demo stack：
-
-```bash
-bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_1gpu_demo_stack.sh
-bash examples/online_serving/aura_omni/minicpm_style_web_demo/stop_1gpu_demo_stack.sh
-```
-
-2-GPU + 兩個 demo 埠（`:7862` + `:7863`，共用同一個 AURA）：
-
-```bash
-bash examples/online_serving/aura_omni/minicpm_style_web_demo/run_2gpu_dual_demo_stack.sh
-bash examples/online_serving/aura_omni/minicpm_style_web_demo/stop_2gpu_dual_demo_stack.sh
-```
-
-呢條線預設唔開 safe tools；要工具先 `export VLLM_AURA_TOOL_EXECUTOR=safe`
-同上面嘅 key。
+本分支展示用 **Native 外觀 demo**（對齊原廠 Gateway 前端）。唔再用 MiniCPM 風格 UI 作正式入口。
 
 ### 執行 OmniInteract Smoke3 benchmark（可選）
 
