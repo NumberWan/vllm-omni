@@ -15,27 +15,27 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 ---
 
-## AURA 快速開始
+## AURA 快速开始
 
-本分支（`AURA_production_v026`）提供 AURA 即時音訊／視訊 pipeline：
+本分支（`AURA_production_v026`）提供 AURA 实时音视频 pipeline：
 `Qwen3-ASR → AURA_v2 → Qwen3-TTS → Code2Wav`。
 
-全新環境先安裝：
+全新环境请先安装：
 
 ```bash
 bash scripts/install_aura_omni.sh
 ```
 
-### 只需 API／WebSocket 接口
+### 仅 API / WebSocket
 
-兩卡生產向 helper（預設 `:8666`、`aura_omni_2gpu_best`）：
+双卡生产配置（默认 `:8666`、`aura_omni_2gpu_best`）：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
 curl http://127.0.0.1:8666/v1/models
 ```
 
-本地 AURA_v2 權重：
+本地 AURA_v2 权重：
 
 ```bash
 MODEL=/workspace/models/AURA_v2 \
@@ -43,38 +43,35 @@ CUDA_VISIBLE_DEVICES=0,1 \
 bash scripts/start_aura_omni.sh
 ```
 
-亦可用 `vllm serve /workspace/models/AURA_v2 --omni`（預設埠 `8000`；固定埠加
-`--port 8666`）。WebSocket：`/v1/video/chat/stream`。
+亦可使用 `vllm serve /workspace/models/AURA_v2 --omni`（默认端口 `8000`；固定端口加
+`--port 8666`）。WebSocket 端点：`/v1/video/chat/stream`。
 
-開 safe 工具時：
+启用 safe 工具时，在**同一 shell** 中 `export` 密钥（勿写入文件或提交 git；修改后须重启 server）：
 
 ```bash
 export VLLM_AURA_TOOL_EXECUTOR=safe
-# 可選 API key（唔好寫入檔／git；改 key 後要重啟 server）
-export DEEPSEEK_API_KEY='sk-...'   # 無 → DeepSeek mock
-export SERPER_API_KEY='...'        # 無 → WebSearch 唔係真搜
-# 可選（預設關）：VLLM_AURA_TOOL_BRAVE / _DDG / _WEBFETCH
+export DEEPSEEK_API_KEY='sk-...'   # 未设置则 DeepSeek 使用 mock
+export SERPER_API_KEY='...'        # 未设置则 WebSearch 无法真实检索
+# 可选（默认关闭）：VLLM_AURA_TOOL_BRAVE / _DDG / _WEBFETCH
 CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
 ```
 
-計算機、上海時間、天氣、匯率、IP 定位唔使 key。`start_aura_omni.sh` 會把上列
-env 傳入 server 進程。Session 要設 `"tool_mode": "auto"`（Web demo 腳本已設）。
+计算器、上海时间、天气、汇率、IP 定位无需密钥。`start_aura_omni.sh` 会将上述环境变量传入 server 进程。WebSocket 客户端须设置 `"tool_mode": "auto"`（Web Demo 启动脚本已配置）。
 
-### 需要瀏覽器 Web Demo（正式：Native 外觀）
+### 浏览器 Web Demo
 
-一條指令啟動 AURA_v2（1-GPU）+ 原版 Native 前端 bridge（自動揀 <2 GiB 空卡，
-唔殺其他人進程；指定卡：`AURA_GPU=N`）：
+一条命令启动 AURA_v2（1-GPU）与 Web 前端（自动选择显存占用 <2 GiB 的空闲 GPU，不终止他人进程；指定 GPU：`AURA_GPU=N`）：
 
 ```bash
-# 同上，可選先 export DEEPSEEK_API_KEY / SERPER_API_KEY
+# 可先 export DEEPSEEK_API_KEY / SERPER_API_KEY
 bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
 ```
 
-開啟：
+访问地址：
 
-- 本地：`http://127.0.0.1:9999/`
-- LAN：`http://<host-ip>:9999/`
-- AURA backend：`:8666`
+- 本机：`http://127.0.0.1:9999/`
+- 局域网：`http://<host-ip>:9999/`
+- AURA 后端：`:8666`
 
 停止：
 
@@ -82,35 +79,46 @@ bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
 bash examples/online_serving/aura_omni/native_gateway_web_demo/stop_1gpu_stack.sh
 ```
 
-預設：`VLLM_AURA_TOOL_EXECUTOR=safe`、`TOOL_MODE=auto`、`max_tool_depth=3`、
-鏡頭 `AUTO_TRIGGER=1`（至少 2 幅可開輪）、Base voice clone、單 session。
-介面支援 camera、PTT、ASR 文字、工具氣泡與串流 TTS；PTT 會停耳邊舊播放
-（frontend barge-in，唔 cancel GPU 上已跑緊嘅 TTS）。未接打字發話／`/eval`。
+默认配置：`VLLM_AURA_TOOL_EXECUTOR=safe`、`TOOL_MODE=auto`、`max_tool_depth=3`、
+摄像头 `AUTO_TRIGGER=1`（至少 2 帧可触发轮次）、Base voice clone、单 session。
+支持摄像头、PTT、ASR 文本、工具气泡与流式 TTS；PTT 可打断当前播放（前端停止播放，不取消 GPU 上已运行的 TTS）。暂不支持文字输入与 `/eval`。
 
-本地已有權重時：
+本地已有权重时：
 
 ```bash
 MODEL=/workspace/models/AURA_v2 \
 bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
 ```
 
-本分支展示用 **Native 外觀 demo**（對齊原廠 Gateway 前端）。唔再用 MiniCPM 風格 UI 作正式入口。
+### 工具调用额外延迟（相对无工具短答「好的」）
 
-### 執行 OmniInteract Smoke3 benchmark（可選）
+基准：无工具短答 e2e 约 **302 ms**（ASR ~91 ms + LLM ~211 ms）。调工具时用户需等待 **Pass1 生成 tool XML → 工具执行 → Pass2 生成完整答复**；下表为相对该基准的额外等待（2-GPU AURA_v2，`tool_mode=auto`，2026-08-23 实测）。
 
-互動試用不需要 Smoke3。只有要量度準確度、TTFT／TPOT 或做 regression
-comparison 時，才需下載 OmniInteract 並執行：
+| 工具 | 等 HTTP | 两轮 LLM（相对「好的」~211 ms） | 用户多等 |
+|---|---:|---:|---:|
+| calculator | 0.5 ms | ~500 ms | +0.5 s |
+| datetime | 1 ms | ~1.0 s | +1.0 s |
+| currency | ~1.1 s | ~1.3 s | +2.4 s |
+| weather | ~1.4 s | ~1.1 s | +2.5 s |
+| DeepSeek | ~4.7 s | ~9 s | +14 s |
+| WebSearch | 0.5 ms（无 key） | 模型空转最长 ~13 s | 非检索慢 |
+
+说明：计算器、时间等本地工具执行 <2 ms，额外时间主要来自 **多一轮 Stage1 生成**。汇率、天气的 HTTP 为 Frankfurter / Open-Meteo 往返。DeepSeek 为真实 API 延迟叠加第二轮长生成。WebSearch 须配置 `SERPER_API_KEY` 方可真实检索；无 key 时工具几乎不耗时，延迟来自模型空转。
+
+### 运行 OmniInteract Smoke3 基准（可选）
+
+交互试用无需 Smoke3。仅在需要测量准确率、TTFT/TPOT 或做回归对比时，下载 OmniInteract 后执行：
 
 ```bash
 bash benchmarks/omniinteract/run_streaming_bench.sh
 ```
 
-benchmark 會先以 `0001` 完成整條 streaming session 作 warmup，再測
-`0002`、`0003`、`0004`；報表的準確率與 latency 統計排除 `0001`。
-結果寫入 `./omniinteract_bench/`，亦可用
-`DATASET_PATH=/path/to/OmniInteract` 指定現有 dataset。
+基准测试会先以 `0001` 完成整条 streaming session 作为 warmup，再测
+`0002`、`0003`、`0004`；报表的准确率与 latency 统计排除 `0001`。
+结果写入 `./omniinteract_bench/`，亦可用
+`DATASET_PATH=/path/to/OmniInteract` 指定已有数据集。
 
-完整安装、WebSocket／HTTP、工具協議、離線模型及故障排查請看：
+完整安装、WebSocket/HTTP、工具协议、离线模型及故障排查请参阅：
 
 - [`examples/online_serving/aura_omni/README.md`](examples/online_serving/aura_omni/README.md)
 - [`examples/online_serving/aura_omni/native_gateway_web_demo/README.md`](examples/online_serving/aura_omni/native_gateway_web_demo/README.md)

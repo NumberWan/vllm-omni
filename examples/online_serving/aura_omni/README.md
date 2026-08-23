@@ -103,19 +103,16 @@ python examples/online_serving/aura_omni/openai_chat_completion_client.py \
   --modalities text,audio
 ```
 
-## AURA_v2 with the original Native frontend
+## AURA_v2 浏览器 Web Demo
 
-Official browser showcase. The one-GPU stack under `native_gateway_web_demo/`
-serves the `AURA_demo-main` frontend and translates its `/ws` protocol to the
-AURA_v2 Omni streaming API:
+官方展示入口。1-GPU 启动脚本位于 `native_gateway_web_demo/`，将 WebSocket 协议映射至 AURA_v2 Omni streaming API：
 
 ```bash
 bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
 ```
 
-It exposes the original UI on `:9999`, uses AURA_v2 on `:8666`, and enables the
-bounded safe tools. See
-[`native_gateway_web_demo/README.md`](native_gateway_web_demo/README.md).
+Web UI 监听 `:9999`，AURA_v2 后端 `:8666`，默认启用 bounded safe 工具。详见
+[`native_gateway_web_demo/README.md`](native_gateway_web_demo/README.md)。
 
 ## Stop the server
 
