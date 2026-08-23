@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import threading
@@ -13,10 +14,29 @@ from typing import Any
 
 import numpy as np
 
+from vllm_omni.model_executor.stage_input_processors.aura_tool_protocol import (
+    AURA_ASSISTANT_PREFIX_V1,
+    aura_assistant_generation_prefix,
+    aura_enable_thinking,
+    aura_natural_content,
+    render_aura_tool_prompt,
+    with_aura_response_instruction,
+)
+
 SILENT_TEXT = "<|silent|>"
-# Qwen3-VL / AURA (matches native AURA ContextManaged SILENT_TOKEN_ID for VL paths).
-AURA_SILENT_TOKEN_ID = 151669
-AURA_IM_END_TOKEN_ID = 151645
+# Qwen3-VL / AURA v1 defaults. Override for AURA_v2 (qwen3_5), e.g.:
+#   VLLM_AURA_SILENT_TOKEN_ID=248070 VLLM_AURA_IM_END_TOKEN_ID=248046
+
+
+def _env_token_id(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    return int(raw)
+
+
+AURA_SILENT_TOKEN_ID = _env_token_id("VLLM_AURA_SILENT_TOKEN_ID", 151669)
+AURA_IM_END_TOKEN_ID = _env_token_id("VLLM_AURA_IM_END_TOKEN_ID", 151645)
 DEFAULT_AURA_SYSTEM_PROMPT = (
     "You are receiving a live video stream where the final frame is the present moment. "
     "Respond only when a response is needed based on the user's message or the visual context. "
@@ -83,6 +103,7 @@ __all__ = [
     "unregister_session",
     "clear_all_sessions",
     "record_pending_turn",
+    "has_pending_turn",
     "commit_session_turn",
 ]
 
@@ -117,20 +138,29 @@ def is_punctuation_only_text(text: str) -> bool:
 
 
 def is_effectively_silent(text: str) -> bool:
-    """Return True for empty, <|silent|>, or punctuation-only filler (e.g. \" ﹑\")."""
+    """Return True for empty, <|silent|>, empty think, or punctuation-only filler.
+
+    AURA_v2 often emits empty ``<think></think>`` instead of ``<|silent|>``. Treat
+    those (and think-only wrappers with no natural content) as silent so they
+    prune like v1 silent turns instead of polluting spoken history.
+    """
     if not isinstance(text, str):
         return False
     stripped = text.strip()
     if stripped == SILENT_TEXT:
         return True
-    return is_punctuation_only_text(text)
+    natural = aura_natural_content(stripped).strip()
+    return is_punctuation_only_text(natural)
 
 
 def normalize_assistant_text(text: str) -> str:
-    """Map degenerate non-answers to the canonical silent marker for history/TTS."""
+    """Map silent / empty-think turns to ``<|silent|>``; strip think for spoken."""
+    if not isinstance(text, str):
+        return SILENT_TEXT
     if is_effectively_silent(text):
         return SILENT_TEXT
-    return text
+    natural = aura_natural_content(text).strip()
+    return natural if natural else SILENT_TEXT
 
 
 class SessionHistory:
@@ -251,69 +281,119 @@ class SessionHistory:
                     return True
         return False
 
-    def _parse_sw_rounds(self) -> list[tuple[dict[str, Any], dict[str, Any] | None]]:
-        rounds: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+    @staticmethod
+    def _copy_history_message(msg: dict[str, Any]) -> dict[str, Any]:
+        """Deep-copy an OpenAI-shaped history message (incl. tool fields)."""
+        out: dict[str, Any] = {
+            "role": msg["role"],
+            "content": msg.get("content"),
+        }
+        if "tool_calls" in msg and msg["tool_calls"] is not None:
+            out["tool_calls"] = copy.deepcopy(msg["tool_calls"])
+        if "tool_call_id" in msg and msg["tool_call_id"] is not None:
+            out["tool_call_id"] = msg["tool_call_id"]
+        if "reasoning_content" in msg and msg["reasoning_content"] is not None:
+            out["reasoning_content"] = msg["reasoning_content"]
+        return out
+
+    @staticmethod
+    def _round_has_tool_chain(follow_msgs: list[dict[str, Any]]) -> bool:
+        return any(
+            m.get("role") == "tool" or m.get("tool_calls")
+            for m in follow_msgs
+        )
+
+    @staticmethod
+    def _final_assistant_message(
+        follow_msgs: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        for msg in reversed(follow_msgs):
+            if msg.get("role") == "assistant" and not msg.get("tool_calls"):
+                return msg
+        return None
+
+    def _parse_sw_rounds(self) -> list[list[dict[str, Any]]]:
+        """One logical round = user + following assistant/tool until next user."""
+        rounds: list[list[dict[str, Any]]] = []
         i = 0
         while i < len(self._sliding_window):
             msg = self._sliding_window[i]
-            if msg["role"] == "user":
-                user_msg = msg
-                assistant_msg = None
-                if i + 1 < len(self._sliding_window) and self._sliding_window[i + 1]["role"] == "assistant":
-                    assistant_msg = self._sliding_window[i + 1]
-                    i += 2
-                else:
-                    i += 1
-                rounds.append((user_msg, assistant_msg))
-            else:
+            if msg["role"] != "user":
                 i += 1
+                continue
+            round_msgs = [msg]
+            i += 1
+            while i < len(self._sliding_window) and self._sliding_window[i]["role"] != "user":
+                round_msgs.append(self._sliding_window[i])
+                i += 1
+            rounds.append(round_msgs)
         return rounds
 
     def _group_rounds_into_qas(
         self,
-        rounds: list[tuple[dict[str, Any], dict[str, Any] | None]],
-    ) -> list[list[tuple[dict[str, Any], dict[str, Any] | None]]]:
-        groups: list[list[tuple[dict[str, Any], dict[str, Any] | None]]] = []
-        current_group: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
-        for user_msg, assistant_msg in rounds:
+        rounds: list[list[dict[str, Any]]],
+    ) -> list[list[list[dict[str, Any]]]]:
+        groups: list[list[list[dict[str, Any]]]] = []
+        current_group: list[list[dict[str, Any]]] = []
+        for round_msgs in rounds:
+            user_msg = round_msgs[0]
             if self._has_user_text(user_msg):
                 if current_group:
                     groups.append(current_group)
-                current_group = [(user_msg, assistant_msg)]
+                current_group = [round_msgs]
             else:
-                current_group.append((user_msg, assistant_msg))
+                current_group.append(round_msgs)
         if current_group:
             groups.append(current_group)
         return groups
 
     def _rewrite_qa_for_history(
         self,
-        qa_rounds: list[tuple[dict[str, Any], dict[str, Any] | None]],
+        qa_rounds: list[list[dict[str, Any]]],
     ) -> list[dict[str, Any]] | None:
         rewritten: list[dict[str, Any]] = []
-        for user_msg, assistant_msg in qa_rounds:
-            if assistant_msg and self._is_silent_response(assistant_msg["content"]):
+        for round_msgs in qa_rounds:
+            if not round_msgs:
                 continue
+            user_msg = round_msgs[0]
+            follow = round_msgs[1:]
+            has_tools = self._round_has_tool_chain(follow)
+            final_asst = self._final_assistant_message(follow)
+            # Drop silent-only rounds; keep rounds that include a tool chain.
+            if not has_tools:
+                if not follow:
+                    continue
+                if final_asst is not None and self._is_silent_response(final_asst.get("content")):
+                    continue
+                if (
+                    len(follow) == 1
+                    and follow[0].get("role") == "assistant"
+                    and self._is_silent_response(follow[0].get("content"))
+                ):
+                    continue
             user_text = self._extract_user_text(user_msg["content"])
             rewritten.append({"role": "user", "content": user_text})
-            if assistant_msg:
-                rewritten.append({"role": "assistant", "content": assistant_msg["content"]})
+            for msg in follow:
+                rewritten.append(self._copy_history_message(msg))
         return rewritten if rewritten else None
 
     @staticmethod
     def _qa_to_round_pairs(qa_messages: list[dict[str, Any]]) -> list[tuple[Any, Any | None]]:
+        """Count user turns for QA classification; skip tool / mid-assistant msgs."""
         pairs: list[tuple[Any, Any | None]] = []
         i = 0
         while i < len(qa_messages):
             if qa_messages[i]["role"] == "user":
                 user_content = qa_messages[i]["content"]
                 assistant_content = None
-                if i + 1 < len(qa_messages) and qa_messages[i + 1]["role"] == "assistant":
-                    assistant_content = qa_messages[i + 1]["content"]
-                    i += 2
-                else:
-                    i += 1
+                j = i + 1
+                while j < len(qa_messages) and qa_messages[j]["role"] != "user":
+                    msg = qa_messages[j]
+                    if msg.get("role") == "assistant" and not msg.get("tool_calls"):
+                        assistant_content = msg.get("content")
+                    j += 1
                 pairs.append((user_content, assistant_content))
+                i = j
             else:
                 i += 1
         return pairs
@@ -345,7 +425,7 @@ class SessionHistory:
             while i < len(qa_messages):
                 if qa_messages[i]["role"] == "user" and qa_messages[i]["content"] == "":
                     del qa_messages[i]
-                    if i < len(qa_messages) and qa_messages[i]["role"] == "assistant":
+                    while i < len(qa_messages) and qa_messages[i]["role"] != "user":
                         del qa_messages[i]
                     found = True
                     break
@@ -389,10 +469,9 @@ class SessionHistory:
                 while i < len(rewritten):
                     if rewritten[i]["role"] == "user":
                         truncated = [rewritten[i]]
-                        if i + 1 < len(rewritten) and rewritten[i + 1]["role"] == "assistant":
-                            truncated.append(rewritten[i + 1])
-                            i += 2
-                        else:
+                        i += 1
+                        while i < len(rewritten) and rewritten[i]["role"] != "user":
+                            truncated.append(rewritten[i])
                             i += 1
                         self._merge_truncated_qa(truncated)
                     else:
@@ -402,10 +481,8 @@ class SessionHistory:
             self._context_history.pop(0)
 
         self._sliding_window = []
-        for user_msg, assistant_msg in rounds_remaining:
-            self._sliding_window.append(user_msg)
-            if assistant_msg is not None:
-                self._sliding_window.append(assistant_msg)
+        for round_msgs in rounds_remaining:
+            self._sliding_window.extend(round_msgs)
 
         self.current_rounds = self._sw_round_count()
         self._rebuild_history()
@@ -464,6 +541,57 @@ class SessionHistory:
         self._sliding_window.append(msg)
         self.history.append(msg)
 
+    def add_assistant_tool_message(
+        self,
+        content: str | None,
+        tool_calls: list[dict[str, Any]],
+        *,
+        reasoning_content: str | None = None,
+    ) -> None:
+        """Append an assistant message that requests tool calls (Native-shaped)."""
+        msg: dict[str, Any] = {
+            "role": "assistant",
+            "content": content if content is not None else "",
+            "tool_calls": copy.deepcopy(tool_calls),
+        }
+        if reasoning_content is not None:
+            msg["reasoning_content"] = reasoning_content
+        self._sliding_window.append(msg)
+        self.history.append(msg)
+
+    def add_tool_message(self, tool_call_id: str, content: str) -> None:
+        """Append a tool-result message linked to ``tool_call_id``."""
+        msg: dict[str, Any] = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": content,
+        }
+        self._sliding_window.append(msg)
+        self.history.append(msg)
+
+    def append_tool_chain(self, tool_chain: list[dict[str, Any]] | None) -> None:
+        """Append OpenAI-shaped assistant(tool_calls)/tool messages before final answer."""
+        if not tool_chain:
+            return
+        for raw in tool_chain:
+            if not isinstance(raw, dict):
+                continue
+            role = raw.get("role")
+            if role == "assistant" and raw.get("tool_calls"):
+                self.add_assistant_tool_message(
+                    raw.get("content"),
+                    list(raw.get("tool_calls") or []),
+                    reasoning_content=raw.get("reasoning_content"),
+                )
+            elif role == "tool":
+                self.add_tool_message(
+                    str(raw.get("tool_call_id") or ""),
+                    str(raw.get("content") if raw.get("content") is not None else ""),
+                )
+            elif role == "assistant":
+                # Mid-chain natural assistant (unusual); keep as spoken text.
+                self.add_assistant_message(str(raw.get("content") or ""))
+
     def preview_vllm_inputs(
         self,
         text: str = "",
@@ -472,8 +600,13 @@ class SessionHistory:
         *,
         vision_pad_text: str | None = None,
         mm_uuid: str | None = None,
+        tokenizer: Any | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        transient_messages: list[dict[str, Any]] | None = None,
+        enable_thinking: bool | None = None,
     ) -> dict[str, Any]:
         """Build prompt/mm inputs for a pending user turn without mutating history."""
+        thinking = aura_enable_thinking() if enable_thinking is None else bool(enable_thinking)
         pending_content: list[dict[str, Any]] = []
         pending_uuid = mm_uuid
         if video_tuple:
@@ -497,12 +630,28 @@ class SessionHistory:
         messages = list(self.history)
         if pending_content:
             messages.append({"role": "user", "content": pending_content})
-        return self._messages_to_vllm_inputs(messages)
+        if transient_messages:
+            messages.extend(transient_messages)
+        return self._messages_to_vllm_inputs(
+            messages,
+            tokenizer=tokenizer,
+            tools=tools,
+            enable_thinking=thinking,
+        )
 
     def get_vllm_inputs(self) -> dict[str, Any]:
         return self._messages_to_vllm_inputs(self.history)
 
-    def _messages_to_vllm_inputs(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    def _messages_to_vllm_inputs(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tokenizer: Any | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> dict[str, Any]:
+        thinking = aura_enable_thinking() if enable_thinking is None else bool(enable_thinking)
+        generation_messages = with_aura_response_instruction(messages)
         full_prompt = ""
         all_images: list[Any] = []
         all_videos: list[Any] = []
@@ -510,10 +659,10 @@ class SessionHistory:
         n_uuid_only = 0
         n_pixel_videos = 0
 
-        for msg in messages:
+        for msg in generation_messages:
             role = msg["role"]
             content = msg["content"]
-            full_prompt += f"<|im_start|>{role}"
+            full_prompt += f"<|im_start|>{role}\n"
 
             if isinstance(content, str):
                 full_prompt += content
@@ -538,9 +687,20 @@ class SessionHistory:
                         else:
                             n_pixel_videos += 1
 
-            full_prompt += "<|im_end|>"
+            full_prompt += "<|im_end|>\n"
 
-        full_prompt += "<|im_start|>assistant"
+        if tools:
+            full_prompt = render_aura_tool_prompt(
+                tokenizer,
+                generation_messages,
+                tools,
+                enable_thinking=thinking,
+            )
+        else:
+            assistant_prefix = aura_assistant_generation_prefix(enable_thinking=thinking)
+            if assistant_prefix == AURA_ASSISTANT_PREFIX_V1:
+                assistant_prefix = f"{assistant_prefix}\n"
+            full_prompt += assistant_prefix
 
         multi_modal_data: dict[str, Any] = {}
         if all_images:
@@ -629,22 +789,36 @@ class SessionHistory:
         return deserialized
 
     def _serialize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [
-            {
+        out: list[dict[str, Any]] = []
+        for msg in messages:
+            entry: dict[str, Any] = {
                 "role": msg["role"],
                 "content": self._serialize_message_content(msg.get("content")),
             }
-            for msg in messages
-        ]
+            if "tool_calls" in msg and msg["tool_calls"] is not None:
+                entry["tool_calls"] = copy.deepcopy(msg["tool_calls"])
+            if "tool_call_id" in msg and msg["tool_call_id"] is not None:
+                entry["tool_call_id"] = msg["tool_call_id"]
+            if "reasoning_content" in msg and msg["reasoning_content"] is not None:
+                entry["reasoning_content"] = msg["reasoning_content"]
+            out.append(entry)
+        return out
 
     def _deserialize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [
-            {
+        out: list[dict[str, Any]] = []
+        for msg in messages:
+            entry: dict[str, Any] = {
                 "role": msg["role"],
                 "content": self._deserialize_message_content(msg.get("content")),
             }
-            for msg in messages
-        ]
+            if "tool_calls" in msg and msg["tool_calls"] is not None:
+                entry["tool_calls"] = copy.deepcopy(msg["tool_calls"])
+            if "tool_call_id" in msg and msg["tool_call_id"] is not None:
+                entry["tool_call_id"] = msg["tool_call_id"]
+            if "reasoning_content" in msg and msg["reasoning_content"] is not None:
+                entry["reasoning_content"] = msg["reasoning_content"]
+            out.append(entry)
+        return out
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -690,6 +864,9 @@ class AuraSessionState:
     # engine request. Later appends belong to the *next* turn and must survive
     # ``commit_turn`` so proactive visuals during TTS are not discarded.
     frozen_turn_frame_count: int = 0
+    # Optional Native-shaped tool chain for API-side commit fallback
+    # (e.g. depth-error exit that never reaches Stage1 final TTS).
+    pending_commit_tool_chain: list[dict[str, Any]] | None = None
 
     def append_turn_frame(self, frame: np.ndarray) -> None:
         self.turn_frame_arrays.append(np.asarray(frame))
@@ -706,6 +883,7 @@ class AuraSessionState:
         request_id: str | None = None,
         video_fps: float = 2.0,
         max_frames_per_round: int = 16,
+        tool_chain: list[dict[str, Any]] | None = None,
     ) -> None:
         """Finish an API-side turn: frames / penalty only.
 
@@ -716,8 +894,10 @@ class AuraSessionState:
         """
         del video_fps, max_frames_per_round
         del request_id
+        chain = tool_chain if tool_chain is not None else self.pending_commit_tool_chain
+        self.pending_commit_tool_chain = None
         if self.session_id:
-            commit_session_turn(self.session_id, response_text)
+            commit_session_turn(self.session_id, response_text, tool_chain=chain)
 
         self.pending_turn_video = None
         # Drop only frames that belonged to the frozen turn; keep frames that
@@ -866,6 +1046,11 @@ def get_session_history(session_id: str) -> SessionHistory | None:
         return _STAGE_WORKER_SESSIONS.get(session_id)
 
 
+def has_pending_turn(session_id: str) -> bool:
+    with _STAGE_WORKER_LOCK:
+        return session_id in _STAGE_PENDING_TURNS
+
+
 def record_pending_turn(
     session_id: str,
     *,
@@ -877,9 +1062,10 @@ def record_pending_turn(
     multi_modal_data: dict[str, Any] | None = None,
     had_vision: bool = False,
     mm_uuid: str | None = None,
+    tool_chain: list[dict[str, Any]] | None = None,
 ) -> None:
     with _STAGE_WORKER_LOCK:
-        _STAGE_PENDING_TURNS[session_id] = {
+        pending: dict[str, Any] = {
             "request_id": request_id,
             "transcript": transcript,
             "video_tuple": video_tuple,
@@ -889,13 +1075,37 @@ def record_pending_turn(
             "had_vision": bool(had_vision),
             "mm_uuid": str(mm_uuid) if mm_uuid else None,
         }
+        if tool_chain:
+            pending["tool_chain"] = [dict(m) for m in tool_chain if isinstance(m, dict)]
+        _STAGE_PENDING_TURNS[session_id] = pending
 
 
-def commit_session_turn(session_id: str, response_text: str) -> None:
-    """Commit the finished user/assistant turn into prompt ``SessionHistory``.
+def discard_pending_turn(session_id: str, request_id: str | None = None) -> None:
+    """Discard an uncommitted pass without touching long-term history."""
+
+    with _STAGE_WORKER_LOCK:
+        pending = _STAGE_PENDING_TURNS.get(session_id)
+        if pending is None:
+            return
+        if request_id is not None and str(pending.get("request_id")) != str(request_id):
+            return
+        _STAGE_PENDING_TURNS.pop(session_id, None)
+
+
+def commit_session_turn(
+    session_id: str,
+    response_text: str,
+    *,
+    tool_chain: list[dict[str, Any]] | None = None,
+) -> None:
+    """Commit the finished user / tool-chain / assistant turn into SessionHistory.
 
     No-op when there is no pending turn (idempotent if ``aura2tts`` already
     committed and the API ``commit_turn`` fallback runs later).
+
+    ``tool_chain`` is the Native-shaped mid-turn sequence
+    ``assistant(tool_calls) + tool × N`` (possibly multi-round). When omitted,
+    any ``tool_chain`` stored on the pending turn is used.
     """
     with _STAGE_WORKER_LOCK:
         history = _STAGE_WORKER_SESSIONS.get(session_id)
@@ -929,6 +1139,12 @@ def commit_session_turn(session_id: str, response_text: str) -> None:
         )
 
         history.add_user_message(AURA_VISION_PAD_TEXT)
+    chain = tool_chain
+    if chain is None:
+        stored = pending.get("tool_chain")
+        if isinstance(stored, list):
+            chain = [m for m in stored if isinstance(m, dict)]
+    history.append_tool_chain(chain)
     history.add_assistant_message(normalized)
     history._pending_mm_uuid = None
     # History fingerprint changed — invalidate pending-splice cache.
@@ -937,11 +1153,12 @@ def commit_session_turn(session_id: str, response_text: str) -> None:
         n_vid, n_frames = _count_videos_in_messages(history.history)
         logger.info(
             "AURA session_history commit pid=%s session_id=%s rounds=%d "
-            "history_videos=%d history_frames=%d video_mode=%s",
+            "history_videos=%d history_frames=%d video_mode=%s tool_chain=%d",
             os.getpid(),
             session_id,
             history.current_rounds,
             n_vid,
             n_frames,
             "all",
+            len(chain or []),
         )

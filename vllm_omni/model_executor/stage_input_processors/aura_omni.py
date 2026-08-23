@@ -8,8 +8,9 @@ import json
 import math
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 import soundfile as sf
@@ -27,16 +28,38 @@ from vllm_omni.model_executor.stage_input_processors.aura_session_history import
     SILENT_TEXT,
     SessionHistory,
     commit_session_turn,
+    discard_pending_turn,
     get_or_create_session_history,
     get_session_history,
     is_effectively_silent,
     record_pending_turn,
 )
+from vllm_omni.model_executor.stage_input_processors.aura_tool_protocol import (
+    AURA_ASSISTANT_PREFIX_V1,
+    aura_assistant_generation_prefix,
+    aura_natural_content,
+    aura_response_instruction,
+    extract_aura_tool_preamble,
+    has_aura_tool_call_marker,
+)
 
-QWEN_IM_START_ID = 151644
-QWEN_IM_END_ID = 151645
-QWEN_ASSISTANT_ID = 77091
-AURA_SILENT_TOKEN_IDS = [151669]
+
+def _env_token_id(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    return int(raw)
+
+
+# AURA v1 (qwen3_vl) defaults. Override via env for AURA_v2 (qwen3_5):
+#   VLLM_AURA_SILENT_TOKEN_ID=248070
+#   VLLM_AURA_IM_END_TOKEN_ID=248046
+#   VLLM_AURA_IM_START_TOKEN_ID=248045
+#   VLLM_AURA_ASSISTANT_TOKEN_ID=74455
+QWEN_IM_START_ID = _env_token_id("VLLM_AURA_IM_START_TOKEN_ID", 151644)
+QWEN_IM_END_ID = _env_token_id("VLLM_AURA_IM_END_TOKEN_ID", 151645)
+QWEN_ASSISTANT_ID = _env_token_id("VLLM_AURA_ASSISTANT_TOKEN_ID", 77091)
+AURA_SILENT_TOKEN_IDS = [_env_token_id("VLLM_AURA_SILENT_TOKEN_ID", 151669)]
 QWEN_TEXT_SILENT_TOKEN_IDS = [27, 91, 68658, 91, 29]
 QWEN_TEXT_SILENT_PREFIX_TOKEN_IDS = [
     [27],
@@ -86,6 +109,14 @@ _AURA_TTS_INFO_KEYS = (
     "tts_ref_code_length",
     "tts_pass_token_ids",
 )
+_AURA_TOOL_INFO_KEYS = (
+    "aura_tool_enabled",
+    "aura_tools",
+    "aura_tool_pass",
+    "aura_tool_resume",
+    "aura_tool_tokenizer_path",
+)
+_AURA_TOOL_TOKENIZERS: dict[str, Any] = {}
 
 # Lazy cache: (path, tokenizer, codec_language_id, spk_is_dialect)
 _qwen3_tts_prompt_len_cache: dict[str, Any] | None = None
@@ -347,6 +378,11 @@ def build_aura_streaming_turn_additional_information(
     pruning_enabled: bool | None = None,
     max_context_qas: int | None = None,
     max_1qna_rounds: int | None = None,
+    tool_enabled: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+    tool_pass: int = 1,
+    tool_resume: dict[str, Any] | None = None,
+    tool_tokenizer_path: str | None = None,
 ) -> dict[str, Any]:
     """Build ``additional_information`` for one AURA streaming inference turn."""
     # Pack pixels before EngineCore msgpack: nested ndarray under scalar_data
@@ -385,6 +421,21 @@ def build_aura_streaming_turn_additional_information(
                 pass_token_ids=tts_pass_token_ids,
             )
         )
+    if tool_enabled:
+        if not tools:
+            raise ValueError("AURA tool-enabled turn requires server-provided tools")
+        additional_information.update(
+            {
+                "aura_tool_enabled": [True],
+                "aura_tools": [tools],
+                "aura_tool_pass": [int(tool_pass)],
+            }
+        )
+        if not tool_tokenizer_path:
+            raise ValueError("AURA tool-enabled turn requires the server Stage1 tokenizer path")
+        additional_information["aura_tool_tokenizer_path"] = [tool_tokenizer_path]
+        if tool_resume is not None:
+            additional_information["aura_tool_resume"] = [tool_resume]
     return additional_information
 
 
@@ -603,11 +654,14 @@ def _pending_vision_pad_text(
 def _aura_prompt(system_prompt: str, transcript: str, multi_modal_data: dict[str, Any]) -> str:
     vision = _vision_placeholder(multi_modal_data)
     query = transcript.strip()
-    user_body = f"{vision}{query}" if query else vision
+    user_body = f"{vision}{query}{aura_response_instruction()}"
+    assistant_prefix = aura_assistant_generation_prefix()
+    if assistant_prefix == AURA_ASSISTANT_PREFIX_V1:
+        assistant_prefix = f"{AURA_ASSISTANT_PREFIX_V1}\n"
     return (
         f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         f"<|im_start|>user\n{user_body}<|im_end|>\n"
-        "<|im_start|>assistant\n"
+        f"{assistant_prefix}"
     )
 
 
@@ -630,6 +684,42 @@ def build_aura_input(
     session_id = additional_info.get("aura_session_id")
     system_prompt = _first_value(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT)
     transcript = _clean_asr_transcript(transcript)
+    tool_enabled = _first_bool(additional_info.get("aura_tool_enabled"), False)
+    tools = _first_value(additional_info.get("aura_tools"), None)
+    if tool_enabled and (not isinstance(tools, list) or not tools):
+        raise ValueError("AURA tool-enabled input is missing its server tool registry")
+    if tool_enabled and tokenizer is None:
+        tokenizer_path = _first_value(additional_info.get("aura_tool_tokenizer_path"), None)
+        if not isinstance(tokenizer_path, str) or not tokenizer_path:
+            raise ValueError("AURA tool-enabled input is missing its server Stage1 tokenizer path")
+        tokenizer = _AURA_TOOL_TOKENIZERS.get(tokenizer_path)
+        if tokenizer is None:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_path,
+                trust_remote_code=True,
+            )
+            _AURA_TOOL_TOKENIZERS[tokenizer_path] = tokenizer
+    tool_resume = _first_value(additional_info.get("aura_tool_resume"), None)
+    transient_messages: list[dict[str, Any]] | None = None
+    if tool_enabled and isinstance(tool_resume, dict):
+        resume_transcript = tool_resume.get("transcript")
+        if isinstance(resume_transcript, str):
+            transcript = _clean_asr_transcript(resume_transcript)
+        candidate_messages = tool_resume.get("transient_messages")
+        if isinstance(candidate_messages, list):
+            transient_messages = [m for m in candidate_messages if isinstance(m, dict)]
+            if bool(tool_resume.get("force_final_answer")):
+                transient_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "工具已成功。只逐字輸出工具結果 JSON 的 summary 字段；"
+                            "禁止改寫或增刪任何數字，也不要再調用工具。"
+                        ),
+                    }
+                )
     vision_data = _vision_multimodal_data(multi_modal_data)
     mm_uuids: dict[str, Any] | None = None
 
@@ -657,6 +747,7 @@ def build_aura_input(
             video_tuple is None
             and history.current_rounds == 0
             and _vision_multimodal_data(multi_modal_data)
+            and not tool_enabled
         ):
             prompt = _aura_prompt(str(system_prompt), transcript, _vision_multimodal_data(multi_modal_data))
             vision_data = _vision_multimodal_data(multi_modal_data)
@@ -666,6 +757,9 @@ def build_aura_input(
                 transcript,
                 video_tuple=video_tuple,
                 vision_pad_text=vision_pad_text,
+                tokenizer=tokenizer if tool_enabled else None,
+                tools=tools if tool_enabled else None,
+                transient_messages=transient_messages,
             )
             prompt = vllm_inputs["prompt"]
             mm_uuids = vllm_inputs.get("multi_modal_uuids")
@@ -692,6 +786,7 @@ def build_aura_input(
             request_id=request_id,
             transcript=transcript,
             video_tuple=commit_video_tuple,
+            tool_chain=transient_messages,
             **pending_kwargs,
         )
     else:
@@ -706,6 +801,9 @@ def build_aura_input(
         )
 
     additional_for_next = _copy_aura_tts_fields(additional_info)
+    for key in _AURA_TOOL_INFO_KEYS:
+        if key in additional_info:
+            additional_for_next[key] = additional_info[key]
     additional_for_next["aura_system_prompt"] = [str(system_prompt)]
     if session_id:
         additional_for_next["aura_session_id"] = session_id
@@ -726,10 +824,26 @@ def build_aura_input(
     return next_input
 
 
+def _tool_chain_from_additional_info(additional_info: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Extract Native-shaped tool chain from ``aura_tool_resume.transient_messages``."""
+    resume = _first_value(additional_info.get("aura_tool_resume"), None)
+    if not isinstance(resume, dict):
+        return None
+    candidate = resume.get("transient_messages")
+    if not isinstance(candidate, list):
+        return None
+    chain = [m for m in candidate if isinstance(m, dict)]
+    return chain or None
+
+
 def _commit_session_turn_if_present(additional_info: dict[str, Any], response_text: str) -> None:
     session_id = additional_info.get("aura_session_id")
     if session_id:
-        commit_session_turn(str(_first_value(session_id)), response_text)
+        commit_session_turn(
+            str(_first_value(session_id)),
+            response_text,
+            tool_chain=_tool_chain_from_additional_info(additional_info),
+        )
 
 
 _AURA_STAGE_INPUT_PROCESSORS: dict[int, Any] = {}
@@ -838,8 +952,9 @@ def _try_splice_pending_video_expand(
 
     text = (transcript or "").strip()
     mini_prompt = (
-        f"<|im_start|>user<|vision_start|><|video_pad|><|vision_end|>{text}"
-        f"<|im_end|><|im_start|>assistant"
+        f"<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>{text}"
+        f"{aura_response_instruction()}"
+        f"<|im_end|>\n{aura_assistant_generation_prefix()}"
     )
     mini_built: dict[str, Any] = {
         "prompt": mini_prompt,
@@ -1764,11 +1879,36 @@ def aura2tts(
         text = _extract_text(source_output).strip()
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
+        token_ids = _extract_token_ids(source_output)
+        if _first_bool(additional_info.get("aura_tool_enabled"), False) and has_aura_tool_call_marker(
+            text,
+            token_ids,
+        ):
+            session_id = _first_value(additional_info.get("aura_session_id"), None)
+            if session_id:
+                discard_pending_turn(str(session_id), str(getattr(source_output, "request_id", idx)))
+            preamble = extract_aura_tool_preamble(text)
+            if preamble:
+                tts_input = build_tts_talker_input(
+                    preamble,
+                    [],
+                    additional_info,
+                    False,
+                )
+                if tts_input is not None:
+                    next_inputs.append(tts_input)
+            continue
+        # Strip AURA_v2 think wrappers for TTS/history on every path (empty think
+        # collapses to silent via normalize_assistant_text / is_effectively_silent).
+        text = aura_natural_content(text).strip()
         _commit_session_turn_if_present(additional_info, text or SILENT_TEXT)
-        pass_token_ids = _first_bool(additional_info.get("tts_pass_token_ids"), False)
+        pass_token_ids = _first_bool(additional_info.get("tts_pass_token_ids"), False) and not _first_bool(
+            additional_info.get("aura_tool_enabled"),
+            False,
+        )
         tts_input = build_tts_talker_input(
             text,
-            _extract_token_ids(source_output),
+            token_ids,
             additional_info,
             pass_token_ids,
         )
@@ -1798,6 +1938,7 @@ def aura2tts_async_chunk(
     finished = bool(is_finished or request.is_finished())
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     additional_info = _request_additional_info(request)
+    tool_enabled = _first_bool(additional_info.get("aura_tool_enabled"), False)
     logger.info(
         "[aura2tts_async_chunk] req=%s is_finished_arg=%s request_finished=%s "
         "content_ids=%d output_text_len=%d",
@@ -1860,10 +2001,15 @@ def aura2tts_async_chunk(
         emit_info = {**cached_tts_metadata, **additional_info}
     else:
         emit_info = additional_info
-    pass_token_ids = _first_bool(emit_info.get("tts_pass_token_ids"), False)
-    sentence_tts = _sentence_tts_enabled()
+    pass_token_ids = _first_bool(emit_info.get("tts_pass_token_ids"), False) and not tool_enabled
     pending_buf = str(state.get("aura2tts_pending_sentence", ""))
     full_text = _clean_tts_text(str(state.get("aura2tts_text", ""))) or request_text
+    # Tool-enabled passes must be classified from the complete Stage-1 output;
+    # emitting an early sentence could speak before a later <tool_call>.
+    # Defer mid-gen sentence TTS whenever think wrappers appear so reasoning is
+    # never spoken; finish path strips to natural content (or silent).
+    think_pending = "<think>" in full_text or "</think>" in full_text
+    sentence_tts = _sentence_tts_enabled() and not tool_enabled and not think_pending
     # Append only newly seen text into the sentence buffer.
     emitted_prefix = str(state.get("aura2tts_emitted_prefix", ""))
     if full_text.startswith(emitted_prefix):
@@ -1917,24 +2063,59 @@ def aura2tts_async_chunk(
 
     # Finished: flush any remainder sentence buffer, then commit history once.
     content_ids = list(state.get("aura2tts_content_ids", content_ids) or [])
+    if tool_enabled and has_aura_tool_call_marker(full_text or request_text, content_ids):
+        session_id = _first_value(additional_info.get("aura_session_id"), None)
+        if session_id:
+            discard_pending_turn(str(session_id), str(request_id))
+        request_payload.pop(str(request_id), None)
+        preamble = extract_aura_tool_preamble(full_text or request_text)
+        if not preamble:
+            logger.info(
+                "[aura2tts_async_chunk] req=%s withheld empty-preamble tool pass from TTS and history",
+                request_id,
+            )
+            return _aura2tts_empty_finished_payload()
+        tts_input = build_tts_talker_input(preamble, [], emit_info, pass_token_ids=False)
+        if tts_input is None:
+            logger.info(
+                "[aura2tts_async_chunk] req=%s preamble TTS input empty; withholding history",
+                request_id,
+            )
+            return _aura2tts_empty_finished_payload()
+        logger.info(
+            "[aura2tts_async_chunk] req=%s emitting safe tool preamble TTS text_len=%d",
+            request_id,
+            len(preamble),
+        )
+        return _tts_payload_from_talker_input(tts_input)
+    # Always strip think wrappers before silent classification / TTS / commit.
+    raw_full_text = full_text
+    full_text = aura_natural_content(full_text).strip()
+    pending_buf = aura_natural_content(pending_buf).strip()
+    if full_text != (raw_full_text or "").strip():
+        # Think wrappers were removed — do not pass raw thinking token ids to TTS.
+        pass_token_ids = False
+    if content_ids and not full_text and not pass_token_ids:
+        try:
+            tokenizer = cached_tokenizer_from_config(transfer_manager.config)
+            full_text = aura_natural_content(_clean_tts_text(tokenizer.decode(content_ids))).strip()
+        except Exception:
+            logger.exception(
+                "[aura2tts_async_chunk] req=%s failed to decode AURA token ids; falling back to token ids",
+                getattr(request, "request_id", None),
+            )
     if not content_ids and not full_text and not pending_buf:
         logger.info("[aura2tts_async_chunk] req=%s finished with no content ids; no TTS input", request_id)
         return None
-    if _is_silent_token_prefix(content_ids) and not pending_buf:
+    if (_is_silent_token_prefix(content_ids) or is_effectively_silent(full_text)) and not pending_buf:
         logger.info("[aura2tts_async_chunk] req=%s final content is silent; emitting finish payload", request_id)
         _commit_session_turn_if_present(additional_info, SILENT_TEXT)
         return _aura2tts_empty_finished_payload()
 
     request_text = full_text
     if not request_text and not pass_token_ids:
-        try:
-            tokenizer = cached_tokenizer_from_config(transfer_manager.config)
-            request_text = _clean_tts_text(tokenizer.decode(content_ids))
-        except Exception:
-            logger.exception(
-                "[aura2tts_async_chunk] req=%s failed to decode AURA token ids; falling back to token ids",
-                getattr(request, "request_id", None),
-            )
+        _commit_session_turn_if_present(additional_info, SILENT_TEXT)
+        return _aura2tts_empty_finished_payload()
 
     if sentence_tts:
         n_emitted = int(state.get("aura2tts_sentence_emits", 0))

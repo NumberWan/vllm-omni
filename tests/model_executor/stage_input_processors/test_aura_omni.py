@@ -414,6 +414,8 @@ def test_aura2tts_async_chunk_passes_token_ids_only_when_enabled():
 
 
 def test_aura2tts_async_chunk_decodes_text_instead_of_passing_source_token_ids(monkeypatch):
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "0")
+
     class FakeTokenizer:
         def decode(self, token_ids):
             assert token_ids == [101, 102, 103, 104]
@@ -487,6 +489,308 @@ def test_aura2tts_async_chunk_emits_finish_payload_when_tts_input_is_silent():
     assert payload is not None
     assert payload["prompt_token_ids"] == []
     assert payload["meta"]["finished"].item() is True
+
+
+def test_aura2tts_async_chunk_empty_think_commits_silent_and_skips_tts():
+    clear_all_sessions()
+    video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    metadata = {"fps": 2.0, "duration": 1.0, "total_num_frames": 2}
+    additional_info = {
+        "aura_session_id": "aura-empty-think",
+        "deferred_multi_modal_data": {"video": [(video, metadata)]},
+        "aura_system_prompt": ["system"],
+    }
+    build_aura_input(
+        transcript="",
+        additional_info=additional_info,
+        multi_modal_data={},
+        request_id="req-empty-think",
+    )
+    transfer_manager = SimpleNamespace(request_payload={}, config=SimpleNamespace())
+    request = SimpleNamespace(
+        request_id="req-empty-think",
+        external_req_id="req-empty-think",
+        output_token_ids=[248068, 198, 248069],
+        output_text="<think>\n\n</think>",
+        additional_information=additional_info,
+        is_finished=lambda: True,
+    )
+
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+
+    assert payload is not None
+    assert payload["prompt_token_ids"] == []
+    assert payload["meta"]["finished"].item() is True
+    history = get_session_history("aura-empty-think")
+    assert history is not None
+    assert history.history[-1]["content"] == SILENT_TEXT
+
+
+def test_aura2tts_async_chunk_strips_think_before_tts_and_history():
+    clear_all_sessions()
+    video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    metadata = {"fps": 2.0, "duration": 1.0, "total_num_frames": 2}
+    additional_info = {
+        "aura_session_id": "aura-strip-think",
+        "deferred_multi_modal_data": {"video": [(video, metadata)]},
+        "aura_system_prompt": ["system"],
+        "tts_task_type": ["CustomVoice"],
+        "tts_speaker": ["Vivian"],
+        "tts_language": ["Chinese"],
+    }
+    build_aura_input(
+        transcript="出现古韵提醒我",
+        additional_info=additional_info,
+        multi_modal_data={},
+        request_id="req-strip-think",
+    )
+    transfer_manager = _transfer_manager()
+    request = SimpleNamespace(
+        request_id="req-strip-think",
+        external_req_id="req-strip-think",
+        output_token_ids=[101, 102, 103],
+        output_text="<think>watch for book</think>\n好的，我会留意。",
+        additional_information=additional_info,
+        is_finished=lambda: True,
+    )
+
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+
+    assert payload["text"] == ["好的，我会留意。"]
+    history = get_session_history("aura-strip-think")
+    assert history.history[-1]["content"] == "好的，我会留意。"
+
+
+def test_aura_tool_pass_is_deferred_then_withheld_from_tts_and_history(monkeypatch):
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["tools"]
+            return f"rendered:{len(messages)}"
+
+        def encode(self, text):
+            return [ord(ch) for ch in text]
+
+    additional = {
+        "aura_session_id": "tool-session",
+        "aura_system_prompt": ["system"],
+        "aura_tool_enabled": [True],
+        "aura_tools": [
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mock_echo",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ]
+        ],
+        "tts_task_type": ["CustomVoice"],
+        "tts_speaker": ["Vivian"],
+        "tts_language": ["Chinese"],
+    }
+    built = build_aura_input(
+        "請回聲",
+        additional,
+        {},
+        "tool-pass-1",
+        tokenizer=FakeTokenizer(),
+    )
+    transfer_manager = _transfer_manager()
+    request = SimpleNamespace(
+        request_id="tool-pass-1",
+        external_req_id="tool-pass-1",
+        output_token_ids=[1, 2, 3],
+        output_text="我先檢查。",
+        additional_information=built["additional_information"],
+        is_finished=lambda: False,
+    )
+
+    # Tool-enabled turns disable sentence streaming before any XML appears.
+    assert aura2tts_async_chunk(transfer_manager, None, request, is_finished=False) is None
+    request.output_token_ids = [1, 2, 248058, 4]
+    request.output_text = (
+        "我先檢查。<tool_call><function=mock_echo>"
+        "<parameter=text>hello</parameter></function></tool_call>"
+    )
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+
+    assert payload["text"] == ["我先檢查。"]
+    assert "<tool_call>" not in str(payload)
+    history = get_session_history("tool-session")
+    assert history is not None
+    assert len(history.history) == 1  # system only: pass1 was not committed
+
+
+@pytest.mark.parametrize(
+    "output_text",
+    [
+        "<tool_call><function=mock_echo><parameter=text>hello</parameter></function></tool_call>",
+        "<think>unfinished reasoning",
+        "<think>private</think><tool_call><function=mock_echo>",
+    ],
+)
+def test_aura_tool_pass_does_not_speak_xml_or_unfinished_think(monkeypatch, output_text):
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    additional = {
+        "aura_session_id": "tool-silent-preamble",
+        "aura_system_prompt": ["system"],
+        "aura_tool_enabled": [True],
+        "tts_task_type": ["CustomVoice"],
+        "tts_speaker": ["Vivian"],
+        "tts_language": ["Chinese"],
+    }
+    transfer_manager = _transfer_manager()
+    request = SimpleNamespace(
+        request_id="tool-silent",
+        external_req_id="tool-silent",
+        output_token_ids=[248058],
+        output_text=output_text,
+        additional_information=additional,
+        is_finished=lambda: True,
+    )
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+    assert payload["prompt_token_ids"] == []
+    assert payload.get("text") in (None, [])
+
+
+def test_aura_tool_input_lazy_loads_server_stage1_tokenizer(monkeypatch):
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["tools"]
+            return "official-tool-template"
+
+        def encode(self, text):
+            assert text == "official-tool-template"
+            return [7, 8, 9]
+
+    from vllm_omni.model_executor.stage_input_processors import aura_omni
+
+    monkeypatch.setitem(
+        aura_omni._AURA_TOOL_TOKENIZERS,
+        "/server/stage1",
+        FakeTokenizer(),
+    )
+    built = build_aura_input(
+        "請使用工具",
+        {
+            "aura_session_id": "lazy-tool-tokenizer",
+            "aura_tool_enabled": [True],
+            "aura_tools": [
+                [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "mock_echo",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ]
+            ],
+            "aura_tool_tokenizer_path": ["/server/stage1"],
+        },
+        {},
+        "lazy-pass-1",
+    )
+
+    assert built["prompt"] == "official-tool-template"
+    assert built["prompt_token_ids"] == [7, 8, 9]
+
+
+def test_aura_tool_pass2_final_answer_tts_and_commits_once():
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            assert any(message.get("role") == "tool" for message in messages)
+            assert messages[-1] == {
+                "role": "user",
+                "content": (
+                    "工具已成功。只逐字輸出工具結果 JSON 的 summary 字段；"
+                    "禁止改寫或增刪任何數字，也不要再調用工具。"
+                ),
+            }
+            return "rendered-pass-2"
+
+        def encode(self, text):
+            return [1, 2, 3]
+
+    additional = {
+        "aura_session_id": "tool-session-2",
+        "aura_system_prompt": ["system"],
+        "aura_tool_enabled": [True],
+        "aura_tools": [
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mock_echo",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ]
+        ],
+        "aura_tool_pass": [2],
+        "aura_tool_resume": [
+            {
+                "transcript": "請回聲",
+                "transient_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "function": {
+                                    "name": "mock_echo",
+                                    "arguments": {"text": "hello"},
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "content": '{"text":"hello"}',
+                    },
+                ],
+                "force_final_answer": True,
+            }
+        ],
+        "tts_task_type": ["CustomVoice"],
+        "tts_speaker": ["Vivian"],
+        "tts_language": ["Chinese"],
+    }
+    built = build_aura_input(
+        "",
+        additional,
+        {},
+        "tool-pass-2",
+        tokenizer=FakeTokenizer(),
+    )
+    request = SimpleNamespace(
+        request_id="tool-pass-2",
+        external_req_id="tool-pass-2",
+        output_token_ids=[101, 102],
+        output_text="<think>tool succeeded</think>\n已為你回聲 hello。",
+        additional_information=built["additional_information"],
+        is_finished=lambda: True,
+    )
+    payload = aura2tts_async_chunk(_transfer_manager(), None, request, is_finished=True)
+
+    assert payload["text"] == ["已為你回聲 hello。"]
+    history = get_session_history("tool-session-2")
+    assert history is not None
+    assert [message["role"] for message in history.history] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert history.history[-3]["tool_calls"][0]["id"] == "call-1"
+    assert history.history[-2]["role"] == "tool"
+    assert history.history[-1]["content"] == "已為你回聲 hello。"
 
 
 def test_pop_native_tts_sentence_matches_native_boundaries():
@@ -1065,10 +1369,19 @@ def test_empty_asr_placeholder_video_prompt_includes_current_user_vision_pad():
         request_id="req-empty-video",
     )
     prompt = next_input["prompt"]
-    assert prompt.endswith("<|im_start|>assistant")
+    assert prompt.endswith("<|im_start|>assistant\n")
     last_user_idx = prompt.rfind("<|im_start|>user")
     last_assistant_idx = prompt.rfind("<|im_start|>assistant")
     assert last_user_idx != -1 and last_user_idx < last_assistant_idx
     current_user_block = prompt[last_user_idx:last_assistant_idx]
     assert "<|vision_start|><|video_pad|><|vision_end|>" in current_user_block
     assert "请简单介绍下这本书讲的是什么。" not in current_user_block
+
+
+def test_pending_video_mini_prompt_keeps_role_newlines():
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[3] / "vllm_omni/model_executor/stage_input_processors/aura_omni.py"
+    text = src.read_text(encoding="utf-8")
+    assert 'f"<|im_start|>user\\n<|vision_start|><|video_pad|><|vision_end|>{text}"' in text
+    assert 'f"<|im_end|>\\n{aura_assistant_generation_prefix()}"' in text
