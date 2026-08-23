@@ -2329,15 +2329,30 @@ class Orchestrator:
             # ASR GPU — vision-only turns may still speak. Stage1→TTS emits an empty
             # finish on <|silent|> so Talker does not synthesize; do not clamp to
             # Stage1 here based on "no mic".
+            #
+            # Prewarm Stage2/3 (and Stage1 when it truly consumes SHM). On v0.26,
+            # Stage1 is often marked connector role=sender because it produces
+            # 1→2 codec chunks — then ``_stage_receives_async_chunks(1)`` is False,
+            # prewarm skips Stage1, and SHM inject would hang forever. In that case
+            # feed Stage1 via orchestrator mock forward (same as non-async Stage0
+            # completion when the next stage is orchestrator-fed).
             if req_state.final_stage_id > 0:
                 await self._prewarm_async_chunk_stages(request_id, stage0_request, req_state)
-            additional_info = (
-                _resolve_prompt_additional_information(stage0_request)
-                or _resolve_prompt_additional_information(original_prompt)
-                or _resolve_prompt_additional_information(req_state.prompt)
-                or {}
-            )
-            await self._inject_bypassed_stage0_chunk(request_id, additional_info)
+            if self._stage_receives_async_chunks(1):
+                additional_info = (
+                    _resolve_prompt_additional_information(stage0_request)
+                    or _resolve_prompt_additional_information(original_prompt)
+                    or _resolve_prompt_additional_information(req_state.prompt)
+                    or {}
+                )
+                await self._inject_bypassed_stage0_chunk(request_id, additional_info)
+            else:
+                logger.info(
+                    "[Orchestrator] Stage0 bypass: Stage1 is orchestrator-fed "
+                    "(not async-chunk receiver); mock-forwarding req=%s",
+                    request_id,
+                )
+                await self._forward_bypassed_stage_zero(request_id, req_state)
             return
 
         await self._forward_bypassed_stage_zero(request_id, req_state)
