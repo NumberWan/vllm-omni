@@ -20,54 +20,38 @@ Easy, fast, and cheap omni-modality model serving for everyone
 本分支（`AURA_production_v026`）提供 AURA 实时音视频 pipeline：
 `Qwen3-ASR → AURA_v2 → Qwen3-TTS → Code2Wav`。
 
-全新环境请先安装：
+### 1. 安装（首次）
 
 ```bash
 bash scripts/install_aura_omni.sh
 ```
 
-### 仅 API / WebSocket
+### 2. 配置环境变量（启动前，同一 shell）
 
-双卡生产配置（默认 `:8666`、`aura_omni_2gpu_best`）：
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
-curl http://127.0.0.1:8666/v1/models
-```
-
-本地 AURA_v2 权重：
+将下列变量按需替换为本地路径与密钥。**勿写入文件或提交 git**；修改后须重启服务。
 
 ```bash
-MODEL=/workspace/models/AURA_v2 \
-CUDA_VISIBLE_DEVICES=0,1 \
-bash scripts/start_aura_omni.sh
-```
+# 模型路径（本地已有权重时）
+export MODEL=/workspace/models/AURA_v2
 
-亦可使用 `vllm serve /workspace/models/AURA_v2 --omni`（默认端口 `8000`；固定端口加
-`--port 8666`）。WebSocket 端点：`/v1/video/chat/stream`。
+# 可选 GPU：指定物理卡编号；不设则自动选择显存占用 <2 GiB 的空闲卡
+# export AURA_GPU=3
 
-启用 safe 工具时，在**同一 shell** 中 `export` 密钥（勿写入文件或提交 git；修改后须重启 server）：
-
-```bash
-export VLLM_AURA_TOOL_EXECUTOR=safe
+# 可选工具 API（计算器 / 上海时间 / 天气 / 汇率 / IP 定位无需密钥）
 export DEEPSEEK_API_KEY='sk-...'   # 未设置则 DeepSeek 使用 mock
 export SERPER_API_KEY='...'        # 未设置则 WebSearch 无法真实检索
-# 可选（默认关闭）：VLLM_AURA_TOOL_BRAVE / _DDG / _WEBFETCH
-CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
 ```
 
-计算器、上海时间、天气、汇率、IP 定位无需密钥。`start_aura_omni.sh` 会将上述环境变量传入 server 进程。WebSocket 客户端须设置 `"tool_mode": "auto"`（Web Demo 启动脚本已配置）。
+Web Demo 启动脚本已默认启用 `VLLM_AURA_TOOL_EXECUTOR=safe`、`TOOL_MODE=auto`、
+`max_tool_depth=3`，**无需再手动 export**。
 
-### 浏览器 Web Demo
-
-一条命令启动 AURA_v2（1-GPU）与 Web 前端（自动选择显存占用 <2 GiB 的空闲 GPU，不终止他人进程；指定 GPU：`AURA_GPU=N`）：
+### 3. 启动浏览器 Web Demo（推荐）
 
 ```bash
-# 可先 export DEEPSEEK_API_KEY / SERPER_API_KEY
 bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
 ```
 
-访问地址：
+访问：
 
 - 本机：`http://127.0.0.1:9999/`
 - 局域网：`http://<host-ip>:9999/`
@@ -79,20 +63,32 @@ bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
 bash examples/online_serving/aura_omni/native_gateway_web_demo/stop_1gpu_stack.sh
 ```
 
-默认配置：`VLLM_AURA_TOOL_EXECUTOR=safe`、`TOOL_MODE=auto`、`max_tool_depth=3`、
-摄像头 `AUTO_TRIGGER=1`（至少 2 帧可触发轮次）、Base voice clone、单 session。
-支持摄像头、PTT、ASR 文本、工具气泡与流式 TTS；PTT 可打断当前播放（前端停止播放，不取消 GPU 上已运行的 TTS）。暂不支持文字输入与 `/eval`。
+默认：Base voice clone、单 session、摄像头至少 2 帧可触发轮次。支持摄像头、PTT、
+ASR 文本、工具气泡与流式 TTS；PTT 可打断当前播放（前端停止播放，不取消 GPU 上已运行的 TTS）。
+暂不支持文字输入与 `/eval`。
 
-本地已有权重时：
+### 4. 仅 API / WebSocket（可选）
+
+双卡生产配置（默认 `:8666`）。此路径**不会**自动打开工具，若需要 safe 工具请自行设置：
 
 ```bash
-MODEL=/workspace/models/AURA_v2 \
-bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
+export MODEL=/workspace/models/AURA_v2
+export VLLM_AURA_TOOL_EXECUTOR=safe   # 仅 API 路径需要；Web Demo 已内置
+export DEEPSEEK_API_KEY='sk-...'
+export SERPER_API_KEY='...'
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
+curl http://127.0.0.1:8666/v1/models
 ```
+
+亦可使用 `vllm serve /workspace/models/AURA_v2 --omni`（默认端口 `8000`；固定端口加
+`--port 8666`）。WebSocket 端点：`/v1/video/chat/stream`；客户端须设置
+`"tool_mode": "auto"`。
 
 ### 工具调用额外延迟（相对无工具短答「好的」）
 
-基准：无工具短答 e2e 约 **302 ms**（ASR ~91 ms + LLM ~211 ms）。调工具时用户需等待 **Pass1 生成 tool XML → 工具执行 → Pass2 生成完整答复**；下表为相对该基准的额外等待（2-GPU AURA_v2，`tool_mode=auto`，2026-08-23 实测）。
+基准：无工具短答 e2e 约 **302 ms**（ASR ~91 ms + LLM ~211 ms）。调工具时用户需等待
+**Pass1 生成 tool XML → 工具执行 → Pass2 生成完整答复**；下表为相对该基准的额外等待
+（2-GPU AURA_v2，`tool_mode=auto`，2026-08-23 实测）。
 
 | 工具 | 等 HTTP | 两轮 LLM（相对「好的」~211 ms） | 用户多等 |
 |---|---:|---:|---:|
@@ -103,7 +99,9 @@ bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
 | DeepSeek | ~4.7 s | ~9 s | +14 s |
 | WebSearch | 0.5 ms（无 key） | 模型空转最长 ~13 s | 非检索慢 |
 
-说明：计算器、时间等本地工具执行 <2 ms，额外时间主要来自 **多一轮 Stage1 生成**。汇率、天气的 HTTP 为 Frankfurter / Open-Meteo 往返。DeepSeek 为真实 API 延迟叠加第二轮长生成。WebSearch 须配置 `SERPER_API_KEY` 方可真实检索；无 key 时工具几乎不耗时，延迟来自模型空转。
+说明：计算器、时间等本地工具执行 <2 ms，额外时间主要来自多一轮 Stage1 生成。
+汇率、天气的 HTTP 为 Frankfurter / Open-Meteo 往返。DeepSeek 为真实 API 延迟叠加
+第二轮长生成。WebSearch 须配置 `SERPER_API_KEY` 方可真实检索；无 key 时延迟来自模型空转。
 
 ### 运行 OmniInteract Smoke3 基准（可选）
 
