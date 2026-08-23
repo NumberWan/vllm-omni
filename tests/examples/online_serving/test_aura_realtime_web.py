@@ -109,6 +109,7 @@ def test_healthz_and_index_config_injection() -> None:
         video_fps=2.0,
         tts_language="Chinese",
         tts_speaker="Vivian",
+        tool_mode="auto",
         listen_port=7862,
     )
     assert app.state.listen_port == 7862
@@ -125,11 +126,14 @@ def test_healthz_and_index_config_injection() -> None:
     assert "aurateam/AURA" in page.text
     assert "v1/video/chat/stream" in page.text
     assert "AURA_WEB_CONFIG" in page.text
+    assert '"toolMode": "auto"' in page.text
 
     app_js = client.get("/static/app.js")
     assert app_js.status_code == 200
     body = app_js.text
     assert "session.config" in body
+    assert "tool_mode: config.toolMode === 'auto' ? 'auto' : 'none'" in body
+    assert "max_tool_depth: 2" in body
     assert "auto_trigger: true" in body
     assert "audio.done" in body
     assert "video.frame" in body

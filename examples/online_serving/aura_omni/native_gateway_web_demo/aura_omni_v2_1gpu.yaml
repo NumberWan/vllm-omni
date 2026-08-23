@@ -1,0 +1,118 @@
+# AURA_v2 Native-frontend demo: all four stages on one visible GPU.
+# Started by run_1gpu_stack.sh; single-session showcase profile.
+# devices: "0" is relative to CUDA_VISIBLE_DEVICES.
+#
+# Stage1 uses /workspace/models/AURA_v2 + AuraQwen3_5ForConditionalGeneration.
+# Silent/im_end stop ids are qwen3_5 tokenizer values (not v1 151669/151645).
+# Also set env when starting:
+#   VLLM_AURA_SILENT_TOKEN_ID=248070
+#   VLLM_AURA_IM_END_TOKEN_ID=248046
+#   VLLM_AURA_IM_START_TOKEN_ID=248045
+#   VLLM_AURA_ASSISTANT_TOKEN_ID=74455
+pipeline: aura_omni
+async_chunk: true
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 20
+      codec_left_context_frames: 72
+      initial_codec_chunk_frames: 8
+      decode_cudagraph_capture_sizes:
+      - 25
+      - 73
+      - 97
+stages:
+- stage_id: 0
+  max_num_seqs: 1
+  gpu_memory_utilization: 0.08
+  trust_remote_code: true
+  enable_prefix_caching: true
+  async_scheduling: true
+  max_model_len: 4096
+  max_num_batched_tokens: 2048
+  devices: '0'
+  model: /workspace/models/Qwen3-ASR-1.7B
+  default_sampling_params:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 256
+- stage_id: 1
+  max_num_seqs: 1
+  gpu_memory_utilization: 0.55
+  trust_remote_code: true
+  # Qwen3.5 hybrid prefix cache uses mamba_cache_mode=align. Omni's GPU AR
+  # runner now calls preprocess_mamba before forward, matching stock vLLM.
+  enable_prefix_caching: true
+  mm_processor_cache_gb: 1
+  async_scheduling: true
+  max_model_len: 32768
+  max_num_batched_tokens: 8192
+  devices: '0'
+  model: /workspace/models/AURA_v2
+  model_arch: AuraQwen3_5ForConditionalGeneration
+  default_sampling_params:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 256
+    repetition_penalty: 1.0
+    stop_token_ids:
+    - 248070
+    - 248046
+  attention_backend: FLASHINFER
+  mm_encoder_attn_backend: FLASHINFER
+- stage_id: 2
+  max_num_seqs: 1
+  gpu_memory_utilization: 0.12
+  enforce_eager: true
+  trust_remote_code: true
+  enable_prefix_caching: false
+  async_scheduling: true
+  max_num_batched_tokens: 4096
+  max_model_len: 4096
+  devices: '0'
+  attention_backend: FLASHINFER
+  input_connectors:
+    from_stage_1: connector_of_shared_memory
+  output_connectors:
+    to_stage_3: connector_of_shared_memory
+  model: /workspace/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe
+  # Match aura_omni_1gpu_demo.yaml Stage2 so AURA v1 vs v2 only differs at Stage1.
+  default_sampling_params:
+    temperature: 0.5
+    top_k: 50
+    max_tokens: 4096
+    min_tokens: 8
+    repetition_penalty: 1.05
+  subtalker_sampling_params:
+    do_sample: true
+    temperature: 0.5
+    top_k: 50
+    top_p: 1.0
+- stage_id: 3
+  max_num_seqs: 1
+  gpu_memory_utilization: 0.12
+  enforce_eager: true
+  trust_remote_code: true
+  enable_prefix_caching: false
+  async_scheduling: true
+  max_num_batched_tokens: 16384
+  max_model_len: 16384
+  devices: '0'
+  input_connectors:
+    from_stage_2: connector_of_shared_memory
+  model: /workspace/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe
+  default_sampling_params:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 16384
+    seed: 42
+    repetition_penalty: 1.0

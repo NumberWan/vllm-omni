@@ -296,11 +296,14 @@ def build_app(
     tts_language: str = "Chinese",
     tts_speaker: str = "Vivian",
     tts_instruct: str | None = None,
+    tool_mode: str = "none",
     startup_warmup: bool = False,
     warmup_audio: Path = DEFAULT_WARMUP_AUDIO,
     listen_port: int = 7862,
 ) -> FastAPI:
     """Build the FastAPI app that serves the UI and proxies AURA streaming WS."""
+    if tool_mode not in {"none", "auto"}:
+        raise ValueError("tool_mode must be 'none' or 'auto'")
     resolved_tts_instruct = (tts_instruct or "").strip() or DEFAULT_TTS_INSTRUCT
 
     @asynccontextmanager
@@ -343,6 +346,7 @@ def build_app(
                 "ttsLanguage": tts_language,
                 "ttsSpeaker": tts_speaker,
                 "ttsInstruct": resolved_tts_instruct,
+                "toolMode": tool_mode,
                 "appVersion": app_version,
             },
             ensure_ascii=True,
@@ -408,6 +412,7 @@ def main() -> None:
     parser.add_argument("--tts-task-type", default="CustomVoice", choices=["CustomVoice", "Base"])
     parser.add_argument("--tts-language", default="Chinese")
     parser.add_argument("--tts-speaker", default="Vivian")
+    parser.add_argument("--tool-mode", default="none", choices=["none", "auto"])
     parser.add_argument(
         "--tts-instruct",
         default="",
@@ -432,6 +437,7 @@ def main() -> None:
         tts_language=args.tts_language,
         tts_speaker=args.tts_speaker,
         tts_instruct=args.tts_instruct or None,
+        tool_mode=args.tool_mode,
         startup_warmup=not args.skip_warmup,
         warmup_audio=args.warmup_audio,
         listen_port=args.port,

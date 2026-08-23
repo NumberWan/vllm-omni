@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>Aura - 视频通话</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#fff}
+
+#cameraVideo{position:fixed;top:0;left:0;width:100%;height:100%;object-fit:cover;z-index:0}
+
+#permOverlay{z-index:100;position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#1a1a2e;gap:24px}
+#permOverlay.hidden{display:none}
+#permOverlay h1{font-size:28px;font-weight:600;color:#667eea}
+#permOverlay p{color:#aaa;font-size:14px;text-align:center;max-width:320px;line-height:1.6}
+.btn-primary{padding:14px 48px;border-radius:40px;border:none;font-size:18px;font-weight:600;color:#fff;cursor:pointer;background:#667eea;transition:opacity .15s}
+.btn-primary:hover{opacity:.85}
+
+#settingsPanel{z-index:50;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(30,30,50,0.85);backdrop-filter:blur(20px);border-radius:20px;padding:32px;min-width:320px;border:1px solid rgba(255,255,255,0.1);display:flex;flex-direction:column;gap:20px}
+#settingsPanel.hidden{display:none}
+#settingsPanel h2{text-align:center;font-size:20px;font-weight:500;color:#ddd}
+.setting-row{display:flex;justify-content:space-between;align-items:center;gap:16px}
+.setting-row label{font-size:14px;color:#aaa}
+.setting-row select{padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.08);color:#fff;font-size:14px;outline:none}
+.setting-row select option{background:#1a1a2e}
+#callBtn{width:100%;padding:14px;border-radius:40px;border:none;font-size:18px;font-weight:600;color:#fff;cursor:pointer;background:#4CAF50;transition:opacity .15s;margin-top:4px}
+#callBtn:disabled{opacity:0.5;cursor:not-allowed}
+
+#statusBadge{z-index:40;position:fixed;top:12px;right:12px;padding:4px 10px;border-radius:12px;font-size:11px;background:rgba(0,0,0,0.45);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.08);display:none;color:rgba(255,255,255,0.6)}
+#statusBadge.connected{color:rgba(255,255,255,0.8);border-color:rgba(76,175,80,0.4)}
+#statusBadge .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;vertical-align:middle;background:rgba(255,255,255,0.3)}
+#statusBadge.connected .dot{background:#4CAF50;animation:pulse 2s infinite}
+
+#chatPanel{z-index:20;position:fixed;left:0;bottom:0;width:100%;max-height:60vh;display:flex;flex-direction:column;pointer-events:none;padding:0 20px}
+#chatPanel:not(.active){display:none}
+#chatScroll{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding-bottom:120px;width:100%;max-width:900px;margin:0 auto;pointer-events:auto;-webkit-overflow-scrolling:touch;scroll-behavior:smooth}
+#chatScroll::-webkit-scrollbar{width:4px}
+#chatScroll::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.15);border-radius:4px}
+
+.msg{max-width:80%;padding:8px 16px;border-radius:12px;font-size:17px;line-height:1.5;word-break:break-word;animation:fadeIn .25s;background:rgba(0,0,0,0.6)}
+.msg.user{align-self:flex-end;color:#fff;border-bottom-right-radius:4px;border-right:3px solid rgba(102,126,234,0.6)}
+.msg.assistant{align-self:flex-start;color:#fff;border-bottom-left-radius:4px;border-left:3px solid rgba(255,255,255,0.3)}
+.msg.tool{align-self:flex-start;background:rgba(0,0,0,0.5);color:rgba(255,255,255,0.6);font-size:12px;padding:5px 12px;border-left:2px solid #ffc107;border-radius:4px 10px 10px 4px;max-width:85%}
+.msg.tool .tool-name{font-weight:600;color:#ffc107}
+.msg.tool .tool-status{color:rgba(255,255,255,0.35);font-size:10px;margin-left:4px}
+.msg.tool .tool-output{padding-top:3px;color:rgba(255,255,255,0.5);font-size:10px;white-space:pre-wrap;max-height:80px;overflow-y:auto}
+.msg.error{align-self:flex-start;background:rgba(0,0,0,0.6);color:#ef5350;border-left:2px solid #ef5350;border-radius:4px 10px 10px 4px;font-size:13px;max-width:85%}
+
+.tool-spinner{display:inline-block;width:10px;height:10px;border:2px solid rgba(255,193,7,0.2);border-top-color:#ffc107;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px}
+.tool-done{color:#81c784;margin-right:3px;font-weight:bold;font-size:13px}
+
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+#controls{z-index:30;position:fixed;bottom:0;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:14px;padding-bottom:max(24px,env(safe-area-inset-bottom,24px));pointer-events:none}
+#controls:not(.active){display:none}
+#controls>*{pointer-events:auto}
+
+#controlsRow{display:flex;align-items:center;gap:24px}
+
+#pttBtn{min-width:140px;height:52px;padding:0 32px;border-radius:26px;border:none;background:rgba(255,255,255,0.92);color:#333;font-size:17px;font-weight:600;letter-spacing:1px;cursor:pointer;transition:all .15s;user-select:none;-webkit-user-select:none;touch-action:manipulation;box-shadow:0 2px 12px rgba(0,0,0,0.3)}
+#pttBtn:active{transform:scale(0.96)}
+#pttBtn.recording{background:#e53935;color:#fff;box-shadow:0 0 28px rgba(229,57,53,0.45)}
+
+#endCallBtn{min-width:72px;height:48px;padding:0 20px;border-radius:24px;border:none;background:#e53935;color:#fff;font-size:15px;font-weight:600;letter-spacing:1px;cursor:pointer;transition:all .15s;box-shadow:0 2px 12px rgba(229,57,53,0.35)}
+#endCallBtn:active{transform:scale(0.94);opacity:.85}
+
+#flipBtn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.55);font-size:16px;cursor:pointer;transition:all .15s;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+#flipBtn:active{background:rgba(255,255,255,0.15)}
+
+#callHistory{z-index:40;position:fixed;top:12px;left:12px;padding:4px 10px;border-radius:12px;font-size:11px;background:rgba(0,0,0,0.35);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.06);display:none;color:rgba(255,255,255,0.5);gap:4px;align-items:center}
+#callHistory .num{color:rgba(255,255,255,0.7);font-weight:600}
+
+@media (max-width:480px) {
+  #chatPanel{max-height:50vh;padding:0 10px}
+  #chatScroll{padding-bottom:80px}
+  .msg{font-size:14px;padding:6px 12px;max-width:88%}
+  .msg.tool{font-size:10px}
+  #pttBtn{min-width:110px;height:44px;padding:0 20px;font-size:14px}
+  #endCallBtn{min-width:60px;height:42px;padding:0 16px;font-size:13px}
+  #flipBtn{width:34px;height:34px;font-size:14px}
+  #controls{gap:10px;padding-bottom:max(16px,env(safe-area-inset-bottom,16px))}
+  #controlsRow{gap:16px}
+}
+@media (min-width:768px) {
+  #chatPanel{max-height:65vh}
+  #chatScroll{padding-bottom:140px}
+  .msg{font-size:19px;padding:10px 20px}
+}
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div id="permOverlay">
+    <div style="font-size:64px;opacity:0.6">📷</div>
+    <h1>Aura</h1>
+    <p>需要摄像头和麦克风权限以开始视频通话</p>
+    <button class="btn-primary" id="permBtn">允许权限</button>
+  </div>
+
+  <video id="cameraVideo" autoplay playsinline muted></video>
+
+  <div id="settingsPanel">
+    <h2>通话设置</h2>
+    <div class="setting-row">
+      <label>发送分辨率</label>
+      <select id="resSelect">
+        <option value="180">180p</option>
+        <option value="240">240p</option>
+        <option value="360" selected>360p (推荐)</option>
+        <option value="480">480p</option>
+        <option value="720">720p</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <label>发送间隔</label>
+      <select id="intervalSelect">
+        <option value="1" selected>1 秒 (推荐)</option>
+        <option value="1.5">1.5 秒</option>
+        <option value="2">2 秒</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <label>每次帧数</label>
+      <select id="framesSelect">
+        <option value="2" selected>2 帧</option>
+        <option value="3">3 帧</option>
+        <option value="4">4 帧</option>
+        <option value="6">6 帧</option>
+      </select>
+    </div>
+    <button id="callBtn">📞 拨通电话</button>
+  </div>
+
+  <div id="statusBadge"><span class="dot"></span><span id="statusText">未连接</span></div>
+  <div id="callHistory">对话 <span class="num" id="msgCount">0</span> 条</div>
+  <div id="asrTiming" style="z-index:45;position:fixed;top:36px;left:12px;padding:3px 8px;border-radius:10px;font-size:10px;background:rgba(0,0,0,0.5);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.08);display:none;color:rgba(255,255,255,0.5);font-family:monospace">ASR: --</div>
+
+  <div id="chatPanel">
+    <div id="chatScroll"></div>
+  </div>
+
+  <div id="controls">
+    <div id="controlsRow">
+      <button id="flipBtn">⇄</button>
+      <button id="endCallBtn">挂断</button>
+      <button id="pttBtn">按住说话</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ============================================================
+   STATE
+   ============================================================ */
+const state = {
+  ws: null,
+  stream: null,
+  connected: false,
+  inCall: false,
+  sessionId: crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2),
+  chunkSeq: 0,
+  audioQueue: [],
+  audioPlaying: false,
+  msgCount: 0,
+  pendingToolMsg: {},
+  lastAudioSendTs: 0,
+  lastAsrTiming: null,
+};
+
+/* ============================================================
+   DOM REFS
+   ============================================================ */
+const $ = id => document.getElementById(id);
+const cameraVideo = $('cameraVideo');
+const permOverlay  = $('permOverlay');
+const permBtn      = $('permBtn');
+const settingsPnl  = $('settingsPanel');
+const callBtn      = $('callBtn');
+const chatPanel    = $('chatPanel');
+const chatScroll   = $('chatScroll');
+const controls     = $('controls');
+const pttBtn       = $('pttBtn');
+const endCallBtn   = $('endCallBtn');
+const flipBtn      = $('flipBtn');
+const statusBdg    = $('statusBadge');
+const statusText   = $('statusText');
+const callHist     = $('callHistory');
+const msgCountEl   = $('msgCount');
+const intervalSelect = $('intervalSelect');
+const framesSelect   = $('framesSelect');
+const resSelect      = $('resSelect');
+const asrTiming    = $('asrTiming');
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+function uuid() { return state.sessionId; }
+function ts() { return Date.now(); }
+function nextChunkId(type) {
+  state.chunkSeq += 1;
+  const callBase = state.callStartTs != null ? state.callStartTs : ts();
+  return `${uuid()}-${callBase}-${state.chunkSeq}-${type}`;
+}
+
+function wsUrl() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/ws`;
+}
+
+function sendMsg(type, data) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  const msg = {
+    type,
+    session_id: uuid(),
+    chunk_id: nextChunkId(type),
+    wall_time_ms: ts(),
+    data,
+  };
+  if (state.callStartTs != null) {
+    msg.video_timestamp_ms = ts() - state.callStartTs;
+  }
+  state.ws.send(JSON.stringify(msg));
+}
+
+/* ============================================================
+   PERMISSION
+   ============================================================ */
+async function requestMedia() {
+  try {
+    state.stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 }, facingMode: { ideal: 'environment' } },
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+    cameraVideo.srcObject = state.stream;
+    permOverlay.classList.add('hidden');
+    settingsPnl.classList.remove('hidden');
+  } catch (e) {
+    alert('无法获取摄像头/麦克风权限: ' + e.message);
+  }
+}
+
+permBtn.addEventListener('click', requestMedia);
+
+/* ============================================================
+   VIDEO CAPTURE
+   ── Canvas-based frame capture: 30fps display, configurable send
+   ── Uniform sampling: capture every (interval/frames) ms
+   ── Sends batch when #frames accumulated == framesPerSend
+   ============================================================ */
+let _frameTimer = null;
+let _frameCanvas = null;
+let _frameCtx = null;
+let _pendingFrames = [];
+let _framesPerSend = 2;
+let _sendInterval = 5000;
+
+function startVideoCapture() {
+  const video = cameraVideo;
+  _sendInterval = (parseFloat(intervalSelect.value) || 1) * 1000;
+  _framesPerSend = parseInt(framesSelect.value) || 2;
+  const maxDim = parseInt(resSelect.value) || 360;
+  const height = maxDim;
+  const width = Math.round(height * 16 / 9 / 2) * 2;
+
+  _frameCanvas = document.createElement('canvas');
+  _frameCanvas.width = width;
+  _frameCanvas.height = height;
+  _frameCtx = _frameCanvas.getContext('2d');
+  _pendingFrames = [];
+
+  // Uniform sampling
+  const captureInterval = Math.round(_sendInterval / _framesPerSend);
+
+  _frameTimer = setInterval(() => {
+    if (video.readyState >= 2) {
+      _frameCtx.drawImage(video, 0, 0, width, height);
+      const dataUrl = _frameCanvas.toDataURL('image/jpeg', 0.7);
+      const b64 = dataUrl.substring(dataUrl.indexOf(';base64,') + 8);
+      _pendingFrames.push(b64);
+
+      if (_pendingFrames.length >= _framesPerSend) {
+        const videoUrl = 'data:video/jpeg;base64,' + _pendingFrames.join(',');
+        sendMsg('video', { video_url: videoUrl });
+        _pendingFrames = [];
+      }
+    }
+  }, captureInterval);
+}
+
+function stopVideoCapture() {
+  if (_frameTimer) { clearInterval(_frameTimer); _frameTimer = null; }
+  _frameCanvas = null;
+  _frameCtx = null;
+  _pendingFrames = [];
+}
+
+/* ============================================================
+   AUDIO PTT -> WAV (ASR requires WAV)
+   ============================================================ */
+let pttCtx = null, pttSource = null, pttProcessor = null, pcmChunks = [];
+
+function startPtt() {
+  if (!state.stream || !state.inCall) return;
+  pcmChunks = [];
+  try {
+    pttCtx = new (window.AudioContext || window.webkitAudioContext)();
+    pttSource = pttCtx.createMediaStreamSource(state.stream);
+    pttProcessor = pttCtx.createScriptProcessor(4096, 1, 1);
+    pttSource.connect(pttProcessor);
+    pttProcessor.connect(pttCtx.destination);
+
+    pttProcessor.onaudioprocess = e => {
+      const input = e.inputBuffer.getChannelData(0);
+      const pcm = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        pcm[i] = Math.max(-32768, Math.min(32767, input[i] * 32768));
+      }
+      pcmChunks.push(pcm);
+    };
+
+    pttBtn.classList.add('recording');
+    pttBtn.textContent = '松开发送';
+  } catch (e) {
+    console.warn('PTT start failed:', e);
+  }
+}
+
+function stopPtt() {
+  if (!pttProcessor) return;
+  pttSource.disconnect();
+  pttProcessor.disconnect();
+  const sampleRate = pttCtx ? pttCtx.sampleRate : 48000;
+  if (pttCtx && pttCtx.state !== 'closed') pttCtx.close();
+  pttCtx = null; pttSource = null; pttProcessor = null;
+
+  pttBtn.classList.remove('recording');
+  pttBtn.textContent = '按住说话';
+
+  if (pcmChunks.length === 0) return;
+  sendWavAudio(pcmChunks, sampleRate);
+}
+
+function sendWavAudio(chunks, sampleRate) {
+  let totalLen = 0;
+  for (const c of chunks) totalLen += c.length;
+  const allPcm = new Int16Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) { allPcm.set(c, offset); offset += c.length; }
+
+  const dataLen = allPcm.length * 2;
+  const buf = new ArrayBuffer(44 + dataLen);
+  const dv = new DataView(buf);
+  function w(off, s) { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); }
+  w(0, 'RIFF'); dv.setUint32(4, 36 + dataLen, true); w(8, 'WAVE'); w(12, 'fmt ');
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, sampleRate, true); dv.setUint32(28, sampleRate * 2, true);
+  dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  w(36, 'data'); dv.setUint32(40, dataLen, true);
+  for (let i = 0; i < allPcm.length; i++) dv.setInt16(44 + i * 2, allPcm[i], true);
+
+  const blob = new Blob([buf], { type: 'audio/wav' });
+  const reader = new FileReader();
+  reader.onload = () => {
+    const dataUrl = reader.result;
+    const idx = dataUrl.indexOf(';base64,');
+    const b64 = idx >= 0 ? dataUrl.substring(idx + 8) : dataUrl.split(',').pop();
+    state.lastAudioSendTs = Date.now();
+    sendMsg('audio', { audio_b64: b64 });
+  };
+  reader.readAsDataURL(blob);
+}
+
+pttBtn.addEventListener('mousedown', e => { e.preventDefault(); startPtt(); });
+pttBtn.addEventListener('mouseup', stopPtt);
+pttBtn.addEventListener('mouseleave', stopPtt);
+pttBtn.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (!window._pttTouch) { window._pttTouch = true; startPtt(); }
+});
+pttBtn.addEventListener('touchend', () => { window._pttTouch = false; stopPtt(); });
+pttBtn.addEventListener('touchcancel', () => { window._pttTouch = false; stopPtt(); });
+
+/* Camera flip */
+let _facingFront = false;
+async function flipCamera() {
+  if (!state.stream) return;
+  _facingFront = !_facingFront;
+  const newStream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: { exact: _facingFront ? 'user' : 'environment' } },
+    audio: false,
+  });
+  const newTrack = newStream.getVideoTracks()[0];
+  const oldTrack = state.stream.getVideoTracks()[0];
+  state.stream.removeTrack(oldTrack);
+  state.stream.addTrack(newTrack);
+  oldTrack.stop();
+  cameraVideo.srcObject = state.stream;
+  // Re-apply resolution constraint
+  if (state.inCall) {
+    const maxDim = parseInt(resSelect.value) || 360;
+    newTrack.applyConstraints({
+      width: { ideal: Math.round(maxDim * 16 / 9 / 2) * 2 },
+      height: { ideal: maxDim },
+    }).catch(() => {});
+  }
+}
+flipBtn.addEventListener('click', flipCamera);
+
+/* ============================================================
+   AUDIO PLAYBACK
+   ============================================================ */
+let _audioCtx = null;
+function ac() {
+  if (!_audioCtx || _audioCtx.state === 'closed')
+    _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return _audioCtx;
+}
+
+async function playNextAudio() {
+  if (state.audioPlaying || state.audioQueue.length === 0) return;
+  state.audioPlaying = true;
+  const { b64 } = state.audioQueue.shift();
+  try {
+    const ctx = ac();
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const buf = await ctx.decodeAudioData(bytes.buffer);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    if (ctx.state === 'suspended') await ctx.resume();
+    src.onended = () => { state.audioPlaying = false; playNextAudio(); };
+    src.start();
+  } catch (e) {
+    console.warn('Audio play error:', e);
+    state.audioPlaying = false;
+    playNextAudio();
+  }
+}
+
+function enqueueAudio(b64, sampleRate) {
+  state.audioQueue.push({ b64, sampleRate });
+  if (!state.audioPlaying) playNextAudio();
+}
+
+/* ============================================================
+   CONVERSATION UI
+   ============================================================ */
+function addMsg(role, html) {
+  const el = document.createElement('div');
+  el.className = `msg ${role}`;
+  el.innerHTML = html;
+  chatScroll.appendChild(el);
+  chatScroll.scrollTop = chatScroll.scrollHeight;
+  state.msgCount++;
+  msgCountEl.textContent = state.msgCount;
+}
+
+function addToolMsg(id, name, status, output) {
+  if (status === 'started') {
+    const el = document.createElement('div');
+    el.className = 'msg tool';
+    el.dataset.toolId = id;
+    el.innerHTML = `<span class="tool-spinner"></span><span class="tool-name">${name}</span><span class="tool-status">进行中...</span>`;
+    chatScroll.appendChild(el);
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+    state.pendingToolMsg[id] = el;
+    return;
+  }
+  const el = state.pendingToolMsg[id];
+  if (el) {
+    const icon = status === 'success' ? '<span class="tool-done">✓</span>' : '<span class="tool-done" style="color:#ef5350">✗</span>';
+    const outputHtml = output ? `<div class="tool-output">${escapeHtml(output)}</div>` : '';
+    el.innerHTML = `${icon}<span class="tool-name">${name}</span><span class="tool-status">${status}</span>${outputHtml}`;
+    delete state.pendingToolMsg[id];
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+  }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+/* ============================================================
+   WEBSOCKET
+   ============================================================ */
+function connectWs() {
+  if (state.ws && state.ws.readyState !== WebSocket.CLOSED && state.ws.readyState !== WebSocket.CLOSING) {
+    state.ws.onclose = null;
+    state.ws.onerror = null;
+    state.ws.close();
+  }
+  const url = wsUrl();
+  state.ws = new WebSocket(url);
+
+  state.ws.onopen = () => {
+    state.connected = true;
+    statusBdg.classList.add('connected');
+    statusText.textContent = '已连接';
+    startVideoCapture();
+  };
+
+  state.ws.onmessage = e => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    handleMessage(msg);
+  };
+
+  state.ws.onclose = () => {
+    state.connected = false;
+    statusBdg.classList.remove('connected');
+    statusText.textContent = '已断开';
+    state.ws = null;
+    if (state.inCall) reconnectWs();
+  };
+
+  state.ws.onerror = () => {
+    statusText.textContent = '连接失败';
+  };
+}
+
+function handleMessage(msg) {
+  const type = msg.type;
+  const data = msg.data || {};
+
+  switch (type) {
+    case 'asr_text':
+      {
+        const rtt = state.lastAudioSendTs ? (Date.now() - state.lastAudioSendTs) : null;
+        const asrMs = data.asr_ms;
+        state.lastAsrTiming = { rtt, asrMs };
+        let timingHtml = '';
+        if (rtt != null && asrMs != null) {
+          const netMs = rtt - asrMs;
+          timingHtml = ` <span style="font-size:10px;color:rgba(255,255,255,0.35);font-family:monospace">[ASR:${asrMs}ms | Net:${netMs}ms | RTT:${rtt}ms]</span>`;
+          asrTiming.style.display = 'block';
+          asrTiming.textContent = `ASR: ${asrMs}ms  Net: ${netMs}ms  RTT: ${rtt}ms`;
+        }
+        addMsg('user', escapeHtml(data.text || '') + timingHtml);
+      }
+      break;
+    case 'text':
+      {
+        let label = escapeHtml(data.text || '');
+        if (data.infer_ms != null) {
+          label += ` <span style="font-size:10px;color:rgba(255,255,255,0.35);font-family:monospace">[Model:${data.infer_ms}ms]</span>`;
+          asrTiming.style.display = 'block';
+          asrTiming.textContent = (asrTiming.textContent || '') + `  Model: ${data.infer_ms}ms`;
+        }
+        addMsg('assistant', label);
+      }
+      break;
+    case 'audio':
+      if (data.audio) {
+        if (data.tts_ms != null && data.tts_ms > 0) {
+          asrTiming.style.display = 'block';
+          asrTiming.textContent = (asrTiming.textContent || '') + `  TTS: ${data.tts_ms}ms`;
+        }
+        enqueueAudio(data.audio, data.sample_rate || 24000);
+      }
+      break;
+    case 'toolcall':
+      addToolMsg(data.id, data.name, data.status, data.output || data.error);
+      break;
+    case 'error':
+      addMsg('error', '⚠ ' + escapeHtml(data.message || ''));
+      break;
+  }
+}
+
+function disconnectWs() {
+  if (state.ws) {
+    state.ws.onclose = null;
+    state.ws.onerror = null;
+    state.ws.close();
+    state.ws = null;
+  }
+  state.connected = false;
+}
+
+function reconnectWs() {
+  if (!state.inCall) return;
+  state._retryCount = (state._retryCount || 0) + 1;
+  const delay = Math.min(1000 * Math.pow(2, state._retryCount), 30000);
+  setTimeout(() => {
+    if (state.inCall && !state.connected) connectWs();
+  }, delay);
+}
+
+/* ============================================================
+   CALL LIFECYCLE
+   ============================================================ */
+function startCall() {
+  state.inCall = true;
+  state.callStartTs = ts();
+  state.chunkSeq = 0;
+
+  // Apply user-selected fps and resolution to the video track
+  const videoTrack = state.stream.getVideoTracks()[0];
+  if (videoTrack) {
+    const maxDim = parseInt(resSelect.value) || 360;
+    const width = Math.round(maxDim * 16 / 9 / 2) * 2;
+    const height = maxDim;
+    videoTrack.applyConstraints({
+      width: { ideal: width },
+      height: { ideal: height },
+    }).catch(e => console.warn('applyConstraints failed:', e));
+  }
+
+  settingsPnl.classList.add('hidden');
+  chatPanel.classList.add('active');
+  controls.classList.add('active');
+  statusBdg.style.display = 'block';
+  callHist.style.display = 'flex';
+  asrTiming.style.display = 'block';
+  asrTiming.textContent = '';
+  connectWs();
+}
+
+function endCall() {
+  state.inCall = false;
+  state.chunkSeq = 0;
+  stopVideoCapture();
+  disconnectWs();
+
+  chatPanel.classList.remove('active');
+  controls.classList.remove('active');
+  statusBdg.style.display = 'none';
+  callHist.style.display = 'none';
+  asrTiming.style.display = 'none';
+
+  settingsPnl.classList.remove('hidden');
+  statusText.textContent = '未连接';
+  pttBtn.classList.remove('recording');
+  pttBtn.textContent = '按住说话';
+
+  chatScroll.innerHTML = '';
+  state.msgCount = 0;
+  msgCountEl.textContent = '0';
+  state.audioQueue = [];
+  state.audioPlaying = false;
+  state.pendingToolMsg = {};
+}
+
+callBtn.addEventListener('click', startCall);
+endCallBtn.addEventListener('click', endCall);
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.code === 'Space' && !e.repeat && state.inCall) {
+    e.preventDefault();
+    startPtt();
+  }
+});
+document.addEventListener('keyup', e => {
+  if (e.code === 'Space' && state.inCall) {
+    e.preventDefault();
+    stopPtt();
+  }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.inCall && !state.connected) {
+    connectWs();
+  }
+});
+
+console.log(`[Aura] session=${state.sessionId}`);
+</script>
+</body>
+</html>

@@ -581,6 +581,8 @@
           // Do not use `||` — falsy "" would re-inject a long English instruct
           // and inflate Talker prompt_len by ~100 zero pads.
           tts_instruct: (typeof config.ttsInstruct === 'string') ? config.ttsInstruct : '',
+          tool_mode: config.toolMode === 'auto' ? 'auto' : 'none',
+          max_tool_depth: 2,
         };
         socket.send(JSON.stringify(session));
         runtimeDetail.textContent = `${captureRate} Hz capture / ${playbackRate} Hz playback`;

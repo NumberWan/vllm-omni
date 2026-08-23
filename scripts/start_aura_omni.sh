@@ -29,6 +29,19 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 ALLOWED_LOCAL_MEDIA_PATH="${ALLOWED_LOCAL_MEDIA_PATH:-}"
 
+# AURA_v2 closed-think prefix / silent trim read these env ids, not YAML
+# stop_token_ids. If Stage1 is AURA_v2 and the ids are unset, workers fall
+# back to v1 assistant prefix and the model can drift into English/LaTeX/code.
+if [[ "$MODEL" == *AURA_v2* ]] \
+  || grep -Eq 'AURA_v2|248070' "$DEPLOY" 2>/dev/null; then
+  : "${VLLM_AURA_SILENT_TOKEN_ID:=248070}"
+  : "${VLLM_AURA_IM_END_TOKEN_ID:=248046}"
+  : "${VLLM_AURA_IM_START_TOKEN_ID:=248045}"
+  : "${VLLM_AURA_ASSISTANT_TOKEN_ID:=74455}"
+  export VLLM_AURA_SILENT_TOKEN_ID VLLM_AURA_IM_END_TOKEN_ID \
+    VLLM_AURA_IM_START_TOKEN_ID VLLM_AURA_ASSISTANT_TOKEN_ID
+fi
+
 SERVER_ENV=("CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
 # Avoid leaking a parent-shell PYTHONPATH (e.g. another checkout's site-packages)
 # into the AURA process, which would defeat an isolated VENV_DIR install.
@@ -37,6 +50,12 @@ for key in \
   VLLM_AURA_STAGE0_BYPASS \
   VLLM_AURA_TTS_GATE_ON_VOICE_ASR \
   VLLM_AURA_SENTENCE_TTS \
+  VLLM_AURA_TTS_TOKENIZER \
+  VLLM_AURA_SILENT_TOKEN_ID \
+  VLLM_AURA_IM_END_TOKEN_ID \
+  VLLM_AURA_IM_START_TOKEN_ID \
+  VLLM_AURA_ASSISTANT_TOKEN_ID \
+  VLLM_AURA_TOOL_EXECUTOR \
   VLLM_VIDEO_ASYNC_CHUNK \
   VLLM_LOGGING_LEVEL
 do
@@ -130,6 +149,20 @@ if [[ -n "$ALLOWED_LOCAL_MEDIA_PATH" ]]; then
   MEDIA_ARGS+=(--allowed-local-media-path "$ALLOWED_LOCAL_MEDIA_PATH")
 fi
 
+TOOL_ARGS=()
+tool_executor="${VLLM_AURA_TOOL_EXECUTOR:-}"
+tool_executor="${tool_executor,,}"
+if [[ "$tool_executor" == "mock" || "$tool_executor" == "safe" ]]; then
+  has_auto_tool_choice=0
+  has_tool_parser=0
+  for arg in "$@"; do
+    [[ "$arg" == "--enable-auto-tool-choice" ]] && has_auto_tool_choice=1
+    [[ "$arg" == "--tool-call-parser" || "$arg" == --tool-call-parser=* ]] && has_tool_parser=1
+  done
+  (( has_auto_tool_choice )) || TOOL_ARGS+=(--enable-auto-tool-choice)
+  (( has_tool_parser )) || TOOL_ARGS+=(--tool-call-parser qwen3_xml)
+fi
+
 if [[ "${CHECK_ONLY:-0}" == "1" ]]; then
   echo "preflight checks passed"
   exit 0
@@ -141,7 +174,7 @@ nohup env "${SERVER_ENV[@]}" \
     --host "$HOST" --port "$PORT" \
     --served-model-name "$MODEL" \
     --trust-remote-code --init-timeout 1200 \
-    "${MEDIA_ARGS[@]}" "$@" \
+    "${MEDIA_ARGS[@]}" "${TOOL_ARGS[@]}" "$@" \
   >"$LOG" 2>&1 &
 echo $! >"$PID_FILE"
 echo "pid=$(cat "$PID_FILE")"

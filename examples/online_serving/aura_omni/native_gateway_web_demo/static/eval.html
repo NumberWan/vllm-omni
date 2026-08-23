@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aura Eval</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f7fa; color: #1f2937; min-height: 100vh;
+  }
+  .container { max-width: 800px; margin: 0 auto; padding: 32px 24px; }
+
+  h1 { font-size: 1.5rem; margin-bottom: 4px; color: #111827; }
+  p.subtitle { color: #6b7280; font-size: 0.9rem; margin-bottom: 24px; }
+  p.subtitle code { background: #e5e7eb; padding: 1px 5px; border-radius: 3px; font-size: 0.85rem; }
+
+  .card {
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 10px;
+    padding: 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.05);
+  }
+  .card h2 { font-size: 1.05rem; margin-bottom: 16px; color: #374151; }
+
+  .form-row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .form-group { flex: 1; min-width: 140px; }
+  .form-group label { display: block; font-size: 0.85rem; color: #6b7280; margin-bottom: 4px; font-weight: 500; }
+  .form-group input, .form-group select {
+    width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #d1d5db;
+    background: #f9fafb; color: #1f2937; font-size: 0.9rem; transition: border-color .15s;
+  }
+  .form-group input:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,.15); }
+
+  textarea {
+    width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #d1d5db;
+    background: #f9fafb; color: #1f2937; font-size: 0.85rem; font-family: ui-monospace, SFMono-Regular, monospace;
+    resize: vertical; min-height: 80px; transition: border-color .15s;
+  }
+  textarea:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,.15); }
+
+  .file-zone {
+    border: 2px dashed #d1d5db; border-radius: 8px; padding: 32px;
+    text-align: center; cursor: pointer; transition: all .2s; background: #f9fafb;
+  }
+  .file-zone:hover, .file-zone.dragover { border-color: #3b82f6; background: #eff6ff; }
+  .file-zone.has-file { border-color: #10b981; border-style: solid; background: #f0fdf4; }
+  .file-zone p { color: #9ca3af; font-size: 0.9rem; }
+  .file-zone .filename { color: #059669; font-size: 0.95rem; font-weight: 500; display: none; }
+  .file-zone.has-file .filename { display: block; }
+  .file-zone.has-file .hint { display: none; }
+
+  .btn {
+    padding: 10px 24px; border-radius: 6px; border: none; font-size: 0.95rem;
+    cursor: pointer; font-weight: 500; transition: all .15s;
+  }
+  .btn-primary { background: #3b82f6; color: #fff; }
+  .btn-primary:hover { background: #2563eb; }
+  .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+  .btn-secondary { background: #fff; color: #374151; border: 1px solid #d1d5db; }
+  .btn-secondary:hover { background: #f9fafb; }
+  .btn-success { background: #10b981; color: #fff; }
+  .btn-success:hover { background: #059669; }
+
+  .status { margin-top: 16px; padding: 12px 16px; border-radius: 6px; display: none; font-size: 0.9rem; }
+  .status.loading { display: block; background: #eff6ff; border: 1px solid #bfdbfe; color: #1d4ed8; }
+  .status.error { display: block; background: #fef2f2; border: 1px solid #fca5a5; color: #b91c1c; }
+  .status.done { display: block; background: #f0fdf4; border: 1px solid #86efac; color: #15803d; }
+
+  .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #bfdbfe; border-top-color: #3b82f6; border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .results { margin-top: 16px; display: none; }
+  .results.visible { display: block; }
+
+  .turn {
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
+    padding: 16px; margin-bottom: 10px;
+  }
+  .turn .meta { font-size: 0.8rem; color: #9ca3af; margin-bottom: 8px; }
+  .turn .query { color: #7c3aed; margin-bottom: 8px; font-weight: 500; }
+  .turn .response { color: #1f2937; white-space: pre-wrap; line-height: 1.6; font-size: 0.95rem; margin-bottom: 4px; }
+  .turn .toolcall { color: #6b7280; font-size: 0.8rem; font-family: monospace; margin-bottom: 2px; }
+  .turn .toolcall.success { color: #059669; }
+  .turn .toolcall.error { color: #dc2626; }
+  .turn .toolcall-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+  }
+  .tool-detail-btn {
+    border: 1px solid #d1d5db;
+    background: #fff;
+    color: #374151;
+    font-size: 0.78rem;
+    border-radius: 999px;
+    padding: 2px 10px;
+    cursor: pointer;
+  }
+  .tool-detail-btn:hover {
+    border-color: #3b82f6;
+    color: #1d4ed8;
+    background: #eff6ff;
+  }
+  .modal-mask {
+    position: fixed;
+    inset: 0;
+    background: rgba(17, 24, 39, 0.45);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 20px;
+  }
+  .modal-mask.visible { display: flex; }
+  .modal {
+    width: min(900px, 100%);
+    max-height: 85vh;
+    background: #fff;
+    border-radius: 10px;
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.16);
+    display: flex;
+    flex-direction: column;
+  }
+  .modal-header {
+    padding: 12px 14px;
+    border-bottom: 1px solid #e5e7eb;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+  }
+  .modal-title {
+    font-size: 0.9rem;
+    color: #111827;
+    font-weight: 600;
+  }
+  .modal-close {
+    border: 1px solid #d1d5db;
+    background: #fff;
+    color: #374151;
+    border-radius: 6px;
+    padding: 2px 8px;
+    cursor: pointer;
+  }
+  .modal-close:hover {
+    border-color: #ef4444;
+    color: #b91c1c;
+    background: #fef2f2;
+  }
+  .modal-body {
+    margin: 0;
+    padding: 14px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    color: #374151;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+  .turn .empty { color: #9ca3af; font-style: italic; }
+
+  .summary { margin-top: 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .summary-item { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; text-align: center; }
+  .summary-item .num { font-size: 1.5rem; font-weight: 600; color: #3b82f6; }
+  .summary-item .label { font-size: 0.8rem; color: #6b7280; margin-top: 4px; }
+  .player-card { display: none; margin-bottom: 16px; }
+  .player-card.visible { display: block; }
+  .player-card video { width: 100%; border-radius: 8px; background: #111827; }
+  .player-card video::cue { font-size: 72%; line-height: 1.25; }
+  .player-card video::cue(.user) { color: #c4b5fd; }
+  .player-card video::cue(.model) { color: #86efac; }
+  .player-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .player-note { color: #6b7280; font-size: 0.82rem; margin-top: 8px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Aura Eval</h1>
+  <p class="subtitle">上传视频运行评测，或使用 CLI <code>aura_eval.py</code></p>
+
+  <div class="card">
+    <h2>上传视频</h2>
+    <div class="file-zone" id="fileZone">
+      <p class="hint">点击或拖拽视频文件到此处</p>
+      <p class="filename" id="fileName"></p>
+    </div>
+    <input type="file" id="fileInput" accept="video/*,.mov" style="display:none">
+
+    <div class="form-group" style="margin-top:16px">
+      <label>提问 (JSON 数组，支持多条)</label>
+      <textarea id="queriesInput">[
+  {"timestamp": 5, "text": "画面里有什么？"}
+]</textarea>
+    </div>
+
+    <div class="form-row" style="margin-top:12px">
+      <div class="form-group">
+        <label>采样帧率 (fps)</label>
+        <input type="number" id="fps" value="2" min="1" step="1">
+      </div>
+      <div class="form-group">
+        <label>每批帧数</label>
+        <input type="number" id="nFrames" value="2" min="2" step="1">
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;margin-top:16px">
+      <button class="btn btn-primary" id="runBtn" onclick="run()" disabled>运行评测</button>
+      <button class="btn btn-success" id="downloadVideoBtn" onclick="downloadVideo()" style="display:none">下载烧录视频</button>
+      <button class="btn btn-secondary" id="downloadBtn" onclick="downloadJSON()" style="display:none">下载 JSON</button>
+    </div>
+
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="results" id="results">
+    <div class="card player-card" id="playerCard">
+      <h2>字幕播放器</h2>
+      <video id="subtitlePlayer" controls preload="metadata"></video>
+      <div class="player-actions">
+        <button class="btn btn-success" id="playerDownloadVideoBtn" onclick="downloadVideo()" style="display:none">下载烧录字幕视频</button>
+        <button class="btn btn-secondary" onclick="downloadSubtitle('vtt')">下载 VTT 字幕</button>
+        <button class="btn btn-secondary" onclick="downloadSubtitle('ass')">下载 ASS 字幕</button>
+      </div>
+      <p class="player-note">播放器使用原视频 + WebVTT 字幕轨，字幕可开关；视频本身可在播放器菜单中下载，字幕请用下方按钮下载。</p>
+    </div>
+    <div class="summary" id="summary"></div>
+    <div id="turns"></div>
+  </div>
+</div>
+<div class="modal-mask" id="toolModalMask">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title" id="toolModalTitle">工具结果</div>
+      <button class="modal-close" id="toolModalClose" type="button">关闭</button>
+    </div>
+    <pre class="modal-body" id="toolModalBody"></pre>
+  </div>
+</div>
+
+<script>
+const fileZone = document.getElementById('fileZone');
+const fileInput = document.getElementById('fileInput');
+const fileName = document.getElementById('fileName');
+const runBtn = document.getElementById('runBtn');
+const statusEl = document.getElementById('status');
+const resultsEl = document.getElementById('results');
+const sumEl = document.getElementById('summary');
+const turnsEl = document.getElementById('turns');
+const downloadBtn = document.getElementById('downloadBtn');
+const downloadVideoBtn = document.getElementById('downloadVideoBtn');
+const playerCard = document.getElementById('playerCard');
+const subtitlePlayer = document.getElementById('subtitlePlayer');
+const playerDownloadVideoBtn = document.getElementById('playerDownloadVideoBtn');
+const toolModalMask = document.getElementById('toolModalMask');
+const toolModalClose = document.getElementById('toolModalClose');
+const toolModalTitle = document.getElementById('toolModalTitle');
+const toolModalBody = document.getElementById('toolModalBody');
+let lastResult = null;
+let toolDetailStore = [];
+
+let selectedFile = null;
+
+fileZone.addEventListener('click', () => fileInput.click());
+fileZone.addEventListener('dragover', e => { e.preventDefault(); fileZone.classList.add('dragover'); });
+fileZone.addEventListener('dragleave', () => fileZone.classList.remove('dragover'));
+fileZone.addEventListener('drop', e => { e.preventDefault(); fileZone.classList.remove('dragover'); if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
+fileInput.addEventListener('change', () => { if (fileInput.files[0]) setFile(fileInput.files[0]); });
+
+function setFile(f) {
+  selectedFile = f;
+  fileZone.classList.add('has-file');
+  fileName.textContent = `${f.name} (${(f.size / 1024 / 1024).toFixed(1)} MB)`;
+  runBtn.disabled = false;
+}
+
+function setStatus(type, msg) {
+  statusEl.className = 'status ' + type;
+  statusEl.innerHTML = msg;
+  statusEl.style.display = 'block';
+}
+
+async function run() {
+  if (!selectedFile) return;
+  runBtn.disabled = true;
+  downloadBtn.style.display = 'none';
+  downloadVideoBtn.style.display = 'none';
+  playerDownloadVideoBtn.style.display = 'none';
+  playerCard.classList.remove('visible');
+  subtitlePlayer.innerHTML = '';
+  subtitlePlayer.removeAttribute('src');
+  resultsEl.classList.remove('visible');
+  setStatus('loading', '<span class="spinner"></span>评测进行中，完成后会生成播放器字幕...');
+
+  const queriesRaw = document.getElementById('queriesInput').value;
+  try { JSON.parse(queriesRaw); } catch (e) {
+    setStatus('error', '✗ 提问 JSON 格式无效: ' + e.message);
+    runBtn.disabled = false;
+    return;
+  }
+
+  const fd = new FormData();
+  fd.append('file', selectedFile);
+  fd.append('queries', queriesRaw);
+  fd.append('fps', document.getElementById('fps').value);
+  fd.append('num_frames_per_chunk', document.getElementById('nFrames').value);
+
+  try {
+    const resp = await fetch('/eval', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (data.status === 'ok' && data.result) {
+      renderResult(data.result);
+      const videoError = data.result.subtitle_video_error;
+      setStatus('done', videoError ? `✓ 评测完成，字幕资产生成失败：${escapeHtml(videoError)}` : '✓ 评测完成，播放器字幕已生成');
+    } else {
+      setStatus('error', '✗ ' + (data.message || '评测失败'));
+    }
+  } catch (e) {
+    setStatus('error', '✗ 请求失败: ' + e.message);
+  } finally {
+    runBtn.disabled = false;
+  }
+}
+
+function renderResult(r) {
+  lastResult = r;
+  toolDetailStore = [];
+  sumEl.innerHTML = '';
+  const toolcallCount = (r.turns || []).reduce((acc, t) => {
+    return acc + ((t.responses || []).filter(x => x.type === 'toolcall').length);
+  }, 0);
+  const items = [
+    ['总用时', (r.elapsed_ms / 1000).toFixed(1) + 's'],
+    ['总帧数', r.total_frames],
+    ['Chunks', r.total_chunks],
+    ['交互轮次', (r.turns || []).length],
+  ];
+  if (r.expected_frames != null) items.push(['期望帧数', r.expected_frames]);
+  if (r.video_duration_sec != null) items.push(['视频时长', Number(r.video_duration_sec).toFixed(1) + 's']);
+  if (toolcallCount > 0) items.push(['工具调用', toolcallCount]);
+  items.forEach(([label, val]) => {
+    const d = document.createElement('div');
+    d.className = 'summary-item';
+    d.innerHTML = `<div class="num">${val}</div><div class="label">${label}</div>`;
+    sumEl.appendChild(d);
+  });
+
+  turnsEl.innerHTML = '';
+  if (!r.turns || r.turns.length === 0) {
+    turnsEl.innerHTML = '<div class="turn"><p class="empty">无回复记录</p></div>';
+  } else {
+    r.turns.forEach(t => {
+      const div = document.createElement('div');
+      div.className = 'turn';
+      let html = renderTurnMeta(t);
+      if ('user' in t || 'model' in t) {
+        const userText = t.user || '';
+        const modelText = t.model || '';
+        if (userText) html += `<div class="query">User: ${escapeHtml(userText)}</div>`;
+        if (modelText) {
+          html += `<div class="response">${escapeHtml(modelText)}</div>`;
+        } else {
+          html += '<div class="empty">(无模型输出)</div>';
+        }
+      } else {
+        html += renderLegacyTurnBody(t);
+      }
+      div.innerHTML = html;
+      turnsEl.appendChild(div);
+    });
+  }
+
+  downloadBtn.style.display = 'inline-block';
+  downloadVideoBtn.style.display = canBurnVideo(r.subtitle_video) ? 'inline-block' : 'none';
+  playerDownloadVideoBtn.style.display = canBurnVideo(r.subtitle_video) ? 'inline-block' : 'none';
+  renderSubtitlePlayer(r.subtitle_video);
+  resultsEl.classList.add('visible');
+}
+
+function canBurnVideo(video) {
+  return Boolean(video?.download_url || (video?.source?.filename && video?.subtitles?.ass?.filename));
+}
+
+function renderSubtitlePlayer(video) {
+  subtitlePlayer.innerHTML = '';
+  subtitlePlayer.removeAttribute('src');
+  if (!video?.source?.download_url || !video?.subtitles?.vtt?.download_url) {
+    playerCard.classList.remove('visible');
+    return;
+  }
+  subtitlePlayer.src = video.source.download_url;
+  const track = document.createElement('track');
+  track.kind = 'subtitles';
+  track.label = 'Aura Eval 字幕';
+  track.srclang = 'zh';
+  track.src = video.subtitles.vtt.download_url;
+  track.default = true;
+  subtitlePlayer.appendChild(track);
+  playerCard.classList.add('visible');
+}
+
+function renderTurnMeta(t) {
+  const parts = [];
+  if (t.chunk_index != null) parts.push(`Chunk ${t.chunk_index}`);
+  if (t.timestamp_ms != null) parts.push(`视频时间 ${t.timestamp_ms}ms`);
+  if (t.query_timestamp_ms != null) parts.push(`提问时间 ${t.query_timestamp_ms}ms`);
+  if (t.elapsed_ms != null) parts.push(`总耗时 ${t.elapsed_ms}ms`);
+  if (t.infer_ms != null) parts.push(`推理 ${t.infer_ms}ms`);
+  return `<div class="meta">${escapeHtml(parts.join(' ｜ '))}</div>`;
+}
+
+function renderLegacyTurnBody(t) {
+  let html = '';
+  if (t.query) html += `<div class="query">User: ${escapeHtml(t.query.text)}</div>`;
+  if (t.responses && t.responses.length > 0) {
+    t.responses.forEach(r => {
+      if (r.type === 'text') {
+        html += `<div class="response">${escapeHtml(r.content)}</div>`;
+      } else if (r.type === 'toolcall') {
+        const cls = r.status === 'error' ? 'error' : 'success';
+        html += `<div class="toolcall-row"><div class="toolcall ${cls}">⚡ ${escapeHtml(String(r.name || 'unknown'))} [${escapeHtml(String(r.status || 'unknown'))}]</div>`;
+        const detail = r.status === 'error' ? r.error : r.output;
+        const text = normalizeDetail(detail);
+        if (text) {
+          const detailId = toolDetailStore.length;
+          toolDetailStore.push({
+            name: String(r.name || 'unknown'),
+            status: String(r.status || 'unknown'),
+            text,
+          });
+          html += `<button class="tool-detail-btn" type="button" data-detail-id="${detailId}">查看结果</button>`;
+        }
+        html += `</div>`;
+      }
+    });
+  } else {
+    html += '<div class="empty">(无回复)</div>';
+  }
+  return html;
+}
+
+function downloadJSON() {
+  if (!lastResult) return;
+  const blob = new Blob([JSON.stringify(lastResult, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'aura_eval_result.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function downloadVideo() {
+  const video = lastResult?.subtitle_video;
+  if (!canBurnVideo(video)) return;
+  if (!video.download_url) {
+    setStatus('loading', '<span class="spinner"></span>正在烧录字幕视频...');
+    try {
+      const resp = await fetch('/eval/burn-video', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_filename: video.source.filename,
+          ass_filename: video.subtitles.ass.filename,
+        }),
+      });
+      const data = await resp.json();
+      if (data.status !== 'ok' || !data.video?.download_url) {
+        setStatus('error', '✗ 烧录字幕视频失败: ' + (data.message || '未知错误'));
+        return;
+      }
+      video.filename = data.video.filename;
+      video.download_url = data.video.download_url;
+      setStatus('done', '✓ 烧录字幕视频已生成');
+    } catch (e) {
+      setStatus('error', '✗ 烧录字幕视频请求失败: ' + e.message);
+      return;
+    }
+  }
+  const a = document.createElement('a');
+  a.href = video.download_url;
+  a.download = video.filename || 'aura_eval_subtitled.mp4';
+  a.click();
+}
+
+function downloadSubtitle(kind) {
+  const subtitle = lastResult?.subtitle_video?.subtitles?.[kind];
+  if (!subtitle?.download_url) return;
+  const a = document.createElement('a');
+  a.href = subtitle.download_url;
+  a.download = subtitle.filename || `aura_eval.${kind}`;
+  a.click();
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = String(s ?? '');
+  return d.innerHTML;
+}
+
+turnsEl.addEventListener('click', (e) => {
+  const btn = e.target.closest('.tool-detail-btn');
+  if (!btn) return;
+  const id = Number(btn.dataset.detailId);
+  if (!Number.isInteger(id) || !toolDetailStore[id]) return;
+  openToolModal(toolDetailStore[id]);
+});
+
+toolModalClose.addEventListener('click', closeToolModal);
+toolModalMask.addEventListener('click', (e) => {
+  if (e.target === toolModalMask) closeToolModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && toolModalMask.classList.contains('visible')) {
+    closeToolModal();
+  }
+});
+
+function openToolModal(detail) {
+  toolModalTitle.textContent = `工具结果：${detail.name} [${detail.status}]`;
+  toolModalBody.textContent = detail.text || '(空)';
+  toolModalMask.classList.add('visible');
+}
+
+function closeToolModal() {
+  toolModalMask.classList.remove('visible');
+}
+
+function normalizeDetail(v) {
+  if (v === undefined || v === null) return '';
+  let s = '';
+  if (typeof v === 'string') {
+    s = v;
+  } else {
+    try {
+      s = JSON.stringify(v, null, 2);
+    } catch (e) {
+      s = String(v);
+    }
+  }
+  const trimmed = s.trim();
+  if (!trimmed) return '';
+  return trimmed;
+}
+</script>
+</body>
+</html>

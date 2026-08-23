@@ -15,6 +15,7 @@ TTS_TASK_TYPE="${TTS_TASK_TYPE:-CustomVoice}"
 TTS_LANGUAGE="${TTS_LANGUAGE:-Chinese}"
 TTS_SPEAKER="${TTS_SPEAKER:-Dylan}"
 TTS_INSTRUCT="${TTS_INSTRUCT:-}"
+TOOL_MODE="${TOOL_MODE:-none}"
 PUBLIC_STREAM_URL="${PUBLIC_STREAM_URL:-}"
 WARMUP_AUDIO="${WARMUP_AUDIO:-}"
 SKIP_WARMUP="${SKIP_WARMUP:-0}"
@@ -31,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     --tts-language) TTS_LANGUAGE="$2"; shift 2 ;;
     --tts-speaker) TTS_SPEAKER="$2"; shift 2 ;;
     --tts-instruct) TTS_INSTRUCT="$2"; shift 2 ;;
+    --tool-mode) TOOL_MODE="$2"; shift 2 ;;
     --public-stream-url) PUBLIC_STREAM_URL="$2"; shift 2 ;;
     --warmup-audio) WARMUP_AUDIO="$2"; shift 2 ;;
     --skip-warmup) SKIP_WARMUP=1; shift ;;
@@ -48,6 +50,7 @@ Usage: $0 [options]
   --tts-language LANG          CustomVoice language (default: Chinese)
   --tts-speaker NAME           CustomVoice speaker (default: Dylan)
   --tts-instruct TEXT          Style instruction (default: clean/brisk, no coughs)
+  --tool-mode MODE             none|auto (default: none)
   --public-stream-url URL      Browser-visible WS URL when reverse-proxying WebSockets
   --warmup-audio PATH          Speech WAV for startup warmup (default: bundled asset)
   --skip-warmup                Start UI without warming the AURA pipeline
@@ -81,6 +84,7 @@ CMD=(
   --tts-task-type "$TTS_TASK_TYPE"
   --tts-language "$TTS_LANGUAGE"
   --tts-speaker "$TTS_SPEAKER"
+  --tool-mode "$TOOL_MODE"
 )
 if [[ -n "$TTS_INSTRUCT" ]]; then
   CMD+=(--tts-instruct "$TTS_INSTRUCT")

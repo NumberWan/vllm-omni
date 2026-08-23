@@ -121,6 +121,20 @@ See the demo's own
 [`README.md`](minicpm_style_web_demo/README.md) for controls, options, and the
 intentional non-full-duplex boundary.
 
+## AURA_v2 with the original Native frontend
+
+The one-GPU showcase under `native_gateway_web_demo/` serves a byte-identical
+copy of the `AURA_demo-main` frontend and translates its `/ws` protocol to the
+AURA_v2 Omni streaming API:
+
+```bash
+bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
+```
+
+It exposes the original UI on `:9999`, uses AURA_v2 on `:8666`, and enables the
+bounded safe tools. See
+[`native_gateway_web_demo/README.md`](native_gateway_web_demo/README.md).
+
 ## Stop the server
 
 ```bash

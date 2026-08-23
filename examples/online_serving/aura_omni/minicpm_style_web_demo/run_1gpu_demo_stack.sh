@@ -48,6 +48,7 @@ mkdir -p "$HF_HOME" "$HF_MODULES_CACHE" "$HUGGINGFACE_HUB_CACHE"
 AURA_PORT_PREF="${AURA_PORT:-8666}"
 DEMO_PORT_PREF="${DEMO_PORT:-7862}"
 TTS_SPEAKER="${TTS_SPEAKER:-Vivian}"
+TOOL_MODE="${TOOL_MODE:-none}"
 # Empty instruct. Uncle_fu/Ryan often OK on short confirms but long vision
 # descriptions dump as cough/「嗯」on Omni CustomVoice — keep Vivian for demo.
 TTS_INSTRUCT="${TTS_INSTRUCT:-}"
@@ -153,5 +154,6 @@ exec env \
   WS_BACKEND="$WS_BACKEND" \
   TTS_SPEAKER="$TTS_SPEAKER" \
   TTS_INSTRUCT="$TTS_INSTRUCT" \
+  TOOL_MODE="$TOOL_MODE" \
   PORT="$DEMO_PORT" \
   bash "$SCRIPT_DIR/run_demo.sh"
