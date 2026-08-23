@@ -582,7 +582,7 @@
           // and inflate Talker prompt_len by ~100 zero pads.
           tts_instruct: (typeof config.ttsInstruct === 'string') ? config.ttsInstruct : '',
           tool_mode: config.toolMode === 'auto' ? 'auto' : 'none',
-          max_tool_depth: 2,
+          max_tool_depth: 3,
         };
         socket.send(JSON.stringify(session));
         runtimeDetail.textContent = `${captureRate} Hz capture / ${playbackRate} Hz playback`;

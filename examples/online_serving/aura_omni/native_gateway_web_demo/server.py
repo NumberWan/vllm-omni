@@ -6,12 +6,13 @@ Serves ``gateway/static`` from AURA_demo and translates:
     ↔
   AURA ``/v1/video/chat/stream`` (session.config / video.frame / audio.chunk)
 
-The files under ``static/`` are vendored byte-for-byte from AURA_demo-main.
+The files under ``static/`` are vendored from AURA_demo with a small PTT
+playback-stop patch so barge-in can mute leftover TTS.
 
 Env:
   AURA_WS_URL, AURA_MODEL, BRIDGE_HOST, BRIDGE_PORT, STATIC_DIR
   TTS_SPEAKER (Vivian), TTS_INSTRUCT (empty), TTS_LANGUAGE (Chinese),
-  TTS_TASK_TYPE (Base), TOOL_MODE (auto), MAX_TOOL_DEPTH (2),
+  TTS_TASK_TYPE (Base), TOOL_MODE (auto), MAX_TOOL_DEPTH (3),
   AURA_TTS_DUMP_DIR (/tmp/aura_v2_native_demo_tts)
 """
 
@@ -55,8 +56,8 @@ TTS_INSTRUCT = os.environ.get(
 TTS_LANGUAGE = os.environ.get("TTS_LANGUAGE", "Chinese")
 TTS_TASK_TYPE = os.environ.get("TTS_TASK_TYPE", "Base")
 TOOL_MODE = os.environ.get("TOOL_MODE", "auto")
-MAX_TOOL_DEPTH = int(os.environ.get("MAX_TOOL_DEPTH", "2"))
-AUTO_TRIGGER = os.environ.get("AUTO_TRIGGER", "0").strip().lower() in {"1", "true", "yes", "on"}
+MAX_TOOL_DEPTH = int(os.environ.get("MAX_TOOL_DEPTH", "3"))
+AUTO_TRIGGER = os.environ.get("AUTO_TRIGGER", "1").strip().lower() in {"1", "true", "yes", "on"}
 TTS_DUMP_DIR = Path(os.environ.get("AURA_TTS_DUMP_DIR", "/tmp/aura_v2_native_demo_tts")).expanduser()
 
 app = FastAPI(title="AURA_v2 Omni ↔ original AURA demo bridge")
@@ -303,6 +304,7 @@ class _NativeTurn:
     sample_rate: int = 24000
     silent: bool = False
     done_sent: bool = False
+    suppress_audio: bool = False
 
 
 class NativeEventTranslator:
@@ -312,6 +314,12 @@ class NativeEventTranslator:
 
     def __init__(self) -> None:
         self.turns: dict[str, _NativeTurn] = {}
+
+    def barge_in(self) -> None:
+        """Drop in-flight TTS so a new PTT is not followed by leftover audio."""
+        for turn in self.turns.values():
+            turn.audio_chunks.clear()
+            turn.suppress_audio = True
 
     def _turn(self, event: dict) -> _NativeTurn:
         request_id = str(event.get("request_id") or self._LEGACY)
@@ -366,6 +374,8 @@ class NativeEventTranslator:
             else:
                 output.append(_envelope("text", {"text": text}, session_id=session_id))
         elif event_type in {"response.audio.delta", "response.tool.preamble.audio.delta"}:
+            if turn.suppress_audio:
+                return output
             data = str(event.get("data") or event.get("delta") or "")
             if data:
                 try:
@@ -384,7 +394,9 @@ class NativeEventTranslator:
                         turn.sample_rate = sample_rate or turn.sample_rate
                         turn.audio_chunks.append(pcm)
         elif event_type == "response.tool.preamble.audio.done":
-            if turn.audio_chunks and not turn.silent:
+            if turn.suppress_audio:
+                turn.audio_chunks.clear()
+            elif turn.audio_chunks and not turn.silent:
                 output.append(
                     _envelope(
                         "audio",
@@ -399,7 +411,9 @@ class NativeEventTranslator:
         elif event_type == "response.audio.done":
             if turn.done_sent:
                 return []
-            if turn.audio_chunks and not turn.silent:
+            if turn.suppress_audio:
+                turn.audio_chunks.clear()
+            elif turn.audio_chunks and not turn.silent:
                 output.append(
                     _envelope(
                         "audio",
@@ -510,6 +524,7 @@ async def _bridge_session(client: WebSocket) -> None:
                             LOG.info("ignoring video-attached text (len=%d)", len(text))
 
                     elif mtype == "audio":
+                        translator.barge_in()
                         b64 = str(data.get("audio_b64") or "")
                         if not b64:
                             continue

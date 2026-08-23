@@ -322,9 +322,9 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
         description="Server-side AURA_v2 tool loop; disabled unless the server has an allowlist executor.",
     )
     max_tool_depth: int = Field(
-        default=2,
+        default=3,
         ge=1,
-        le=2,
+        le=3,
         description="Maximum tool-call passes in one logical turn.",
     )
 

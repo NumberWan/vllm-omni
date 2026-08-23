@@ -24,7 +24,32 @@ DEMO_ROOT = (
     Path(__file__).resolve().parents[3]
     / "examples/online_serving/aura_omni/native_gateway_web_demo"
 )
-ORIGINAL_INDEX_SHA256 = "81503f4a67f3088390f1a3b94cbe3cdbf5bc2a1170a1cd7799439b45a67a7e0a"
+ORIGINAL_EVAL_SHA256 = "c7b33d9a6c4a9faa09b84c1697895f56a671ea224043a6466f9267e05b867afe"
+
+
+def test_index_stops_playback_on_ptt() -> None:
+    index = (DEMO_ROOT / "static/index.html").read_text(encoding="utf-8")
+    assert "function stopPlayback()" in index
+    assert "stopPlayback();" in index
+    assert "function startPtt()" in index
+    start = index.index("function startPtt()")
+    assert "stopPlayback();" in index[start : start + 120]
+
+
+def test_bridge_health_and_index() -> None:
+    client = TestClient(bridge_app)
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.json()["model"] == "/workspace/models/AURA_v2"
+    assert health.json()["tool_mode"] == "auto"
+    assert health.json()["auto_trigger"] is True
+    assert health.json()["max_tool_depth"] == 3
+
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "function stopPlayback()" in page.text
+    eval_page = DEMO_ROOT / "static/eval.html"
+    assert hashlib.sha256(eval_page.read_bytes()).hexdigest() == ORIGINAL_EVAL_SHA256
 
 
 def _wav_b64(samples: list[int], sample_rate: int = 24000) -> str:
@@ -39,24 +64,6 @@ def _wav_b64(samples: list[int], sample_rate: int = 24000) -> str:
 
 def _decode_envelope(raw: str) -> dict:
     return json.loads(raw)
-
-
-def test_original_native_index_is_vendored_byte_for_byte() -> None:
-    index = DEMO_ROOT / "static/index.html"
-    assert hashlib.sha256(index.read_bytes()).hexdigest() == ORIGINAL_INDEX_SHA256
-
-
-def test_bridge_health_and_original_index() -> None:
-    client = TestClient(bridge_app)
-    health = client.get("/health")
-    assert health.status_code == 200
-    assert health.json()["model"] == "/workspace/models/AURA_v2"
-    assert health.json()["tool_mode"] == "auto"
-    assert health.json()["auto_trigger"] is False
-
-    page = client.get("/")
-    assert page.status_code == 200
-    assert hashlib.sha256(page.content).hexdigest() == ORIGINAL_INDEX_SHA256
 
 
 def test_native_video_batch_splits_into_omni_frames() -> None:
@@ -233,3 +240,28 @@ def test_translator_maps_safe_tool_result_to_original_tool_ui() -> None:
         "name": "calculator",
         "output": "37 * 19 = 703",
     }
+
+
+def test_translator_barge_in_drops_pending_tts() -> None:
+    translator = NativeEventTranslator()
+    request_id = "old-turn"
+    translator.observe(
+        {"type": "response.text.done", "request_id": request_id, "text": "先聽這段。"},
+        session_id="s",
+    )
+    translator.observe(
+        {
+            "type": "response.audio.delta",
+            "request_id": request_id,
+            "data": _wav_b64([1, 2, 3, 4]),
+        },
+        session_id="s",
+    )
+    translator.barge_in()
+    leftover = translator.observe(
+        {"type": "response.audio.done", "request_id": request_id},
+        session_id="s",
+    )
+    types = [_decode_envelope(item)["type"] for item in leftover]
+    assert types == ["turn_done"]
+    assert "audio" not in types

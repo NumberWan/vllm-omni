@@ -77,7 +77,7 @@ installation, local model paths, and troubleshooting.
 | `video_fps` | float | `2.0` | FPS metadata attached to each `video_tuple`. |
 | `stream_text_deltas` | bool | `false` | When `false`, the server buffers assistant text and only sends `response.text.done` (no per-token `response.text.delta`). Set `true` for incremental text streaming. |
 | `tool_mode` | `"none"` or `"auto"` | `"none"` | Enable the bounded server-side AURA tool loop. The server must also start with an allowlist executor and Qwen3 XML parser. |
-| `max_tool_depth` | int | `2` | Maximum tool-call passes in one logical turn (range 1–2). |
+| `max_tool_depth` | int | `3` | Maximum tool-call passes in one logical turn (range 1–3). |
 
 All standard fields from [video_stream_api.md](video_stream_api.md) (`max_frames`, EVS, `sampling_params_list`, etc.) still apply.
 
@@ -95,12 +95,19 @@ Tool execution is disabled by default. The built-in safe allowlist exposes:
 - `get_current_datetime` — local `Asia/Shanghai` time
 - `get_city_weather` — fixed Open-Meteo endpoints
 - `convert_currency` — fixed Frankfurter endpoint
-- `DeepSeek` — Native-aligned `query` / `enable_search` schema; **fixed mock, no live API**
+- `DeepSeek` — Native-compatible Anthropic endpoint when `DEEPSEEK_API_KEY`
+  is set; otherwise returns the deterministic mock. Optional overrides:
+  `DEEPSEEK_BASE_URL` and `DEEPSEEK_MODEL`.
 - `get_current_location` — Native-like ipwho.is → ipapi.co fallback
 - `WebSearch` — Native Serper schema `query` / `max_results`; key only from `SERPER_API_KEY`
 
-Brave / DuckDuckGo / WebFetch stay out of this allowlist. The executor never
-logs or writes the Serper key.
+Optional tools, **off by default** (same as Native `TOOL_ENABLED`):
+
+- `BraveSearch` — enable with `VLLM_AURA_TOOL_BRAVE=1`; key from `BRAVE_SEARCH_API_KEY`
+- `duckduckgo_search` — enable with `VLLM_AURA_TOOL_DDG=1`
+- `WebFetch` — enable with `VLLM_AURA_TOOL_WEBFETCH=1`; public `http(s)` only, SSRF-blocked
+
+The executor never logs or writes search API keys.
 
 It does not expose arbitrary URLs, shell commands, files, or side-effecting actions.
 

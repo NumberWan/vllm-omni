@@ -9,15 +9,19 @@ import asyncio
 import copy
 import datetime as dt
 import hashlib
+import ipaddress
 import json
 import math
 import operator
 import os
 import re
+import socket
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -35,7 +39,7 @@ logger = init_logger(__name__)
 
 DEFAULT_TOOL_TIMEOUT_SECONDS = 5.0
 DEFAULT_TOOL_OUTPUT_LIMIT_BYTES = 64 * 1024
-DEFAULT_TOOL_MAX_DEPTH = 2
+DEFAULT_TOOL_MAX_DEPTH = 3
 DEFAULT_TOOL_MAX_CONCURRENCY = 8
 SAFE_HTTP_TIMEOUT_SECONDS = 3.0
 SAFE_HTTP_RESPONSE_LIMIT_BYTES = 256 * 1024
@@ -43,6 +47,16 @@ MAX_CALCULATOR_EXPRESSION_LENGTH = 200
 MAX_CALCULATOR_AST_NODES = 64
 MAX_CALCULATOR_ABS_VALUE = 1e100
 MAX_CALCULATOR_EXPONENT = 100
+DEEPSEEK_MAX_OUTPUT_CHARS = 8_000
+DEEPSEEK_TIMEOUT_SECONDS = 30.0
+
+_DEEPSEEK_SYSTEM_PROMPT = (
+    "你是一个口语化、简洁的AI助手，必须优先使用联网搜索。"
+    "默认每次回答前都先联网检索，能搜就搜，尽量不要跳过搜索。"
+    "如果搜索失败，再基于已有知识给出答案，并简短说明未检索成功。"
+    "用中文口语化回答，像朋友聊天一样自然。"
+    "回复简短直接。不要列点、不要markdown格式。"
+)
 
 _CURRENCY_CODE_PATTERN = re.compile(r"^[A-Z]{3}$")
 _CURRENCY_NAMES_ZH = {
@@ -161,6 +175,19 @@ class WebSearchArguments(BaseModel):
 
     query: str = Field(min_length=1, max_length=256)
     max_results: int = Field(default=10, ge=1, le=20)
+
+
+class DuckDuckGoArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    query: str = Field(min_length=1, max_length=256)
+    max_results: int = Field(default=5, ge=1, le=10)
+
+
+class WebFetchArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    url: str = Field(min_length=1, max_length=2048)
 
 
 @dataclass(frozen=True)
@@ -308,12 +335,13 @@ def _post_bounded_json(
     *,
     json_body: dict[str, Any],
     headers: dict[str, str] | None = None,
+    timeout_seconds: float = SAFE_HTTP_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     response = requests.post(
         url,
         json=json_body,
         headers=headers,
-        timeout=SAFE_HTTP_TIMEOUT_SECONDS,
+        timeout=timeout_seconds,
     )
     response.raise_for_status()
     if len(response.content) > SAFE_HTTP_RESPONSE_LIMIT_BYTES:
@@ -461,9 +489,65 @@ def _convert_currency(arguments: BaseModel) -> dict[str, Any]:
     return result
 
 
-def _deepseek_mock(arguments: BaseModel) -> dict[str, Any]:
+def _deepseek(arguments: BaseModel) -> dict[str, Any]:
     assert isinstance(arguments, DeepSeekArguments)
     query = arguments.query.strip()
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if api_key:
+        base_url = os.environ.get(
+            "DEEPSEEK_BASE_URL",
+            "https://api.deepseek.com/anthropic",
+        ).rstrip("/")
+        model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip() or "deepseek-chat"
+        body: dict[str, Any] = {
+            "model": model,
+            "max_tokens": 256,
+            "temperature": 0.7,
+            "system": _DEEPSEEK_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": query}],
+        }
+        if arguments.enable_search:
+            body["tools"] = [
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 5,
+                }
+            ]
+        try:
+            payload = _post_bounded_json(
+                f"{base_url}/v1/messages",
+                json_body=body,
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                timeout_seconds=DEEPSEEK_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            raise ValueError("deepseek_upstream_failed") from exc
+        content = payload.get("content")
+        if not isinstance(content, list):
+            raise ValueError("deepseek_invalid_response")
+        parts = [
+            str(block.get("text") or "").strip()
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        text = "\n".join(part for part in parts if part).strip()
+        if not text:
+            raise ValueError("deepseek_empty_response")
+        text = text[:DEEPSEEK_MAX_OUTPUT_CHARS]
+        return {
+            "query": query,
+            "enable_search": arguments.enable_search,
+            "mocked": False,
+            "model": model,
+            "text": text,
+            "summary": text,
+        }
+
     summary = f"DeepSeek mock：已收到問題「{query}」，未呼叫真實搜尋。"
     return {
         "query": query,
@@ -583,6 +667,212 @@ def _web_search(arguments: BaseModel) -> dict[str, Any]:
     }
 
 
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _brave_search(arguments: BaseModel) -> dict[str, Any]:
+    assert isinstance(arguments, WebSearchArguments)
+    api_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("search_api_key_missing")
+    query = arguments.query.strip()
+    endpoint = os.environ.get(
+        "BRAVE_SEARCH_ENDPOINT",
+        "https://api.search.brave.com/res/v1/web/search",
+    ).strip()
+    if not endpoint:
+        endpoint = "https://api.search.brave.com/res/v1/web/search"
+    try:
+        response = requests.get(
+            endpoint,
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": api_key,
+            },
+            params={"q": query, "count": arguments.max_results},
+            timeout=SAFE_HTTP_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        if len(response.content) > SAFE_HTTP_RESPONSE_LIMIT_BYTES:
+            raise ValueError("upstream_response_too_large")
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise ValueError("search_upstream_failed") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("search_invalid_response")
+    raw = ((payload.get("web") or {}).get("results") or [])
+    if not isinstance(raw, list):
+        raise ValueError("search_invalid_response")
+    results: list[dict[str, str]] = []
+    for item in raw[: arguments.max_results]:
+        if not isinstance(item, dict):
+            continue
+        results.append(
+            {
+                "title": str(item.get("title", ""))[:500],
+                "snippet": str(item.get("description", ""))[:500],
+                "link": str(item.get("url", ""))[:500],
+            }
+        )
+    summary = (
+        f"Brave 搜尋「{query}」找到{len(results)}筆結果。"
+        if results
+        else f"Brave 搜尋「{query}」沒有結果。"
+    )
+    if results and results[0].get("title"):
+        summary = f"{summary}首筆：{results[0]['title']}"
+    return {
+        "query": query,
+        "max_results": arguments.max_results,
+        "source": "brave",
+        "results": results,
+        "summary": summary,
+    }
+
+
+class _DuckDuckGoHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.results: list[dict[str, str]] = []
+        self._in_link = False
+        self._in_snippet = False
+        self._skip_snippet = False
+        self._current: dict[str, str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = dict(attrs)
+        cls = attrs_dict.get("class") or ""
+        if tag == "a" and "result__a" in cls:
+            self._in_link = True
+            self._current = {
+                "title": "",
+                "snippet": "",
+                "url": str(attrs_dict.get("href") or ""),
+            }
+            return
+        if self._current is not None and tag == "a" and "badge" in cls:
+            self._skip_snippet = True
+            return
+        if tag == "td" and "result__snippet" in cls:
+            self._in_snippet = True
+
+    def handle_data(self, data: str) -> None:
+        if self._current is None:
+            return
+        if self._in_link:
+            self._current["title"] += data
+        elif self._in_snippet and not self._skip_snippet:
+            self._current["snippet"] += data
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._in_link and tag == "a":
+            self._in_link = False
+        if self._in_snippet and tag == "td":
+            self._in_snippet = False
+        if not self._in_link and not self._in_snippet and self._current is not None:
+            if self._current["title"] or self._current["snippet"]:
+                self.results.append(dict(self._current))
+            self._current = None
+            self._skip_snippet = False
+
+
+def _duckduckgo_search(arguments: BaseModel) -> dict[str, Any]:
+    assert isinstance(arguments, DuckDuckGoArguments)
+    query = arguments.query.strip()
+    try:
+        response = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            timeout=SAFE_HTTP_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        if len(response.content) > SAFE_HTTP_RESPONSE_LIMIT_BYTES:
+            raise ValueError("upstream_response_too_large")
+        html = response.text
+    except requests.RequestException as exc:
+        raise ValueError("search_upstream_failed") from exc
+    parser = _DuckDuckGoHTMLParser()
+    parser.feed(html)
+    results = []
+    for item in parser.results[: arguments.max_results]:
+        results.append(
+            {
+                "title": str(item.get("title", ""))[:500],
+                "snippet": str(item.get("snippet", ""))[:500],
+                "link": str(item.get("url", ""))[:500],
+            }
+        )
+    summary = (
+        f"DuckDuckGo 搜尋「{query}」找到{len(results)}筆結果。"
+        if results
+        else f"DuckDuckGo 搜尋「{query}」沒有結果。"
+    )
+    return {
+        "query": query,
+        "max_results": arguments.max_results,
+        "source": "duckduckgo",
+        "results": results,
+        "summary": summary,
+    }
+
+
+def _check_ssrf(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("webfetch_invalid_url")
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError("webfetch_dns_failed") from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_unspecified
+            or ip.is_reserved
+            or ip.is_multicast
+        ):
+            raise ValueError("webfetch_ssrf_blocked")
+    return url
+
+
+def _web_fetch(arguments: BaseModel) -> dict[str, Any]:
+    assert isinstance(arguments, WebFetchArguments)
+    url = arguments.url.strip().strip("\"'`“”‘’")
+    _check_ssrf(url)
+    try:
+        response = requests.get(
+            url,
+            timeout=SAFE_HTTP_TIMEOUT_SECONDS,
+            allow_redirects=False,
+            headers={"User-Agent": "AURA-WebFetch/1.0"},
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise ValueError("webfetch_upstream_failed") from exc
+    if len(response.content) > SAFE_HTTP_RESPONSE_LIMIT_BYTES:
+        raise ValueError("upstream_response_too_large")
+    content_type = str(response.headers.get("content-type") or "")
+    if "html" in content_type or "xml" in content_type or "text" in content_type or "json" in content_type:
+        text = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", response.text)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()[:8000]
+    else:
+        text = f"Binary or non-text response ({content_type}, {len(response.content)} bytes)."
+    summary = text[:240] if text else f"已取得 {url}"
+    return {
+        "url": url,
+        "content_type": content_type,
+        "text": text,
+        "summary": summary,
+    }
+
+
 def _tool_schema(name: str, description: str, arguments_model: type[BaseModel]) -> dict[str, Any]:
     return {
         "type": "function",
@@ -621,9 +911,9 @@ _SAFE_TOOL_DEFINITIONS = (
     ),
     (
         "DeepSeek",
-        "General assistant for open questions. This Omni deployment returns a fixed mock and does not call a live model.",
+        "General assistant for open questions. Uses live DeepSeek with DEEPSEEK_API_KEY; otherwise returns a mock.",
         DeepSeekArguments,
-        _deepseek_mock,
+        _deepseek,
     ),
     (
         "get_current_location",
@@ -638,6 +928,37 @@ _SAFE_TOOL_DEFINITIONS = (
         _web_search,
     ),
 )
+
+_OPTIONAL_SAFE_TOOL_DEFINITIONS = (
+    (
+        "VLLM_AURA_TOOL_BRAVE",
+        "BraveSearch",
+        "Alternative web search via Brave Search API. Prefer as a second source when Serper is unavailable.",
+        WebSearchArguments,
+        _brave_search,
+    ),
+    (
+        "VLLM_AURA_TOOL_DDG",
+        "duckduckgo_search",
+        "Search the web via DuckDuckGo HTML results. Fallback / alternative search engine.",
+        DuckDuckGoArguments,
+        _duckduckgo_search,
+    ),
+    (
+        "VLLM_AURA_TOOL_WEBFETCH",
+        "WebFetch",
+        "Fetch a public http(s) URL and return cleaned text. Private/loopback hosts are blocked.",
+        WebFetchArguments,
+        _web_fetch,
+    ),
+)
+
+
+def _iter_safe_tool_definitions() -> Iterator[tuple[str, str, type[BaseModel], Callable[[BaseModel], Any]]]:
+    yield from _SAFE_TOOL_DEFINITIONS
+    for env_name, name, description, arguments_model, handler in _OPTIONAL_SAFE_TOOL_DEFINITIONS:
+        if _env_enabled(env_name):
+            yield name, description, arguments_model, handler
 
 
 def parse_aura_tool_output(
@@ -731,7 +1052,7 @@ class AuraToolExecutor:
                     arguments_model=arguments_model,
                     handler=handler,
                 )
-                for name, description, arguments_model, handler in _SAFE_TOOL_DEFINITIONS
+                for name, description, arguments_model, handler in _iter_safe_tool_definitions()
             }
         else:
             raise ValueError("AuraToolExecutor mode must be 'mock' or 'safe'")
@@ -797,9 +1118,14 @@ class AuraToolExecutor:
                 raise ValueError("invalid_tool_arguments") from exc
 
             async with self._semaphore:
+                timeout_seconds = (
+                    max(self.timeout_seconds, DEEPSEEK_TIMEOUT_SECONDS)
+                    if call.name == "DeepSeek" and os.environ.get("DEEPSEEK_API_KEY", "").strip()
+                    else self.timeout_seconds
+                )
                 value = await asyncio.wait_for(
                     asyncio.to_thread(spec.handler, validated),
-                    timeout=self.timeout_seconds,
+                    timeout=timeout_seconds,
                 )
             content = json.dumps(
                 {"ok": True, "result": value},

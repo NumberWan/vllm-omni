@@ -1,7 +1,7 @@
 # AURA_v2 Omni with the original Native frontend
 
 This demo runs the four-stage AURA_v2 Omni pipeline on one GPU and serves the
-unmodified frontend from `AURA_demo-main` on port 9999.
+Native frontend from `AURA_demo-main` on port 9999.
 
 ```text
 browser (Native /ws) -> protocol bridge -> AURA_v2 Omni (:8666)
@@ -9,13 +9,14 @@ browser (Native /ws) -> protocol bridge -> AURA_v2 Omni (:8666)
 
 ## Frontend provenance
 
-The files in `static/` are byte-for-byte copies from
-`/home/wtk/AURA_demo-main/gateway/static/` as of 2026-08-20. The bridge adapts
-the protocol; it does not modify the UI.
+`eval.html` and `question_pages.html` are byte-for-byte copies from
+`/home/wtk/AURA_demo-main/gateway/static/` as of 2026-08-20.
+`index.html` is that same page plus a small PTT `stopPlayback()` patch so a new
+hold-to-talk mutes leftover TTS. Omni pipeline TTS is not cancelled.
 
 | File | SHA-256 |
 |---|---|
-| `index.html` | `81503f4a67f3088390f1a3b94cbe3cdbf5bc2a1170a1cd7799439b45a67a7e0a` |
+| `index.html` | `14ec901cb3deb89e9216f5ed7060dd60d789a49e064f4474ba995ef3a591902e` |
 | `eval.html` | `c7b33d9a6c4a9faa09b84c1697895f56a671ea224043a6466f9267e05b867afe` |
 | `question_pages.html` | `79ca4b00e095b4830f77b238c370aec1681b7fa6681b90b692bc199f9067f43c` |
 
@@ -39,12 +40,18 @@ Defaults:
 - Native frontend/bridge: `:9999`
 - AURA model: `/workspace/models/AURA_v2`
 - one concurrent session
-- PTT-triggered turns (`auto_trigger=false`); camera frames provide visual context
+- `auto_trigger=true` with `auto_trigger_min_frames=2` (same as MiniCPM demo):
+  enough camera frames can start a silent or spoken turn; PTT still works
 - Qwen3-TTS 1.7B Base voice clone using bundled `clone_2.wav`
 - Chinese; default style instruct asks for professional, clear, slightly faster,
   emotionally restrained delivery (override with `TTS_INSTRUCT`)
-- safe tools enabled: calculator, datetime, weather, currency, DeepSeek mock,
-  location, and Serper `WebSearch` (key from `SERPER_API_KEY` only)
+- safe tools enabled: calculator, datetime, weather, currency, DeepSeek
+  (live with `DEEPSEEK_API_KEY`, otherwise mock), location, and Serper
+  `WebSearch` (key from `SERPER_API_KEY` only)
+- `max_tool_depth=3`
+- Brave / DuckDuckGo / WebFetch exist in the executor but stay **off** unless
+  `VLLM_AURA_TOOL_BRAVE`, `VLLM_AURA_TOOL_DDG`, or `VLLM_AURA_TOOL_WEBFETCH` is set
+- Set `AUTO_TRIGGER=0` to restore PTT-only turns
 
 Stop:
 
@@ -75,8 +82,10 @@ versa), because their speaker embeddings have different dimensions.
   and **do not** send `turn_done`.
 - Final Omni TTS chunks are buffered into one WAV; the bridge synthesizes
   exactly one Native `turn_done` after final audio, silent text, or error.
+- A new Native `audio` (PTT) barges in at the bridge: pending TTS is dropped.
+  The page also stops the current `AudioBufferSource`. Server TTS may still
+  finish on GPU.
 
-Typed text, proactive video-only replies, and the Native HTTP eval flow are not
-part of the realtime showcase. Disabling video-only auto-trigger avoids a race
-where a silent camera turn can lock out PTT audio. Realtime camera context,
-PTT, and tool bubbles are supported.
+Typed text and the Native HTTP eval flow are not part of the realtime
+showcase. Realtime camera context, PTT, tool bubbles, and 2-frame auto-trigger
+are supported.

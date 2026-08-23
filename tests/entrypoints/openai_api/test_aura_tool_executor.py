@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import socket
 import threading
 import time
 from dataclasses import replace
@@ -51,7 +52,7 @@ async def test_executor_accepts_allowlisted_strict_schema():
         (_call(name="not_registered"), 1, "unknown_tool"),
         (_call(arguments={"text": 123}), 1, "invalid_tool_arguments"),
         (_call(arguments={"text": "ok", "extra": True}), 1, "invalid_tool_arguments"),
-        (_call(), 3, "tool_depth_exceeded"),
+        (_call(), 4, "tool_depth_exceeded"),
     ],
 )
 async def test_executor_fail_closed_boundaries(call, depth, error_code):
@@ -225,15 +226,27 @@ async def test_safe_datetime_uses_shanghai_timezone():
 
 
 class _FakeResponse:
-    def __init__(self, payload):
-        self._payload = payload
-        self.content = json.dumps(payload).encode()
+    def __init__(self, payload, *, text: str | None = None, headers: dict | None = None):
+        if isinstance(payload, str):
+            self._payload = {}
+            self._text = payload
+            self.content = payload.encode()
+        else:
+            self._payload = payload
+            encoded = json.dumps(payload).encode()
+            self.content = encoded
+            self._text = text if text is not None else encoded.decode()
+        self.headers = headers or {"content-type": "application/json"}
 
     def raise_for_status(self):
         return None
 
     def json(self):
         return self._payload
+
+    @property
+    def text(self):
+        return self._text
 
 
 @pytest.mark.asyncio
@@ -327,10 +340,11 @@ async def test_safe_currency_validates_and_uses_fixed_frankfurter_endpoint(monke
 
 
 @pytest.mark.asyncio
-async def test_safe_deepseek_is_fixed_mock_without_network(monkeypatch):
+async def test_safe_deepseek_without_key_is_mock_and_uses_no_network(monkeypatch):
     def fail_get(*_args, **_kwargs):
         raise AssertionError("DeepSeek mock must not use HTTP")
 
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.setattr(
         "vllm_omni.entrypoints.openai.aura_tool_executor.requests.get",
         fail_get,
@@ -351,6 +365,43 @@ async def test_safe_deepseek_is_fixed_mock_without_network(monkeypatch):
     assert payload["mocked"] is True
     assert payload["query"] == "今天天氣如何"
     assert "真實搜尋" in payload["summary"]
+
+
+@pytest.mark.asyncio
+async def test_safe_deepseek_with_key_uses_native_compatible_endpoint(monkeypatch):
+    posts = []
+
+    def fake_post(url, *, json, headers, timeout):
+        posts.append((url, json, headers, timeout))
+        return _FakeResponse(
+            {
+                "content": [
+                    {"type": "text", "text": "這是真實 DeepSeek 回覆。"},
+                ]
+            }
+        )
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.aura_tool_executor.requests.post",
+        fake_post,
+    )
+    executor = AuraToolExecutor(mode="safe")
+    result = await executor.execute(
+        session_id="deepseek-live",
+        request_id="deepseek-live",
+        call=_call(name="DeepSeek", arguments={"query": "測試", "enable_search": True}),
+        depth=1,
+    )
+
+    payload = json.loads(result.content)["result"]
+    assert result.status == "completed"
+    assert payload["mocked"] is False
+    assert payload["text"] == "這是真實 DeepSeek 回覆。"
+    assert posts[0][0] == "https://api.deepseek.com/anthropic/v1/messages"
+    assert posts[0][1]["tools"][0]["type"] == "web_search_20250305"
+    assert posts[0][2]["x-api-key"] == "test-key"
+    assert posts[0][3] == 30.0
 
 
 @pytest.mark.asyncio
@@ -477,3 +528,131 @@ async def test_safe_websearch_requires_key_and_bounds_serper(monkeypatch):
         depth=1,
     )
     assert '"code":"tool_timeout"' in timed_out.content
+
+
+@pytest.mark.asyncio
+async def test_executor_allows_depth_three():
+    executor = AuraToolExecutor()
+    result = await executor.execute(
+        session_id="depth-3",
+        request_id="depth-3",
+        call=_call(),
+        depth=3,
+    )
+    assert result.status == "completed"
+
+
+def test_optional_search_tools_default_off(monkeypatch):
+    monkeypatch.delenv("VLLM_AURA_TOOL_BRAVE", raising=False)
+    monkeypatch.delenv("VLLM_AURA_TOOL_DDG", raising=False)
+    monkeypatch.delenv("VLLM_AURA_TOOL_WEBFETCH", raising=False)
+    names = [schema["function"]["name"] for schema in AuraToolExecutor(mode="safe").tool_schemas]
+    assert names == [
+        "calculator",
+        "get_current_datetime",
+        "get_city_weather",
+        "convert_currency",
+        "DeepSeek",
+        "get_current_location",
+        "WebSearch",
+    ]
+
+
+def test_optional_search_tools_enabled_by_env(monkeypatch):
+    monkeypatch.setenv("VLLM_AURA_TOOL_BRAVE", "1")
+    monkeypatch.setenv("VLLM_AURA_TOOL_DDG", "true")
+    monkeypatch.setenv("VLLM_AURA_TOOL_WEBFETCH", "yes")
+    names = [schema["function"]["name"] for schema in AuraToolExecutor(mode="safe").tool_schemas]
+    assert names[-3:] == ["BraveSearch", "duckduckgo_search", "WebFetch"]
+
+
+@pytest.mark.asyncio
+async def test_brave_requires_key_when_enabled(monkeypatch):
+    monkeypatch.setenv("VLLM_AURA_TOOL_BRAVE", "1")
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    executor = AuraToolExecutor(mode="safe")
+    missing = await executor.execute(
+        session_id="brave-missing",
+        request_id="brave-missing",
+        call=_call(name="BraveSearch", arguments={"query": "AURA"}),
+        depth=1,
+    )
+    assert '"code":"search_api_key_missing"' in missing.content
+
+    def fake_get(url, *, headers, params, timeout):
+        del timeout
+        assert headers["X-Subscription-Token"] == "brave-key"
+        assert params == {"q": "AURA", "count": 10}
+        return _FakeResponse(
+            {"web": {"results": [{"title": "B", "description": "D", "url": "https://b.example"}]}}
+        )
+
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-key")
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.aura_tool_executor.requests.get",
+        fake_get,
+    )
+    ok = await executor.execute(
+        session_id="brave-ok",
+        request_id="brave-ok",
+        call=_call(name="BraveSearch", arguments={"query": "AURA"}),
+        depth=1,
+    )
+    payload = json.loads(ok.content)["result"]
+    assert ok.status == "completed"
+    assert payload["source"] == "brave"
+    assert payload["results"][0]["title"] == "B"
+
+
+@pytest.mark.asyncio
+async def test_webfetch_blocks_private_urls(monkeypatch):
+    monkeypatch.setenv("VLLM_AURA_TOOL_WEBFETCH", "1")
+
+    def fake_addrinfo(host, port, type=0):
+        del port, type
+        assert host == "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 80))]
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.aura_tool_executor.socket.getaddrinfo",
+        fake_addrinfo,
+    )
+    executor = AuraToolExecutor(mode="safe")
+    blocked = await executor.execute(
+        session_id="fetch-ssrf",
+        request_id="fetch-ssrf",
+        call=_call(name="WebFetch", arguments={"url": "http://127.0.0.1/secret"}),
+        depth=1,
+    )
+    assert '"code":"webfetch_ssrf_blocked"' in blocked.content
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_parses_html_when_enabled(monkeypatch):
+    monkeypatch.setenv("VLLM_AURA_TOOL_DDG", "1")
+    html = (
+        '<a class="result__a" href="https://example.com/a">Title A</a>'
+        '<td class="result__snippet">Snippet A</td>'
+    )
+
+    def fake_get(url, *, params, timeout):
+        del timeout
+        assert url == "https://html.duckduckgo.com/html/"
+        assert params == {"q": "AURA"}
+        return _FakeResponse(html, headers={"content-type": "text/html"})
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.aura_tool_executor.requests.get",
+        fake_get,
+    )
+    executor = AuraToolExecutor(mode="safe")
+    result = await executor.execute(
+        session_id="ddg",
+        request_id="ddg",
+        call=_call(name="duckduckgo_search", arguments={"query": "AURA", "max_results": 5}),
+        depth=1,
+    )
+    payload = json.loads(result.content)["result"]
+    assert result.status == "completed"
+    assert payload["source"] == "duckduckgo"
+    assert payload["results"][0]["title"] == "Title A"

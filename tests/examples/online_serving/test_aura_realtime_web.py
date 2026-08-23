@@ -133,7 +133,7 @@ def test_healthz_and_index_config_injection() -> None:
     body = app_js.text
     assert "session.config" in body
     assert "tool_mode: config.toolMode === 'auto' ? 'auto' : 'none'" in body
-    assert "max_tool_depth: 2" in body
+    assert "max_tool_depth: 3" in body
     assert "auto_trigger: true" in body
     assert "audio.done" in body
     assert "video.frame" in body
