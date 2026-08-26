@@ -151,7 +151,7 @@ def main() -> None:
     ap.add_argument("--tts-speaker", default="Vivian")
     ap.add_argument("--tts-language", default="Chinese")
     ap.add_argument("--tts-instruct", default="")
-    ap.add_argument("--tts-task-type", default="CustomVoice")
+    ap.add_argument("--tts-task-type", default="Base")
     ap.add_argument("--timeout", type=float, default=180)
     args = ap.parse_args()
 

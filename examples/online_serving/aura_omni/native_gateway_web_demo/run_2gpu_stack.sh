@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# Start AURA_v2 Omni on one free GPU and serve the original Native frontend.
+# Start AURA_v2 Omni on two GPUs (ASR+TTS | AURA) and Native frontend.
+# Launch via this script; it re-execs under `gpu run --` so the guard does not kill us.
 set -euo pipefail
+
+if [[ "${SKIP_GPU_RUN:-0}" != "1" ]] && command -v gpu >/dev/null 2>&1; then
+  exec gpu run --gpus 2 --timeout "${GPU_TIMEOUT:-12h}" --note "${GPU_NOTE:-AURA_v2 2-GPU Native demo}" -- \
+    env SKIP_GPU_RUN=1 bash "$0" "$@"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv}"
 PYTHON_BIN="${PYTHON_BIN:-$VENV_DIR/bin/python}"
 
-# Local tool keys (outside git). Override by exporting before this script.
 AURA_TOOL_KEYS_ENV="${AURA_TOOL_KEYS_ENV:-$HOME/.config/aura/tool_keys.env}"
 if [[ -f "$AURA_TOOL_KEYS_ENV" ]]; then
   # shellcheck disable=SC1090
@@ -18,23 +23,30 @@ fi
 
 MODEL="${MODEL:-/workspace/models/AURA_v2}"
 BASE_TTS_MODEL="/workspace/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3"
-DEPLOY="${DEPLOY:-$SCRIPT_DIR/aura_omni_v2_1gpu_base.yaml}"
+# Do not inherit DEPLOY from a parent 1-GPU shell.
+DEPLOY="${AURA_DEPLOY:-$SCRIPT_DIR/aura_omni_v2_2gpu_base.yaml}"
 AURA_PORT="${AURA_PORT:-8666}"
 BRIDGE_PORT="${BRIDGE_PORT:-9999}"
-LOG_DIR="${LOG_DIR:-/tmp/aura_v2_native_demo}"
+LOG_DIR="${LOG_DIR:-/tmp/aura_v2_native_2gpu}"
 PID_FILE="${PID_FILE:-$LOG_DIR/server.pid}"
 BRIDGE_PID_FILE="${BRIDGE_PID_FILE:-$LOG_DIR/bridge.pid}"
 STATIC_DIR="${STATIC_DIR:-$SCRIPT_DIR/static}"
-AURA_GPU="${AURA_GPU:-auto}"
+AURA_GPUS="${AURA_GPUS:-auto}"
 DEFAULT_TTS_INSTRUCT="请用专业、清晰、自然的语气说话，语速稍快，情绪克制，避免夸张和过度热情。"
 
-if [[ "$AURA_GPU" == "auto" ]]; then
-  AURA_GPU="$(
-    nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits |
-      awk -F, '$2 + 0 < 2000 {gsub(/ /, "", $1); print $1; exit}'
-  )"
-  if [[ -z "$AURA_GPU" ]]; then
-    echo "ERROR: no GPU with less than 2 GiB in use; refusing to stop other users' processes." >&2
+if [[ "$AURA_GPUS" == "auto" ]]; then
+  if [[ "${CUDA_VISIBLE_DEVICES:-}" == *,* ]]; then
+    AURA_GPUS="$CUDA_VISIBLE_DEVICES"
+  else
+    AURA_GPUS="$(
+      nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits |
+        awk -F, '$2 + 0 < 2000 {gsub(/ /, "", $1); print $1}' |
+        awk 'NR<=2 {printf "%s%s", (NR==1?"":","), $1}'
+    )"
+  fi
+  n_commas="${AURA_GPUS//[^,]/}"
+  if [[ -z "$AURA_GPUS" || ${#n_commas} -lt 1 ]]; then
+    echo "ERROR: need two GPUs; use: gpu run --gpus 2 -- bash $0" >&2
     exit 1
   fi
 fi
@@ -45,7 +57,7 @@ if [[ "${CHECK_ONLY:-0}" == "1" ]]; then
   [[ -x "$PYTHON_BIN" ]] || { echo "ERROR: Python missing: $PYTHON_BIN" >&2; exit 1; }
   [[ -f "$DEPLOY" ]] || { echo "ERROR: deploy missing: $DEPLOY" >&2; exit 1; }
   [[ -f "$STATIC_DIR/index.html" ]] || { echo "ERROR: Native UI missing: $STATIC_DIR/index.html" >&2; exit 1; }
-  echo "preflight passed: gpu=$AURA_GPU model=$MODEL deploy=$DEPLOY"
+  echo "preflight passed: gpus=$AURA_GPUS model=$MODEL deploy=$DEPLOY"
   exit 0
 fi
 
@@ -85,12 +97,11 @@ else
     echo "ERROR: AURA port $AURA_PORT is occupied by a non-AURA service." >&2
     exit 1
   fi
-  echo "Starting AURA_v2 on physical GPU $AURA_GPU ..."
+  echo "Starting AURA_v2 on physical GPUs $AURA_GPUS ..."
   (
     cd "$REPO_ROOT"
     env \
-      CUDA_VISIBLE_DEVICES="$AURA_GPU" \
-      ALLOW_ONE_GPU=1 \
+      CUDA_VISIBLE_DEVICES="$AURA_GPUS" \
       MODEL="$MODEL" \
       DEPLOY="$DEPLOY" \
       HOST=0.0.0.0 \
@@ -102,7 +113,7 @@ else
       VLLM_AURA_IM_END_TOKEN_ID=248046 \
       VLLM_AURA_IM_START_TOKEN_ID=248045 \
       VLLM_AURA_ASSISTANT_TOKEN_ID=74455 \
-      VLLM_AURA_SENTENCE_TTS=0 \
+      VLLM_AURA_SENTENCE_TTS="${VLLM_AURA_SENTENCE_TTS:-0}" \
       VLLM_AURA_TOOL_EXECUTOR=safe \
       VLLM_AURA_TTS_TOKENIZER="${VLLM_AURA_TTS_TOKENIZER:-$BASE_TTS_MODEL}" \
       ALLOWED_LOCAL_MEDIA_PATH="${ALLOWED_LOCAL_MEDIA_PATH:-$REPO_ROOT/tests/assets/qwen3_tts}" \
@@ -112,14 +123,20 @@ else
   ) >"$LOG_DIR/aura_start.out" 2>&1 &
   echo $! >"$LOG_DIR/aura_wrapper.pid"
 
-  for attempt in $(seq 1 120); do
+  for attempt in $(seq 1 180); do
     if curl -sf --max-time 2 "http://127.0.0.1:${AURA_PORT}/v1/models" >/dev/null 2>&1; then
       echo "AURA_v2 ready after about $((attempt * 10)) seconds."
       break
     fi
-    if [[ -f "$PID_FILE" ]] && ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-      echo "ERROR: AURA_v2 exited; see $LOG_DIR/aura_start.out" >&2
-      exit 1
+    wrapper_pid="$(cat "$LOG_DIR/aura_wrapper.pid" 2>/dev/null || true)"
+    server_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    # Only treat as dead once the start wrapper has exited AND the server
+    # pid is missing/dead (avoids racing a stale PID file before rewrite).
+    if [[ -n "$wrapper_pid" ]] && ! kill -0 "$wrapper_pid" 2>/dev/null; then
+      if [[ -z "$server_pid" ]] || ! kill -0 "$server_pid" 2>/dev/null; then
+        echo "ERROR: AURA_v2 exited; see $LOG_DIR/aura_start.out" >&2
+        exit 1
+      fi
     fi
     sleep 10
   done
@@ -150,7 +167,7 @@ nohup env \
   TTS_LANGUAGE="${TTS_LANGUAGE:-Chinese}" \
   TTS_INSTRUCT="${TTS_INSTRUCT:-$DEFAULT_TTS_INSTRUCT}" \
   TTS_TASK_TYPE="${TTS_TASK_TYPE:-Base}" \
-  TOOL_MODE=auto \
+  TOOL_MODE="${TOOL_MODE:-auto}" \
   MAX_TOOL_DEPTH=3 \
   AUTO_TRIGGER="${AUTO_TRIGGER:-1}" \
   AURA_TTS_DUMP_DIR="${AURA_TTS_DUMP_DIR:-$LOG_DIR/tts}" \
@@ -172,3 +189,13 @@ echo "AURA_v2 backend: http://127.0.0.1:${AURA_PORT}"
 echo "Native frontend: http://127.0.0.1:${BRIDGE_PORT}/"
 [[ -n "$LAN_IP" ]] && echo "LAN frontend: http://${LAN_IP}:${BRIDGE_PORT}/"
 echo "Stop: LOG_DIR=$LOG_DIR bash $SCRIPT_DIR/stop_1gpu_stack.sh"
+
+# Stay alive so `gpu run` keeps the reservation heartbeat; otherwise the
+# guard will treat AURA as an unreserved process and kill it.
+server_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+if [[ -n "$server_pid" ]]; then
+  echo "Holding GPU reservation until AURA pid=$server_pid exits."
+  while kill -0 "$server_pid" 2>/dev/null; do
+    sleep 10
+  done
+fi

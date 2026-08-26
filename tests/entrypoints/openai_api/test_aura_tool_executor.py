@@ -13,6 +13,8 @@ import pytest
 from vllm_omni.entrypoints.openai.aura_tool_executor import (
     AuraToolCall,
     AuraToolExecutor,
+    aura_any_tool_intent,
+    aura_tool_intent_allowed,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -29,6 +31,48 @@ def _call(
         name=name,
         arguments=arguments if arguments is not None else {"text": "hello"},
     )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "user_text"),
+    [
+        ("get_city_weather", "上海現在天氣怎麼樣？"),
+        ("get_city_weather", "現在天氣怎麼樣？"),
+        ("convert_currency", "請把一美元換算成人民幣"),
+        ("calculator", "幫我算一下 37 * 19"),
+        ("get_current_datetime", "現在幾點？"),
+        ("get_current_location", "我目前位置在哪裡？"),
+        ("WebSearch", "請上網搜尋今天的最新消息"),
+        ("DeepSeek", "請使用 DeepSeek 解釋這個問題"),
+    ],
+)
+def test_tool_intent_gate_accepts_user_domain_cues(tool_name, user_text):
+    assert aura_tool_intent_allowed(tool_name, user_text) is True
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "WebSearch",
+        "DeepSeek",
+        "convert_currency",
+        "get_city_weather",
+        "get_current_location",
+        "calculator",
+    ],
+)
+def test_tool_intent_gate_rejects_hallucinated_tools_for_visual_question(tool_name):
+    assert aura_tool_intent_allowed(tool_name, "你現在看到畫面嗎？") is False
+
+
+def test_tool_intent_gate_does_not_trust_model_arguments():
+    assert aura_tool_intent_allowed("WebSearch", "畫面中有幾本書？") is False
+
+
+def test_any_tool_intent_uses_only_exposed_tool_domains():
+    schemas = AuraToolExecutor(mode="safe").tool_schemas
+    assert aura_any_tool_intent(schemas, "請查詢上海現在的天氣") is True
+    assert aura_any_tool_intent(schemas, "請描述你現在看到的畫面") is False
 
 
 @pytest.mark.asyncio
@@ -337,6 +381,43 @@ async def test_safe_currency_validates_and_uses_fixed_frankfurter_endpoint(monke
     assert result.status == "completed"
     assert payload["converted_amount"] == 724.5
     assert calls[0][0] == "https://api.frankfurter.app/latest"
+
+
+@pytest.mark.asyncio
+async def test_safe_convert_currency_accepts_xml_style_string_args(monkeypatch):
+    """Qwen XML parsers often emit amount/date as strings or null."""
+
+    def fake_get(url, *, params, timeout):
+        del timeout
+        assert params["amount"] == 1.0
+        assert params["from"] == "HKD"
+        assert params["to"] == "CNY"
+        return _FakeResponse({"date": "2026-08-25", "rates": {"CNY": 0.91}})
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.aura_tool_executor.requests.get",
+        fake_get,
+    )
+    executor = AuraToolExecutor(mode="safe")
+    result = await executor.execute(
+        session_id="currency-xml",
+        request_id="currency-xml",
+        call=_call(
+            name="convert_currency",
+            arguments={
+                "amount": "1",
+                "from_currency": " HKD ",
+                "to_currency": "CNY",
+                "date": None,
+            },
+        ),
+        depth=1,
+    )
+
+    payload = json.loads(result.content)["result"]
+    assert result.status == "completed"
+    assert payload["converted_amount"] == 0.91
+    assert payload["from_currency"] == "HKD"
 
 
 @pytest.mark.asyncio

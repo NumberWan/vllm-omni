@@ -29,6 +29,11 @@ user's process. Select a specific free GPU with `AURA_GPU=N`.
 bash examples/online_serving/aura_omni/native_gateway_web_demo/run_1gpu_stack.sh
 ```
 
+Optional tool keys (DeepSeek / Serper): put them in
+`~/.config/aura/tool_keys.env` (outside git; `chmod 600`). The start script
+sources that file when present. You can also `export DEEPSEEK_API_KEY=...`
+and `export SERPER_API_KEY=...` before starting.
+
 Open:
 
 - local: `http://127.0.0.1:9999/`
@@ -40,18 +45,9 @@ Defaults:
 - Native frontend/bridge: `:9999`
 - AURA model: `/workspace/models/AURA_v2`
 - one concurrent session
-- `auto_trigger=true` with `auto_trigger_min_frames=2` (same as MiniCPM demo):
-  enough camera frames can start a silent or spoken turn; PTT still works
-- Qwen3-TTS 1.7B Base voice clone using bundled `clone_2.wav`
-- Chinese; default style instruct asks for professional, clear, slightly faster,
-  emotionally restrained delivery (override with `TTS_INSTRUCT`)
-- safe tools enabled: calculator, datetime, weather, currency, DeepSeek
-  (live with `DEEPSEEK_API_KEY`, otherwise mock), location, and Serper
-  `WebSearch` (key from `SERPER_API_KEY` only)
-- `max_tool_depth=3`
-- Brave / DuckDuckGo / WebFetch exist in the executor but stay **off** unless
-  `VLLM_AURA_TOOL_BRAVE`, `VLLM_AURA_TOOL_DDG`, or `VLLM_AURA_TOOL_WEBFETCH` is set
-- Set `AUTO_TRIGGER=0` to restore PTT-only turns
+- `auto_trigger=true` with `auto_trigger_min_frames=2` (default; same as Native
+  Gateway always running inference on each video batch). Silence depends on the
+  model emitting `<|silent|>`. Set `AUTO_TRIGGER=0` for PTT-only turns.
 
 Stop:
 

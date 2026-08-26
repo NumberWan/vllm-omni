@@ -699,6 +699,24 @@ def test_aura_tool_input_lazy_loads_server_stage1_tokenizer(monkeypatch):
     assert built["prompt_token_ids"] == [7, 8, 9]
 
 
+def test_aura_intent_gate_retry_reuses_transcript_without_tool_template():
+    built = build_aura_input(
+        "",
+        {
+            "aura_session_id": "intent-gate-retry",
+            "aura_system_prompt": ["system"],
+            "aura_tool_enabled": [False],
+            "aura_tool_pass": [2],
+            "aura_tool_resume": [{"transcript": "你現在看到畫面嗎？"}],
+        },
+        {},
+        "intent-gate-pass-2",
+    )
+
+    assert "你現在看到畫面嗎？" in built["prompt"]
+    assert "<tools>" not in built["prompt"]
+
+
 def test_aura_tool_pass2_final_answer_tts_and_commits_once():
     class FakeTokenizer:
         def apply_chat_template(self, messages, **kwargs):

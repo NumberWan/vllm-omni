@@ -25,6 +25,8 @@ from vllm_omni.entrypoints.openai.aura_tool_executor import (
 from vllm_omni.entrypoints.openai.serving_video_stream import (
     AuraStreamingVideoHandler,
     AuraStreamingVideoSessionConfig,
+    canonical_aura_response_text,
+    decode_aura_content_ids_for_display,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import VideoStreamTurnTrigger
 from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty import (
@@ -35,6 +37,7 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     unpack_aura_video_ndarray,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    SILENT_TEXT,
     AuraSessionState,
     SessionHistory,
     clear_all_sessions,
@@ -84,6 +87,7 @@ def test_aura_streaming_session_config_native_aligned_defaults():
     config = AuraStreamingVideoSessionConfig(model="test")
     assert config.cross_turn_penalty == 1.0
     assert config.cross_turn_lookback == 10
+    assert config.tool_intent_gate is True
 
 
 def test_should_trigger_turn_respects_auto_trigger_gate():
@@ -486,6 +490,7 @@ async def test_tool_loop_drains_pass1_executes_once_and_resumes(monkeypatch):
         config=AuraStreamingVideoSessionConfig(
             model="test",
             tool_mode="auto",
+            tool_intent_gate=False,
             cross_turn_penalty=0,
         ),
         frame_buffer=[_b64(_make_jpeg())],
@@ -543,6 +548,125 @@ async def test_tool_loop_drains_pass1_executes_once_and_resumes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tool_intent_gate_retries_visual_question_without_executing(monkeypatch):
+    raw_tool = (
+        "<tool_call><function=WebSearch><parameter=query>"
+        "2024-10-01 人民幣匯率"
+        "</parameter></function></tool_call>"
+    )
+
+    class FakeEngine:
+        async def get_tokenizer(self):
+            return object()
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.events = []
+
+        async def send_json(self, event):
+            self.events.append(event)
+
+    def fake_parse(_tokenizer, raw, *, request_id, tool_schemas):
+        del request_id, tool_schemas
+        if "<tool_call>" in raw:
+            return ParsedAuraToolTurn(
+                reasoning=None,
+                content="",
+                calls=[
+                    AuraToolCall(
+                        id="hallucinated",
+                        name="WebSearch",
+                        arguments={"query": "2024-10-01 人民幣匯率"},
+                    )
+                ],
+            )
+        return ParsedAuraToolTurn(reasoning=None, content="我看到清楚的辦公室畫面。", calls=[])
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.serving_video_stream.parse_aura_tool_output",
+        fake_parse,
+    )
+    executor = AuraToolExecutor(mode="safe")
+
+    async def forbidden_execute(**kwargs):
+        raise AssertionError(f"intent-gated tool executed: {kwargs}")
+
+    executor.execute = forbidden_execute  # type: ignore[method-assign]
+    handler = AuraStreamingVideoHandler(
+        chat_service=SimpleNamespace(enable_auto_tools=True, parser_cls=object()),
+        engine_client=FakeEngine(),
+        tool_executor=executor,
+        tool_tokenizer_path="/workspace/models/AURA_v2",
+    )
+    preprocessed = []
+
+    async def fake_preprocess(chat_request):
+        preprocessed.append(getattr(chat_request, "additional_information"))
+        return chat_request
+
+    passes = 0
+
+    async def fake_collect(*, on_text_ready, on_transcript, **kwargs):
+        nonlocal passes
+        del kwargs
+        passes += 1
+        if passes == 1:
+            await on_transcript("你現在看到畫面嗎？")
+            await on_text_ready(raw_tool)
+            return {
+                "interrupted": False,
+                "transcript": "你現在看到畫面嗎？",
+                "text": raw_tool,
+                "preamble_audio_count": 0,
+                "audio_deltas": [],
+            }
+        await on_text_ready("我看到清楚的辦公室畫面。")
+        return {
+            "interrupted": False,
+            "transcript": "",
+            "text": "我看到清楚的辦公室畫面。",
+            "preamble_audio_count": 0,
+            "audio_deltas": [],
+        }
+
+    final_texts = []
+
+    async def fake_emit(**kwargs):
+        final_texts.append(kwargs["response_text"])
+
+    handler._preprocess_to_engine_prompt = fake_preprocess  # type: ignore[method-assign]
+    handler._collect_aura_tool_pass = fake_collect  # type: ignore[method-assign]
+    handler._emit_aura_tool_final = fake_emit  # type: ignore[method-assign]
+
+    state = _session_state()
+    state.turn_frame_arrays = [np.zeros((8, 8, 3), dtype=np.uint8)]
+    get_or_create_session_history(state.session_id)
+    websocket = FakeWebSocket()
+    await handler._process_query_engine(
+        websocket=websocket,
+        config=AuraStreamingVideoSessionConfig(
+            model="test",
+            tool_mode="auto",
+            cross_turn_penalty=0,
+        ),
+        frame_buffer=[_b64(_make_jpeg())],
+        audio_buffer=bytearray(),
+        message_history=state,
+        query_text="",
+        request_id="intent-gate",
+        interrupt_event=SimpleNamespace(is_set=lambda: False),
+        prewarmed_frames={},
+    )
+
+    assert passes == 2
+    assert preprocessed[0]["aura_tool_enabled"] == [False]
+    assert preprocessed[1]["aura_tool_enabled"] == [False]
+    assert preprocessed[1]["aura_tool_resume"][0]["transcript"] == "你現在看到畫面嗎？"
+    assert not any(event["type"].startswith("response.tool.") for event in websocket.events)
+    assert final_texts == ["我看到清楚的辦公室畫面。"]
+
+
+@pytest.mark.asyncio
 async def test_tool_loop_interrupt_drains_without_execution(monkeypatch):
     drained = False
 
@@ -586,6 +710,7 @@ async def test_tool_loop_interrupt_drains_without_execution(monkeypatch):
         config=AuraStreamingVideoSessionConfig(
             model="test",
             tool_mode="auto",
+            tool_intent_gate=False,
             cross_turn_penalty=0,
         ),
         frame_buffer=[],
@@ -686,7 +811,12 @@ async def test_tool_loop_preamble_audio_overlaps_delayed_tool(monkeypatch):
     state.turn_frame_arrays = [np.zeros((8, 8, 3), dtype=np.uint8)]
     await handler._process_query_engine(
         websocket=websocket,
-        config=AuraStreamingVideoSessionConfig(model="test", tool_mode="auto", cross_turn_penalty=0),
+        config=AuraStreamingVideoSessionConfig(
+            model="test",
+            tool_mode="auto",
+            tool_intent_gate=False,
+            cross_turn_penalty=0,
+        ),
         frame_buffer=[],
         audio_buffer=bytearray(),
         message_history=state,
@@ -771,7 +901,12 @@ async def test_tool_loop_async_chunk_off_still_emits_preamble_without_overlap_cl
     state.turn_frame_arrays = [np.zeros((8, 8, 3), dtype=np.uint8)]
     await handler._process_query_engine(
         websocket=FakeWebSocket(),
-        config=AuraStreamingVideoSessionConfig(model="test", tool_mode="auto", cross_turn_penalty=0),
+        config=AuraStreamingVideoSessionConfig(
+            model="test",
+            tool_mode="auto",
+            tool_intent_gate=False,
+            cross_turn_penalty=0,
+        ),
         frame_buffer=[],
         audio_buffer=bytearray(),
         message_history=state,
@@ -872,3 +1007,98 @@ async def test_tool_pass_only_publishes_finished_asr_transcript(monkeypatch):
 
     assert published == ["請查上海天氣"]
     assert collected["transcript"] == "請查上海天氣"
+
+
+def test_canonical_aura_response_text_prefers_decoded_ids():
+    streaming = "会被罚款30元。"
+    decoded = "会被罚款3000元。"
+    assert (
+        canonical_aura_response_text(streaming_text=streaming, decoded_text=decoded) == decoded
+    )
+
+
+def test_canonical_aura_response_text_keeps_streaming_when_decode_empty():
+    assert canonical_aura_response_text(streaming_text="你好。", decoded_text="") == "你好。"
+
+
+def test_canonical_aura_response_text_keeps_silent_marker():
+    assert (
+        canonical_aura_response_text(streaming_text=SILENT_TEXT, decoded_text="会被罚款3000元。")
+        == SILENT_TEXT
+    )
+
+
+def test_canonical_aura_response_text_rejects_wrong_vocab_latin_soup():
+    streaming = "没看到，画面里就一个戴眼镜的男生在摸头发。"
+    decoded = (
+        "Trilogy-même getting拥有 democrat departamento widget Nay诗词/utility責任eworld conexao通过对_r"
+    )
+    assert canonical_aura_response_text(streaming_text=streaming, decoded_text=decoded) == streaming
+
+
+def test_decode_aura_content_ids_strips_think_wrappers():
+    class FakeTokenizer:
+        def decode(self, token_ids: list[int]) -> str:
+            del token_ids
+            return "<think>内部推理</think>会被罚款3000元。"
+
+    assert decode_aura_content_ids_for_display(FakeTokenizer(), [11, 22, 33]) == "会被罚款3000元。"
+
+
+@pytest.mark.asyncio
+async def test_text_done_uses_full_token_decode_when_incremental_detok_drops_digits():
+    from vllm_omni.outputs import OmniRequestOutput
+
+    streaming_wrong = "会被罚款30元。"
+    decoded_right = "会被罚款3000元。"
+
+    class FakeTokenizer:
+        def decode(self, token_ids: list[int]) -> str:
+            del token_ids
+            return decoded_right
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            tok = FakeTokenizer()
+            self.engine = SimpleNamespace(
+                output_processors=[SimpleNamespace(tokenizer=None), SimpleNamespace(tokenizer=tok)]
+            )
+
+        async def get_tokenizer(self):
+            raise AssertionError("must use Stage-1 tokenizer, not ASR get_tokenizer()")
+
+        async def generate(self, *, prompt, request_id, output_modalities):
+            del prompt, request_id, output_modalities
+            output = SimpleNamespace(text=streaming_wrong, token_ids=[11, 22, 33])
+            yield OmniRequestOutput(
+                final_output_type="text",
+                request_output=SimpleNamespace(outputs=[output]),
+                finished=True,
+            )
+
+    events: list[dict[str, Any]] = []
+
+    class FakeWebSocket:
+        async def send_json(self, event):
+            events.append(event)
+
+    handler = AuraStreamingVideoHandler(
+        chat_service=object(),
+        engine_client=FakeEngine(),
+    )
+    await handler._run_engine_generation(
+        websocket=FakeWebSocket(),
+        config=AuraStreamingVideoSessionConfig(
+            model="test",
+            modalities=["text"],
+            stream_text_deltas=False,
+            cross_turn_penalty=0,
+        ),
+        message_history=_session_state(),
+        user_message={"role": "user", "content": "呢张海报系咩嚟？"},
+        request_id="poster-30-vs-3000",
+        interrupt_event=SimpleNamespace(is_set=lambda: False),
+        engine_prompt={"prompt": "x"},
+    )
+    done = next(event for event in events if event.get("type") == "response.text.done")
+    assert done["text"] == decoded_right

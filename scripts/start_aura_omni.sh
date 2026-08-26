@@ -183,7 +183,7 @@ nohup env "${SERVER_ENV[@]}" \
     --deploy-config "$DEPLOY" \
     --host "$HOST" --port "$PORT" \
     --served-model-name "$MODEL" \
-    --trust-remote-code --init-timeout 1200 \
+    --trust-remote-code --init-timeout "${INIT_TIMEOUT:-2400}" \
     "${MEDIA_ARGS[@]}" "${TOOL_ARGS[@]}" "$@" \
   >"$LOG" 2>&1 &
 echo $! >"$PID_FILE"
@@ -234,7 +234,7 @@ show_startup_dashboard() {
   DASHBOARD_DRAWN=1
 }
 
-deadline=$((SECONDS + 1200))
+deadline=$((SECONDS + ${INIT_TIMEOUT:-2400}))
 started=$SECONDS
 next_heartbeat=$SECONDS
 until curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; do

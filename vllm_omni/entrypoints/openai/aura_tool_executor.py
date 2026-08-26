@@ -24,7 +24,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.logger import init_logger
 from vllm.parser.qwen3 import Qwen3Parser
@@ -59,6 +59,104 @@ _DEEPSEEK_SYSTEM_PROMPT = (
 )
 
 _CURRENCY_CODE_PATTERN = re.compile(r"^[A-Z]{3}$")
+_TOOL_INTENT_CUES: dict[str, tuple[str, ...]] = {
+    "calculator": (
+        "calculator",
+        "calculate",
+        "compute",
+        "計算",
+        "计算",
+        "算一下",
+        "算出",
+        "等於多少",
+        "等于多少",
+        "加減乘除",
+        "加减乘除",
+    ),
+    "get_current_datetime": (
+        "getcurrentdatetime",
+        "currentdatetime",
+        "currenttime",
+        "currentdate",
+        "幾點",
+        "几点",
+        "星期幾",
+        "星期几",
+        "日期",
+        "時間",
+        "时间",
+    ),
+    "get_city_weather": (
+        "getcityweather",
+        "weather",
+        "天氣",
+        "天气",
+        "氣溫",
+        "气温",
+        "會下雨",
+        "会下雨",
+    ),
+    "convert_currency": (
+        "convertcurrency",
+        "exchange rate",
+        "currency",
+        "匯率",
+        "汇率",
+        "換算",
+        "换算",
+        "兌換",
+        "兑换",
+        "換成",
+        "换成",
+    ),
+    "get_current_location": (
+        "getcurrentlocation",
+        "currentlocation",
+        "location",
+        "我在哪",
+        "目前位置",
+        "當前位置",
+        "当前位置",
+        "定位",
+    ),
+    "websearch": (
+        "websearch",
+        "searchtheweb",
+        "searchonline",
+        "搜尋網路",
+        "搜索网络",
+        "上網搜尋",
+        "上网搜索",
+        "網路搜尋",
+        "网络搜索",
+        "新聞",
+        "新闻",
+        "最新消息",
+    ),
+    "bravesearch": (
+        "bravesearch",
+        "搜尋網路",
+        "搜索网络",
+        "上網搜尋",
+        "上网搜索",
+        "網路搜尋",
+        "网络搜索",
+    ),
+    "duckduckgo_search": (
+        "duckduckgo",
+        "搜尋網路",
+        "搜索网络",
+        "上網搜尋",
+        "上网搜索",
+        "網路搜尋",
+        "网络搜索",
+    ),
+    "webfetch": ("webfetch", "fetchurl", "讀取網址", "读取网址", "打開網址", "打开网址"),
+    # DeepSeek is a broad fallback assistant. Require an explicit request so it
+    # cannot absorb ordinary visual or conversational questions.
+    "deepseek": ("deepseek", "deep seek"),
+}
+_ARITHMETIC_INTENT_PATTERN = re.compile(r"\d+(?:\.\d+)?\s*[-+*/%^]\s*\d")
 _CURRENCY_NAMES_ZH = {
     "CNY": "人民幣",
     "EUR": "歐元",
@@ -94,6 +192,43 @@ _CALCULATOR_FUNCTIONS: dict[str, Callable[..., float]] = {
     "exp": math.exp,
 }
 _CALCULATOR_CONSTANTS = {"pi": math.pi, "e": math.e, "tau": math.tau}
+
+
+def aura_tool_intent_allowed(tool_name: str, user_text: str) -> bool:
+    """Return whether the user's own words justify executing ``tool_name``.
+
+    Tool arguments are deliberately ignored: they are model output and cannot
+    be trusted as evidence of user intent.
+    """
+
+    if not isinstance(user_text, str) or not user_text.strip():
+        return False
+    text = user_text.casefold()
+    compact = re.sub(r"[\s_-]+", "", text)
+    normalized_name = str(tool_name or "").casefold()
+    compact_name = re.sub(r"[\s_-]+", "", normalized_name)
+
+    if compact_name and compact_name in compact:
+        return True
+    if normalized_name == "calculator" and _ARITHMETIC_INTENT_PATTERN.search(text):
+        return True
+
+    cues = _TOOL_INTENT_CUES.get(normalized_name)
+    if cues is None:
+        cues = _TOOL_INTENT_CUES.get(compact_name, ())
+    return any(cue in text or re.sub(r"[\s_-]+", "", cue) in compact for cue in cues)
+
+
+def aura_any_tool_intent(tool_schemas: list[dict[str, Any]], user_text: str) -> bool:
+    """Return whether the user requested any tool exposed by the server."""
+
+    for schema in tool_schemas:
+        function = schema.get("function")
+        if not isinstance(function, dict):
+            continue
+        if aura_tool_intent_allowed(str(function.get("name") or ""), user_text):
+            return True
+    return False
 _WEATHER_LABELS_ZH = {
     0: "晴朗",
     1: "大致晴朗",
@@ -151,12 +286,39 @@ class CityWeatherArguments(BaseModel):
 
 
 class CurrencyArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    # Not strict: Qwen XML tool args often arrive as strings (e.g. amount="1").
+    # Coercion matches Native convert_currency(float(amount) + strip codes).
+    model_config = ConfigDict(extra="forbid")
 
     amount: float = Field(ge=0, le=1e12, allow_inf_nan=False)
     from_currency: str = Field(pattern=r"^[A-Za-z]{3}$")
     to_currency: str = Field(pattern=r"^[A-Za-z]{3}$")
     date: str = Field(default="", max_length=10)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _coerce_amount(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("amount must be a number")
+        if isinstance(value, str):
+            value = value.strip().replace(",", "")
+        return value
+
+    @field_validator("from_currency", "to_currency", mode="before")
+    @classmethod
+    def _strip_currency_code(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("date", mode="before")
+    @classmethod
+    def _null_date_to_empty(cls, value: Any) -> Any:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return value
 
 
 class DeepSeekArguments(BaseModel):
@@ -1115,6 +1277,12 @@ class AuraToolExecutor:
             try:
                 validated = spec.arguments_model.model_validate(call.arguments)
             except ValidationError as exc:
+                logger.info(
+                    "AURA tool argument validation failed tool=%s call_id=%s errors=%s",
+                    call.name,
+                    call.id,
+                    exc.errors(),
+                )
                 raise ValueError("invalid_tool_arguments") from exc
 
             async with self._semaphore:

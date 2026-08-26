@@ -78,6 +78,7 @@ installation, local model paths, and troubleshooting.
 | `stream_text_deltas` | bool | `false` | When `false`, the server buffers assistant text and only sends `response.text.done` (no per-token `response.text.delta`). Set `true` for incremental text streaming. |
 | `tool_mode` | `"none"` or `"auto"` | `"none"` | Enable the bounded server-side AURA tool loop. The server must also start with an allowlist executor and Qwen3 XML parser. |
 | `max_tool_depth` | int | `3` | Maximum tool-call passes in one logical turn (range 1–3). |
+| `tool_intent_gate` | bool | `true` | Start the turn without a tool template. After ASR, only matching tool-domain intent enables a tool pass against the same video and transcript; once tools are on, selected tools execute like Native (no per-tool name re-check). |
 
 All standard fields from [video_stream_api.md](video_stream_api.md) (`max_frames`, EVS, `sampling_params_list`, etc.) still apply.
 

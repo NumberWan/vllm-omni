@@ -41,9 +41,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import time
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
+from PIL import Image
 from pydantic import Field
 from vllm.logger import init_logger
 
@@ -51,6 +55,7 @@ from vllm_omni.entrypoints.openai.aura_tool_executor import (
     AuraToolCall,
     AuraToolResult,
     ParsedAuraToolTurn,
+    aura_any_tool_intent,
     parse_aura_tool_output,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
@@ -71,6 +76,7 @@ from vllm_omni.model_executor.stage_input_processors.aura_cross_turn_penalty imp
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     _clean_asr_transcript,
+    _clean_tts_text,
     _extract_text,
     _trim_aura_response_token_ids,
     build_aura_streaming_turn_additional_information,
@@ -87,6 +93,7 @@ from vllm_omni.model_executor.stage_input_processors.aura_session_history import
     unregister_session,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_tool_protocol import (
+    aura_natural_content,
     extract_aura_tool_preamble,
 )
 
@@ -103,6 +110,53 @@ logger = init_logger(__name__)
 
 _AURA_PIPELINE_NAMES = frozenset({"aura_omni"})
 _AURA_ADDITIONAL_INFO_KEY = "_aura_additional_information"
+
+
+def decode_aura_content_ids_for_display(tokenizer: Any, token_ids: list[int] | None) -> str:
+    """Full-sequence decode of trimmed Stage-1 ids (same source TTS uses)."""
+    content_ids = _trim_aura_response_token_ids(list(token_ids or []))
+    if not content_ids or tokenizer is None:
+        return ""
+    decode = getattr(tokenizer, "decode", None)
+    if not callable(decode):
+        return ""
+    try:
+        decoded = decode(content_ids)
+    except Exception:
+        return ""
+    return aura_natural_content(_clean_tts_text(decoded)).strip()
+
+
+def _cjk_char_count(text: str) -> int:
+    return sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+
+
+def _latin_alnum_count(text: str) -> int:
+    return sum(1 for ch in text if ("a" <= ch <= "z") or ("A" <= ch <= "Z"))
+
+
+def canonical_aura_response_text(*, streaming_text: str, decoded_text: str) -> str:
+    """Prefer Stage-1 full decode when it refines streaming (e.g. 30→3000).
+
+    Never replace good CJK streaming text with a wrong-vocab decode (ASR
+    tokenizer on AURA ids yields Latin/CJK soup such as ``Trilogy-même…``).
+    """
+    if streaming_text == SILENT_TEXT:
+        return SILENT_TEXT
+    if not decoded_text:
+        return streaming_text or ""
+    if not streaming_text:
+        return decoded_text
+    if decoded_text == streaming_text:
+        return decoded_text
+
+    stream_cjk = _cjk_char_count(streaming_text)
+    decoded_cjk = _cjk_char_count(decoded_text)
+    decoded_latin = _latin_alnum_count(decoded_text)
+    # Wrong tokenizer: streaming reads as Chinese speech, decode is Latin soup.
+    if stream_cjk >= 2 and decoded_latin >= max(8, decoded_cjk):
+        return streaming_text
+    return decoded_text
 
 
 def _resolve_deploy_pipeline(engine_client: Any) -> str | None:
@@ -327,6 +381,14 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
         le=3,
         description="Maximum tool-call passes in one logical turn.",
     )
+    tool_intent_gate: bool = Field(
+        default=True,
+        description=(
+            "Start without a tool template and enable tools only when the user's "
+            "transcript matches a tool domain. Once tools are enabled, selected "
+            "tools execute like Native (no per-tool name re-check)."
+        ),
+    )
 
     def session_history_kwargs(self) -> dict[str, Any]:
         return {
@@ -371,6 +433,35 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         super().__init__(*args, **kwargs)
         self._tool_executor = tool_executor
         self._tool_tokenizer_path = tool_tokenizer_path
+        self._aura_stage1_tokenizer: Any | None = None
+        self._aura_stage1_tokenizer_loaded = False
+
+    async def _get_aura_stage1_tokenizer(self) -> Any | None:
+        """Tokenizer for Stage-1 AURA ids — not ``get_tokenizer()`` (often ASR)."""
+        if self._aura_stage1_tokenizer_loaded:
+            return self._aura_stage1_tokenizer
+        self._aura_stage1_tokenizer_loaded = True
+        engine = getattr(self._engine_client, "engine", None)
+        processors = getattr(engine, "output_processors", None) if engine is not None else None
+        if isinstance(processors, list) and len(processors) > 1:
+            tok = getattr(processors[1], "tokenizer", None)
+            if tok is not None:
+                self._aura_stage1_tokenizer = tok
+                return tok
+        model = _resolve_aura_stage1_model(self._engine_client)
+        if not model:
+            return None
+        try:
+            from transformers import AutoTokenizer
+
+            self._aura_stage1_tokenizer = AutoTokenizer.from_pretrained(
+                model,
+                trust_remote_code=True,
+            )
+        except Exception:
+            logger.exception("Failed to load Stage-1 tokenizer from %s", model)
+            self._aura_stage1_tokenizer = None
+        return self._aura_stage1_tokenizer
 
     def supports_manual_query_turn(self) -> bool:
         return False
@@ -477,6 +568,38 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             fps=aura_config.video_fps,
             max_frames=aura_config.max_frames_per_round,
         )
+        # Vision debug: dump the exact ndarray last frame that enters Stage-1.
+        if os.environ.get("AURA_STAGE1_FRAME_DUMP", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            try:
+                dump_dir = Path(
+                    os.environ.get(
+                        "AURA_STAGE1_FRAME_DUMP_DIR",
+                        "/tmp/aura_v2_native_demo/stage1_frames",
+                    )
+                )
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                last = np.asarray(video_array[-1])
+                if last.ndim == 3 and last.shape[-1] == 3:
+                    stamp = time.strftime("%H%M%S")
+                    out = dump_dir / (
+                        f"stage1_{stamp}_n{len(video_array)}_"
+                        f"{last.shape[1]}x{last.shape[0]}_"
+                        f"{'voice' if len(audio_buffer) else 'silent'}.jpg"
+                    )
+                    Image.fromarray(last.astype("uint8", copy=False)).save(out, quality=90)
+                    logger.info(
+                        "AURA stage1 frame dump %s shape=%s voice=%s",
+                        out,
+                        tuple(video_array.shape),
+                        bool(audio_buffer),
+                    )
+            except Exception as exc:
+                logger.warning("AURA stage1 frame dump failed: %s", exc)
 
         user_content: list[dict[str, Any]] = []
         if len(audio_buffer) > 0:
@@ -719,8 +842,14 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         pass_number = 1
         tool_depth = 1
         depth_error_returned = False
+        intent_gate_retries = 0
         current_kwargs = request_kwargs
-        current_additional = base_additional
+        routing_pass = aura_config.tool_intent_gate
+        current_additional = (
+            {**base_additional, "aura_tool_enabled": [False]}
+            if routing_pass
+            else base_additional
+        )
 
         while True:
             internal_request_id = f"{request_id}-tool-p{pass_number}"
@@ -737,6 +866,47 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             tool_task: asyncio.Task[list[AuraToolResult]] | None = None
             tool_results: list[AuraToolResult] | None = None
             transaction_calls: list[AuraToolCall] = []
+
+            async def start_tool_execution() -> asyncio.Task[list[AuraToolResult]]:
+                for call in transaction_calls:
+                    await websocket.send_json(
+                        {
+                            "type": "response.tool.started",
+                            "request_id": request_id,
+                            "call_id": call.id,
+                            "name": call.name,
+                            "status": "started",
+                        }
+                    )
+
+                async def _execute_calls() -> list[AuraToolResult]:
+                    results = list(
+                        await asyncio.gather(
+                            *[
+                                self._tool_executor.execute(
+                                    session_id=message_history.session_id,
+                                    request_id=internal_request_id,
+                                    call=call,
+                                    depth=tool_depth,
+                                )
+                                for call in transaction_calls
+                            ]
+                        )
+                    )
+                    for result in results:
+                        await websocket.send_json(
+                            {
+                                "type": "response.tool.done",
+                                "request_id": request_id,
+                                "call_id": result.call_id,
+                                "name": result.name,
+                                "status": result.status,
+                                "content": result.content,
+                            }
+                        )
+                    return results
+
+                return asyncio.create_task(_execute_calls())
 
             async def on_stage1_text(raw_text: str) -> bool:
                 nonlocal parsed, tool_task, tool_results, transaction_calls, depth_error_returned
@@ -803,45 +973,14 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                         )
                     return True
 
-                for call in transaction_calls:
-                    await websocket.send_json(
-                        {
-                            "type": "response.tool.started",
-                            "request_id": request_id,
-                            "call_id": call.id,
-                            "name": call.name,
-                            "status": "started",
-                        }
-                    )
-
-                async def _execute_calls() -> list[AuraToolResult]:
-                    results = list(
-                        await asyncio.gather(
-                            *[
-                                self._tool_executor.execute(
-                                    session_id=message_history.session_id,
-                                    request_id=internal_request_id,
-                                    call=call,
-                                    depth=tool_depth,
-                                )
-                                for call in transaction_calls
-                            ]
-                        )
-                    )
-                    for result in results:
-                        await websocket.send_json(
-                            {
-                                "type": "response.tool.done",
-                                "request_id": request_id,
-                                "call_id": result.call_id,
-                                "name": result.name,
-                                "status": result.status,
-                                "content": result.content,
-                            }
-                        )
-                    return results
-
-                tool_task = asyncio.create_task(_execute_calls())
+                # Routing / no-tool passes keep tools disabled. Defer execution
+                # until the pass finishes so we can retry without executing.
+                tools_enabled = bool(
+                    (current_additional.get("aura_tool_enabled") or [False])[0]
+                )
+                if aura_config.tool_intent_gate and not tools_enabled:
+                    return True
+                tool_task = await start_tool_execution()
                 return True
 
             async def on_preamble_audio(b64: str) -> None:
@@ -907,6 +1046,26 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     }
                 )
             if not parsed.calls and parsed.error is None:
+                if routing_pass:
+                    routing_pass = False
+                    intent_text = transcript or query_text
+                    if aura_any_tool_intent(self._tool_executor.tool_schemas, intent_text):
+                        # The routing pass intentionally had no tool template.
+                        # Reuse its ASR transcript and video in a tool-enabled
+                        # pass only when the user's own words request a tool.
+                        pass_number += 1
+                        current_additional = {
+                            **base_additional,
+                            "aura_tool_enabled": [True],
+                            "aura_tool_pass": [pass_number],
+                            "aura_tool_resume": [{"transcript": transcript}],
+                            "omni_skip_stages": [0],
+                        }
+                        current_kwargs = {
+                            **request_kwargs,
+                            "messages": [{"role": "user", "content": []}],
+                        }
+                        continue
                 final_text = (parsed.content or "").strip()
                 await self._emit_aura_tool_final(
                     websocket=websocket,
@@ -925,6 +1084,58 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             calls = transaction_calls or list(parsed.calls)
             if parsed.error and not calls:
                 calls = [AuraToolCall(id=f"{internal_request_id}-invalid", name="invalid_tool_call", arguments={})]
+            tools_enabled = bool(
+                (current_additional.get("aura_tool_enabled") or [False])[0]
+            )
+            # Native has no per-tool intent classifier. Omni only uses the gate
+            # to decide whether tools are on; while they are off, never execute.
+            if (
+                aura_config.tool_intent_gate
+                and not tools_enabled
+                and calls
+                and parsed.error is None
+            ):
+                if intent_gate_retries:
+                    await self._emit_aura_tool_final(
+                        websocket=websocket,
+                        config=aura_config,
+                        message_history=message_history,
+                        user_message=user_message,
+                        request_id=request_id,
+                        response_text=(parsed.content or "").strip()
+                        or "抱歉，我暫時無法直接回答這個問題。",
+                        audio_deltas=[],
+                        release_turn_lock=release_turn_lock,
+                        transcript=transcript,
+                    )
+                    return
+                logger.warning(
+                    "AURA tool intent gate ignored tool calls while tools disabled "
+                    "request_id=%s tools=%s transcript=%r",
+                    internal_request_id,
+                    [call.name for call in calls],
+                    transcript or query_text,
+                )
+                # Re-run Stage-1 against the same video and transcript without a
+                # tool template. Do not persist the hallucinated call or expose
+                # it as a real tool event.
+                intent_gate_retries += 1
+                pass_number += 1
+                current_additional = {
+                    **base_additional,
+                    "aura_tool_enabled": [False],
+                    "aura_tool_pass": [pass_number],
+                    "aura_tool_resume": [{"transcript": transcript}],
+                    "omni_skip_stages": [0],
+                }
+                current_kwargs = {
+                    **request_kwargs,
+                    "messages": [{"role": "user", "content": []}],
+                }
+                continue
+            if tool_task is None and calls and parsed.error is None:
+                transaction_calls = calls
+                tool_task = await start_tool_execution()
             if tool_task is not None:
                 tool_results = await tool_task
             results = tool_results or []
@@ -1016,6 +1227,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
         text_parts: list[str] = []
         previous_text = ""
+        last_token_ids: list[int] = []
         transcript = ""
         audio_deltas: list[str] = []
         audio_chunks_drained = 0
@@ -1025,6 +1237,18 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         text_ready = False
         tool_transaction = False
         preamble_audio_count = 0
+        tokenizer = None
+        if self._engine_client is not None:
+            try:
+                tokenizer = await self._get_aura_stage1_tokenizer()
+            except Exception:
+                tokenizer = None
+
+        def _pass_text() -> str:
+            return canonical_aura_response_text(
+                streaming_text="".join(text_parts),
+                decoded_text=decode_aura_content_ids_for_display(tokenizer, last_token_ids),
+            )
 
         async def notify_text_ready() -> None:
             nonlocal text_ready, tool_transaction
@@ -1032,7 +1256,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 return
             text_ready = True
             if on_text_ready is not None:
-                tool_transaction = bool(await on_text_ready("".join(text_parts)))
+                tool_transaction = bool(await on_text_ready(_pass_text()))
 
         async def take_audio_b64(b64: str) -> None:
             nonlocal preamble_audio_count
@@ -1079,6 +1303,9 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     if audio_data is not None:
                         audio_tail_tensors = list(audio_data) if isinstance(audio_data, list) else [audio_data]
                 continue
+            token_ids = self._output_token_ids(output)
+            if token_ids:
+                last_token_ids = token_ids
             delta_text, previous_text = self._extract_text_delta(output, previous_text)
             if delta_text:
                 text_parts.append(delta_text)
@@ -1104,7 +1331,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             await take_audio_b64(b64)
         await notify_text_ready()
         return {
-            "text": "".join(text_parts),
+            "text": _pass_text(),
             "transcript": transcript,
             "audio_deltas": audio_deltas,
             "preamble_audio_count": preamble_audio_count,
@@ -1225,6 +1452,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
         await websocket.send_json(_response_event({"type": "response.start"}))
         text_parts: list[str] = []
+        last_token_ids: list[int] = []
         text_done_sent = False
         turn_lock_released = False
         audio_chunk_count = 0
@@ -1245,6 +1473,18 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         audio_tail_tensors: list[Any] = []
         last_text_metrics: dict[str, Any] | None = None
         last_audio_metrics: dict[str, Any] | None = None
+        tokenizer = None
+        if self._engine_client is not None:
+            try:
+                tokenizer = await self._get_aura_stage1_tokenizer()
+            except Exception:
+                tokenizer = None
+
+        def _client_text() -> str:
+            return canonical_aura_response_text(
+                streaming_text="".join(text_parts),
+                decoded_text=decode_aura_content_ids_for_display(tokenizer, last_token_ids),
+            )
 
         def _event_metrics(output: OmniRequestOutput | None) -> dict[str, Any] | None:
             if not getattr(config, "return_stage_metrics", False) or output is None:
@@ -1291,7 +1531,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 return
             await _finalize_silent_turn()
             if not text_done_sent:
-                full_text = "".join(text_parts)
+                full_text = _client_text()
                 await websocket.send_json(
                     _with_metrics(
                         _response_event({"type": "response.text.done", "text": full_text}),
@@ -1341,7 +1581,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
                 if out_type == "audio":
                     if streaming and not text_done_sent:
-                        full_text = "".join(text_parts)
+                        full_text = _client_text()
                         await websocket.send_json(
                             _with_metrics(
                                 _response_event({"type": "response.text.done", "text": full_text}),
@@ -1388,6 +1628,8 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 else:
                     last_text_metrics = metrics or last_text_metrics
                     token_ids = self._output_token_ids(output)
+                    if token_ids:
+                        last_token_ids = token_ids
                     content_ids = _trim_aura_response_token_ids(token_ids)
                     # Classify silent on trimmed content ids (not chat-template prefix).
                     if content_ids and should_stop_aura_silent_generation(token_ids=content_ids):
@@ -1412,7 +1654,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                             )
 
             if not text_done_sent:
-                full_text = "".join(text_parts)
+                full_text = _client_text()
                 await websocket.send_json(
                     _with_metrics(
                         _response_event({"type": "response.text.done", "text": full_text}),
@@ -1460,14 +1702,14 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 )
 
             if release_turn_lock is None and not turn_lock_released:
-                response_text = "".join(text_parts)
+                response_text = _client_text()
                 self.on_turn_complete(message_history, user_message, response_text, request_id)
 
         except Exception:
             await self._send_error(websocket, "Query processing failed")
 
         if not text_done_sent:
-            full_text = "".join(text_parts)
+            full_text = _client_text()
             await websocket.send_json(
                 _with_metrics(
                     _response_event({"type": "response.text.done", "text": full_text}),

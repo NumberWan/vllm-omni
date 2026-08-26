@@ -59,8 +59,40 @@ TOOL_MODE = os.environ.get("TOOL_MODE", "auto")
 MAX_TOOL_DEPTH = int(os.environ.get("MAX_TOOL_DEPTH", "3"))
 AUTO_TRIGGER = os.environ.get("AUTO_TRIGGER", "1").strip().lower() in {"1", "true", "yes", "on"}
 TTS_DUMP_DIR = Path(os.environ.get("AURA_TTS_DUMP_DIR", "/tmp/aura_v2_native_demo_tts")).expanduser()
+FRAME_DUMP_DIR = Path(
+    os.environ.get("AURA_FRAME_DUMP_DIR", "/tmp/aura_v2_native_demo/frames")
+).expanduser()
+FRAME_DUMP_ENABLED = os.environ.get("AURA_FRAME_DUMP", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_frame_dump_idx = 0
 
 app = FastAPI(title="AURA_v2 Omni ↔ original AURA demo bridge")
+
+
+def _dump_incoming_frames(frames: list[str]) -> None:
+    """Save a few recent client JPEGs for vision debugging (capped)."""
+    global _frame_dump_idx
+    if not FRAME_DUMP_ENABLED or not frames:
+        return
+    FRAME_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+    for fr in frames:
+        _frame_dump_idx += 1
+        path = FRAME_DUMP_DIR / f"frame_{_frame_dump_idx:06d}.jpg"
+        try:
+            raw = base64.b64decode(fr)
+            path.write_bytes(raw)
+        except Exception as exc:
+            LOG.warning("frame dump failed: %s", exc)
+            continue
+        # Keep only the newest ~40 files.
+        if _frame_dump_idx % 10 == 0:
+            old = sorted(FRAME_DUMP_DIR.glob("frame_*.jpg"))
+            for stale in old[:-40]:
+                stale.unlink(missing_ok=True)
 
 
 def _tts_config() -> dict:
@@ -517,6 +549,7 @@ async def _bridge_session(client: WebSocket) -> None:
 
                     if mtype == "video":
                         frames = _parse_video_frames(str(data.get("video_url") or ""))
+                        _dump_incoming_frames(frames)
                         for fr in frames:
                             await aura.send(json.dumps({"type": "video.frame", "data": fr}))
                         text = str(data.get("text") or "").strip()

@@ -703,23 +703,24 @@ def build_aura_input(
             _AURA_TOOL_TOKENIZERS[tokenizer_path] = tokenizer
     tool_resume = _first_value(additional_info.get("aura_tool_resume"), None)
     transient_messages: list[dict[str, Any]] | None = None
-    if tool_enabled and isinstance(tool_resume, dict):
+    if isinstance(tool_resume, dict):
         resume_transcript = tool_resume.get("transcript")
         if isinstance(resume_transcript, str):
             transcript = _clean_asr_transcript(resume_transcript)
-        candidate_messages = tool_resume.get("transient_messages")
-        if isinstance(candidate_messages, list):
-            transient_messages = [m for m in candidate_messages if isinstance(m, dict)]
-            if bool(tool_resume.get("force_final_answer")):
-                transient_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "工具已成功。只逐字輸出工具結果 JSON 的 summary 字段；"
-                            "禁止改寫或增刪任何數字，也不要再調用工具。"
-                        ),
-                    }
-                )
+        if tool_enabled:
+            candidate_messages = tool_resume.get("transient_messages")
+            if isinstance(candidate_messages, list):
+                transient_messages = [m for m in candidate_messages if isinstance(m, dict)]
+                if bool(tool_resume.get("force_final_answer")):
+                    transient_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "工具已成功。只逐字輸出工具結果 JSON 的 summary 字段；"
+                                "禁止改寫或增刪任何數字，也不要再調用工具。"
+                            ),
+                        }
+                    )
     vision_data = _vision_multimodal_data(multi_modal_data)
     mm_uuids: dict[str, Any] | None = None
 
