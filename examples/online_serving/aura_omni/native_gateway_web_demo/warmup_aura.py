@@ -24,21 +24,25 @@ DEFAULT_WAVS = [
 ]
 
 
-def _make_frame() -> bytes:
-    from PIL import Image, ImageDraw
+def _make_frames(count: int = 2, width: int = 640, height: int = 360) -> list[bytes]:
     import io
 
-    img = Image.new("RGB", (320, 240), (44, 36, 28))
-    d = ImageDraw.Draw(img)
-    d.text((80, 110), "AURA warmup", fill=(220, 220, 220))
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=80)
-    return buf.getvalue()
+    from PIL import Image, ImageDraw
+
+    frames = []
+    for index in range(count):
+        img = Image.new("RGB", (width, height), (44 + index, 36, 28))
+        d = ImageDraw.Draw(img)
+        position = (max((width - 160) // 2, 0), max((height - 20) // 2, 0))
+        d.text(position, "AURA warmup", fill=(220, 220, 220))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        frames.append(buf.getvalue())
+    return frames
 
 
 def _wav_to_pcm16_16k(path: Path) -> bytes:
     import audioop
-    import io
     import wave
 
     with wave.open(str(path), "rb") as wf:
@@ -64,14 +68,50 @@ async def _warmup(
     tts_instruct: str,
     tts_task_type: str,
     timeout_s: float,
+    frame_count: int,
+    frame_width: int,
+    frame_height: int,
+    silent_first: bool,
 ) -> dict:
-    frame_b64 = base64.b64encode(_make_frame()).decode()
+    frame_b64s = [
+        base64.b64encode(frame).decode()
+        for frame in _make_frames(frame_count, frame_width, frame_height)
+    ]
     pcm = _wav_to_pcm16_16k(wav)
     text = ""
     audio_n = 0
     errors: list[str] = []
     events: list[str] = []
     t0 = time.time()
+
+    async def recv_turn(ws, *, phase: str) -> tuple[str, int, float]:
+        phase_text = ""
+        phase_audio_n = 0
+        phase_t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=60)
+            except asyncio.TimeoutError:
+                errors.append(f"{phase}_timeout")
+                break
+            msg = json.loads(raw)
+            event_type = str(msg.get("type") or "")
+            events.append(f"{phase}:{event_type}")
+            if event_type == "response.text.delta":
+                phase_text += str(msg.get("delta") or "")
+            elif event_type == "response.text.done":
+                phase_text = str(msg.get("text") or phase_text)
+                if "<|silent|>" in phase_text:
+                    break
+            elif event_type == "response.audio.delta":
+                phase_audio_n += 1
+            elif event_type == "response.audio.done":
+                break
+            elif event_type == "error":
+                errors.append(f"{phase}:{msg.get('message') or msg}")
+                break
+        return phase_text, phase_audio_n, round(time.time() - phase_t0, 2)
+
     async with websockets.connect(aura_ws, max_size=32 * 1024 * 1024) as ws:
         await ws.send(
             json.dumps(
@@ -79,7 +119,7 @@ async def _warmup(
                     "type": "session.config",
                     "model": model,
                     "modalities": ["text", "audio"],
-                    "auto_trigger": False,
+                    "auto_trigger": silent_first,
                     "auto_trigger_min_frames": 2,
                     "max_frames": 64,
                     "max_frames_per_round": 16,
@@ -93,7 +133,24 @@ async def _warmup(
                 }
             )
         )
-        await ws.send(json.dumps({"type": "video.frame", "data": frame_b64}))
+        for frame_b64 in frame_b64s:
+            await ws.send(json.dumps({"type": "video.frame", "data": frame_b64}))
+        silent_text = ""
+        silent_elapsed_s = 0.0
+        if silent_first:
+            silent_text, _, silent_elapsed_s = await recv_turn(ws, phase="silent")
+            if errors:
+                return {
+                    "ok": False,
+                    "elapsed_s": round(time.time() - t0, 2),
+                    "silent_text": silent_text[:120],
+                    "silent_elapsed_s": silent_elapsed_s,
+                    "text": "",
+                    "audio_n": 0,
+                    "errors": errors,
+                    "events": events[-40:],
+                    "wav": str(wav),
+                }
         chunk = 16000 * 2
         for off in range(0, len(pcm), chunk):
             await ws.send(
@@ -105,40 +162,20 @@ async def _warmup(
                 )
             )
         await ws.send(json.dumps({"type": "audio.done"}))
-
-        got_audio = False
-        while time.time() - t0 < timeout_s:
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=60)
-            except asyncio.TimeoutError:
-                errors.append("timeout")
-                break
-            msg = json.loads(raw)
-            et = str(msg.get("type") or "")
-            events.append(et)
-            if et == "response.text.delta":
-                text += str(msg.get("delta") or "")
-            elif et == "response.text.done":
-                text = str(msg.get("text") or text)
-            elif et == "response.audio.delta":
-                audio_n += 1
-                if msg.get("data"):
-                    got_audio = True
-            elif et == "response.audio.done":
-                break
-            elif et == "error":
-                errors.append(str(msg.get("message") or msg))
-                break
+        text, audio_n, voice_elapsed_s = await recv_turn(ws, phase="voice")
 
     silent = "<|silent|>" in (text or "")
-    ok = got_audio and not silent and not errors
+    ok = audio_n > 0 and not silent and not errors
     return {
         "ok": ok,
         "elapsed_s": round(time.time() - t0, 2),
+        "silent_text": silent_text[:120],
+        "silent_elapsed_s": silent_elapsed_s,
+        "voice_elapsed_s": voice_elapsed_s,
         "text": text[:120],
         "audio_n": audio_n,
         "errors": errors,
-        "events": events[-20:],
+        "events": events[-40:],
         "wav": str(wav),
     }
 
@@ -153,6 +190,10 @@ def main() -> None:
     ap.add_argument("--tts-instruct", default="")
     ap.add_argument("--tts-task-type", default="Base")
     ap.add_argument("--timeout", type=float, default=180)
+    ap.add_argument("--frame-count", type=int, default=2)
+    ap.add_argument("--frame-width", type=int, default=640)
+    ap.add_argument("--frame-height", type=int, default=360)
+    ap.add_argument("--silent-first", action="store_true")
     args = ap.parse_args()
 
     wav = args.wav
@@ -173,6 +214,10 @@ def main() -> None:
             tts_instruct=args.tts_instruct,
             tts_task_type=args.tts_task_type,
             timeout_s=args.timeout,
+            frame_count=args.frame_count,
+            frame_width=args.frame_width,
+            frame_height=args.frame_height,
+            silent_first=args.silent_first,
         )
     )
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)

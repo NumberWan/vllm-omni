@@ -137,6 +137,10 @@ if [[ "${SKIP_WARMUP:-0}" != "1" ]]; then
     --tts-language "${TTS_LANGUAGE:-Chinese}" \
     --tts-instruct "${TTS_INSTRUCT:-$DEFAULT_TTS_INSTRUCT}" \
     --tts-task-type "${TTS_TASK_TYPE:-Base}" \
+    --frame-count "${WARMUP_FRAME_COUNT:-2}" \
+    --frame-width "${WARMUP_FRAME_WIDTH:-640}" \
+    --frame-height "${WARMUP_FRAME_HEIGHT:-360}" \
+    --silent-first \
     | tee "$LOG_DIR/warmup.out"
 fi
 

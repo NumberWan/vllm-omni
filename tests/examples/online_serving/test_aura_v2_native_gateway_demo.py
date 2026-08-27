@@ -10,8 +10,10 @@ import json
 import wave
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+from examples.online_serving.aura_omni.native_gateway_web_demo import warmup_aura
 from examples.online_serving.aura_omni.native_gateway_web_demo.server import (
     NativeEventTranslator,
     _parse_video_frames,
@@ -64,6 +66,97 @@ def _wav_b64(samples: list[int], sample_rate: int = 24000) -> str:
 
 def _decode_envelope(raw: str) -> dict:
     return json.loads(raw)
+
+
+@pytest.mark.asyncio
+async def test_warmup_runs_browser_aligned_silent_turn_before_voice(
+    monkeypatch, tmp_path
+) -> None:
+    wav_path = tmp_path / "input.wav"
+    with wave.open(str(wav_path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16000)
+        writer.writeframes(b"\0\0" * 1600)
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.sent = []
+            self.received = [
+                {"type": "session.ready"},
+                {"type": "response.start", "request_id": "silent"},
+                {
+                    "type": "response.text.done",
+                    "request_id": "silent",
+                    "text": "<|silent|>",
+                },
+                {"type": "response.start", "request_id": "voice"},
+                {
+                    "type": "response.text.done",
+                    "request_id": "voice",
+                    "text": "沒問題。",
+                },
+                {
+                    "type": "response.audio.delta",
+                    "request_id": "voice",
+                    "data": "d2F2",
+                },
+                {"type": "response.audio.done", "request_id": "voice"},
+            ]
+
+        async def send(self, payload: str) -> None:
+            self.sent.append(json.loads(payload))
+
+        async def recv(self) -> str:
+            return json.dumps(self.received.pop(0))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+    websocket = FakeWebSocket()
+    monkeypatch.setattr(
+        warmup_aura.websockets,
+        "connect",
+        lambda *_args, **_kwargs: websocket,
+    )
+    result = await warmup_aura._warmup(
+        aura_ws="ws://test",
+        model="model",
+        wav=wav_path,
+        tts_speaker="Vivian",
+        tts_language="Chinese",
+        tts_instruct="",
+        tts_task_type="Base",
+        timeout_s=5,
+        frame_count=2,
+        frame_width=640,
+        frame_height=360,
+        silent_first=True,
+    )
+
+    assert result["ok"] is True
+    assert result["silent_text"] == "<|silent|>"
+    assert result["text"] == "沒問題。"
+    assert [message["type"] for message in websocket.sent[:3]] == [
+        "session.config",
+        "video.frame",
+        "video.frame",
+    ]
+    assert websocket.sent[0]["auto_trigger"] is True
+
+
+def test_stack_scripts_require_browser_aligned_warmup() -> None:
+    for name in ("run_1gpu_stack.sh", "run_2gpu_stack.sh"):
+        script = (DEMO_ROOT / name).read_text(encoding="utf-8")
+        warmup_call = script[script.index('"$PYTHON_BIN" "$SCRIPT_DIR/warmup_aura.py"') :]
+        assert '--frame-count "${WARMUP_FRAME_COUNT:-2}"' in warmup_call
+        assert '--frame-width "${WARMUP_FRAME_WIDTH:-640}"' in warmup_call
+        assert '--frame-height "${WARMUP_FRAME_HEIGHT:-360}"' in warmup_call
+        assert "--silent-first" in warmup_call
+        assert warmup_call.index("--silent-first") < warmup_call.index("nohup env")
 
 
 def test_native_video_batch_splits_into_omni_frames() -> None:
