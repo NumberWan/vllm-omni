@@ -388,6 +388,23 @@ def test_aura2tts_async_chunk_accumulates_and_sends_full_text_once_finished():
     assert payload["prompt_token_ids"]
 
 
+def test_aura2tts_async_chunk_finishes_without_audio_when_tts_disabled():
+    transfer_manager = _transfer_manager()
+    request = SimpleNamespace(
+        request_id="req-text-only",
+        external_req_id="req-text-only",
+        output_token_ids=[108386, 1773],
+        output_text="文字回覆",
+        additional_information={"aura_tts_enabled": [False]},
+        is_finished=lambda: True,
+    )
+
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+
+    assert payload["prompt_token_ids"] == []
+    assert payload["meta"]["finished"].item() is True
+
+
 def test_aura2tts_async_chunk_passes_token_ids_only_when_enabled():
     transfer_manager = _transfer_manager()
     request = SimpleNamespace(
@@ -1259,6 +1276,7 @@ def test_build_aura_input_resolves_packed_deferred_video():
     assert len(videos) == 1
     arr = videos[0][0] if isinstance(videos[0], (tuple, list)) else videos[0]
     assert hasattr(arr, "shape") and arr.shape == (2, 4, 4, 3)
+    assert next_input["additional_information"]["aura_tts_enabled"] == [False]
     clear_all_sessions()
 
 

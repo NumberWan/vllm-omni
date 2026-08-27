@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.stage_input_processors.stage_bypass import (
+    OMNI_BYPASS_STAGE_TEXT_KEY,
     OMNI_SKIP_STAGES_KEY,
     build_empty_asr_aura_chunk_payload,
     make_mock_text_stage_output,
@@ -45,3 +46,12 @@ def test_build_empty_asr_aura_chunk_payload():
     assert bool(meta["finished"].item()) is True
     assert bool(meta["is_segment_finished"].item()) is True
     assert meta["finished"].dtype == torch.bool
+
+
+def test_bypassed_stage_payload_preserves_explicit_input_text():
+    info = {
+        OMNI_SKIP_STAGES_KEY: [0],
+        OMNI_BYPASS_STAGE_TEXT_KEY: ["typed question"],
+    }
+    payload = build_empty_asr_aura_chunk_payload(info)
+    assert payload["aura_asr_transcript"] == "typed question"

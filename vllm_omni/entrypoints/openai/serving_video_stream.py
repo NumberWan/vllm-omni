@@ -20,11 +20,13 @@ Shared protocol (see :mod:`video_stream_base`):
         {"type": "response.text.done", "text": "...", "request_id": "..."}
         {"type": "response.audio.delta", "data": "...", "format": "wav", "request_id": "..."}
         {"type": "response.audio.done", "request_id": "..."}
+        {"type": "response.done", "request_id": "..."}
         {"type": "response.tool.preamble.text", "text": "...", "request_id": "..."}
         {"type": "response.tool.preamble.audio.delta", "data": "...", "format": "wav", "request_id": "..."}
         {"type": "response.tool.preamble.audio.done", "request_id": "..."}
         {"type": "response.tool.started", "call_id": "...", "name": "...", "request_id": "..."}
-        {"type": "response.tool.done", "call_id": "...", "name": "...", "status": "...", "content": "...", "request_id": "..."}
+        {"type": "response.tool.done", "call_id": "...", "name": "...",
+         "status": "...", "content": "...", "request_id": "..."}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 
@@ -33,7 +35,7 @@ Model-specific handlers:
         turns start on ``video.query`` only.
     :class:`AuraStreamingVideoHandler` — AURA Omni (ASR -> AURA -> TTS -> code2wav);
         auto-trigger on buffered frames; ``audio.done`` opens a turn after a full
-        utterance when unlocked; ``video.query`` is ignored.
+        utterance when unlocked; ``video.query`` opens a typed-text turn.
 """
 
 from __future__ import annotations
@@ -464,7 +466,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         return self._aura_stage1_tokenizer
 
     def supports_manual_query_turn(self) -> bool:
-        return False
+        return True
 
     def supports_query_interrupt(self) -> bool:
         return False
@@ -627,6 +629,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             system_prompt=system_prompt,
             skip_asr=len(audio_buffer) == 0,
             include_tts="audio" in aura_config.modalities,
+            input_text=query_text,
             max_rounds=aura_config.max_rounds,
             num_rounds_keep=aura_config.num_rounds_keep,
             pruning_enabled=aura_config.pruning_enabled,
@@ -1415,6 +1418,12 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     "request_id": request_id,
                 }
             )
+        await websocket.send_json(
+            {
+                "type": "response.done",
+                "request_id": request_id,
+            }
+        )
 
     @staticmethod
     def _tool_error_result(call: AuraToolCall, code: str) -> AuraToolResult:
@@ -1716,6 +1725,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     last_text_metrics,
                 )
             )
+        await websocket.send_json(_response_event({"type": "response.done"}))
 
     @staticmethod
     def _as_aura_config(config: StreamingVideoSessionConfig) -> AuraStreamingVideoSessionConfig:

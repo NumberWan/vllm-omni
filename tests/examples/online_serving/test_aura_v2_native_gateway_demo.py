@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -13,7 +14,13 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from examples.online_serving.aura_omni.native_gateway_web_demo import warmup_aura
+from examples.online_serving.aura_omni.native_gateway_web_demo import (
+    eval_runner,
+    warmup_aura,
+)
+from examples.online_serving.aura_omni.native_gateway_web_demo import (
+    server as native_server,
+)
 from examples.online_serving.aura_omni.native_gateway_web_demo.server import (
     NativeEventTranslator,
     _parse_video_frames,
@@ -167,6 +174,124 @@ def test_native_video_batch_splits_into_omni_frames() -> None:
     ]
 
 
+def test_eval_chunking_attaches_timestamped_queries_once() -> None:
+    chunks = eval_runner.build_chunks(
+        ["a", "b", "c"],
+        [0.5, 1.0, 1.5],
+        2,
+        [
+            {"timestamp": 0.8, "text": "first"},
+            {"timestamp": 1.2, "text": "second"},
+        ],
+    )
+    assert [[query["text"] for query in chunk["queries"]] for chunk in chunks] == [
+        ["first"],
+        ["second"],
+    ]
+    assert chunks[1]["frames"] == ["c", "c"]
+
+
+def test_eval_post_validates_and_runs_uploaded_video(monkeypatch) -> None:
+    async def fake_evaluate(video_path, **kwargs):
+        assert video_path.read_bytes() == b"video"
+        assert kwargs["queries"] == [{"timestamp": 1.0, "text": "看到了什麼？"}]
+        return {
+            "turns": [{"user": "看到了什麼？", "model": "一本書。"}],
+            "total_frames": 2,
+            "total_chunks": 1,
+            "elapsed_ms": 10,
+        }
+
+    monkeypatch.setattr(native_server, "evaluate_video", fake_evaluate)
+    monkeypatch.setattr(native_server, "create_subtitle_assets", lambda *_args: None)
+    client = TestClient(bridge_app)
+    response = client.post(
+        "/eval",
+        files={"file": ("sample.mp4", b"video", "video/mp4")},
+        data={
+            "queries": json.dumps([{"timestamp": 1, "text": "看到了什麼？"}]),
+            "fps": "2",
+            "num_frames_per_chunk": "2",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    assert response.json()["result"]["turns"][0]["model"] == "一本書。"
+
+
+def test_native_text_and_eval_video_map_to_manual_queries(monkeypatch) -> None:
+    class FakeAura:
+        def __init__(self) -> None:
+            self.sent = []
+            self.responses = asyncio.Queue()
+
+        async def send(self, payload: str) -> None:
+            message = json.loads(payload)
+            self.sent.append(message)
+            if message["type"] == "video.query":
+                await self.responses.put(
+                    json.dumps({"type": "response.start", "request_id": "typed"})
+                )
+                await self.responses.put(
+                    json.dumps(
+                        {
+                            "type": "response.text.done",
+                            "request_id": "typed",
+                            "text": "收到。",
+                        }
+                    )
+                )
+                await self.responses.put(
+                    json.dumps({"type": "response.done", "request_id": "typed"})
+                )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await self.responses.get()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+    aura = FakeAura()
+    monkeypatch.setattr(native_server.websockets, "connect", lambda *_args, **_kwargs: aura)
+    client = TestClient(bridge_app)
+    with client.websocket_connect("/ws?tts=0") as websocket:
+        websocket.send_json(
+            {
+                "type": "video",
+                "session_id": "eval",
+                "data": {
+                    "video_url": "data:video/jpeg;base64,one,two",
+                    "text": "畫面是什麼？",
+                },
+            }
+        )
+        assert websocket.receive_json()["type"] == "text"
+        assert websocket.receive_json()["type"] == "turn_done"
+        websocket.send_json(
+            {
+                "type": "text",
+                "session_id": "eval",
+                "data": {"text": "再說一次"},
+            }
+        )
+        assert websocket.receive_json()["type"] == "text"
+        assert websocket.receive_json()["type"] == "turn_done"
+
+    assert aura.sent[0]["type"] == "session.config"
+    assert aura.sent[0]["auto_trigger"] is False
+    assert aura.sent[0]["modalities"] == ["text"]
+    assert [message for message in aura.sent if message["type"] == "video.query"] == [
+        {"type": "video.query", "text": "畫面是什麼？"},
+        {"type": "video.query", "text": "再說一次"},
+    ]
+
+
 def test_translator_buffers_audio_into_one_native_wav_and_one_turn_done() -> None:
     translator = NativeEventTranslator()
     session_id = "session"
@@ -225,6 +350,24 @@ def test_translator_silent_turn_finishes_once_without_audio() -> None:
         )
         == []
     )
+
+
+def test_translator_text_only_turn_finishes_on_response_done() -> None:
+    translator = NativeEventTranslator()
+    translator.observe(
+        {"type": "response.start", "request_id": "typed"},
+        session_id="s",
+    )
+    text = translator.observe(
+        {"type": "response.text.done", "request_id": "typed", "text": "收到。"},
+        session_id="s",
+    )
+    done = translator.observe(
+        {"type": "response.done", "request_id": "typed"},
+        session_id="s",
+    )
+    assert [_decode_envelope(item)["type"] for item in text] == ["text"]
+    assert [_decode_envelope(item)["type"] for item in done] == ["turn_done"]
 
 
 def test_translator_preamble_audio_does_not_send_turn_done() -> None:

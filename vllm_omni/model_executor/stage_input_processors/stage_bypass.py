@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 OMNI_SKIP_STAGES_KEY = "omni_skip_stages"
+OMNI_BYPASS_STAGE_TEXT_KEY = "omni_bypass_stage_text"
 
 
 def _parse_skip_stage_ids(value: Any) -> frozenset[int]:
@@ -43,6 +44,16 @@ def should_skip_stage_from_info(additional_info: Any, stage_id: int) -> bool:
     return stage_id in _parse_skip_stage_ids(additional_info.get(OMNI_SKIP_STAGES_KEY))
 
 
+def bypass_stage_text_from_info(additional_info: Any) -> str:
+    """Return explicit text that replaces output from a bypassed text stage."""
+    if not isinstance(additional_info, dict):
+        return ""
+    value = additional_info.get(OMNI_BYPASS_STAGE_TEXT_KEY, "")
+    while isinstance(value, (list, tuple)) and len(value) == 1:
+        value = value[0]
+    return str(value) if isinstance(value, str) else ""
+
+
 def make_mock_text_stage_output(request_id: str, text: str = "", *, finished: bool = True) -> Any:
     """Synthetic text-stage output used when an upstream stage is bypassed (sync path)."""
     output = SimpleNamespace(
@@ -71,7 +82,7 @@ def build_empty_asr_aura_chunk_payload(
     """
     info = dict(additional_info) if isinstance(additional_info, dict) else {}
     payload: dict[str, Any] = {
-        "aura_asr_transcript": "",
+        "aura_asr_transcript": bypass_stage_text_from_info(info),
         "additional_information": info,
         "mm_processor_kwargs": mm_processor_kwargs,
         "meta": {

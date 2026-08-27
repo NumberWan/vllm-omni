@@ -76,9 +76,9 @@ def _session_state() -> AuraSessionState:
     return AuraSessionState(history=history, turn_frame_arrays=[], session_id=session_id)
 
 
-def test_aura_disables_manual_query_and_interrupt():
+def test_aura_enables_manual_query_without_interrupt():
     handler = AuraStreamingVideoHandler(chat_service=object())
-    assert handler.supports_manual_query_turn() is False
+    assert handler.supports_manual_query_turn() is True
     assert handler.supports_query_interrupt() is False
     assert handler.releases_turn_after_text_done() is True
 
@@ -261,10 +261,12 @@ def test_build_engine_prompt_omni_skip_stages():
         [],
         bytearray(),
         state,
-        "",
+        "typed question",
         {},
     )
     assert text_only["_aura_additional_information"]["omni_skip_stages"] == [0]
+    assert text_only["_aura_additional_information"]["omni_bypass_stage_text"] == ["typed question"]
+    assert text_only["_aura_additional_information"]["aura_tts_enabled"] == [False]
 
     _, with_audio = handler.build_engine_prompt(
         AuraStreamingVideoSessionConfig(model="test"),
@@ -275,6 +277,7 @@ def test_build_engine_prompt_omni_skip_stages():
         {},
     )
     assert with_audio["_aura_additional_information"]["omni_skip_stages"] == []
+    assert with_audio["_aura_additional_information"]["aura_tts_enabled"] == [True]
     assert "tts_ref_audio" not in text_only["_aura_additional_information"]
 
 
@@ -524,6 +527,7 @@ async def test_tool_loop_drains_pass1_executes_once_and_resumes(monkeypatch):
         "response.tool.done",
         "response.text.done",
         "response.audio.done",
+        "response.done",
     ]
     transcript_done = next(
         event for event in websocket.events if event["type"] == "user.transcript.done"
@@ -946,6 +950,7 @@ async def test_tool_final_without_audio_chunks_still_closes_audio_segment():
     assert [event["type"] for event in events] == [
         "response.text.done",
         "response.audio.done",
+        "response.done",
     ]
 
 

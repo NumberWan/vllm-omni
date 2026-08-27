@@ -42,6 +42,9 @@ from vllm_omni.model_executor.stage_input_processors.aura_tool_protocol import (
     extract_aura_tool_preamble,
     has_aura_tool_call_marker,
 )
+from vllm_omni.model_executor.stage_input_processors.stage_bypass import (
+    OMNI_BYPASS_STAGE_TEXT_KEY,
+)
 
 
 def _env_token_id(name: str, default: int) -> int:
@@ -97,6 +100,7 @@ DEFAULT_QWEN3_TTS_REF_TEXT = (
 DEFAULT_QWEN3_TTS_TOKENIZER = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
 _AURA_TTS_INFO_KEYS = (
+    "aura_tts_enabled",
     "tts_task_type",
     "tts_language",
     "tts_instruct",
@@ -365,6 +369,7 @@ def build_aura_streaming_turn_additional_information(
     system_prompt: str,
     skip_asr: bool,
     include_tts: bool,
+    input_text: str = "",
     tts_task_type: str | None = None,
     tts_language: str | None = None,
     tts_speaker: str | None = None,
@@ -395,7 +400,10 @@ def build_aura_streaming_turn_additional_information(
         },
         "aura_system_prompt": [system_prompt],
         "omni_skip_stages": [0] if skip_asr else [],
+        "aura_tts_enabled": [include_tts],
     }
+    if skip_asr and input_text:
+        additional_information[OMNI_BYPASS_STAGE_TEXT_KEY] = [input_text]
     # Pass client/API history knobs so Stage-1 does not fall back to its
     # shorter constructor defaults (max_rounds=20).
     if max_rounds is not None:
@@ -2005,6 +2013,13 @@ def aura2tts_async_chunk(
     pass_token_ids = _first_bool(emit_info.get("tts_pass_token_ids"), False) and not tool_enabled
     pending_buf = str(state.get("aura2tts_pending_sentence", ""))
     full_text = _clean_tts_text(str(state.get("aura2tts_text", ""))) or request_text
+    if not _first_bool(additional_info.get("aura_tts_enabled"), True):
+        if not finished:
+            return None
+        _commit_session_turn_if_present(additional_info, full_text or SILENT_TEXT)
+        request_payload.pop(str(request_id), None)
+        return _aura2tts_empty_finished_payload()
+
     # Tool-enabled passes must be classified from the complete Stage-1 output;
     # emitting an early sentence could speak before a later <tool_call>.
     # Defer mid-gen sentence TTS whenever think wrappers appear so reasoning is

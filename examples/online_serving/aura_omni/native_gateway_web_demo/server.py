@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import os
+import tempfile
 import time
 import wave
 from array import array
@@ -34,9 +35,18 @@ from pathlib import Path
 
 import uvicorn
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+try:
+    from examples.online_serving.aura_omni.native_gateway_web_demo.eval_runner import (
+        burn_subtitles,
+        create_subtitle_assets,
+        evaluate_video,
+    )
+except ModuleNotFoundError:
+    from eval_runner import burn_subtitles, create_subtitle_assets, evaluate_video
 
 LOG = logging.getLogger("aura_v2_native_bridge")
 
@@ -68,6 +78,9 @@ FRAME_DUMP_ENABLED = os.environ.get("AURA_FRAME_DUMP", "1").strip().lower() in {
     "yes",
     "on",
 }
+EVAL_VIDEO_DIR = Path(
+    os.environ.get("AURA_EVAL_VIDEO_DIR", "/tmp/aura_v2_native_eval/videos")
+).expanduser()
 _frame_dump_idx = 0
 
 app = FastAPI(title="AURA_v2 Omni ↔ original AURA demo bridge")
@@ -137,6 +150,125 @@ async def eval_page():
     if path.exists():
         return FileResponse(path)
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.post("/eval")
+async def run_eval(
+    file: UploadFile = File(...),
+    queries: str = Form("[]"),
+    fps: int = Form(2),
+    num_frames_per_chunk: int = Form(4),
+):
+    """Evaluate an uploaded video through this bridge with TTS disabled."""
+    try:
+        parsed_queries = json.loads(queries)
+    except json.JSONDecodeError:
+        return JSONResponse(
+            {"status": "error", "message": "queries 格式無效，應為 JSON 陣列"},
+            status_code=400,
+        )
+    if not isinstance(parsed_queries, list):
+        return JSONResponse(
+            {"status": "error", "message": "queries 應為 JSON 陣列"},
+            status_code=400,
+        )
+    if fps < 1 or fps > 30 or num_frames_per_chunk < 1 or num_frames_per_chunk > 64:
+        return JSONResponse(
+            {"status": "error", "message": "fps 或 num_frames_per_chunk 超出範圍"},
+            status_code=400,
+        )
+    for query in parsed_queries:
+        if not isinstance(query, dict) or not isinstance(query.get("text"), str):
+            return JSONResponse(
+                {"status": "error", "message": "每個 query 必須包含文字 text"},
+                status_code=400,
+            )
+        try:
+            query["timestamp"] = float(query.get("timestamp", 0))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"status": "error", "message": "query timestamp 必須是數字"},
+                status_code=400,
+            )
+
+    suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
+    with tempfile.NamedTemporaryFile(prefix="aura_eval_", suffix=suffix, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        while chunk := await file.read(1024 * 1024):
+            tmp.write(chunk)
+    try:
+        result = await evaluate_video(
+            tmp_path,
+            ws_url=f"ws://127.0.0.1:{BRIDGE_PORT}/ws?tts=0",
+            queries=parsed_queries,
+            fps=fps,
+            frames_per_chunk=num_frames_per_chunk,
+        )
+        assets = await asyncio.to_thread(
+            create_subtitle_assets,
+            tmp_path,
+            result,
+            file.filename or "video.mp4",
+            EVAL_VIDEO_DIR,
+        )
+        if assets is not None:
+            result["subtitle_video"] = assets
+        return {"status": "ok", "result": result}
+    except ValueError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+    except Exception as exc:
+        LOG.exception("eval failed")
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@app.post("/eval/burn-video")
+async def burn_eval_video(payload: dict):
+    source_name = str(payload.get("source_filename") or "")
+    ass_name = str(payload.get("ass_filename") or "")
+    if Path(source_name).name != source_name or Path(ass_name).name != ass_name:
+        return JSONResponse({"status": "error", "message": "檔名無效"}, status_code=400)
+    source_path = EVAL_VIDEO_DIR / source_name
+    ass_path = EVAL_VIDEO_DIR / ass_name
+    if not source_path.is_file() or not ass_path.is_file():
+        return JSONResponse({"status": "error", "message": "來源影片或字幕不存在"}, status_code=404)
+    output_name = f"{Path(source_name).stem}_burned.mp4"
+    output_path = EVAL_VIDEO_DIR / output_name
+    try:
+        if not output_path.exists():
+            await asyncio.to_thread(burn_subtitles, source_path, ass_path, output_path)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+    return {
+        "status": "ok",
+        "video": {
+            "filename": output_name,
+            "download_url": f"/eval/videos/{output_name}",
+        },
+    }
+
+
+@app.get("/eval/videos/{filename}")
+async def download_eval_video(filename: str):
+    if Path(filename).name != filename:
+        return JSONResponse({"status": "error", "message": "檔名無效"}, status_code=400)
+    path = EVAL_VIDEO_DIR / filename
+    if not path.is_file():
+        return JSONResponse({"status": "error", "message": "檔案不存在"}, status_code=404)
+    media_types = {
+        ".ass": "text/plain; charset=utf-8",
+        ".mov": "video/quicktime",
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".vtt": "text/vtt; charset=utf-8",
+    }
+    return FileResponse(
+        path,
+        media_type=media_types.get(path.suffix.lower()),
+        filename=filename,
+        content_disposition_type="inline",
+    )
 
 
 @app.get("/question_pages")
@@ -458,6 +590,8 @@ class NativeEventTranslator:
                 )
                 turn.audio_chunks.clear()
             output.extend(self._done(turn, session_id))
+        elif event_type == "response.done":
+            output.extend(self._done(turn, session_id))
         elif event_type == "response.tool.started":
             output.append(
                 _envelope(
@@ -501,6 +635,7 @@ async def _bridge_session(client: WebSocket) -> None:
     session_id = "unknown"
     dumper = _TtsTurnDumper(TTS_DUMP_DIR)
     translator = NativeEventTranslator()
+    tts_enabled = client.query_params.get("tts", "1") != "0"
     await client.accept()
 
     try:
@@ -510,8 +645,8 @@ async def _bridge_session(client: WebSocket) -> None:
                     {
                         "type": "session.config",
                         "model": AURA_MODEL,
-                        "modalities": ["text", "audio"],
-                        "auto_trigger": AUTO_TRIGGER,
+                        "modalities": ["text", "audio"] if tts_enabled else ["text"],
+                        "auto_trigger": AUTO_TRIGGER if tts_enabled else False,
                         "auto_trigger_min_frames": 2,
                         "max_frames": 256,
                         "max_frames_per_round": 16,
@@ -553,8 +688,8 @@ async def _bridge_session(client: WebSocket) -> None:
                         for fr in frames:
                             await aura.send(json.dumps({"type": "video.frame", "data": fr}))
                         text = str(data.get("text") or "").strip()
-                        if text:
-                            LOG.info("ignoring video-attached text (len=%d)", len(text))
+                        if text or not tts_enabled:
+                            await aura.send(json.dumps({"type": "video.query", "text": text}))
 
                     elif mtype == "audio":
                         translator.barge_in()
@@ -586,14 +721,19 @@ async def _bridge_session(client: WebSocket) -> None:
                         await aura.send(json.dumps({"type": "audio.done"}))
 
                     elif mtype == "text":
-                        await _send_client(
-                            client,
-                            _envelope(
-                                "error",
-                                {"message": "AURA_v2 Omni typed text is unavailable; use hold-to-talk"},
-                                session_id=session_id,
-                            ),
-                        )
+                        text = str(data.get("text") or "").strip()
+                        if not text:
+                            await _send_client(
+                                client,
+                                _envelope(
+                                    "error",
+                                    {"message": "typed text must not be empty"},
+                                    session_id=session_id,
+                                ),
+                            )
+                            continue
+                        translator.barge_in()
+                        await aura.send(json.dumps({"type": "video.query", "text": text}))
 
             async def aura_to_client() -> None:
                 async for raw in aura:

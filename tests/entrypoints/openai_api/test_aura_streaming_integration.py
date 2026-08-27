@@ -15,14 +15,13 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from vllm_omni.model_executor.stage_input_processors.aura_session_history import SessionHistory
-from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
-    AuraSessionState,
-    SessionHistory,
-)
 from vllm_omni.entrypoints.openai.serving_video_stream import (
     AuraStreamingVideoHandler,
     AuraStreamingVideoSessionConfig,
+)
+from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+    AuraSessionState,
+    SessionHistory,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -130,6 +129,42 @@ async def test_aura_auto_trigger_fires_after_min_frames():
     ws.put({"type": "video.done"})
     await asyncio.wait_for(task, timeout=2.0)
     assert "session.done" in ws.sent_types()
+
+
+@pytest.mark.asyncio
+async def test_aura_manual_query_starts_typed_turn_without_asr():
+    captured_query = ""
+    query_started = asyncio.Event()
+
+    class CapturingAuraHandler(AuraStreamingVideoHandler):
+        async def _process_query(self, *args, **kwargs):
+            nonlocal captured_query
+            captured_query = str(args[5])
+            query_started.set()
+
+    ws = TimedWebSocket()
+    handler = CapturingAuraHandler(
+        chat_service=object(),
+        engine_client=MagicMock(),
+        idle_timeout=5.0,
+    )
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "auto_trigger": False,
+            "enable_frame_filter": False,
+        }
+    )
+    await asyncio.sleep(0.05)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+    ws.put({"type": "video.query", "text": "描述畫面"})
+    await asyncio.wait_for(query_started.wait(), timeout=2.0)
+    assert captured_query == "描述畫面"
+
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
 
 
 @pytest.mark.asyncio

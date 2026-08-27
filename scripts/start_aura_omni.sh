@@ -45,7 +45,15 @@ fi
 SERVER_ENV=("CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
 # Avoid leaking a parent-shell PYTHONPATH (e.g. another checkout's site-packages)
 # into the AURA process, which would defeat an isolated VENV_DIR install.
-SERVER_ENV+=("PYTHONPATH=")
+if [[ -n "${VLLM_SOURCE_ROOT:-}" ]]; then
+  if [[ ! -f "$VLLM_SOURCE_ROOT/pyproject.toml" ]]; then
+    echo "ERROR: VLLM_SOURCE_ROOT is not a repository root: $VLLM_SOURCE_ROOT" >&2
+    exit 1
+  fi
+  SERVER_ENV+=("PYTHONPATH=$VLLM_SOURCE_ROOT")
+else
+  SERVER_ENV+=("PYTHONPATH=")
+fi
 for key in \
   VLLM_AURA_STAGE0_BYPASS \
   VLLM_AURA_TTS_GATE_ON_VOICE_ASR \

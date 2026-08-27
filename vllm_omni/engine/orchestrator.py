@@ -59,6 +59,7 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.model_executor.stage_input_processors.stage_bypass import (
     build_empty_asr_aura_chunk_payload,
+    bypass_stage_text_from_info,
     make_mock_text_stage_output,
     should_skip_stage,
     should_skip_stage_from_info,
@@ -2323,6 +2324,12 @@ class Orchestrator:
             request_id,
             self.async_chunk,
         )
+        additional_info = (
+            _resolve_prompt_additional_information(stage0_request)
+            or _resolve_prompt_additional_information(original_prompt)
+            or _resolve_prompt_additional_information(req_state.prompt)
+            or {}
+        )
 
         if self.async_chunk:
             # Keep final_stage_id as requested (typically 3). Stage0 bypass only skips
@@ -2339,12 +2346,6 @@ class Orchestrator:
             if req_state.final_stage_id > 0:
                 await self._prewarm_async_chunk_stages(request_id, stage0_request, req_state)
             if self._stage_receives_async_chunks(1):
-                additional_info = (
-                    _resolve_prompt_additional_information(stage0_request)
-                    or _resolve_prompt_additional_information(original_prompt)
-                    or _resolve_prompt_additional_information(req_state.prompt)
-                    or {}
-                )
                 await self._inject_bypassed_stage0_chunk(request_id, additional_info)
             else:
                 logger.info(
@@ -2352,18 +2353,22 @@ class Orchestrator:
                     "(not async-chunk receiver); mock-forwarding req=%s",
                     request_id,
                 )
-                await self._forward_bypassed_stage_zero(request_id, req_state)
+                await self._forward_bypassed_stage_zero(request_id, req_state, additional_info)
             return
 
-        await self._forward_bypassed_stage_zero(request_id, req_state)
+        await self._forward_bypassed_stage_zero(request_id, req_state, additional_info)
 
     async def _forward_bypassed_stage_zero(
         self,
         request_id: str,
         req_state: OrchestratorRequestState,
+        additional_info: dict[str, Any],
     ) -> None:
         """Sync-path Stage0 bypass via mock text output (non-async_chunk only)."""
-        mock_output = make_mock_text_stage_output(request_id, text="")
+        mock_output = make_mock_text_stage_output(
+            request_id,
+            text=bypass_stage_text_from_info(additional_info),
+        )
         is_streaming = req_state.streaming.enabled
         if is_streaming:
             await self._forward_to_next_stage(
