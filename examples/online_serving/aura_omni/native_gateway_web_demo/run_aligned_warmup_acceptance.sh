@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Validate three fresh browser-aligned warmups on isolated 2-GPU stacks.
+# Validate three fresh browser-aligned warmups on isolated 1-GPU stacks.
+# Functional acceptance uses 1 GPU; 2-GPU is reserved for performance runs.
 set -euo pipefail
+
+if [[ "${SKIP_GPU_RUN:-0}" != "1" ]] && command -v gpu >/dev/null 2>&1; then
+  exec gpu run --gpus 1 --timeout "${GPU_TIMEOUT:-6h}" \
+    --note "${GPU_NOTE:-AURA aligned warmup 1-GPU acceptance}" -- \
+    env SKIP_GPU_RUN=1 AURA_GPU=0 bash "$0" "$@"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${VENV_DIR:-/home/wtk/vllm-omni-AURA_026/.venv}"
@@ -9,6 +16,7 @@ OUT_ROOT="${OUT_ROOT:-/tmp/aura_aligned_warmup_acceptance}"
 REPS="${REPS:-3}"
 AURA_PORT="${AURA_PORT:-8670}"
 BRIDGE_PORT="${BRIDGE_PORT:-19999}"
+AURA_GPU="${AURA_GPU:-0}"
 RESULTS="$OUT_ROOT/results.tsv"
 
 mkdir -p "$OUT_ROOT"
@@ -56,11 +64,10 @@ for rep in $(seq 1 "$REPS"); do
     BRIDGE_PORT="$BRIDGE_PORT" \
     LOG_DIR="$log_dir" \
     VENV_DIR="$VENV_DIR" \
+    AURA_GPU="$AURA_GPU" \
     VLLM_AURA_SENTENCE_TTS=0 \
     TOOL_MODE=none \
-    GPU_TIMEOUT=2h \
-    GPU_NOTE="AURA aligned warmup acceptance ${rep}/${REPS}" \
-    bash "$SCRIPT_DIR/run_2gpu_stack.sh" >"$log_dir/stack.out" 2>&1 &
+    bash "$SCRIPT_DIR/run_1gpu_stack.sh" >"$log_dir/stack.out" 2>&1 &
   launcher_pid=$!
 
   ready=0
@@ -115,7 +122,7 @@ verify_s = float(verify.get("bridge_result", {}).get("elapsed_s") or 0)
 passed = (
     warmup.get("ok") is True
     and "<|silent|>" in str(warmup.get("silent_text") or "")
-    and 0 < warm_voice_s <= 8
+    and warm_voice_s > 0
     and verify_rc == 0
     and verify.get("pass") is True
     and 0 < verify_s <= 8
