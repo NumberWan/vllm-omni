@@ -108,6 +108,7 @@ else
       ALLOWED_LOCAL_MEDIA_PATH="${ALLOWED_LOCAL_MEDIA_PATH:-$REPO_ROOT/tests/assets/qwen3_tts}" \
       ${DEEPSEEK_API_KEY:+DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"} \
       ${SERPER_API_KEY:+SERPER_API_KEY="$SERPER_API_KEY"} \
+      ${VLLM_SOURCE_ROOT:+VLLM_SOURCE_ROOT="$VLLM_SOURCE_ROOT"} \
       bash scripts/start_aura_omni.sh
   ) >"$LOG_DIR/aura_start.out" 2>&1 &
   echo $! >"$LOG_DIR/aura_wrapper.pid"

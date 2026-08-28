@@ -479,11 +479,14 @@ class NativeEventTranslator:
     def __init__(self) -> None:
         self.turns: dict[str, _NativeTurn] = {}
 
-    def barge_in(self) -> None:
-        """Drop in-flight TTS so a new PTT is not followed by leftover audio."""
+    def barge_in(self, session_id: str = "") -> list[str]:
+        """Drop in-flight TTS and close the Native turn so playback can stop now."""
+        output: list[str] = []
         for turn in self.turns.values():
             turn.audio_chunks.clear()
             turn.suppress_audio = True
+            output.extend(self._done(turn, session_id))
+        return output
 
     def _turn(self, event: dict) -> _NativeTurn:
         request_id = str(event.get("request_id") or self._LEGACY)
@@ -692,7 +695,8 @@ async def _bridge_session(client: WebSocket) -> None:
                             await aura.send(json.dumps({"type": "video.query", "text": text}))
 
                     elif mtype == "audio":
-                        translator.barge_in()
+                        for payload in translator.barge_in(session_id):
+                            await _send_client(client, payload)
                         b64 = str(data.get("audio_b64") or "")
                         if not b64:
                             continue
@@ -732,7 +736,8 @@ async def _bridge_session(client: WebSocket) -> None:
                                 ),
                             )
                             continue
-                        translator.barge_in()
+                        for payload in translator.barge_in(session_id):
+                            await _send_client(client, payload)
                         await aura.send(json.dumps({"type": "video.query", "text": text}))
 
             async def aura_to_client() -> None:

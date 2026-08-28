@@ -80,6 +80,7 @@ def test_aura_enables_manual_query_without_interrupt():
     handler = AuraStreamingVideoHandler(chat_service=object())
     assert handler.supports_manual_query_turn() is True
     assert handler.supports_query_interrupt() is False
+    assert handler.supports_user_barge_in() is True
     assert handler.releases_turn_after_text_done() is True
 
 
@@ -1107,3 +1108,183 @@ async def test_text_done_uses_full_token_decode_when_incremental_detok_drops_dig
     )
     done = next(event for event in events if event.get("type") == "response.text.done")
     assert done["text"] == decoded_right
+
+
+class _TimedWebSocket:
+    def __init__(self):
+        self._q: asyncio.Queue[str] = asyncio.Queue()
+        self.accepted = False
+        self.sent: list[dict[str, Any]] = []
+
+    async def accept(self):
+        self.accepted = True
+
+    async def receive_text(self) -> str:
+        return await self._q.get()
+
+    async def send_json(self, data: dict[str, Any]):
+        self.sent.append(data)
+
+    def put(self, msg: dict[str, Any]):
+        import json
+
+        self._q.put_nowait(json.dumps(msg))
+
+
+def _pcm_chunk() -> str:
+    return base64.b64encode(b"\x00\x00" * 160).decode()
+
+
+class _BargeHandler(AuraStreamingVideoHandler):
+    def __init__(self):
+        self.started: list[str] = []
+        self.cancelled: list[str] = []
+        self.aborted: list[str] = []
+        self.release_after_text = False
+        self.started_event = asyncio.Event()
+        self.hold = asyncio.Event()
+        engine = SimpleNamespace(abort=self._abort, request_states={})
+        super().__init__(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+
+    def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
+        del trigger
+        return False
+
+    async def _abort(self, request_ids):
+        ids = list(request_ids) if isinstance(request_ids, list) else [request_ids]
+        self.aborted.extend(ids)
+
+    async def _process_query(self, *args, **kwargs):
+        request_id = kwargs.get("request_id") or args[6]
+        release_turn_lock = kwargs.get("release_turn_lock")
+        self.started.append(request_id)
+        if self.release_after_text and release_turn_lock is not None:
+            await release_turn_lock(
+                message_history=args[4],
+                user_message={"role": "user", "content": "x"},
+                response_text="先聽這段。",
+                request_id=request_id,
+            )
+        self.started_event.set()
+        try:
+            await self.hold.wait()
+        except asyncio.CancelledError:
+            self.cancelled.append(request_id)
+            raise
+
+
+async def _finish_session(handler: _BargeHandler, ws: _TimedWebSocket, task: asyncio.Task) -> None:
+    handler.hold.set()
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+async def _open_aura_session(handler: AuraStreamingVideoHandler, ws: _TimedWebSocket) -> asyncio.Task:
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put({"type": "session.config", "model": "test", "enable_frame_filter": False})
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+    await asyncio.sleep(0)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_abort_request_tree_includes_tool_pass_ids():
+    aborted: list[list[str]] = []
+
+    class FakeEngine:
+        def __init__(self):
+            self.request_states = {
+                "int-1": SimpleNamespace(external_request_id="video-abc"),
+                "int-2": SimpleNamespace(external_request_id="video-abc-tool-p1"),
+                "int-3": SimpleNamespace(external_request_id="video-zzz"),
+            }
+
+        async def abort(self, request_ids):
+            aborted.append(list(request_ids))
+
+    handler = AuraStreamingVideoHandler(chat_service=object(), engine_client=FakeEngine())
+    await handler._abort_request_tree("video-abc")
+    assert set(aborted[0]) == {"video-abc", "video-abc-tool-p1"}
+
+
+@pytest.mark.asyncio
+async def test_user_barge_in_aborts_locked_generation():
+    handler = _BargeHandler()
+    ws = _TimedWebSocket()
+    task = await _open_aura_session(handler, ws)
+    ws.put({"type": "video.query", "text": "先講一段。"})
+    await asyncio.wait_for(handler.started_event.wait(), timeout=2.0)
+    first = handler.started[0]
+
+    handler.started_event = asyncio.Event()
+    ws.put({"type": "audio.chunk", "data": _pcm_chunk()})
+    ws.put({"type": "audio.done"})
+    await asyncio.wait_for(handler.started_event.wait(), timeout=2.0)
+
+    assert first in handler.cancelled
+    assert first in handler.aborted
+    assert len(handler.started) == 2
+    await _finish_session(handler, ws, task)
+
+
+@pytest.mark.asyncio
+async def test_user_barge_in_aborts_tts_after_text_unlock():
+    handler = _BargeHandler()
+    handler.release_after_text = True
+    ws = _TimedWebSocket()
+    task = await _open_aura_session(handler, ws)
+    ws.put({"type": "video.query", "text": "先講一段。"})
+    await asyncio.wait_for(handler.started_event.wait(), timeout=2.0)
+    first = handler.started[0]
+
+    handler.started_event = asyncio.Event()
+    ws.put({"type": "audio.chunk", "data": _pcm_chunk()})
+    ws.put({"type": "audio.done"})
+    await asyncio.wait_for(handler.started_event.wait(), timeout=2.0)
+
+    assert first in handler.cancelled
+    assert first in handler.aborted
+    await _finish_session(handler, ws, task)
+
+
+@pytest.mark.asyncio
+async def test_vision_auto_trigger_does_not_abort_draining_tts():
+    class VisionHandler(_BargeHandler):
+        def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
+            return (not trigger.is_turn_locked) and trigger.frame_count >= 2
+
+    handler = VisionHandler()
+    handler.release_after_text = True
+    ws = _TimedWebSocket()
+    task = await _open_aura_session(handler, ws)
+    ws.put({"type": "video.query", "text": "先講一段。"})
+    await asyncio.wait_for(handler.started_event.wait(), timeout=2.0)
+    first = handler.started[0]
+
+    handler.started_event = asyncio.Event()
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(1, 2, 3))})
+    await asyncio.wait_for(handler.started_event.wait(), timeout=2.0)
+
+    assert first not in handler.cancelled
+    assert handler.aborted == []
+    assert len(handler.started) == 2
+    await _finish_session(handler, ws, task)
+
+
+@pytest.mark.asyncio
+async def test_user_barge_in_soak_does_not_deadlock():
+    handler = _BargeHandler()
+    ws = _TimedWebSocket()
+    task = await _open_aura_session(handler, ws)
+    ws.put({"type": "video.query", "text": "開始。"})
+    await asyncio.wait_for(handler.started_event.wait(), timeout=2.0)
+    for idx in range(8):
+        handler.started_event = asyncio.Event()
+        ws.put({"type": "audio.chunk", "data": _pcm_chunk()})
+        ws.put({"type": "audio.done"})
+        await asyncio.wait_for(handler.started_event.wait(), timeout=2.0)
+        assert len(handler.started) == idx + 2
+    assert len(handler.cancelled) == 8
+    await _finish_session(handler, ws, task)
+

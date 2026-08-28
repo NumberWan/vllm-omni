@@ -29,7 +29,9 @@ Protocol:
     then ``audio.done`` / ``audio.commit``. Pipelines that enable voice auto-trigger
     open a turn only after ``audio.done`` (not per chunk), when the turn lock is free.
     If ``audio.done`` arrives while locked, the buffered utterance is retained and the
-    voice turn starts automatically once the lock clears.
+    voice turn starts automatically once the lock clears, unless the pipeline enables
+    user barge-in. User barge-in aborts in-flight engine work immediately so a spoken
+    or typed turn does not leave the GPU synthesizing leftover TTS.
 """
 
 import asyncio
@@ -295,6 +297,14 @@ class OmniStreamingVideoHandler:
         """Whether a new turn may interrupt in-flight generation."""
         return True
 
+    def supports_user_barge_in(self) -> bool:
+        """Abort in-flight engine work when the user starts a spoken or typed turn.
+
+        Vision auto-trigger must not use this path: overlapping a silent visual
+        turn with draining TTS is intentional for AURA.
+        """
+        return False
+
     def releases_turn_after_text_done(self) -> bool:
         """Release turn lock and update history after assistant text (TTS may continue)."""
         return False
@@ -329,6 +339,7 @@ class OmniStreamingVideoHandler:
             audio_buffer = bytearray()  # raw PCM16 16kHz mono
             message_history: Any = self.create_message_history(config)
             active_request_id: str | None = None
+            inflight_request_id: str | None = None
             prev_request_id: str | None = None  # abort target iff prev was interrupted
             prev_was_interrupted: bool = False
             is_turn_locked: bool = False
@@ -396,7 +407,7 @@ class OmniStreamingVideoHandler:
                     )
                     return
                 pending_audio_done = False
-                await _start_query_turn(query_text="")
+                await _start_query_turn(query_text="", barge_in=self.supports_user_barge_in())
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
 
@@ -448,26 +459,35 @@ class OmniStreamingVideoHandler:
                     raise
 
             async def _cancel_active_query(*, abort_now: bool = False) -> None:
-                """Signal soft interrupt for the active query."""
-                nonlocal active_request_id, prev_was_interrupted, query_task, is_turn_locked
-                if active_request_id is not None:
-                    interrupt_event.set()
-                    prev_was_interrupted = True
-                    logger.info("Interrupt signaled for %s", active_request_id)
-                    if abort_now and self._engine_client:
-                        try:
-                            await self._engine_client.abort(active_request_id)
-                        except Exception:
-                            logger.debug("Abort failed for %s", active_request_id, exc_info=True)
-                    if query_task is not None and not query_task.done():
-                        query_task.cancel()
-                        await asyncio.gather(query_task, return_exceptions=True)
-                    query_task = None
-                    is_turn_locked = False
+                """Stop the in-flight query, including TTS that outlives the turn lock."""
+                nonlocal active_request_id, inflight_request_id, prev_request_id
+                nonlocal prev_was_interrupted, query_task, is_turn_locked
+                target_id = inflight_request_id or active_request_id
+                has_task = query_task is not None and not query_task.done()
+                if target_id is None and not has_task:
+                    return
+                interrupt_event.set()
+                prev_was_interrupted = True
+                if target_id is not None:
+                    logger.info("Interrupt signaled for %s abort_now=%s", target_id, abort_now)
+                    prev_request_id = target_id
+                    if abort_now:
+                        await self._abort_request_tree(target_id)
+                if has_task:
+                    query_task.cancel()
+                    await asyncio.gather(query_task, return_exceptions=True)
+                query_task = None
+                is_turn_locked = False
+                active_request_id = None
+                inflight_request_id = None
 
-            async def _start_query_turn(*, query_text: str) -> None:
+            async def _start_query_turn(*, query_text: str, barge_in: bool = False) -> None:
                 """Schedule a new inference turn from the current buffers."""
-                nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task, is_turn_locked
+                nonlocal active_request_id, inflight_request_id, prev_request_id
+                nonlocal prev_was_interrupted, query_task, is_turn_locked
+
+                if barge_in and self.supports_user_barge_in():
+                    await _cancel_active_query(abort_now=True)
 
                 if self.releases_turn_after_text_done():
                     turn_busy = is_turn_locked
@@ -493,6 +513,7 @@ class OmniStreamingVideoHandler:
 
                 request_id = f"video-{uuid.uuid4().hex[:12]}"
                 active_request_id = request_id
+                inflight_request_id = request_id
                 if self.releases_turn_after_text_done():
                     is_turn_locked = True
                 interrupt_event.clear()
@@ -502,7 +523,7 @@ class OmniStreamingVideoHandler:
                 query_prewarmed_frames = dict(frame_pil_cache)
 
                 async def _run_query() -> None:
-                    nonlocal active_request_id, prev_request_id, is_turn_locked
+                    nonlocal active_request_id, inflight_request_id, prev_request_id, is_turn_locked
                     release_cb = _release_turn_lock if self.releases_turn_after_text_done() else None
                     try:
                         await self._process_query(
@@ -518,6 +539,8 @@ class OmniStreamingVideoHandler:
                             release_turn_lock=release_cb,
                         )
                     finally:
+                        if inflight_request_id == request_id:
+                            inflight_request_id = None
                         if active_request_id == request_id:
                             is_turn_locked = False
                             prev_request_id = request_id
@@ -529,7 +552,7 @@ class OmniStreamingVideoHandler:
 
             async def _processor() -> None:
                 """Process enqueued messages."""
-                nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
+                nonlocal active_request_id, inflight_request_id, prev_request_id, prev_was_interrupted, query_task
                 nonlocal pending_audio_done
 
                 while True:
@@ -643,7 +666,7 @@ class OmniStreamingVideoHandler:
                         if not has_audio:
                             pending_audio_done = False
                             continue
-                        if audio_locked:
+                        if audio_locked and not self.supports_user_barge_in():
                             # Keep the utterance and open a voice turn after unlock.
                             # Dropping here would lose push-to-talk while silent/vision
                             # turns hold the lock under continuous video.frame streaming.
@@ -665,7 +688,10 @@ class OmniStreamingVideoHandler:
                             )
                             continue
                         pending_audio_done = False
-                        await _start_query_turn(query_text="")
+                        await _start_query_turn(
+                            query_text="",
+                            barge_in=self.supports_user_barge_in(),
+                        )
 
                     elif msg_type == "video.query":
                         if not self.supports_manual_query_turn():
@@ -684,13 +710,22 @@ class OmniStreamingVideoHandler:
                             except Exception:
                                 pass
 
-                        is_generating = active_request_id is not None or (
-                            query_task is not None and not query_task.done()
+                        is_generating = (
+                            active_request_id is not None
+                            or inflight_request_id is not None
+                            or (query_task is not None and not query_task.done())
                         )
-                        if is_generating and not self.supports_query_interrupt():
+                        if (
+                            is_generating
+                            and not self.supports_query_interrupt()
+                            and not self.supports_user_barge_in()
+                        ):
                             continue
 
-                        await _start_query_turn(query_text=query_text)
+                        await _start_query_turn(
+                            query_text=query_text,
+                            barge_in=self.supports_user_barge_in(),
+                        )
 
                     elif msg_type == "video.done":
                         await _gather_pending_query_tasks()
@@ -775,6 +810,25 @@ class OmniStreamingVideoHandler:
             return None
 
         return config
+
+    async def _abort_request_tree(self, request_id: str) -> None:
+        """Abort a logical turn and any engine ids derived from it (tool passes)."""
+        if self._engine_client is None or not request_id:
+            return
+        abort_ids = {request_id}
+        states = getattr(self._engine_client, "request_states", None)
+        if isinstance(states, dict):
+            prefix = f"{request_id}-"
+            for state in states.values():
+                external_id = getattr(state, "external_request_id", None)
+                if external_id == request_id or (
+                    isinstance(external_id, str) and external_id.startswith(prefix)
+                ):
+                    abort_ids.add(external_id)
+        try:
+            await self._engine_client.abort(list(abort_ids))
+        except Exception:
+            logger.debug("Abort failed for %s", request_id, exc_info=True)
 
     async def _process_query(
         self,
@@ -941,12 +995,13 @@ class OmniStreamingVideoHandler:
             )
 
             async for output in result_gen:
-                # Soft interrupt: drain without sending
+                # Soft interrupt: stop forwarding immediately. Engine abort is
+                # issued by the session loop so leftover TTS does not keep GPU busy.
                 if interrupt_event.is_set():
                     if not interrupted:
-                        logger.info("Generation interrupted — draining")
+                        logger.info("Generation interrupted — stopping output")
                         interrupted = True
-                    continue
+                    break
 
                 if not isinstance(output, OmniRequestOutput):
                     continue

@@ -471,6 +471,9 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     def supports_query_interrupt(self) -> bool:
         return False
 
+    def supports_user_barge_in(self) -> bool:
+        return True
+
     def releases_turn_after_text_done(self) -> bool:
         # Allow the next vision turn after assistant text finishes while TTS may
         # still be draining. Combined with freeze_turn_video / commit_turn frame
@@ -1559,10 +1562,8 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
             async for output in result_gen:
                 if interrupt_event.is_set():
-                    if not interrupted:
-                        interrupted = True
-                if interrupted:
-                    continue
+                    interrupted = True
+                    break
 
                 if not isinstance(output, OmniRequestOutput):
                     continue

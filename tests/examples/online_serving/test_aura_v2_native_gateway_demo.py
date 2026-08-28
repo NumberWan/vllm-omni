@@ -493,11 +493,22 @@ def test_translator_barge_in_drops_pending_tts() -> None:
         },
         session_id="s",
     )
-    translator.barge_in()
+    translator.barge_in("s")
     leftover = translator.observe(
         {"type": "response.audio.done", "request_id": request_id},
         session_id="s",
     )
     types = [_decode_envelope(item)["type"] for item in leftover]
-    assert types == ["turn_done"]
+    assert types == []
     assert "audio" not in types
+
+
+def test_translator_barge_in_closes_native_turn_immediately() -> None:
+    translator = NativeEventTranslator()
+    request_id = "old-turn"
+    translator.observe(
+        {"type": "response.text.done", "request_id": request_id, "text": "先聽這段。"},
+        session_id="s",
+    )
+    closed = [_decode_envelope(item)["type"] for item in translator.barge_in("s")]
+    assert closed == ["turn_done"]
