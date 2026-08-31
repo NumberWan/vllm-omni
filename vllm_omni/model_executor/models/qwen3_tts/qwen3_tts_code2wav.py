@@ -66,6 +66,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self.has_postprocess = False
         self.enable_update_additional_information = True
         self.requires_raw_input_tokens = True
+        self.requires_request_ids = True
 
         self._decode_chunk_frames = 300
         self._decode_left_context_frames = 25
@@ -305,9 +306,22 @@ class Qwen3TTSCode2Wav(nn.Module):
         empty = torch.zeros((0,), dtype=torch.float32)
 
         if input_ids is None or input_ids.numel() == 0:
+            request_ids = kwargs.get("request_ids")
+            seq_token_counts = kwargs.get("seq_token_counts")
+            if request_ids is not None:
+                num_req = len(request_ids)
+            elif seq_token_counts is not None:
+                num_req = len(seq_token_counts)
+            elif runtime_additional_information:
+                num_req = len(runtime_additional_information)
+            else:
+                num_req = 1
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
+                multimodal_outputs={
+                    "model_outputs": [empty] * num_req,
+                    "sr": [sr_tensor] * num_req,
+                },
             )
 
         runtime_infos = runtime_additional_information or []

@@ -452,16 +452,30 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 )
         elif isinstance(multimodal_outputs_raw, Mapping):
             num_reqs = self.input_batch.num_reqs
+            model_outputs = multimodal_outputs_raw.get("model_outputs")
+            broadcast_empty_output = (
+                num_reqs > 1
+                and isinstance(model_outputs, list)
+                and len(model_outputs) == 1
+                and (
+                    model_outputs[0] is None
+                    or (isinstance(model_outputs[0], torch.Tensor) and model_outputs[0].numel() == 0)
+                )
+            )
             for i in range(num_reqs):
                 mm_payload = {}
                 for key, out in multimodal_outputs_raw.items():
                     if isinstance(out, list):
                         if len(out) != num_reqs:
-                            raise ValueError(
-                                f"Multimodal output list for key '{key}' has length {len(out)} "
-                                f"but expected {num_reqs} (one entry per request)."
-                            )
-                        mm_payload[key] = out[i].detach().to("cpu").contiguous()
+                            if not (broadcast_empty_output and len(out) == 1):
+                                raise ValueError(
+                                    f"Multimodal output list for key '{key}' has length {len(out)} "
+                                    f"but expected {num_reqs} (one entry per request)."
+                                )
+                            value = out[0]
+                        else:
+                            value = out[i]
+                        mm_payload[key] = value.detach().to("cpu").contiguous() if value is not None else None
                     elif isinstance(out, torch.Tensor):
                         mm_payload[key] = out.detach().to("cpu").contiguous()
                     else:

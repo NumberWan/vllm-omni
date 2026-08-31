@@ -16,14 +16,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyInputBatch:
-    def __init__(self):
-        self.req_ids = ["req-1"]
-        self.req_id_to_index = {"req-1": 0}
-        self.num_reqs = 1
+    def __init__(self, num_reqs=1):
+        self.req_ids = [f"req-{i}" for i in range(num_reqs)]
+        self.req_id_to_index = {req_id: i for i, req_id in enumerate(self.req_ids)}
+        self.num_reqs = num_reqs
         self.vocab_size = 10
 
 
-def _make_runner(multimodal_outputs):
+def _make_runner(multimodal_outputs, num_reqs=1):
     runner = object.__new__(GPUGenerationModelRunner)
     runner.execute_model_state = ExecuteModelState(
         None,
@@ -40,7 +40,7 @@ def _make_runner(multimodal_outputs):
         None,
     )
     runner.kv_connector_output = None
-    runner.input_batch = _DummyInputBatch()
+    runner.input_batch = _DummyInputBatch(num_reqs)
     runner.use_async_scheduling = False
     runner.device = torch.device("cpu")
     runner.supports_mm_inputs = False
@@ -90,6 +90,31 @@ def test_sample_tokens_dict_output():
     assert "audio" in output.multimodal_outputs[0]
     assert "unused" not in output.multimodal_outputs[0]
     assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
+
+
+def test_sample_tokens_broadcasts_single_empty_sentinel_to_batch():
+    empty = torch.zeros(0)
+    sample_rate = torch.tensor(24000)
+    runner = _make_runner(
+        {"model_outputs": [empty], "sr": [sample_rate]},
+        num_reqs=4,
+    )
+
+    output = GPUGenerationModelRunner.sample_tokens(runner)
+
+    assert len(output.multimodal_outputs) == 4
+    assert all(payload["model_outputs"].numel() == 0 for payload in output.multimodal_outputs)
+    assert all(payload["sr"].item() == 24000 for payload in output.multimodal_outputs)
+
+
+def test_sample_tokens_rejects_single_nonempty_output_for_batch():
+    runner = _make_runner(
+        {"model_outputs": [torch.ones(1)], "sr": [torch.tensor(24000)]},
+        num_reqs=2,
+    )
+
+    with pytest.raises(ValueError, match="length 1 but expected 2"):
+        GPUGenerationModelRunner.sample_tokens(runner)
 
 
 class _StubSchedulerOutput:

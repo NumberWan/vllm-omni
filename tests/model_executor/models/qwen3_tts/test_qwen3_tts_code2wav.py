@@ -391,6 +391,34 @@ def test_forward_emits_zero_samples_for_empty_codec_payload():
     assert out.multimodal_outputs["model_outputs"][0].numel() == 0
 
 
+def test_forward_emits_one_empty_output_per_request_for_empty_batch():
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=torch.zeros(0, dtype=torch.long),
+        request_ids=["req-0", "req-1", "req-2", "req-3"],
+    )
+
+    assert model.requires_request_ids
+    assert len(out.multimodal_outputs["model_outputs"]) == 4
+    assert len(out.multimodal_outputs["sr"]) == 4
+    assert all(audio.numel() == 0 for audio in out.multimodal_outputs["model_outputs"])
+
+
+def test_forward_uses_runtime_info_count_for_empty_batch_without_token_counts():
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=None,
+        runtime_additional_information=[
+            {"meta": {"finished": torch.tensor(True)}} for _ in range(4)
+        ],
+    )
+
+    assert len(out.multimodal_outputs["model_outputs"]) == 4
+    assert len(out.multimodal_outputs["sr"]) == 4
+
+
 def test_forward_batches_equal_length_requests_in_one_decoder_call():
     model = _make_model()
 
