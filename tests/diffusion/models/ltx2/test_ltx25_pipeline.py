@@ -185,7 +185,7 @@ def test_ltx25_missing_gemma4_recommends_supported_transformers_range(monkeypatc
         ltx2_components.initialize_pipeline_components(pipe, od_config)
 
     assert str(exc_info.value) == (
-        "LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.10.1,<5.15."
+        "LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.13.0,<5.15."
     )
 
 

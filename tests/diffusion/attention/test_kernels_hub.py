@@ -56,6 +56,36 @@ def test_explicit_kernels_hub_selection_does_not_fallback(monkeypatch: pytest.Mo
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_explicit_kernels_hub_variant_miss_does_not_fallback(monkeypatch: pytest.MonkeyPatch):
+    """Explicit Hub backends must fail loudly when no build variant resolves (#6971)."""
+    from vllm.platforms.interface import DeviceCapability
+
+    from vllm_omni.diffusion.envs import PACKAGES_CHECKER
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(9, 0)),
+    )
+    monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": True})
+
+    kernels_module = types.ModuleType("kernels")
+
+    def _missing_variant(repo_id, version=None, **kwargs):
+        raise FileNotFoundError(f"Cannot find a build variant for this system in {repo_id}")
+
+    kernels_module.get_kernel = _missing_variant  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "kernels", kernels_module)
+
+    with pytest.raises(RuntimeError, match="no compatible build"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_3_HUB", head_size=64)
+    with pytest.raises(RuntimeError, match="no compatible build"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_HUB", head_size=64)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_explicit_flash_attention_unavailable_does_not_fallback(monkeypatch: pytest.MonkeyPatch):
     from vllm.platforms.interface import DeviceCapability
 
