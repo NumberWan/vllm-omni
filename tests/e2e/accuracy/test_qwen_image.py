@@ -73,7 +73,22 @@ def _local_files_only(model: str) -> bool:
     return Path(model).exists()
 
 
+_OMNI_FA3_HUB_BACKEND = "FLASH_ATTN_3_HUB"
+_OMNI_FA3_HUB_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_FA3_HUB_BACKEND}
+
+
+def _assert_omni_fa3_hub_resolves() -> None:
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls(_OMNI_FA3_HUB_BACKEND, head_size=128)
+    expected = DiffusionAttentionBackendEnum.FLASH_ATTN_3_HUB.get_path()
+    assert path == expected, path
+    print(f"Resolved Omni attention backend: {_OMNI_FA3_HUB_BACKEND} -> {path}")
+
+
 def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
+    _assert_omni_fa3_hub_resolves()
     server_args = [
         "--num-gpus",
         "1",
@@ -82,8 +97,10 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
         "--init-timeout",
         "900",
         "--fa-deterministic",
+        "--diffusion-attention-backend",
+        _OMNI_FA3_HUB_BACKEND,
     ]
-    with OmniServer(model, server_args, use_omni=True) as omni_server:
+    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_FA3_HUB_ENV) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
@@ -144,8 +161,18 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
 
 
 def _run_vllm_omni_qwen_image_2512(*, model: str, output_path: Path) -> Image.Image:
-    server_args = ["--num-gpus", "1", "--stage-init-timeout", "300", "--init-timeout", "900"]
-    with OmniServer(model, server_args, use_omni=True) as omni_server:
+    _assert_omni_fa3_hub_resolves()
+    server_args = [
+        "--num-gpus",
+        "1",
+        "--stage-init-timeout",
+        "300",
+        "--init-timeout",
+        "900",
+        "--diffusion-attention-backend",
+        _OMNI_FA3_HUB_BACKEND,
+    ]
+    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_FA3_HUB_ENV) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={

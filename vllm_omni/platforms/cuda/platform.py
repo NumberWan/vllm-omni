@@ -232,17 +232,17 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                     )
 
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
-                # Resolve the Hub build at selection time. A missing torch/CUDA
-                # variant used to degrade silently to native/SDPA later (#6971).
+                # Same loader/cache as execution (Hub versions 1 then 2). A missing
+                # torch/CUDA variant used to degrade silently to native/SDPA (#6971).
                 hub_repo = (
                     "kernels-community/flash-attn3"
                     if backend_upper == "FLASH_ATTN_3_HUB"
                     else "kernels-community/flash-attn2"
                 )
                 try:
-                    from kernels import get_kernel
+                    from vllm_omni.diffusion.attention.backends.flash_attn_hub import _get_hub_module
 
-                    get_kernel(hub_repo, version=1)
+                    _get_hub_module(hub_repo)
                 except Exception as e:
                     raise RuntimeError(
                         f"{backend_upper} was explicitly selected, but {hub_repo} has no "
