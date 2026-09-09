@@ -186,9 +186,12 @@ class StageEngineCoreClientBase(StageClientBase):
             )
             if engine_manager is not None:
                 self.resources.engine_manager = engine_manager
-                self.start_engine_core_monitor()
             if coordinator is not None:
                 self.resources.coordinator = coordinator
+            # Defer the sentinel/liveness thread until every sibling stage is up.
+            # Starting it as soon as stage-0 attaches lets a later stage spawn
+            # trip the monitor and SIGTERM a healthy earlier engine.
+            self._liveness_monitor_started = False
         except Exception:
             logger.exception(
                 "[%s] stage-%s [rep-%s] EngineCore init failed",
@@ -225,6 +228,17 @@ class StageEngineCoreClientBase(StageClientBase):
         """
         if self.resources.engine_dead:
             raise EngineDeadError(f"Stage-{self.stage_id} engine core is dead")
+
+    def start_liveness_monitor(self) -> None:
+        """Start the engine-core monitor after every sibling stage is up.
+
+        Starting it as soon as stage-0 attaches lets a later stage spawn
+        trip the monitor and SIGTERM a healthy earlier engine.
+        """
+        if self._liveness_monitor_started or self.resources.engine_manager is None:
+            return
+        self._liveness_monitor_started = True
+        self.start_engine_core_monitor()
 
     # ==================== Overrides ====================
 

@@ -293,6 +293,32 @@ class StageRuntime:
     ) -> None:
         """Populate runtime fields after replica initialization succeeds."""
         self.stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients)
+        # Start liveness monitors only after all stages have finished spawning.
+        # Per-stage monitors that start during bring-up can false-positive when
+        # a sibling stage is launched in the same parent process.
+        for pool in self.stage_pools:
+            for client in pool.clients:
+                if client is None:
+                    continue
+                mgr = getattr(getattr(client, "resources", None), "engine_manager", None)
+                if mgr is not None:
+                    for proc in getattr(mgr, "processes", []):
+                        alive: bool | None = None
+                        if proc.pid is not None:
+                            try:
+                                os.kill(proc.pid, 0)
+                                alive = True
+                            except ProcessLookupError:
+                                alive = False
+                        logger.info(
+                            "[StageRuntime] pre-monitor %s pid=%s kill0=%s",
+                            proc.name,
+                            proc.pid,
+                            alive,
+                        )
+                start_monitor = getattr(client, "start_liveness_monitor", None)
+                if start_monitor is not None:
+                    start_monitor()
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         """Hook for runtimes that need infrastructure before replica init."""

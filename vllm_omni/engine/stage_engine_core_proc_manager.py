@@ -13,15 +13,19 @@ own ZMQ allocation from :class:`OmniMasterServer` and (when an
 ``omni_coordinator_address`` is provided) its own
 :class:`OmniCoordClientForStage` reporting heartbeat / status.
 
-Liveness monitoring and shutdown are inherited from
-:class:`CoreEngineProcManager` unchanged.
+Shutdown is inherited from :class:`CoreEngineProcManager`. Liveness monitoring
+is overridden so a later stage spawn cannot spuriously SIGTERM an earlier
+stage that is still alive.
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
+import time
 import weakref
+from multiprocessing import get_context
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
 
@@ -29,7 +33,6 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils import numa_utils
-from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor import Executor
 from vllm.v1.utils import shutdown
@@ -82,7 +85,11 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         if local_engine_count <= 0:
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
 
-        context = get_mp_context()
+        # Omni stages share a CUDA-using parent. vLLM's default mp method is
+        # fork, which copies the parent's CUDA context and kills earlier
+        # stage processes when the 3rd+ engine is launched (G1: s0 dies at
+        # stage-2 start, s1 dies at stage-3 start, even on separate GPUs).
+        context = get_context("spawn")
         common_kwargs: dict[str, object] = {
             "vllm_config": vllm_config,
             "local_client": local_client,
@@ -158,3 +165,46 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         finally:
             if self.finished_procs():
                 self.shutdown()
+
+    def monitor_engine_liveness(self) -> None:
+        """Wait until a stage engine OS process actually exits.
+
+        Do not use ``connection.wait`` on multiprocessing sentinels. Spawning a
+        later stage in the same parent makes earlier sentinels readable; a
+        follow-up ``Process.is_alive()`` / ``Popen.poll()`` can then latch a
+        false exit. ``MPClient`` treats that return as unexpected death and
+        SIGTERMs a healthy engine (G1: stages 0–2 die as soon as the next
+        stage is spawned).
+        """
+        while not self.manager_stopped.is_set():
+            time.sleep(1.0)
+            for proc in list(self.processes):
+                if _os_child_is_running(proc):
+                    continue
+                logger.error(
+                    "Engine process %s is gone (pid=%s)",
+                    proc.name,
+                    proc.pid,
+                )
+                self.failed_proc_name = proc.name
+                self.shutdown()
+                return
+
+
+def _os_child_is_running(proc: BaseProcess) -> bool:
+    """Return True if the OS still has this pid.
+
+    ``os.kill(pid, 0)`` does not reap and does not call ``Popen.poll()``.
+    ``waitpid``/sentinels/``is_alive()`` can false-positive while a sibling
+    stage is spawning; the monitor then SIGTERMs a healthy engine.
+    """
+    pid = proc.pid
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
