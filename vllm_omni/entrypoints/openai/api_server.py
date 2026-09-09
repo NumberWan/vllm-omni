@@ -161,6 +161,8 @@ from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
     VideoFrames,
+    _decode_image_bytes,
+    _validate_image_pixel_limit,
     decode_audio_url,
     decode_input_reference,
 )
@@ -201,9 +203,9 @@ def _load_model_chat_template_json(model: str) -> str | None:
 
     if template_path is None:
         try:
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            template_path = hf_hub_download(
+            template_path = hf_api().hf_hub_download(
                 repo_id=model,
                 filename="chat_template.json",
                 local_files_only=True,
@@ -1290,10 +1292,12 @@ async def omni_init_app_state(
     state.openai_serving_duplex = None
     if state.openai_serving_chat is not None and should_enable_duplex_endpoint(
         state.stage_configs,
-        config_path=getattr(args, "deploy_config", None),
+        config_path=getattr(engine_client, "config_path", None) or getattr(args, "deploy_config", None),
     ):
         state.openai_serving_duplex = OmniDuplexSessionHandler(
             chat_service=state.openai_serving_chat,
+            served_model_name=model_name,
+            log_stats=state.log_stats,
             duplex_session_config=getattr(engine_client, "duplex_session_config", None),
             serving_runtime_adapter_path=getattr(engine_client, "duplex_serving_adapter_path", None),
         )
@@ -1850,8 +1854,8 @@ async def realtime_websocket(websocket: WebSocket):
             logger.warning("Duplex warmup still running after 120 s; admitting the client anyway.")
     duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
     duplex_query = websocket.query_params.get("duplex")
-    use_duplex_realtime = (
-        duplex_handler is not None and isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}
+    use_duplex_realtime = duplex_handler is not None and (
+        duplex_query is None or (isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"})
     )
     if use_duplex_realtime and duplex_handler is not None:
         await duplex_handler.handle_realtime_session(websocket)
@@ -3436,6 +3440,15 @@ def _validate_minimax_h3_image_payload(
     try:
         with Image.open(io.BytesIO(payload)) as image:
             image_format = str(image.format or "").lower()
+            if image_format in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
+                _validate_image_pixel_limit(image)
+    except InvalidInputReferenceError as exc:
+        raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+    except Image.DecompressionBombError as exc:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST.value,
+            detail=f"Invalid uploaded image reference: {filename}; image exceeds the decoder pixel limit.",
+        ) from exc
     except (OSError, ValueError) as exc:
         if allow_non_image:
             return
@@ -3476,10 +3489,14 @@ async def _persist_uploaded_media_references(
             if kind == "image":
                 try:
                     _validate_minimax_h3_image_payload(payload, filename=upload.filename)
-                    with Image.open(io.BytesIO(payload)) as image:
-                        images.append(image.convert("RGB"))
-                except (OSError, ValueError) as exc:
-                    raise HTTPException(400, detail=f"Invalid uploaded image reference: {upload.filename}") from exc
+                    images.append(
+                        _decode_image_bytes(
+                            payload,
+                            source=f"uploaded image reference: {upload.filename}",
+                        )
+                    )
+                except InvalidInputReferenceError as exc:
+                    raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
                 continue
             suffix = Path(upload.filename or "").suffix.lower()
             if kind == "video" and suffix and suffix not in MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES:
