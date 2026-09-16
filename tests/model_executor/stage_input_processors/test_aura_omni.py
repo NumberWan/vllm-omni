@@ -28,6 +28,8 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     _estimate_tts_prompt_len_from_token_ids,
     _pop_emit_ready_tts_text,
     _pop_native_tts_sentence,
+    _clean_tts_text,
+    _tts_content_char_count,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
     SessionHistory,
@@ -386,6 +388,7 @@ def test_aura2tts_async_chunk_accumulates_and_sends_full_text_once_finished():
     assert payload["task_type"] == ["Base"]
     assert payload["ref_audio"] == ["custom.wav"]
     assert payload["prompt_token_ids"]
+    assert payload["meta"]["finished"].item() is True
 
 
 def test_aura2tts_async_chunk_finishes_without_audio_when_tts_disabled():
@@ -673,6 +676,62 @@ def test_aura_tool_pass_does_not_speak_xml_or_unfinished_think(monkeypatch, outp
     assert payload.get("text") in (None, [])
 
 
+def test_tools_disabled_routing_pass_withholds_hallucinated_tool_xml(monkeypatch):
+    """Intent-gate routing (tools off) must not speak raw <tool_call> XML."""
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    xml = (
+        "<tool_call><function=calculator>"
+        "<parameter=expression>37 * 19</parameter></function></tool_call>"
+    )
+    additional = {
+        "aura_session_id": "tool-routing-hallucination",
+        "aura_system_prompt": ["system"],
+        "aura_tool_enabled": [False],
+        "tts_task_type": ["CustomVoice"],
+        "tts_speaker": ["Vivian"],
+        "tts_language": ["Chinese"],
+    }
+    transfer_manager = _transfer_manager()
+    request = SimpleNamespace(
+        request_id="tool-routing",
+        external_req_id="tool-routing",
+        output_token_ids=[248058],
+        output_text=xml,
+        additional_information=additional,
+        is_finished=lambda: False,
+    )
+    # Mid-gen with tool marker: hold (no sentence TTS of XML).
+    assert aura2tts_async_chunk(transfer_manager, None, request, is_finished=False) is None
+    request.is_finished = lambda: True
+    payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+    assert payload["prompt_token_ids"] == []
+    assert payload.get("text") in (None, [])
+    assert "<tool_call>" not in str(payload)
+    # TTS-only path does not create a session; if one exists it must not
+    # contain the hallucinated tool XML as an assistant turn.
+    history = get_session_history("tool-routing-hallucination")
+    if history is not None:
+        joined = " ".join(str(m.get("content", "")) for m in history.history)
+        assert "<tool_call>" not in joined
+
+
+def test_aura_sync_path_withholds_tool_xml_when_tools_disabled():
+    xml = (
+        "<tool_call><function=calculator>"
+        "<parameter=expression>1+1</parameter></function></tool_call>"
+    )
+    prompt = {
+        "additional_information": {
+            "aura_session_id": "sync-xml",
+            "aura_tool_enabled": [False],
+            "tts_task_type": ["CustomVoice"],
+            "tts_speaker": ["Vivian"],
+            "tts_language": ["Chinese"],
+        }
+    }
+    assert aura2tts([_source_output(xml, token_ids=[248058])], prompt=[prompt]) == []
+
+
 def test_aura_tool_input_lazy_loads_server_stage1_tokenizer(monkeypatch):
     class FakeTokenizer:
         def apply_chat_template(self, messages, **kwargs):
@@ -836,14 +895,48 @@ def test_pop_native_tts_sentence_matches_native_boundaries():
     assert s is None and rest == "短，"
 
 
+def test_clean_tts_text_strips_box_markup():
+    """Box-only replies must not reach Talker (coords sound like gibberish)."""
+    box = "<|box_start|>(401.0,472.0),(483.0,706.0)<|box_end|>"
+    assert _clean_tts_text(box) == ""
+    assert _clean_tts_text(f"手机在左边。{box}") == "手机在左边。"
+    # Incomplete mid-stream box must also be held back from TTS.
+    assert _clean_tts_text("<|box_start|>(401.0,472.0),") == ""
+
+
 def test_pop_emit_ready_tts_text_holds_short_sentence_until_merge():
-    held, rest = _pop_emit_ready_tts_text("有。")
+    # Explicit low floor: short "有。" stays buffered until more text arrives.
+    held, rest = _pop_emit_ready_tts_text("有。", min_chars=4)
     assert held is None
     assert rest == "有。"
 
-    merged, rest = _pop_emit_ready_tts_text("有。画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，")
+    merged, rest = _pop_emit_ready_tts_text(
+        "有。画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，",
+        min_chars=4,
+    )
     assert merged == "有。画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，"
     assert rest == ""
+
+
+def test_pop_emit_ready_tts_text_batches_until_default_min_chars():
+    """Default ~30 content chars: one short sentence must not mid-gen emit alone."""
+    held, rest = _pop_emit_ready_tts_text("今天天气很好。")
+    assert held is None
+    assert rest == "今天天气很好。"
+
+    # 23 content chars — still under the default 30 floor.
+    held, rest = _pop_emit_ready_tts_text(
+        "有。画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，"
+    )
+    assert held is None
+    assert "年轻男子" in rest
+
+    # Cross two sentence ends to clear the 30-char floor.
+    text = "有。画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，他正面对着镜头微笑。窗外是晴朗的蓝天。"
+    merged, rest = _pop_emit_ready_tts_text(text)
+    assert merged is not None
+    assert _tts_content_char_count(merged) >= 30
+    assert merged.endswith(("。", "，", "！", "？"))
 
 
 def test_estimate_tts_max_new_tokens_scales_without_flat_48_floor():
@@ -916,6 +1009,8 @@ def test_aura2tts_customvoice_prompt_len_stays_near_text_size():
 
 def test_aura2tts_async_chunk_emits_mid_generation_sentence(monkeypatch):
     monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    # Low floor: one completed sentence may stream mid-gen (legacy behaviour).
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS_MIN_CHARS", "4")
     transfer_manager = _transfer_manager()
     request = SimpleNamespace(
         request_id="req-sent",
@@ -932,16 +1027,52 @@ def test_aura2tts_async_chunk_emits_mid_generation_sentence(monkeypatch):
     mid = aura2tts_async_chunk(transfer_manager, None, request, is_finished=False)
     assert mid is not None
     assert mid["text"] == ["今天天气很好。"]
+    assert mid["meta"]["finished"].item() is False
     # Finish with more text: remnant after prior sentence emit.
     request.output_text = "今天天气很好。后面还有内容"
     request.is_finished = lambda: True
     fin = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
     assert fin is not None
+    assert fin["meta"]["finished"].item() is True
     assert "后面还有内容" in (fin.get("text") or [""])[0] or fin.get("prompt_token_ids") == []
+
+
+def test_aura2tts_async_chunk_batches_until_min_chars_before_finish(monkeypatch):
+    """Default ~30-char floor: hold short sentences mid-gen; flush on finish."""
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    monkeypatch.delenv("VLLM_AURA_SENTENCE_TTS_MIN_CHARS", raising=False)
+    transfer_manager = _transfer_manager()
+    request = SimpleNamespace(
+        request_id="req-batch",
+        external_req_id="req-batch",
+        output_token_ids=[1, 2, 3],
+        output_text="今天天气很好。后面还有",
+        additional_information={
+            "tts_task_type": ["CustomVoice"],
+            "tts_speaker": ["Vivian"],
+            "tts_language": ["Chinese"],
+        },
+        is_finished=lambda: False,
+    )
+    assert aura2tts_async_chunk(transfer_manager, None, request, is_finished=False) is None
+
+    # Still under ~30 content chars → keep buffering.
+    request.output_text = "今天天气很好。空气也非常清新。"
+    assert aura2tts_async_chunk(transfer_manager, None, request, is_finished=False) is None
+
+    # Finish flushes the buffered multi-sentence remainder.
+    request.is_finished = lambda: True
+    fin = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
+    assert fin is not None
+    text0 = (fin.get("text") or [""])[0]
+    assert "今天天气很好" in text0
+    assert "空气也非常清新" in text0
+    assert fin["meta"]["finished"].item() is True
 
 
 def test_aura2tts_async_chunk_merges_short_leading_sentence(monkeypatch):
     monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS_MIN_CHARS", "4")
     transfer_manager = _transfer_manager()
     request = SimpleNamespace(
         request_id="req-short",

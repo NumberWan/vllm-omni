@@ -526,7 +526,7 @@ class OmniBase(PDDisaggregationMixin):
         if _m is not None:
             stage_durations.setdefault(f"stage_{stage_id}_gen_ms", _m.stage_gen_time_ms)
 
-        finished = engine_outputs.finished
+        finished = bool(getattr(engine_outputs, "finished", False) or result.finished)
 
         submit_ts = result.stage_submit_ts
         now = time.time()

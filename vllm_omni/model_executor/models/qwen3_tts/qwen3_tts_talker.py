@@ -901,7 +901,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
             last_hidden = hs.get("last")
             if not isinstance(last_hidden, torch.Tensor):
-                raise RuntimeError("Missing hidden_states['last'] in additional_information; postprocess must run.")
+                raise RuntimeError(
+                    "Missing hidden_states['last'] for Talker decode. "
+                    "A late Stage1 payload likely overwrote live conditioning; "
+                    "do not apply the next sentence mid-decode."
+                )
             past_hidden_list.append(last_hidden.to(device=device, dtype=dtype).reshape(1, -1))
             text_step_list.append(text_step)
 

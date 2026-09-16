@@ -16,7 +16,7 @@ if [[ -f "$AURA_TOOL_KEYS_ENV" ]]; then
   set +a
 fi
 
-MODEL="${MODEL:-/workspace/models/AURA_v2}"
+MODEL="${MODEL:-/workspace/models/AURA_v2new}"
 BASE_TTS_MODEL="/workspace/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3"
 DEPLOY="${DEPLOY:-$SCRIPT_DIR/aura_omni_v2_1gpu_base.yaml}"
 AURA_PORT="${AURA_PORT:-8666}"
@@ -26,7 +26,10 @@ PID_FILE="${PID_FILE:-$LOG_DIR/server.pid}"
 BRIDGE_PID_FILE="${BRIDGE_PID_FILE:-$LOG_DIR/bridge.pid}"
 STATIC_DIR="${STATIC_DIR:-$SCRIPT_DIR/static}"
 AURA_GPU="${AURA_GPU:-auto}"
-DEFAULT_TTS_INSTRUCT="请用专业、清晰、自然的语气说话，语速稍快，情绪克制，避免夸张和过度热情。"
+# Base voice clone does NOT support instruction control; injecting a style
+# instruct into the ICL prompt makes Chinese sound unnatural / "foreign".
+# Keep empty for Base (CustomVoice is where instruct belongs).
+DEFAULT_TTS_INSTRUCT=""
 
 if [[ "$AURA_GPU" == "auto" ]]; then
   AURA_GPU="$(
@@ -86,6 +89,11 @@ else
     exit 1
   fi
   echo "Starting AURA_v2 on physical GPU $AURA_GPU ..."
+  # Drop a leftover PID from a previous dead stack so the wait loop
+  # does not treat that stale file as "the new AURA just exited".
+  if [[ -f "$PID_FILE" ]] && ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    rm -f "$PID_FILE"
+  fi
   (
     cd "$REPO_ROOT"
     env \
@@ -102,7 +110,7 @@ else
       VLLM_AURA_IM_END_TOKEN_ID=248046 \
       VLLM_AURA_IM_START_TOKEN_ID=248045 \
       VLLM_AURA_ASSISTANT_TOKEN_ID=74455 \
-      VLLM_AURA_SENTENCE_TTS=0 \
+      VLLM_AURA_SENTENCE_TTS="${VLLM_AURA_SENTENCE_TTS:-1}" \
       VLLM_AURA_TOOL_EXECUTOR=safe \
       VLLM_AURA_TTS_TOKENIZER="${VLLM_AURA_TTS_TOKENIZER:-$BASE_TTS_MODEL}" \
       ALLOWED_LOCAL_MEDIA_PATH="${ALLOWED_LOCAL_MEDIA_PATH:-$REPO_ROOT/tests/assets/qwen3_tts}" \
@@ -131,6 +139,8 @@ else
 fi
 
 if [[ "${SKIP_WARMUP:-0}" != "1" ]]; then
+  # Warmup may exit 2 when silent-only (no spoken audio); still start the UI.
+  set +e
   "$PYTHON_BIN" "$SCRIPT_DIR/warmup_aura.py" \
     --aura-ws "ws://127.0.0.1:${AURA_PORT}/v1/video/chat/stream" \
     --model "$MODEL" \
@@ -143,6 +153,12 @@ if [[ "${SKIP_WARMUP:-0}" != "1" ]]; then
     --frame-height "${WARMUP_FRAME_HEIGHT:-360}" \
     --silent-first \
     | tee "$LOG_DIR/warmup.out"
+  warmup_rc=${PIPESTATUS[0]}
+  set -e
+  if [[ "$warmup_rc" -ne 0 && "$warmup_rc" -ne 2 ]]; then
+    echo "ERROR: warmup failed with exit $warmup_rc; see $LOG_DIR/warmup.out" >&2
+    exit "$warmup_rc"
+  fi
 fi
 
 nohup env \
@@ -156,7 +172,7 @@ nohup env \
   TTS_INSTRUCT="${TTS_INSTRUCT:-$DEFAULT_TTS_INSTRUCT}" \
   TTS_TASK_TYPE="${TTS_TASK_TYPE:-Base}" \
   TOOL_MODE=auto \
-  MAX_TOOL_DEPTH=3 \
+  MAX_TOOL_DEPTH="${MAX_TOOL_DEPTH:-5}" \
   AUTO_TRIGGER="${AUTO_TRIGGER:-1}" \
   AURA_TTS_DUMP_DIR="${AURA_TTS_DUMP_DIR:-$LOG_DIR/tts}" \
   "$PYTHON_BIN" "$SCRIPT_DIR/server.py" \
@@ -177,3 +193,13 @@ echo "AURA_v2 backend: http://127.0.0.1:${AURA_PORT}"
 echo "Native frontend: http://127.0.0.1:${BRIDGE_PORT}/"
 [[ -n "$LAN_IP" ]] && echo "LAN frontend: http://${LAN_IP}:${BRIDGE_PORT}/"
 echo "Stop: LOG_DIR=$LOG_DIR bash $SCRIPT_DIR/stop_1gpu_stack.sh"
+
+# Stay alive so `gpu run` keeps the reservation heartbeat; otherwise the
+# supervisor can SIGTERM the launcher and leave HTTP zombies with dead stages.
+server_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+if [[ -n "$server_pid" ]]; then
+  echo "Holding GPU reservation until AURA pid=$server_pid exits."
+  while kill -0 "$server_pid" 2>/dev/null; do
+    sleep 10
+  done
+fi

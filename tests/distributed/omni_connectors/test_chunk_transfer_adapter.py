@@ -20,6 +20,8 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTran
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
     _apply_max_new_tokens_from_payload,
+    _meta_to_dict,
+    _payload_has_talker_conditioning,
 )
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
@@ -34,7 +36,7 @@ class DummyWaitingQueue(list):
         self.append(request)
 
 
-def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None):
+def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None, *, resumable: bool = False):
     return SimpleNamespace(
         request_id=req_id,
         external_req_id=external_req_id or req_id,
@@ -45,6 +47,7 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         num_output_placeholders=0,
         prefill_stats=None,
         additional_information=None,
+        resumable=resumable,
         is_finished=lambda: status == RequestStatus.FINISHED_STOPPED,
     )
 
@@ -391,6 +394,168 @@ def test_send_single_request_respects_processor_receiver_boundary(build_adapter,
     assert sent_payload.meta.is_segment_finished.item() is False
 
 
+def test_load_poll_ar_clears_prewarm_resumable_on_dict_meta_finished(build_adapter):
+    """Spoken aura2tts payload: nested meta.finished must drop Talker.resumable."""
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req(
+        "video-tool-p1",
+        RequestStatus.WAITING,
+        external_req_id="video-tool-p1",
+        resumable=True,
+    )
+    adapter.request_ids_mapping[request.request_id] = request.external_req_id
+    connector.get.return_value = (
+        {
+            "text": ["好的，我会留意，等《古韵》这本书出现时我会告诉你。"],
+            "max_new_tokens": [98],
+            "prompt_token_ids": [0] * 8,
+            "meta": {
+                "finished": torch.tensor(True, dtype=torch.bool),
+                "is_segment_finished": torch.tensor(True, dtype=torch.bool),
+            },
+        },
+        16,
+    )
+
+    assert adapter._poll_single_request(request) is True
+    assert request.resumable is False
+    assert "video-tool-p1" in adapter.upstream_exhausted_requests
+
+
+def test_load_poll_ar_clears_prewarm_resumable_on_flat_meta_finished(build_adapter):
+    """Flattened wire keys must still clear prewarmed Talker.resumable."""
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-flat", RequestStatus.WAITING, external_req_id="ext-flat", resumable=True)
+    adapter.request_ids_mapping[request.request_id] = request.external_req_id
+    connector.get.return_value = (
+        {
+            "text": ["你好。"],
+            "max_new_tokens": [26],
+            "meta.finished": torch.tensor(True, dtype=torch.bool),
+            "meta.is_segment_finished": torch.tensor(True, dtype=torch.bool),
+        },
+        16,
+    )
+
+    assert adapter._poll_single_request(request) is True
+    assert request.resumable is False
+    assert "req-flat" in adapter.upstream_exhausted_requests
+    assert request.additional_information["meta"]["finished"].item() is True
+
+
+def test_load_poll_ar_keeps_resumable_on_mid_gen_sentence(build_adapter):
+    """Mid-gen sentence TTS must keep Talker resumable while Stage1 continues."""
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-mid", RequestStatus.WAITING, external_req_id="ext-mid", resumable=True)
+    adapter.request_ids_mapping[request.request_id] = request.external_req_id
+    connector.get.return_value = (
+        {
+            "text": ["你好。"],
+            "meta": {
+                "finished": torch.tensor(False, dtype=torch.bool),
+                "is_segment_finished": torch.tensor(True, dtype=torch.bool),
+            },
+        },
+        16,
+    )
+
+    assert adapter._poll_single_request(request) is True
+    assert request.resumable is True
+    assert "req-mid" not in adapter.upstream_exhausted_requests
+    assert "req-mid" in adapter.segment_finished_requests
+
+
+def test_send_single_request_preserves_dict_processor_finished(build_adapter, monkeypatch):
+    """aura2tts sets meta.finished so prewarmed Talker clears resumable.
+
+    save_async stores is_finished=request.is_finished() and not resumable.
+    A resumable Stage1 segment stop therefore passes is_finished=False and
+    used to overwrite the processor marker — Talker never sent finished=True
+    to Code2Wav and generate() hung.
+    """
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-aura2tts", RequestStatus.WAITING, external_req_id="ext-aura2tts")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: {
+        "text": ["好的，我会留意，等《古韵》这本书出现时我会告诉你。"],
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": True}
+    )
+
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload["meta"]["finished"].item() is True
+    assert sent_payload["meta"]["is_segment_finished"].item() is True
+
+
+def test_send_single_request_dict_mid_gen_keeps_finished_false(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-mid", RequestStatus.WAITING, external_req_id="ext-mid")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: {
+        "text": ["你好。"],
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": False}
+    )
+
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload["meta"]["finished"].item() is False
+
+
+def test_send_single_request_struct_still_overwrites_processor_finished(build_adapter, monkeypatch):
+    """Talker2Code2Wav conflates segment flush with request finish.
+
+    Mid-gen sentence TTS keeps Talker resumable=True. Adapter must not
+    forward that leftover's processor finished=True, or Code2Wav ends
+    after the first sentence.
+    """
+    adapter, connector = build_adapter(stage_id=2)
+    request = _req("req-talker", RequestStatus.WAITING, external_req_id="ext-talker", resumable=True)
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+    )
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": True}
+    )
+
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.finished.item() is False
+    assert sent_payload.meta.is_segment_finished.item() is True
+
+
+def test_send_single_request_struct_keeps_spoken_leftover_finished(build_adapter, monkeypatch):
+    """Spoken leftover: Talker already not resumable; keep processor finished.
+
+    Live hang: leftover frames=131 had MetaStruct.finished=True, then
+    save_async snapshot is_finished=False overwrote the wire flag.
+    """
+    adapter, connector = build_adapter(stage_id=2)
+    request = _req("req-spoken", RequestStatus.WAITING, external_req_id="ext-spoken", resumable=False)
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+    )
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": True}
+    )
+
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.finished.item() is True
+    assert sent_payload.meta.is_segment_finished.item() is True
+
+
 def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
@@ -459,8 +624,8 @@ def test_load_poll_non_ar_merges_into_existing_additional_information(build_adap
     )
     assert request.additional_information["ids"]["prompt"] == [11, 12]
     assert request.additional_information["ids"]["all"] == [21, 22]
-    # non-ar merge path intentionally doesn't overwrite meta.finished.
-    assert request.additional_information["meta"]["finished"].item() is False
+    # Latest chunk wins: spoken leftover finished=True must reach Code2Wav.
+    assert request.additional_information["meta"]["finished"].item() is True
     assert request.additional_information["meta"]["phase"] == "decode"
     assert request.additional_information["kv_metadata"] == {"foo": "bar"}
     assert "req-non-ar" in adapter._finished_load_reqs
@@ -571,6 +736,23 @@ def test_process_and_restore_queues(build_adapter):
     assert running_queue == [running_req]
     assert adapter.waiting_for_chunk_waiting_requests == deque()
     assert adapter.waiting_for_chunk_running_requests == deque()
+
+
+def test_process_pending_chunks_keeps_generating_talker_on_running_queue(build_adapter):
+    adapter, _ = build_adapter(stage_id=2, max_num_seqs=8)
+    running_req = _req("talker-gen", RequestStatus.RUNNING)
+    running_req.prompt_token_ids = [0] * 22
+    running_req.num_prompt_tokens = 22
+    running_req.num_computed_tokens = 79
+    waiting_queue = DummyWaitingQueue()
+    running_queue = [running_req]
+    scheduler_requests = {running_req.request_id: running_req}
+
+    adapter.process_pending_chunks(waiting_queue, running_queue, scheduler_requests=scheduler_requests)
+
+    assert running_queue == [running_req]
+    assert running_req.status == RequestStatus.RUNNING
+    assert running_req.request_id in {req.request_id for req in adapter._pending_load_reqs}
 
 
 def test_fifo_promotion(build_adapter):
@@ -1629,7 +1811,13 @@ def test_purge_is_noop_on_empty_deques(build_adapter):
 def test_apply_max_new_tokens_from_flat_talker_payload_clamps_request():
     """async_chunk Talker prewarm keeps deploy max_tokens until payload arrives."""
     sampling = SimpleNamespace(max_tokens=4096)
-    request = SimpleNamespace(request_id="video-x", sampling_params=sampling, max_tokens=4096)
+    request = SimpleNamespace(
+        request_id="video-x",
+        sampling_params=sampling,
+        max_tokens=4096,
+        num_prompt_tokens=0,
+        num_computed_tokens=0,
+    )
 
     effective = _apply_max_new_tokens_from_payload(
         request,
@@ -1639,6 +1827,23 @@ def test_apply_max_new_tokens_from_flat_talker_payload_clamps_request():
     assert effective == 26
     assert request.max_tokens == 26
     assert sampling.max_tokens == 26
+
+
+def test_apply_max_new_tokens_raises_mid_decode():
+    """Late next-sentence cap must fail, not silently floor to already_generated."""
+    sampling = SimpleNamespace(max_tokens=143)
+    request = SimpleNamespace(
+        request_id="video-floor",
+        sampling_params=sampling,
+        max_tokens=143,
+        num_prompt_tokens=22,
+        num_computed_tokens=102,  # already_generated=80 > late cap 73
+    )
+
+    with pytest.raises(RuntimeError, match="Refuse max_new_tokens=73 mid-decode"):
+        _apply_max_new_tokens_from_payload(request, {"max_new_tokens": 73})
+    assert request.max_tokens == 143
+    assert sampling.max_tokens == 143
 
 # --- AURA port: test_load_poll_ar_replaces_prewarm_prompt_from_full_payload ---
 def test_load_poll_ar_replaces_prewarm_prompt_from_full_payload(build_adapter):
@@ -1664,6 +1869,694 @@ def test_load_poll_ar_replaces_prewarm_prompt_from_full_payload(build_adapter):
     assert request.num_prompt_tokens == 4
     assert request._all_token_ids == [10, 20, 30, 40]
     assert request.additional_information == payload
+
+
+def test_load_poll_ar_late_finished_payload_keeps_decode_additional_information(build_adapter):
+    """Mid-decode Stage1 sentence must not apply max_new_tokens / payload onto the live turn."""
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("video-talker", RequestStatus.RUNNING, external_req_id="video-talker", resumable=True)
+    request.prompt_token_ids = [0] * 22
+    request.num_prompt_tokens = 22
+    request.num_computed_tokens = 76
+    request.max_tokens = 140
+    request.sampling_params = SimpleNamespace(max_tokens=140)
+    request._output_token_ids = [1]
+    request._all_token_ids = [0] * 22 + [1]
+    request.update_block_hashes = lambda: None
+    last_hidden = torch.ones(4)
+    request.additional_information = {"hidden_states": {"last": last_hidden}}
+
+    payload: OmniPayload = {
+        "prompt_token_ids": [0] * 23,
+        "max_new_tokens": 73,
+        "text": ["下一句。"],
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    connector.get.return_value = (payload, 16)
+
+    # Queue only; return False so recv loop keeps polling until Talker EOS.
+    assert adapter._poll_single_request(request) is False
+
+    assert request.prompt_token_ids == [0] * 22
+    assert request.max_tokens == 140
+    assert request.sampling_params.max_tokens == 140
+    assert request.additional_information["hidden_states"]["last"] is last_hidden
+    assert getattr(request, "omni_stage_payload", None) is None
+    assert "video-talker" not in adapter.upstream_exhausted_requests
+    assert request.resumable is True
+    assert "video-talker" not in adapter._finished_load_reqs
+    pending = adapter._pending_upstream_payloads["video-talker"]
+    assert len(pending) == 1
+    assert pending[0]["payload"]["max_new_tokens"] == 73
+
+    request.status = RequestStatus.WAITING
+    connector.get.return_value = None
+    assert adapter._poll_single_request(request) is True
+    assert request.max_tokens == 73
+    assert request.sampling_params.max_tokens == 73
+    assert request.num_computed_tokens == 0
+    assert request.num_prompt_tokens == 23
+    assert request.additional_information["text"] == ["下一句。"]
+    assert "video-talker" in adapter.upstream_exhausted_requests
+    assert request.resumable is False
+    assert "video-talker" in adapter._finished_load_reqs
+    assert "video-talker" not in adapter._pending_upstream_payloads
+
+
+
+
+def test_load_poll_ar_late_finished_payload_while_waiting_drains_as_new_segment(build_adapter):
+    """Post-EOS WAITING with computed>prompt must queue then drain as new_segment (not wipe)."""
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("video-talker-wait", RequestStatus.WAITING, external_req_id="video-talker-wait", resumable=True)
+    request.prompt_token_ids = [0] * 22
+    request.num_prompt_tokens = 22
+    request.num_computed_tokens = 79
+    request.max_tokens = 143
+    request.sampling_params = SimpleNamespace(max_tokens=143)
+    request._output_token_ids = []
+    request._all_token_ids = [0] * 22 + [1] * 57
+    request.update_block_hashes = lambda: None
+    last_hidden = torch.ones(4)
+    request.additional_information = {"hidden_states": {"last": last_hidden}}
+
+    payload: OmniPayload = {
+        "prompt_token_ids": [0] * 23,
+        "max_new_tokens": 73,
+        "text": ["下一句。"],
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    connector.get.return_value = (payload, 16)
+
+    assert adapter._poll_single_request(request) is True
+
+    # Drained as new segment in the same poll (between_segments path).
+    assert request.max_tokens == 73
+    assert request.sampling_params.max_tokens == 73
+    assert request.num_computed_tokens == 0
+    assert request.num_prompt_tokens == 23
+    assert request.additional_information["text"] == ["下一句。"]
+    assert "video-talker-wait" in adapter.upstream_exhausted_requests
+    assert request.resumable is False
+    assert "video-talker-wait" not in adapter._pending_upstream_payloads
+
+
+
+
+def test_try_apply_pending_empty_finish_sentinel_skips_new_segment(build_adapter):
+    """Empty finished sentinel must mark exhausted without wiping Talker conditioning."""
+    adapter, _connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req(
+        "video-talker-fin",
+        RequestStatus.WAITING,
+        external_req_id="video-talker-fin",
+        resumable=True,
+    )
+    request.prompt_token_ids = [0] * 22
+    request.num_prompt_tokens = 22
+    request.num_computed_tokens = 0
+    last_hidden = torch.ones(4)
+    request.additional_information = {
+        "text": ["第一句。"],
+        "hidden_states": {"last": last_hidden},
+    }
+    adapter._pending_upstream_payloads["video-talker-fin"] = deque(
+        [
+            {
+                "payload": {
+                    "prompt_token_ids": [],
+                    "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+                },
+                "finished": True,
+                "segment_finished": False,
+                "chunk_id": 2,
+            }
+        ]
+    )
+    # False: sentinel consumed but must NOT advertise finished_load / ready_chunks.
+    assert adapter.try_apply_pending_upstream_payload(request) is False
+    assert request.additional_information["text"] == ["第一句。"]
+    assert request.additional_information["hidden_states"]["last"] is last_hidden
+    assert "video-talker-fin" in adapter.upstream_exhausted_requests
+    assert "video-talker-fin" in adapter._terminal_empty_finish_reqs
+    assert request.resumable is False
+    assert "video-talker-fin" not in adapter._pending_upstream_payloads
+
+
+def test_load_poll_ar_late_finished_payload_while_waiting_for_chunk_only_queues(build_adapter):
+    """WAITING_FOR_CHUNK is mid-decode parking — queue only, do not drain as new_segment."""
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req(
+        "video-talker-wfc",
+        RequestStatus.WAITING_FOR_CHUNK,
+        external_req_id="video-talker-wfc",
+        resumable=True,
+    )
+    request.prompt_token_ids = [0] * 22
+    request.num_prompt_tokens = 22
+    request.num_computed_tokens = 176
+    request.max_tokens = 143
+    request.sampling_params = SimpleNamespace(max_tokens=143)
+    request._output_token_ids = [1]
+    request._all_token_ids = [0] * 22 + [1]
+    request.update_block_hashes = lambda: None
+    last_hidden = torch.ones(4)
+    request.additional_information = {
+        "text": ["第一句。"],
+        "hidden_states": {"last": last_hidden},
+    }
+
+    payload: OmniPayload = {
+        "prompt_token_ids": [0] * 23,
+        "max_new_tokens": 73,
+        "text": ["下一句。"],
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    connector.get.return_value = (payload, 16)
+
+    # Queue only — do not finished_load (that re-admits as new req with stale KV).
+    assert adapter._poll_single_request(request) is False
+
+    assert request.max_tokens == 143
+    assert request.sampling_params.max_tokens == 143
+    assert request.num_computed_tokens == 176
+    assert request.additional_information["text"] == ["第一句。"]
+    assert request.additional_information["hidden_states"]["last"] is last_hidden
+    assert "video-talker-wfc" not in adapter.upstream_exhausted_requests
+    assert request.resumable is True
+    assert "video-talker-wfc" not in adapter._finished_load_reqs
+    pending = adapter._pending_upstream_payloads["video-talker-wfc"]
+    assert len(pending) == 1
+    assert pending[0]["payload"]["max_new_tokens"] == 73
+
+
+
+def test_process_pending_chunks_resumes_mid_decode_wfc_without_ready_chunks(build_adapter):
+    """Mid-decode WFC must return to RUNNING without advertising ready_chunks."""
+    adapter, _connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req(
+        "video-talker-wfc-resume",
+        RequestStatus.WAITING_FOR_CHUNK,
+        external_req_id="video-talker-wfc-resume",
+        resumable=True,
+    )
+    request.prompt_token_ids = [0] * 22
+    request.num_prompt_tokens = 22
+    request.num_computed_tokens = 176
+    request._output_token_ids = [1] * 10
+    request._all_token_ids = [0] * 22 + [1] * 10
+    adapter._pending_upstream_payloads["video-talker-wfc-resume"] = deque(
+        [{"payload": {"text": ["下一句。"]}, "finished": True, "segment_finished": False, "chunk_id": 2}]
+    )
+    running_queue = [request]
+    waiting_queue = []
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert request.status == RequestStatus.RUNNING
+    assert "video-talker-wfc-resume" not in adapter.requests_with_ready_chunks
+    assert request in running_queue
+
+
+def test_load_poll_ar_late_payload_after_eos_waiting_for_chunk_drains_new_segment(build_adapter):
+    """Post-EOS WAITING_FOR_CHUNK + empty outputs must open next sentence (Smoke3 hang fix)."""
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req(
+        "video-talker-eos-wfc",
+        RequestStatus.WAITING_FOR_CHUNK,
+        external_req_id="video-talker-eos-wfc",
+        resumable=True,
+    )
+    request.prompt_token_ids = [0] * 22
+    request.num_prompt_tokens = 22
+    # Stale watermark after Talker EOS (scheduler cleared outputs).
+    request.num_computed_tokens = 79
+    request.max_tokens = 143
+    request.sampling_params = SimpleNamespace(max_tokens=143)
+    request._output_token_ids = []
+    request._all_token_ids = [0] * 22 + [1] * 57
+    request.update_block_hashes = lambda: None
+    last_hidden = torch.ones(4)
+    request.additional_information = {
+        "text": ["第一句。"],
+        "hidden_states": {"last": last_hidden},
+    }
+
+    payload: OmniPayload = {
+        "prompt_token_ids": [0] * 23,
+        "max_new_tokens": 73,
+        "text": ["下一句。"],
+        "task_type": ["CustomVoice"],
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    connector.get.return_value = (payload, 16)
+
+    assert adapter._poll_single_request(request) is True
+    assert request.max_tokens == 73
+    assert request.num_computed_tokens == 0
+    assert request.num_prompt_tokens == 23
+    assert request.additional_information["text"] == ["下一句。"]
+    assert "video-talker-eos-wfc" in adapter.upstream_exhausted_requests
+    assert request.resumable is False
+    assert "video-talker-eos-wfc" not in adapter._pending_upstream_payloads
+
+
+
+def _talker_session(
+    req_id: str,
+    status: RequestStatus,
+    *,
+    computed: int,
+    prompt_len: int,
+    max_tokens: int,
+    text: str,
+    last_hidden: torch.Tensor,
+) -> SimpleNamespace:
+    request = _req(req_id, status, external_req_id=req_id, resumable=True)
+    request.prompt_token_ids = [0] * prompt_len
+    request.num_prompt_tokens = prompt_len
+    request.num_computed_tokens = computed
+    request.max_tokens = max_tokens
+    request.sampling_params = SimpleNamespace(max_tokens=max_tokens)
+    generated = max(0, computed - prompt_len)
+    request._output_token_ids = [1] * generated
+    request._all_token_ids = [0] * prompt_len + [1] * generated
+    request.update_block_hashes = lambda: None
+    request.additional_information = {
+        "text": [text],
+        "hidden_states": {"last": last_hidden},
+        "task_type": ["CustomVoice"],
+    }
+    return request
+
+
+def test_two_sentence_session_queues_until_waiting_then_opens_new_segment(build_adapter):
+    """CPU stand-in for Smoke3: sentence-1 decode → late sentence-2 → EOS rearm → drain."""
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    last_hidden = torch.ones(4)
+    request = _talker_session(
+        "video-e2e",
+        RequestStatus.WAITING,
+        computed=0,
+        prompt_len=22,
+        max_tokens=4096,
+        text="第一句。",
+        last_hidden=last_hidden,
+    )
+    request.additional_information = None
+
+    sentence1: OmniPayload = {
+        "prompt_token_ids": [0] * 22,
+        "max_new_tokens": 143,
+        "text": ["第一句。"],
+        "task_type": ["CustomVoice"],
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool), "is_segment_finished": True},
+    }
+    connector.get.return_value = (sentence1, 16)
+    assert adapter._poll_single_request(request) is True
+    assert request.max_tokens == 143
+    assert request.additional_information["text"] == ["第一句。"]
+    assert request.resumable is True
+    assert "video-e2e" not in adapter.upstream_exhausted_requests
+
+    # Sentence 1 is now decoding.
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 76
+    request._output_token_ids = [1] * 54
+    request._all_token_ids = [0] * 22 + [1] * 54
+    request.additional_information["hidden_states"] = {"last": last_hidden}
+
+    sentence2: OmniPayload = {
+        "prompt_token_ids": [0] * 23,
+        "max_new_tokens": 73,
+        "text": ["下一句。"],
+        "task_type": ["CustomVoice"],
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    connector.get.return_value = (sentence2, 16)
+    assert adapter._poll_single_request(request) is False
+    assert request.max_tokens == 143
+    assert request.additional_information["text"] == ["第一句。"]
+    assert request.additional_information["hidden_states"]["last"] is last_hidden
+    assert "video-e2e" not in adapter.upstream_exhausted_requests
+
+    # Connector parking mid-decode must not drain.
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    connector.get.return_value = None
+    assert adapter._poll_single_request(request) is False
+    assert adapter.try_apply_pending_upstream_payload(request) is False
+    assert request.max_tokens == 143
+    assert request.additional_information["text"] == ["第一句。"]
+    assert len(adapter._pending_upstream_payloads["video-e2e"]) == 1
+
+    # Talker segment EOS rearms to WAITING — now drain as a new prefill.
+    request.status = RequestStatus.WAITING
+    assert adapter._poll_single_request(request) is True
+    assert request.num_computed_tokens == 0
+    assert request.num_prompt_tokens == 23
+    assert request.max_tokens == 73
+    assert request.additional_information["text"] == ["下一句。"]
+    assert request.resumable is False
+    assert "video-e2e" in adapter.upstream_exhausted_requests
+    assert "video-e2e" not in adapter._pending_upstream_payloads
+
+
+def test_try_apply_pending_refuses_waiting_for_chunk(build_adapter):
+    adapter, _connector = build_adapter(stage_id=2, model_mode="ar")
+    last_hidden = torch.ones(4)
+    request = _talker_session(
+        "video-wfc-try",
+        RequestStatus.WAITING_FOR_CHUNK,
+        computed=176,
+        prompt_len=34,
+        max_tokens=143,
+        text="第一句。",
+        last_hidden=last_hidden,
+    )
+    adapter._enqueue_pending_upstream_payload(
+        request.request_id,
+        {"prompt_token_ids": [0] * 23, "max_new_tokens": 73, "text": ["下一句。"]},
+        finished=True,
+        segment_finished=False,
+        chunk_id=1,
+    )
+    assert adapter.try_apply_pending_upstream_payload(request) is False
+    assert request.additional_information["text"] == ["第一句。"]
+    assert request.max_tokens == 143
+    assert request.num_computed_tokens == 176
+
+
+def test_two_queued_sentences_drain_fifo_on_waiting(build_adapter):
+    adapter, _connector = build_adapter(stage_id=2, model_mode="ar")
+    last_hidden = torch.ones(4)
+    request = _talker_session(
+        "video-fifo",
+        RequestStatus.WAITING,
+        computed=80,
+        prompt_len=22,
+        max_tokens=143,
+        text="第一句。",
+        last_hidden=last_hidden,
+    )
+    adapter._enqueue_pending_upstream_payload(
+        request.request_id,
+        {"prompt_token_ids": [0] * 23, "max_new_tokens": 73, "text": ["第二句。"]},
+        finished=False,
+        segment_finished=True,
+        chunk_id=1,
+    )
+    adapter._enqueue_pending_upstream_payload(
+        request.request_id,
+        {"prompt_token_ids": [0] * 24, "max_new_tokens": 50, "text": ["第三句。"]},
+        finished=True,
+        segment_finished=False,
+        chunk_id=2,
+    )
+    assert adapter.try_apply_pending_upstream_payload(request) is True
+    assert request.additional_information["text"] == ["第二句。"]
+    assert request.max_tokens == 73
+    assert request.resumable is True
+    assert "video-fifo" not in adapter.upstream_exhausted_requests
+    pending = adapter._pending_upstream_payloads["video-fifo"]
+    assert len(pending) == 1
+    assert pending[0]["payload"]["text"] == ["第三句。"]
+
+
+def test_payload_has_talker_conditioning_matrix():
+    assert _payload_has_talker_conditioning({"text": ["下一句。"]}) is True
+    assert _payload_has_talker_conditioning({"prompt_token_ids": [1, 2, 3]}) is True
+    assert _payload_has_talker_conditioning({"ids": {"prompt": [1, 2]}}) is True
+    assert _payload_has_talker_conditioning({"precomputed_text_id": torch.tensor([1])}) is True
+    assert (
+        _payload_has_talker_conditioning(
+            {"additional_information": {"text": ["嵌套句。"]}}
+        )
+        is True
+    )
+    assert (
+        _payload_has_talker_conditioning(
+            {"hidden_states": {"last": torch.ones(2, 4)}}
+        )
+        is True
+    )
+    # Empty Stage1 finish sentinel — must NOT look like a speakable segment.
+    assert _payload_has_talker_conditioning({"prompt_token_ids": [], "meta": {"finished": True}}) is False
+    assert _payload_has_talker_conditioning({"text": [""], "prompt_token_ids": []}) is False
+    assert _payload_has_talker_conditioning({}) is False
+
+
+def test_meta_to_dict_accepts_metastruct_replace_flags():
+    meta = MetaStruct(
+        finished=None,
+        replace_streaming_prompt=True,
+        next_stage_prompt_len=23,
+    )
+    as_dict = _meta_to_dict(meta)
+    assert as_dict["replace_streaming_prompt"] is True
+    assert as_dict["next_stage_prompt_len"] == 23
+
+
+def test_construct_replace_prompt_with_metastruct(mocker: MockerFixture) -> None:
+    """replace_streaming_prompt must work when meta is MetaStruct, not only dict."""
+    request = SimpleNamespace(
+        request_id="video-meta",
+        _all_token_ids=[0] * 22 + [1] * 50,
+        _output_token_ids=[1] * 50,
+        prompt_token_ids=[0] * 22,
+        num_computed_tokens=72,
+        num_prompt_tokens=22,
+        update_block_hashes=mocker.Mock(),
+    )
+    payload = {
+        "ids": {"prompt": [0] * 23},
+        "meta": MetaStruct(
+            finished=None,
+            replace_streaming_prompt=True,
+            next_stage_prompt_len=23,
+        ),
+    }
+    construct_next_stage_streaming_input_prompt(payload, request)
+    assert request.num_computed_tokens == 0
+    assert request.num_prompt_tokens == 23
+    assert request.prompt_token_ids == [0] * 23
+    assert request._output_token_ids == []
+    request.update_block_hashes.assert_called_once_with()
+
+
+def test_three_sentence_lifecycle_then_empty_finish_preserves_conditioning(build_adapter):
+    """CPU stand-in for full multi-sentence Talker handoff without GPU.
+
+    Proves the protocol can finish inference state transitions:
+    s1 apply → mid-decode queue s2+s3+empty-finish → WAITING drain s2 →
+    rearm WAITING drain s3 → rearm WAITING drain empty finish (exhausted,
+    keep last spoken text / hidden last).
+    """
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    last_hidden = torch.ones(4)
+    request = _talker_session(
+        "video-life",
+        RequestStatus.WAITING,
+        computed=0,
+        prompt_len=22,
+        max_tokens=4096,
+        text="第一句。",
+        last_hidden=last_hidden,
+    )
+    request.additional_information = None
+
+    s1: OmniPayload = {
+        "prompt_token_ids": [0] * 22,
+        "max_new_tokens": 143,
+        "text": ["第一句。"],
+        "task_type": ["CustomVoice"],
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool), "is_segment_finished": True},
+    }
+    connector.get.return_value = (s1, 16)
+    assert adapter._poll_single_request(request) is True
+    assert request.additional_information["text"] == ["第一句。"]
+    assert request.max_tokens == 143
+
+    # Mid-decode: Stage1 races ahead with s2, s3, then empty finish.
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 80
+    request._output_token_ids = [1] * 58
+    request._all_token_ids = [0] * 22 + [1] * 58
+    request.additional_information["hidden_states"] = {"last": last_hidden}
+
+    for payload in (
+        {
+            "prompt_token_ids": [0] * 23,
+            "max_new_tokens": 73,
+            "text": ["第二句。"],
+            "meta": {"finished": torch.tensor(False, dtype=torch.bool), "is_segment_finished": True},
+        },
+        {
+            "prompt_token_ids": [0] * 24,
+            "max_new_tokens": 50,
+            "text": ["第三句。"],
+            "meta": {"finished": torch.tensor(False, dtype=torch.bool), "is_segment_finished": True},
+        },
+        {
+            "prompt_token_ids": [],
+            "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+        },
+    ):
+        connector.get.return_value = (payload, 16)
+        assert adapter._poll_single_request(request) is False
+
+    assert request.additional_information["text"] == ["第一句。"]
+    assert request.additional_information["hidden_states"]["last"] is last_hidden
+    assert request.max_tokens == 143
+    assert len(adapter._pending_upstream_payloads["video-life"]) == 3
+    assert "video-life" not in adapter.upstream_exhausted_requests
+
+    # WAITING_FOR_CHUNK parking must still refuse drain.
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    connector.get.return_value = None
+    assert adapter.try_apply_pending_upstream_payload(request) is False
+    assert request.additional_information["text"] == ["第一句。"]
+
+    # Segment EOS → WAITING → open sentence 2 as new_segment.
+    request.status = RequestStatus.WAITING
+    assert adapter._poll_single_request(request) is True
+    assert request.additional_information["text"] == ["第二句。"]
+    assert request.max_tokens == 73
+    assert request.num_computed_tokens == 0
+    assert request.num_prompt_tokens == 23
+    assert request.resumable is True
+    assert "video-life" not in adapter.upstream_exhausted_requests
+    assert len(adapter._pending_upstream_payloads["video-life"]) == 2
+
+    # Sentence 2 "decodes", then EOS rearms WAITING for sentence 3.
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 60
+    request._output_token_ids = [1] * 37
+    request._all_token_ids = [0] * 23 + [1] * 37
+    s2_hidden = torch.ones(4) * 2
+    request.additional_information["hidden_states"] = {"last": s2_hidden}
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    assert adapter.try_apply_pending_upstream_payload(request) is False
+
+    request.status = RequestStatus.WAITING
+    connector.get.return_value = None
+    assert adapter._poll_single_request(request) is True
+    assert request.additional_information["text"] == ["第三句。"]
+    assert request.max_tokens == 50
+    assert request.num_computed_tokens == 0
+    assert request.num_prompt_tokens == 24
+    assert request.resumable is True
+    assert "video-life" not in adapter.upstream_exhausted_requests
+    assert len(adapter._pending_upstream_payloads["video-life"]) == 1
+
+    # Sentence 3 decodes; empty finish drains only as exhausted marker.
+    # Must NOT return True / finished_load (that re-schedules with stale KV).
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 40
+    s3_hidden = torch.ones(4) * 3
+    request.additional_information["hidden_states"] = {"last": s3_hidden}
+    request.status = RequestStatus.WAITING
+    request._output_token_ids = []
+    connector.get.return_value = None
+    assert adapter._poll_single_request(request) is False
+    assert request.additional_information["text"] == ["第三句。"]
+    assert request.additional_information["hidden_states"]["last"] is s3_hidden
+    assert request.max_tokens == 50
+    assert "video-life" in adapter.upstream_exhausted_requests
+    assert "video-life" in adapter._terminal_empty_finish_reqs
+    assert request.resumable is False
+    assert "video-life" not in adapter._pending_upstream_payloads
+
+
+def test_post_eos_empty_finish_poll_does_not_finished_load(build_adapter):
+    """THERMOS/Smoke3 crash: post-EOS empty finish must not re-admit decode.
+
+    Talker segment EOS clears outputs but leaves computed>>prompt. Stage1 empty
+    finish then arrives; applying it as ready_chunks schedules
+    scheduled_new_reqs with prompt_len=34, computed=176 → CUDA indexSelect.
+    """
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req(
+        "video-thermos",
+        RequestStatus.WAITING,
+        external_req_id="video-thermos",
+        resumable=True,
+    )
+    request.prompt_token_ids = [0] * 34
+    request.num_prompt_tokens = 34
+    request.num_computed_tokens = 176
+    request.max_tokens = 143
+    request.sampling_params = SimpleNamespace(max_tokens=143)
+    request._output_token_ids = []
+    request._all_token_ids = [0] * 34 + [1] * 142
+    request.update_block_hashes = lambda: None
+    last_hidden = torch.ones(4)
+    request.additional_information = {
+        "text": ["现在画面左侧出现了一个蓝色的保温杯。"],
+        "hidden_states": {"last": last_hidden},
+    }
+
+    empty_finish: OmniPayload = {
+        "prompt_token_ids": [],
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    connector.get.return_value = (empty_finish, 16)
+
+    assert adapter._poll_single_request(request) is False
+    assert "video-thermos" not in adapter._finished_load_reqs
+    assert "video-thermos" not in adapter.requests_with_ready_chunks
+    assert "video-thermos" in adapter.upstream_exhausted_requests
+    assert "video-thermos" in adapter._terminal_empty_finish_reqs
+    assert request.resumable is False
+    # Conditioning preserved; computed watermark untouched (no fake new_segment).
+    assert request.additional_information["text"] == ["现在画面左侧出现了一个蓝色的保温杯。"]
+    assert request.num_computed_tokens == 176
+    assert request.num_prompt_tokens == 34
+
+
+def test_gpu_intermediate_buffer_wipes_only_on_replace_streaming_prompt():
+    """Fresh chunk without replace keeps live 'last'; explicit replace wipes."""
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+    class _FakeRunner:
+        def __init__(self):
+            self.requests = {"req": object()}
+            self.model_intermediate_buffer = {
+                "req": {"hidden_states": {"last": torch.ones(2, 4)}, "text": ["旧句。"]}
+            }
+            self.updated = []
+
+        def _is_fresh_chunk_payload(self, payload_info):
+            return OmniGPUModelRunner._is_fresh_chunk_payload(payload_info)
+
+        def _update_intermediate_buffer(self, req_id, payload_info):
+            self.updated.append((req_id, payload_info))
+            buf = self.model_intermediate_buffer.setdefault(req_id, {})
+            buf.update(payload_info)
+
+        def _set_or_update_intermediate_buffer(self, req_id, payload_info):
+            return OmniGPUModelRunner._set_or_update_intermediate_buffer(self, req_id, payload_info)
+
+    runner = _FakeRunner()
+    late_same_segment = {
+        "prompt_token_ids": [0] * 23,
+        "text": ["下一句。"],
+        "meta": {"finished": True},
+    }
+    runner._set_or_update_intermediate_buffer("req", late_same_segment)
+    assert "last" in runner.model_intermediate_buffer["req"]["hidden_states"]
+    assert torch.equal(
+        runner.model_intermediate_buffer["req"]["hidden_states"]["last"],
+        torch.ones(2, 4),
+    )
+
+    runner2 = _FakeRunner()
+    new_segment = {
+        "prompt_token_ids": [0] * 23,
+        "text": ["下一句。"],
+        "meta": {"replace_streaming_prompt": True, "next_stage_prompt_len": 23},
+    }
+    runner2._set_or_update_intermediate_buffer("req", new_segment)
+    assert "last" not in runner2.model_intermediate_buffer["req"].get("hidden_states", {})
+    assert runner2.model_intermediate_buffer["req"]["text"] == ["下一句。"]
+
 
 # --- AURA port: test_load_poll_ar_preserves_prewarm_tts_metadata ---
 def test_load_poll_ar_preserves_prewarm_tts_metadata(build_adapter):

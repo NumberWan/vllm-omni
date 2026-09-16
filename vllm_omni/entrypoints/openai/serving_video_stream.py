@@ -378,9 +378,9 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
         description="Server-side AURA_v2 tool loop; disabled unless the server has an allowlist executor.",
     )
     max_tool_depth: int = Field(
-        default=3,
+        default=5,
         ge=1,
-        le=3,
+        le=8,
         description="Maximum tool-call passes in one logical turn.",
     )
     tool_intent_gate: bool = Field(
@@ -848,6 +848,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         pass_number = 1
         tool_depth = 1
         depth_error_returned = False
+        awaiting_force_final = False
         intent_gate_retries = 0
         current_kwargs = request_kwargs
         routing_pass = aura_config.tool_intent_gate
@@ -981,12 +982,19 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
                 # Routing / no-tool passes keep tools disabled. Defer execution
                 # until the pass finishes so we can retry without executing.
+                # Return "end_after_audio" so collect can stop after Stage1 text
+                # / first audio instead of waiting forever for generate()
+                # exhaustion after empty/placeholder TTS (#5471).
                 tools_enabled = bool(
                     (current_additional.get("aura_tool_enabled") or [False])[0]
                 )
                 if aura_config.tool_intent_gate and not tools_enabled:
-                    return True
+                    return "end_after_audio"
                 tool_task = await start_tool_execution()
+                # Tools-on with no speakable preamble: fail-closed TTS already
+                # withheld XML; do not wait for placeholder Code2Wav hang.
+                if not extract_aura_tool_preamble(raw_text):
+                    return "end_after_audio"
                 return True
 
             async def on_preamble_audio(b64: str) -> None:
@@ -1073,6 +1081,74 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                         }
                         continue
                 final_text = (parsed.content or "").strip()
+                tool_summary = self._summaries_from_tool_transient(transient_messages)
+                # Model sometimes emits foreign tool XML as "plain text" after a
+                # successful Safe tool. Prefer the known tool summary + speak it.
+                if self._looks_like_leaked_tool_markup(final_text) and tool_summary:
+                    response_text = tool_summary
+                    audio_deltas: list[str] = []
+                    speak_pass = pass_number + 1
+                    speak_additional = {
+                        **base_additional,
+                        "aura_tool_enabled": [False],
+                        "aura_tool_pass": [speak_pass],
+                        "aura_tool_resume": [
+                            {
+                                "transcript": (
+                                    f"{transcript}\n"
+                                    "请只朗读以下工具结果，不要调用工具，不要改写："
+                                    f"{tool_summary}"
+                                )
+                            }
+                        ],
+                        "omni_skip_stages": [0],
+                    }
+                    try:
+                        speak_kwargs = {
+                            **request_kwargs,
+                            "messages": [{"role": "user", "content": []}],
+                        }
+                        speak_request = ChatCompletionRequest(**speak_kwargs)
+                        setattr(
+                            speak_request,
+                            "additional_information",
+                            speak_additional,
+                        )
+                        speak_prompt = await self._preprocess_to_engine_prompt(
+                            speak_request
+                        )
+                        spoken = await self._collect_aura_tool_pass(
+                            config=aura_config,
+                            request_id=f"{request_id}-tool-speak-leak",
+                            interrupt_event=interrupt_event,
+                            engine_prompt=speak_prompt,
+                        )
+                        if not spoken.get("interrupted"):
+                            spoken_text = (spoken.get("text") or "").strip()
+                            if spoken_text and not self._looks_like_leaked_tool_markup(
+                                spoken_text
+                            ):
+                                response_text = spoken_text
+                            audio_deltas = list(spoken.get("audio_deltas") or [])
+                    except Exception:
+                        logger.exception(
+                            "AURA leaked-tool markup speak pass failed request_id=%s",
+                            request_id,
+                        )
+                    await self._emit_aura_tool_final(
+                        websocket=websocket,
+                        config=aura_config,
+                        message_history=message_history,
+                        user_message=user_message,
+                        request_id=request_id,
+                        response_text=response_text,
+                        audio_deltas=audio_deltas,
+                        release_turn_lock=release_turn_lock,
+                        tool_chain=transient_messages or None,
+                        transcript=transcript,
+                        rearm_pending=True,
+                    )
+                    return
                 await self._emit_aura_tool_final(
                     websocket=websocket,
                     config=aura_config,
@@ -1094,13 +1170,38 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 (current_additional.get("aura_tool_enabled") or [False])[0]
             )
             # Native has no per-tool intent classifier. Omni only uses the gate
-            # to decide whether tools are on; while they are off, never execute.
+            # to decide whether tools are on; while they are off, never execute
+            # the hallucinated calls. If the user's own words request a tool,
+            # escalate to a tools-enabled pass instead of looping tools-off.
             if (
                 aura_config.tool_intent_gate
                 and not tools_enabled
                 and calls
                 and parsed.error is None
             ):
+                intent_text = transcript or query_text
+                if aura_any_tool_intent(self._tool_executor.tool_schemas, intent_text):
+                    logger.info(
+                        "AURA tool intent gate escalating tools-disabled hallucination "
+                        "to tools-enabled pass request_id=%s tools=%s transcript=%r",
+                        internal_request_id,
+                        [call.name for call in calls],
+                        intent_text,
+                    )
+                    routing_pass = False
+                    pass_number += 1
+                    current_additional = {
+                        **base_additional,
+                        "aura_tool_enabled": [True],
+                        "aura_tool_pass": [pass_number],
+                        "aura_tool_resume": [{"transcript": transcript}],
+                        "omni_skip_stages": [0],
+                    }
+                    current_kwargs = {
+                        **request_kwargs,
+                        "messages": [{"role": "user", "content": []}],
+                    }
+                    continue
                 if intent_gate_retries:
                     await self._emit_aura_tool_final(
                         websocket=websocket,
@@ -1122,9 +1223,8 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     [call.name for call in calls],
                     transcript or query_text,
                 )
-                # Re-run Stage-1 against the same video and transcript without a
-                # tool template. Do not persist the hallucinated call or expose
-                # it as a real tool event.
+                # Visual / non-tool turn: re-run without a tool template. Do not
+                # persist the hallucinated call or expose it as a real tool event.
                 intent_gate_retries += 1
                 pass_number += 1
                 current_additional = {
@@ -1177,26 +1277,161 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 and results
                 and all(result.status == "completed" for result in results)
             )
+            tool_summary = self._summaries_from_tool_transient(transient_messages)
+            # After a successful tool, refuse to burn the depth budget on more
+            # malformed XML / unknown tools — speak the known summary instead.
+            force_final_ignored = bool(
+                awaiting_force_final
+                and (
+                    depth_error_returned
+                    or not results
+                    or any(result.status != "completed" for result in results)
+                )
+            )
+            depth_hard_stop = bool(
+                depth_error_returned and pass_number > aura_config.max_tool_depth + 1
+            )
+            if depth_hard_stop or force_final_ignored:
+                response_text = tool_summary or "抱歉，工具呼叫未能完成，請稍後再試。"
+                audio_deltas: list[str] = []
+                if tool_summary:
+                    speak_pass = pass_number + 1
+                    speak_additional = {
+                        **base_additional,
+                        "aura_tool_enabled": [False],
+                        "aura_tool_pass": [speak_pass],
+                        "aura_tool_resume": [
+                            {
+                                "transcript": (
+                                    f"{transcript}\n"
+                                    "请只朗读以下工具结果，不要调用工具，不要改写："
+                                    f"{tool_summary}"
+                                )
+                            }
+                        ],
+                        "omni_skip_stages": [0],
+                    }
+                    try:
+                        speak_kwargs = {
+                            **request_kwargs,
+                            "messages": [{"role": "user", "content": []}],
+                        }
+                        speak_request = ChatCompletionRequest(**speak_kwargs)
+                        setattr(
+                            speak_request,
+                            "additional_information",
+                            speak_additional,
+                        )
+                        speak_prompt = await self._preprocess_to_engine_prompt(
+                            speak_request
+                        )
+                        spoken = await self._collect_aura_tool_pass(
+                            config=aura_config,
+                            request_id=f"{request_id}-tool-speak",
+                            interrupt_event=interrupt_event,
+                            engine_prompt=speak_prompt,
+                        )
+                        if not spoken.get("interrupted"):
+                            spoken_text = (spoken.get("text") or "").strip()
+                            if (
+                                spoken_text
+                                and not self._looks_like_leaked_tool_markup(spoken_text)
+                            ):
+                                response_text = spoken_text
+                            audio_deltas = list(spoken.get("audio_deltas") or [])
+                    except Exception:
+                        logger.exception(
+                            "AURA tool summary speak pass failed request_id=%s",
+                            request_id,
+                        )
+                await self._emit_aura_tool_final(
+                    websocket=websocket,
+                    config=aura_config,
+                    message_history=message_history,
+                    user_message=user_message,
+                    request_id=request_id,
+                    response_text=response_text,
+                    audio_deltas=audio_deltas,
+                    release_turn_lock=release_turn_lock,
+                    tool_chain=transient_messages or None,
+                    transcript=transcript,
+                    rearm_pending=True,
+                )
+                return
 
-            if depth_error_returned:
-                # Give the model one final error-response pass. A repeated tool
-                # call cannot execute and is converted to a safe text fallback.
-                if pass_number > aura_config.max_tool_depth + 1:
-                    await self._emit_aura_tool_final(
-                        websocket=websocket,
-                        config=aura_config,
-                        message_history=message_history,
-                        user_message=user_message,
-                        request_id=request_id,
-                        response_text="抱歉，工具呼叫未能完成，請稍後再試。",
-                        audio_deltas=[],
-                        release_turn_lock=release_turn_lock,
-                        tool_chain=transient_messages or None,
-                        transcript=transcript,
-                        rearm_pending=True,
-                    )
-                    return
+            if force_final_answer:
+                # Tool succeeded under safe mode: stop the tool loop now and speak
+                # the known summary. Further model tool XML is unreliable (weather).
+                response_text = tool_summary or "工具已完成。"
+                audio_deltas = []
+                if tool_summary:
+                    speak_pass = pass_number + 1
+                    speak_additional = {
+                        **base_additional,
+                        "aura_tool_enabled": [False],
+                        "aura_tool_pass": [speak_pass],
+                        "aura_tool_resume": [
+                            {
+                                "transcript": (
+                                    "请只朗读以下内容，不要调用工具，不要输出XML："
+                                    f"{tool_summary}"
+                                ),
+                                "force_final_answer": True,
+                            }
+                        ],
+                        "omni_skip_stages": [0],
+                    }
+                    try:
+                        speak_kwargs = {
+                            **request_kwargs,
+                            "messages": [{"role": "user", "content": []}],
+                        }
+                        speak_request = ChatCompletionRequest(**speak_kwargs)
+                        setattr(
+                            speak_request,
+                            "additional_information",
+                            speak_additional,
+                        )
+                        speak_prompt = await self._preprocess_to_engine_prompt(
+                            speak_request
+                        )
+                        spoken = await self._collect_aura_tool_pass(
+                            config=aura_config,
+                            request_id=f"{request_id}-tool-speak-final",
+                            interrupt_event=interrupt_event,
+                            engine_prompt=speak_prompt,
+                        )
+                        if not spoken.get("interrupted"):
+                            spoken_text = (spoken.get("text") or "").strip()
+                            if (
+                                spoken_text
+                                and not self._looks_like_leaked_tool_markup(spoken_text)
+                            ):
+                                response_text = spoken_text
+                            audio_deltas = list(spoken.get("audio_deltas") or [])
+                    except Exception:
+                        logger.exception(
+                            "AURA immediate force-final speak failed request_id=%s",
+                            request_id,
+                        )
+                # If speak produced no audio, still return the known summary text;
+                # require_wav cases may fail, but XML leak is avoided.
+                await self._emit_aura_tool_final(
+                    websocket=websocket,
+                    config=aura_config,
+                    message_history=message_history,
+                    user_message=user_message,
+                    request_id=request_id,
+                    response_text=response_text,
+                    audio_deltas=audio_deltas,
+                    release_turn_lock=release_turn_lock,
+                    tool_chain=transient_messages or None,
+                    transcript=transcript,
+                    rearm_pending=True,
+                )
+                return
 
+            awaiting_force_final = bool(force_final_answer or awaiting_force_final)
             pass_number += 1
             tool_depth += 1
             current_additional = {
@@ -1206,7 +1441,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     {
                         "transcript": transcript,
                         "transient_messages": transient_messages,
-                        "force_final_answer": force_final_answer,
+                        "force_final_answer": force_final_answer or awaiting_force_final,
                     }
                 ],
                 "omni_skip_stages": [0],
@@ -1242,6 +1477,9 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         streaming = video_stream_envs.VLLM_VIDEO_ASYNC_CHUNK == "on"
         text_ready = False
         tool_transaction = False
+        # Tools-off routing hallucination: Stage1 text is enough; do not wait
+        # for placeholder TTS generate() to exhaust (can hang ~180s).
+        end_after_stage1 = False
         preamble_audio_count = 0
         tokenizer = None
         if self._engine_client is not None:
@@ -1257,12 +1495,17 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             )
 
         async def notify_text_ready() -> None:
-            nonlocal text_ready, tool_transaction
+            nonlocal text_ready, tool_transaction, end_after_stage1
             if text_ready:
                 return
             text_ready = True
             if on_text_ready is not None:
-                tool_transaction = bool(await on_text_ready(_pass_text()))
+                ready = await on_text_ready(_pass_text())
+                if ready == "end_after_audio":
+                    tool_transaction = True
+                    end_after_stage1 = True
+                elif ready:
+                    tool_transaction = True
 
         async def take_audio_b64(b64: str) -> None:
             nonlocal preamble_audio_count
@@ -1308,6 +1551,10 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     audio_data = self._get_audio_data(output)
                     if audio_data is not None:
                         audio_tail_tensors = list(audio_data) if isinstance(audio_data, list) else [audio_data]
+                # Routing hold: Stage1 tool XML is already parsed; stop waiting
+                # for generate() after first (often placeholder) audio chunk.
+                if end_after_stage1 or getattr(output, "finished", False):
+                    break
                 continue
             token_ids = self._output_token_ids(output)
             if token_ids:
@@ -1317,7 +1564,8 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 text_parts.append(delta_text)
             if getattr(output, "finished", False):
                 await notify_text_ready()
-
+                if end_after_stage1:
+                    break
         if not streaming and audio_tail_tensors:
             import torch
 
@@ -1343,6 +1591,54 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
             "preamble_audio_count": preamble_audio_count,
             "interrupted": interrupted,
         }
+
+
+    @staticmethod
+
+    @staticmethod
+    def _looks_like_leaked_tool_markup(text: str) -> bool:
+        """Detect non-AURA / unparsed tool markup leaking into final answer text."""
+        lowered = (text or "").lower()
+        markers = (
+            "<tool_call>",
+            "</tool_call>",
+            "<function=",
+            "<function_call>",
+            "<function_arguments>",
+            "<tool_call>",
+            "function_call",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _summaries_from_tool_transient(transient_messages: list[dict[str, Any]]) -> str | None:
+        """Best-effort spoken fallback from the last successful tool payload."""
+        summaries: list[str] = []
+        for message in transient_messages:
+            if message.get("role") != "tool":
+                continue
+            raw = message.get("content")
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict) or payload.get("ok") is False:
+                continue
+            result = payload.get("result")
+            summary = None
+            if isinstance(result, dict):
+                summary = result.get("summary") or result.get("text")
+            if not summary and isinstance(payload.get("summary"), str):
+                summary = payload.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                summaries.append(summary.strip())
+        if not summaries:
+            return None
+        # Prefer an earlier successful tool summary when a later tool (e.g. location)
+        # is an accidental follow-up after the user-requested tool already succeeded.
+        return summaries[0] if len(summaries) == 1 else summaries[0]
 
     async def _emit_aura_tool_final(
         self,
@@ -1592,14 +1888,15 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 if out_type == "audio":
                     if streaming and not text_done_sent:
                         full_text = _client_text()
-                        await websocket.send_json(
-                            _with_metrics(
-                                _response_event({"type": "response.text.done", "text": full_text}),
-                                last_text_metrics,
+                        if full_text.strip() and full_text != SILENT_TEXT:
+                            await websocket.send_json(
+                                _with_metrics(
+                                    _response_event({"type": "response.text.done", "text": full_text}),
+                                    last_text_metrics,
+                                )
                             )
-                        )
-                        text_done_sent = True
-                        await _try_release_turn_lock(full_text)
+                            text_done_sent = True
+                            await _try_release_turn_lock(full_text)
 
                     audio_chunk_count += 1
                     last_audio_metrics = metrics or last_audio_metrics

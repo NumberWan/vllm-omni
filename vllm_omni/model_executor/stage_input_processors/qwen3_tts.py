@@ -162,9 +162,16 @@ def talker2code2wav_async_chunk(
 
     if length <= 0:
         if finished:
+            # Never send zero codec frames to Code2Wav (#5196/#5471): an empty
+            # finished payload parks the request in running forever. Use the
+            # same one-frame placeholder as talker2code2wav_full_payload so
+            # Stage1 empty finishes (silent / withheld tool XML) close cleanly.
+            done = torch.tensor(True, dtype=torch.bool)
             return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                codes=CodesStruct(
+                    audio=torch.ones(_NUM_QUANTIZERS_DEFAULT, dtype=torch.long)
+                ),
+                meta=MetaStruct(finished=done, stream_finished=done),
             )
         return None
 
@@ -174,9 +181,10 @@ def talker2code2wav_async_chunk(
         if not emit:
             return None
         if context_length == 0:
+            done = torch.tensor(True, dtype=torch.bool)
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                meta=MetaStruct(finished=done, stream_finished=done),
             )
     else:
         use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
@@ -246,9 +254,13 @@ def talker2code2wav_async_chunk(
         dtype=torch.long,
     )
 
+    finished_flag = torch.tensor(finished, dtype=torch.bool)
     meta = MetaStruct(
         left_context_size=left_context_size,
-        finished=torch.tensor(finished, dtype=torch.bool),
+        finished=finished_flag,
+        # Adapter used to drop meta.finished on the generation merge path.
+        # stream_finished survives that merge and Code2Wav reads it too.
+        stream_finished=finished_flag,
     )
     if ref_context_size > 0 and ref_context_request_id is not None:
         meta.ref_context_size = ref_context_size

@@ -7,6 +7,7 @@ from typing import Any
 from vllm_omni.metrics import OrchestratorAggregator
 
 from .utils.logging import get_connector_logger
+from collections.abc import Mapping
 
 logger = get_connector_logger(__name__)
 
@@ -216,6 +217,38 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
     return sum_user_len + assistant_len
 
 
+def _coerce_payload_meta(meta: Any) -> Mapping[str, Any]:
+    """Normalize payload meta to a Mapping (dict / msgspec Struct / Mapping).
+
+    ``MetaStruct`` is msgspec.Struct, not ``collections.abc.Mapping``, so
+    ``isinstance(meta, Mapping)`` alone silently drops ``replace_streaming_prompt``
+    and falls through to the extend-prompt path (Smoke3 text-conditioning wipe).
+    """
+    if meta is None:
+        return {}
+    if isinstance(meta, Mapping):
+        return meta
+    if isinstance(meta, dict):
+        return meta
+    try:
+        import msgspec
+
+        return msgspec.structs.asdict(meta)
+    except Exception:
+        pass
+    out: dict[str, Any] = {}
+    for key in (
+        "finished",
+        "is_segment_finished",
+        "next_stage_prompt_len",
+        "replace_streaming_prompt",
+        "codec_streaming",
+    ):
+        if hasattr(meta, key):
+            out[key] = getattr(meta, key)
+    return out
+
+
 def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], request: Any) -> None:
     """Update a downstream streaming request prompt from connector payload ids.
 
@@ -229,9 +262,9 @@ def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], re
       extended prompt without discarding prior computed state.
     """
     ids = payload_data.get("ids", {})
-    meta = payload_data.get("meta", {})
-    replace_prompt = isinstance(meta, dict) and meta.get("replace_streaming_prompt") is True
-    next_stage_prompt_len = meta.get("next_stage_prompt_len") if isinstance(meta, dict) else None
+    meta = _coerce_payload_meta(payload_data.get("meta", {}))
+    replace_prompt = meta.get("replace_streaming_prompt") is True
+    next_stage_prompt_len = meta.get("next_stage_prompt_len")
     if replace_prompt and isinstance(next_stage_prompt_len, int) and next_stage_prompt_len > 0:
         # Some downstream stages consume complete, independently conditioned
         # segments instead of extending an existing KV prefix. The producer

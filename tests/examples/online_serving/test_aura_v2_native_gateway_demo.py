@@ -45,14 +45,21 @@ def test_index_stops_playback_on_ptt() -> None:
     assert "stopPlayback();" in index[start : start + 120]
 
 
+def test_index_draws_show_to_user_boxes() -> None:
+    index = (DEMO_ROOT / "static/index.html").read_text(encoding="utf-8")
+    assert 'id="highlightLayer"' in index
+    assert "function showToUser(" in index
+    assert "data.name === 'ShowToUser'" in index
+
+
 def test_bridge_health_and_index() -> None:
     client = TestClient(bridge_app)
     health = client.get("/health")
     assert health.status_code == 200
-    assert health.json()["model"] == "/workspace/models/AURA_v2"
+    assert health.json()["model"] == "/workspace/models/AURA_v2new"
     assert health.json()["tool_mode"] == "auto"
     assert health.json()["auto_trigger"] is True
-    assert health.json()["max_tool_depth"] == 3
+    assert health.json()["max_tool_depth"] == 5
 
     page = client.get("/")
     assert page.status_code == 200
@@ -303,9 +310,11 @@ def test_translator_buffers_audio_into_one_native_wav_and_one_turn_done() -> Non
     )
     assert [_decode_envelope(item)["type"] for item in text_events] == ["text"]
 
+    delta_frames = 0
     for samples in ([1, 2], [3, 4, 5]):
-        assert (
-            translator.observe(
+        delta_events = [
+            _decode_envelope(item)
+            for item in translator.observe(
                 {
                     "type": "response.audio.delta",
                     "request_id": request_id,
@@ -313,8 +322,13 @@ def test_translator_buffers_audio_into_one_native_wav_and_one_turn_done() -> Non
                 },
                 session_id=session_id,
             )
-            == []
-        )
+        ]
+        assert [event["type"] for event in delta_events] == ["audio"]
+        raw = base64.b64decode(delta_events[0]["data"]["audio"])
+        with wave.open(io.BytesIO(raw), "rb") as wav_file:
+            assert wav_file.getframerate() == 24000
+            delta_frames += wav_file.getnframes()
+    assert delta_frames == 5
 
     done_events = [
         _decode_envelope(item)
@@ -323,11 +337,7 @@ def test_translator_buffers_audio_into_one_native_wav_and_one_turn_done() -> Non
             session_id=session_id,
         )
     ]
-    assert [event["type"] for event in done_events] == ["audio", "turn_done"]
-    raw = base64.b64decode(done_events[0]["data"]["audio"])
-    with wave.open(io.BytesIO(raw), "rb") as wav_file:
-        assert wav_file.getframerate() == 24000
-        assert wav_file.getnframes() == 5
+    assert [event["type"] for event in done_events] == ["turn_done"]
 
     assert (
         translator.observe(
@@ -336,6 +346,68 @@ def test_translator_buffers_audio_into_one_native_wav_and_one_turn_done() -> Non
         )
         == []
     )
+
+
+def test_translator_strips_box_tokens_and_emits_show_to_user() -> None:
+    translator = NativeEventTranslator()
+    events = [
+        _decode_envelope(item)
+        for item in translator.observe(
+            {
+                "type": "response.text.done",
+                "request_id": "box",
+                "text": "杯子在这里。<|box_start|>120,180,520,640<|box_end|>",
+            },
+            session_id="s",
+        )
+    ]
+    assert [item["type"] for item in events] == ["toolcall", "toolcall", "text"]
+    started, done, text = events
+    assert started["data"]["name"] == "ShowToUser"
+    assert started["data"]["status"] == "started"
+    assert started["data"]["arguments"]["boxes"] == [[120, 180, 520, 640]]
+    assert done["data"]["status"] == "success"
+    assert text["data"]["text"] == "杯子在这里。"
+
+
+def test_translator_box_only_turn_is_not_silent() -> None:
+    translator = NativeEventTranslator()
+    events = [
+        _decode_envelope(item)
+        for item in translator.observe(
+            {
+                "type": "response.text.done",
+                "request_id": "box-only",
+                "text": "<|box_start|>(10,20),(30,40)<|box_end|>",
+            },
+            session_id="s",
+        )
+    ]
+    assert [item["type"] for item in events] == ["toolcall", "toolcall"]
+    assert events[0]["data"]["arguments"]["boxes"] == [[10, 20, 30, 40]]
+
+
+def test_translator_empty_text_done_does_not_close_spoken_turn() -> None:
+    translator = NativeEventTranslator()
+    assert (
+        translator.observe(
+            {"type": "response.text.done", "request_id": "voice", "text": ""},
+            session_id="s",
+        )
+        == []
+    )
+    audio = [
+        _decode_envelope(item)
+        for item in translator.observe(
+            {
+                "type": "response.audio.delta",
+                "request_id": "voice",
+                "data": _wav_b64([1, 2, 3]),
+            },
+            session_id="s",
+        )
+    ]
+    assert [item["type"] for item in audio] == ["audio"]
 
 
 def test_translator_silent_turn_finishes_once_without_audio() -> None:
@@ -384,14 +456,18 @@ def test_translator_preamble_audio_does_not_send_turn_done() -> None:
     ]
     assert [event["type"] for event in preamble_text] == ["text"]
 
-    translator.observe(
-        {
-            "type": "response.tool.preamble.audio.delta",
-            "request_id": request_id,
-            "data": _wav_b64([1, 2, 3]),
-        },
-        session_id=session_id,
-    )
+    preamble_delta = [
+        _decode_envelope(item)
+        for item in translator.observe(
+            {
+                "type": "response.tool.preamble.audio.delta",
+                "request_id": request_id,
+                "data": _wav_b64([1, 2, 3]),
+            },
+            session_id=session_id,
+        )
+    ]
+    assert [event["type"] for event in preamble_delta] == ["audio"]
     preamble_audio = [
         _decode_envelope(item)
         for item in translator.observe(
@@ -399,7 +475,7 @@ def test_translator_preamble_audio_does_not_send_turn_done() -> None:
             session_id=session_id,
         )
     ]
-    assert [event["type"] for event in preamble_audio] == ["audio"]
+    assert preamble_audio == []
 
     translator.observe(
         {"type": "response.tool.started", "request_id": request_id, "call_id": "c", "name": "calculator"},
@@ -428,7 +504,7 @@ def test_translator_preamble_audio_does_not_send_turn_done() -> None:
             session_id=session_id,
         )
     ]
-    assert [event["type"] for event in final_events] == ["audio", "turn_done"]
+    assert [event["type"] for event in final_events] == ["turn_done"]
     assert (
         translator.observe(
             {"type": "response.audio.done", "request_id": request_id},

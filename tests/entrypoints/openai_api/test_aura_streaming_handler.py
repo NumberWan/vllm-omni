@@ -672,6 +672,150 @@ async def test_tool_intent_gate_retries_visual_question_without_executing(monkey
 
 
 @pytest.mark.asyncio
+async def test_tool_intent_gate_escalates_when_user_asks_for_tool(monkeypatch):
+    """Routing hallucination + clear tool intent → escalate to tools-enabled."""
+    raw_tool = (
+        "<tool_call><function=calculator>"
+        "<parameter=expression>37 * 19</parameter></function></tool_call>"
+    )
+
+    class FakeEngine:
+        async def get_tokenizer(self):
+            return object()
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.events = []
+
+        async def send_json(self, event):
+            self.events.append(event)
+
+    def fake_parse(_tokenizer, raw, *, request_id, tool_schemas):
+        del tool_schemas
+        if "<tool_call>" in raw:
+            return ParsedAuraToolTurn(
+                reasoning=None,
+                content="",
+                calls=[
+                    AuraToolCall(
+                        id=f"{request_id}-calc",
+                        name="calculator",
+                        arguments={"expression": "37 * 19"},
+                    )
+                ],
+            )
+        return ParsedAuraToolTurn(
+            reasoning=None,
+            content="37 * 19 = 703",
+            calls=[],
+        )
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.serving_video_stream.parse_aura_tool_output",
+        fake_parse,
+    )
+    executor = AuraToolExecutor(mode="safe")
+    executed = []
+
+    async def record_execute(**kwargs):
+        call = kwargs["call"]
+        executed.append(call.name)
+        from vllm_omni.entrypoints.openai.aura_tool_executor import AuraToolResult
+
+        return AuraToolResult(
+            call_id=call.id,
+            name=call.name,
+            status="completed",
+            content='{"summary":"37 * 19 = 703","result":703}',
+            latency_ms=1.0,
+            output_bytes=40,
+        )
+
+    executor.execute = record_execute  # type: ignore[method-assign]
+    handler = AuraStreamingVideoHandler(
+        chat_service=SimpleNamespace(enable_auto_tools=True, parser_cls=object()),
+        engine_client=FakeEngine(),
+        tool_executor=executor,
+        tool_tokenizer_path="/workspace/models/AURA_v2",
+    )
+    preprocessed = []
+
+    async def fake_preprocess(chat_request):
+        preprocessed.append(getattr(chat_request, "additional_information"))
+        return chat_request
+
+    passes = 0
+
+    async def fake_collect(*, on_text_ready, on_transcript, **kwargs):
+        nonlocal passes
+        del kwargs
+        passes += 1
+        tools_on = bool((preprocessed[-1].get("aura_tool_enabled") or [False])[0])
+        if passes == 1:
+            await on_transcript("請使用 calculator 工具計算 37 乘以 19")
+            await on_text_ready(raw_tool)
+            return {
+                "interrupted": False,
+                "transcript": "請使用 calculator 工具計算 37 乘以 19",
+                "text": raw_tool,
+                "preamble_audio_count": 0,
+                "audio_deltas": [],
+            }
+        if tools_on:
+            await on_text_ready(raw_tool)
+            return {
+                "interrupted": False,
+                "transcript": "",
+                "text": raw_tool,
+                "preamble_audio_count": 0,
+                "audio_deltas": [],
+            }
+        await on_text_ready("37 * 19 = 703")
+        return {
+            "interrupted": False,
+            "transcript": "",
+            "text": "37 * 19 = 703",
+            "preamble_audio_count": 0,
+            "audio_deltas": [],
+        }
+
+    final_texts = []
+
+    async def fake_emit(**kwargs):
+        final_texts.append(kwargs["response_text"])
+
+    handler._preprocess_to_engine_prompt = fake_preprocess  # type: ignore[method-assign]
+    handler._collect_aura_tool_pass = fake_collect  # type: ignore[method-assign]
+    handler._emit_aura_tool_final = fake_emit  # type: ignore[method-assign]
+
+    state = _session_state()
+    state.turn_frame_arrays = [np.zeros((8, 8, 3), dtype=np.uint8)]
+    get_or_create_session_history(state.session_id)
+    websocket = FakeWebSocket()
+    await handler._process_query_engine(
+        websocket=websocket,
+        config=AuraStreamingVideoSessionConfig(
+            model="test",
+            tool_mode="auto",
+            cross_turn_penalty=0,
+        ),
+        frame_buffer=[_b64(_make_jpeg())],
+        audio_buffer=bytearray(),
+        message_history=state,
+        query_text="",
+        request_id="intent-escalate",
+        interrupt_event=SimpleNamespace(is_set=lambda: False),
+        prewarmed_frames={},
+    )
+
+    assert passes >= 2
+    assert preprocessed[0]["aura_tool_enabled"] == [False]
+    assert any(info.get("aura_tool_enabled") == [True] for info in preprocessed[1:])
+    assert "calculator" in executed
+    assert any("703" in text for text in final_texts) or final_texts
+
+
+@pytest.mark.asyncio
 async def test_tool_loop_interrupt_drains_without_execution(monkeypatch):
     drained = False
 

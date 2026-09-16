@@ -443,6 +443,33 @@ async def test_video_done_waits_for_in_flight_query():
 
 
 @pytest.mark.asyncio
+async def test_video_done_emits_session_done_if_query_hangs(monkeypatch):
+    """Stuck generate() must not block session.done after video.done."""
+    monkeypatch.setattr(video_stream_base, "_VIDEO_DONE_DRAIN_TIMEOUT", 0.2)
+    query_started = asyncio.Event()
+
+    class HangingHandler(QwenOmniStreamingVideoHandler):
+        async def _process_query(self, *args, **kwargs):
+            query_started.set()
+            await asyncio.Event().wait()
+
+    ws = TimedWebSocket()
+    handler = HangingHandler(chat_service=object(), idle_timeout=5.0)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    ws.put({"type": "session.config", "model": "test"})
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+    await asyncio.sleep(0)
+    ws.put({"type": "video.query", "text": "describe"})
+    await asyncio.wait_for(query_started.wait(), timeout=2.0)
+    ws.put({"type": "video.done"})
+
+    await asyncio.wait_for(task, timeout=3.0)
+    assert "session.done" in ws.sent_types()
+
+
+@pytest.mark.asyncio
 async def test_frame_prewarm_does_not_block_following_query(monkeypatch):
     decode_started = threading.Event()
     release_decode = threading.Event()

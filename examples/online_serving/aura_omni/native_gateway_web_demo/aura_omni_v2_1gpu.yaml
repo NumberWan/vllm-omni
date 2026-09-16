@@ -2,7 +2,7 @@
 # Started by run_1gpu_stack.sh; single-session showcase profile.
 # devices: "0" is relative to CUDA_VISIBLE_DEVICES.
 #
-# Stage1 uses /workspace/models/AURA_v2 + AuraQwen3_5ForConditionalGeneration.
+# Stage1 uses /workspace/models/AURA_v2new + AuraQwen3_5ForConditionalGeneration.
 # Silent/im_end stop ids are qwen3_5 tokenizer values (not v1 151669/151645).
 # Also set env when starting:
 #   VLLM_AURA_SILENT_TOKEN_ID=248070
@@ -55,7 +55,7 @@ stages:
   max_model_len: 32768
   max_num_batched_tokens: 8192
   devices: '0'
-  model: /workspace/models/AURA_v2
+  model: /workspace/models/AURA_v2new
   model_arch: AuraQwen3_5ForConditionalGeneration
   default_sampling_params:
     temperature: 0.0

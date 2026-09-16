@@ -100,10 +100,24 @@ def _apply_max_new_tokens_from_payload(request: Any, payload_data: Any) -> int:
     The real TTS payload later arrives over SharedMemory with a text-proportional
     ``max_new_tokens`` cap, but without this clamp the Talker can babble for many
     seconds when EOS is late (e.g. ``你好。`` → 200 frames / ~16s).
+
+    Call only at segment start (computed == prompt, no generated tokens).
+    Mid-decode apply is a protocol bug: queue the next sentence instead of
+    clamping below/around live ``num_computed``.
     """
     max_new_tokens = _extract_max_new_tokens_from_payload(payload_data)
     if max_new_tokens <= 0:
         return 0
+
+    prompt_len = int(getattr(request, "num_prompt_tokens", 0) or 0)
+    computed = int(getattr(request, "num_computed_tokens", 0) or 0)
+    already_generated = max(0, computed - prompt_len) if prompt_len > 0 else 0
+    if already_generated > 0:
+        raise RuntimeError(
+            f"Refuse max_new_tokens={max_new_tokens} mid-decode "
+            f"(computed={computed} prompt_len={prompt_len} already_generated={already_generated}). "
+            "Queue the next sentence until Talker WAITING; do not clamp a live budget."
+        )
 
     sampling_params = getattr(request, "sampling_params", None)
     if sampling_params is not None and getattr(sampling_params, "max_tokens", None) is not None:
@@ -111,8 +125,8 @@ def _apply_max_new_tokens_from_payload(request: Any, payload_data: Any) -> int:
 
     current = getattr(request, "max_tokens", None)
     if current is None:
-        request.max_tokens = max_new_tokens
         effective = max_new_tokens
+        request.max_tokens = effective
     else:
         effective = min(int(current), max_new_tokens)
         request.max_tokens = effective
@@ -125,6 +139,73 @@ def _apply_max_new_tokens_from_payload(request: Any, payload_data: Any) -> int:
             current,
         )
     return effective
+
+
+def _meta_to_dict(meta: Any) -> dict[str, Any]:
+    """Coerce payload meta (dict / Mapping / msgspec Struct) to a plain dict."""
+    if meta is None:
+        return {}
+    if isinstance(meta, dict):
+        return dict(meta)
+    if isinstance(meta, Mapping):
+        return dict(meta)
+    try:
+        import msgspec
+
+        return dict(msgspec.structs.asdict(meta))
+    except Exception:
+        pass
+    out: dict[str, Any] = {}
+    for key in (
+        "finished",
+        "is_segment_finished",
+        "next_stage_prompt_len",
+        "replace_streaming_prompt",
+        "codec_streaming",
+    ):
+        if hasattr(meta, key):
+            out[key] = getattr(meta, key)
+    return out
+
+
+def _payload_has_talker_conditioning(payload_data: Any) -> bool:
+    """True if payload can start/continue Talker (text or precomputed ids).
+
+    Empty Stage1 finish sentinels carry finished=True with no text / prompt ids.
+    Applying those as new_segment wipes live TTS conditioning and crashes
+    Qwen3-TTS decode with "Missing Qwen3-TTS text conditioning".
+    """
+    if not isinstance(payload_data, Mapping):
+        return False
+    text_list = payload_data.get("text")
+    if isinstance(text_list, list) and bool(text_list) and bool(text_list[0]):
+        return True
+    additional = payload_data.get("additional_information")
+    if isinstance(additional, Mapping):
+        text_list = additional.get("text")
+        if isinstance(text_list, list) and bool(text_list) and bool(text_list[0]):
+            return True
+        if additional.get("precomputed_text_id") is not None:
+            return True
+    if payload_data.get("precomputed_text_id") is not None:
+        return True
+    hs = payload_data.get("hidden_states")
+    if isinstance(hs, Mapping):
+        tail = hs.get("trailing_text")
+        if hasattr(tail, "numel") and int(tail.numel()) > 0:
+            return True
+        last = hs.get("last")
+        if hasattr(last, "numel") and int(last.numel()) > 0:
+            return True
+    prompt_ids = payload_data.get("prompt_token_ids")
+    if isinstance(prompt_ids, list) and prompt_ids:
+        return True
+    ids = payload_data.get("ids")
+    if isinstance(ids, Mapping):
+        prompt_ids = ids.get("prompt")
+        if isinstance(prompt_ids, list) and prompt_ids:
+            return True
+    return False
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -189,6 +270,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # request-global for connector key continuity).
         self.ramp_chunk_count: dict[str, int] = defaultdict(int)
         self.upstream_exhausted_requests: set[str] = set()
+        # Mid-decode Stage1 sentences parked until the current Talker segment
+        # stops. Drained when the scheduler rearms the connector (WAITING).
+        self._pending_upstream_payloads: dict[str, deque[dict[str, Any]]] = {}
+        # Empty Stage1 finish sentinels that exhausted upstream without opening
+        # a new Talker segment. Scheduler must finish these (not re-schedule
+        # decode with stale computed >> prompt_len).
+        self._terminal_empty_finish_reqs: set[str] = set()
         self.segment_finished_requests: set[str] = set()
         self.request_payload = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
@@ -214,6 +302,37 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if isinstance(value, torch.Tensor):
             return value.numel() == 1 and bool(value.item())
         return bool(value) if value is not None else False
+
+    @classmethod
+    def _payload_terminal_flags(cls, payload_data: Any) -> tuple[bool, bool]:
+        """Read finished / is_segment_finished from nested, flat, or struct meta.
+
+        SharedMemory round-trips keep nested ``meta.finished``. Some worker
+        paths flatten to ``meta.finished`` at the top level; without unflatten
+        the AR recv used to see ``meta={}`` and leave prewarmed Talker
+        ``resumable=True``.
+        """
+        if payload_data is None:
+            return False, False
+        if isinstance(payload_data, Mapping):
+            nested = unflatten_payload(payload_data)
+            meta = nested.get("meta", {})
+            if isinstance(meta, Mapping):
+                return (
+                    cls._is_truthy_scalar(meta.get("finished")),
+                    cls._is_truthy_scalar(meta.get("is_segment_finished")),
+                )
+            return (
+                cls._is_truthy_scalar(getattr(meta, "finished", None)),
+                cls._is_truthy_scalar(getattr(meta, "is_segment_finished", None)),
+            )
+        meta = getattr(payload_data, "meta", None)
+        if meta is None:
+            return False, False
+        return (
+            cls._is_truthy_scalar(getattr(meta, "finished", None)),
+            cls._is_truthy_scalar(getattr(meta, "is_segment_finished", None)),
+        )
 
     @staticmethod
     def _confirmed_num_computed_tokens(request: Request) -> int:
@@ -319,10 +438,248 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         with self._save_cond:
             self._save_cond.notify()
 
+    def _enqueue_pending_upstream_payload(
+        self,
+        req_id: str,
+        payload_data: Any,
+        *,
+        finished: bool,
+        segment_finished: bool,
+        chunk_id: int,
+    ) -> None:
+        queued = dict(payload_data) if isinstance(payload_data, Mapping) else payload_data
+        bucket = self._pending_upstream_payloads.setdefault(req_id, deque())
+        bucket.append(
+            {
+                "payload": queued,
+                "finished": finished,
+                "segment_finished": segment_finished,
+                "chunk_id": chunk_id,
+            }
+        )
+
+    def try_apply_pending_upstream_payload(self, request: Request) -> bool:
+        """Apply one queued Stage1 sentence after the live Talker segment stops."""
+        req_id = request.request_id
+        bucket = self._pending_upstream_payloads.get(req_id)
+        if not bucket:
+            return False
+        # Mid-decode parking uses RUNNING / WAITING_FOR_CHUNK with computed still
+        # past the prompt. Only WAITING (rearmed after Talker segment EOS) is a
+        # safe boundary to open the next sentence as new_segment. Draining while
+        # WAITING_FOR_CHUNK wiped TTS text / last-hidden and OOBd embeddings.
+        if self._request_already_generating(request):
+            if getattr(request, "status", None) != RequestStatus.WAITING:
+                return False
+        self.segment_finished_requests.discard(req_id)
+        item = bucket.popleft()
+        more_pending = bool(bucket)
+        if not more_pending:
+            self._pending_upstream_payloads.pop(req_id, None)
+        payload_data = item["payload"]
+        if isinstance(payload_data, Mapping):
+            payload_data = unflatten_payload(payload_data)
+        meta = _meta_to_dict(
+            payload_data.get("meta") if isinstance(payload_data, Mapping) else None
+        )
+        # Only mark turn exhausted when this drained item is finished AND no
+        # further queued sentences remain (defensive against out-of-order flags).
+        apply_finished = bool(item.get("finished")) and not more_pending
+        # Empty finish sentinels must not open a new Talker segment: they only
+        # release the upstream wait gate and would wipe TTS text conditioning.
+        # Return False so callers do NOT mark finished_load / ready_chunks —
+        # that re-admits Talker as scheduled_new_reqs with stale computed
+        # (Smoke3 CUDA indexSelect: prompt_len=34, computed=145).
+        if not _payload_has_talker_conditioning(payload_data):
+            if apply_finished:
+                self.upstream_exhausted_requests.add(req_id)
+                request.resumable = False
+                # Post-EOS empty finish: do not finished_load / re-schedule.
+                # Scheduler finishes via _terminal_empty_finish_reqs.
+                self._terminal_empty_finish_reqs.add(req_id)
+                # If Talker already left RUNNING (segment EOS → WAITING), do not
+                # wait for the next schedule sweep — immediately tell Code2Wav
+                # finished=True. Otherwise already_generating (stale computed)
+                # can skip _finish_empty_prompt_chunk_requests and hang generate().
+                if getattr(request, "status", None) != RequestStatus.RUNNING:
+                    self._pending_save_reqs.append(
+                        {
+                            "multimodal_output": None,
+                            "request": request,
+                            "is_finished": True,
+                            "is_segment_finished": True,
+                        }
+                    )
+                    with self._save_cond:
+                        self._save_cond.notify()
+            if bool(item.get("segment_finished")):
+                self.segment_finished_requests.add(req_id)
+            logger.info(
+                "[async_chunk] req=%s drained_pending_finish_sentinel finished=%s "
+                "segment_finished=%s remaining_pending=%d (no talker conditioning; skip new_segment)",
+                req_id,
+                apply_finished,
+                bool(item.get("segment_finished")),
+                len(self._pending_upstream_payloads.get(req_id, ())),
+            )
+            return False
+        applied = self._apply_ar_talker_payload(
+            request,
+            payload_data,
+            finished=apply_finished,
+            segment_finished=bool(item.get("segment_finished")),
+            resolved_aura_payload=False,
+            meta=meta,
+            chunk_id=max(1, int(item.get("chunk_id") or 0)),
+            new_segment=True,
+        )
+        logger.info(
+            "[async_chunk] req=%s drained_pending_payload finished=%s segment_finished=%s "
+            "remaining_pending=%d resumable=%s applied=%s",
+            req_id,
+            apply_finished,
+            bool(item.get("segment_finished")),
+            len(self._pending_upstream_payloads.get(req_id, ())),
+            getattr(request, "resumable", False),
+            applied,
+        )
+        return bool(applied)
+
+    def _apply_ar_talker_payload(
+        self,
+        request: Request,
+        payload_data: Any,
+        *,
+        finished: bool,
+        segment_finished: bool,
+        resolved_aura_payload: bool,
+        meta: Mapping[str, Any],
+        chunk_id: int,
+        new_segment: bool = False,
+    ) -> bool:
+        """Apply Stage1→Talker payload. Returns True only when decode-ready work was applied."""
+        req_id = request.request_id
+        if not isinstance(payload_data, Mapping):
+            return False
+        # Belt-and-suspenders: never wipe live Talker decode state. Callers must
+        # pass new_segment=True only after the previous segment has stopped.
+        if not new_segment and not resolved_aura_payload and self._request_already_generating(request):
+            self._enqueue_pending_upstream_payload(
+                req_id,
+                payload_data,
+                finished=finished,
+                segment_finished=segment_finished,
+                chunk_id=chunk_id,
+            )
+            logger.warning(
+                "[async_chunk] req=%s refuse_apply_mid_decode computed=%s prompt_len=%s "
+                "finished=%s → queued pending=%d",
+                req_id,
+                getattr(request, "num_computed_tokens", None),
+                len(getattr(request, "prompt_token_ids", []) or []),
+                finished,
+                len(self._pending_upstream_payloads.get(req_id, ())),
+            )
+            return False
+        payload_data = dict(unflatten_payload(payload_data))
+        merged_meta = _meta_to_dict(payload_data.get("meta"))
+        for key, value in _meta_to_dict(meta).items():
+            merged_meta.setdefault(key, value)
+        meta = merged_meta
+        if new_segment:
+            # Refuse new_segment wipe when this payload cannot condition Talker.
+            if not _payload_has_talker_conditioning(payload_data):
+                if finished:
+                    self.upstream_exhausted_requests.add(req_id)
+                    request.resumable = False
+                if segment_finished:
+                    self.segment_finished_requests.add(req_id)
+                logger.info(
+                    "[async_chunk] req=%s skip_new_segment_empty_payload finished=%s "
+                    "segment_finished=%s",
+                    req_id,
+                    finished,
+                    segment_finished,
+                )
+                return False
+            prompt_ids = payload_data.get("prompt_token_ids")
+            if prompt_ids is None:
+                ids = payload_data.get("ids", {})
+                prompt_ids = ids.get("prompt") if isinstance(ids, Mapping) else None
+            next_len = meta.get("next_stage_prompt_len")
+            if not isinstance(next_len, int) or next_len <= 0:
+                if isinstance(prompt_ids, list) and prompt_ids:
+                    meta["next_stage_prompt_len"] = len(prompt_ids)
+            # Only declare replace when we actually know the next prompt length.
+            if isinstance(meta.get("next_stage_prompt_len"), int) and meta["next_stage_prompt_len"] > 0:
+                meta["replace_streaming_prompt"] = True
+            else:
+                logger.warning(
+                    "[async_chunk] req=%s new_segment missing next_stage_prompt_len; "
+                    "skip replace_streaming_prompt to avoid wiping TTS state",
+                    req_id,
+                )
+                if finished:
+                    self.upstream_exhausted_requests.add(req_id)
+                    request.resumable = False
+                if segment_finished:
+                    self.segment_finished_requests.add(req_id)
+                return False
+            payload_data["meta"] = meta
+
+        if not new_segment:
+            prompt_token_ids = payload_data.get("prompt_token_ids")
+            if prompt_token_ids is None:
+                prompt_token_ids = payload_data.get("ids", {}).get("prompt") if isinstance(payload_data.get("ids"), Mapping) else None
+            if isinstance(prompt_token_ids, list) and all(isinstance(token_id, int) for token_id in prompt_token_ids):
+                _replace_request_prompt_token_ids(request, prompt_token_ids)
+
+        prev_info = getattr(request, "additional_information", None)
+        if isinstance(prev_info, dict):
+            prev_tts_info = {key: value for key, value in prev_info.items() if str(key).startswith("tts_")}
+            payload_additional_info = payload_data.get("additional_information")
+            if prev_tts_info and isinstance(payload_additional_info, dict):
+                payload_data = dict(payload_data)
+                payload_data["additional_information"] = {**prev_tts_info, **payload_additional_info}
+        request.omni_stage_payload = payload_data
+        if resolved_aura_payload:
+            slim_info = payload_data.get("additional_information")
+            request.additional_information = slim_info if isinstance(slim_info, dict) else {}
+        else:
+            request.additional_information = payload_data
+
+        replace_prompt = meta.get("replace_streaming_prompt") is True
+        if new_segment or (getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt)):
+            construct_next_stage_streaming_input_prompt(payload_data, request)
+
+        if not resolved_aura_payload:
+            _apply_max_new_tokens_from_payload(request, payload_data)
+
+        if finished:
+            self.upstream_exhausted_requests.add(req_id)
+            request.resumable = False
+        if segment_finished:
+            self.segment_finished_requests.add(req_id)
+        if finished or getattr(request, "resumable", False):
+            logger.info(
+                "[async_chunk] recv req=%s finished=%s segment_finished=%s resumable=%s new_segment=%s",
+                req_id,
+                finished,
+                segment_finished,
+                getattr(request, "resumable", False),
+                new_segment,
+            )
+        if not resolved_aura_payload:
+            _mark_async_chunk_stage_ready(request)
+        return True
+
     def _poll_single_request(self, request: Request):
         stage_id = self.connector.stage_id
         target_stage_id = stage_id - 1
         req_id = request.request_id
+        if self.model_mode == "ar" and self.try_apply_pending_upstream_payload(request):
+            self._finished_load_reqs.add(req_id)
+            return True
         chunk_id = self.get_req_chunk[req_id]
         external_req_id = self.request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
@@ -346,9 +703,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Update connector state
             self.get_req_chunk[req_id] += 1
 
-            meta = payload_data.get("meta", {})
-            payload_finished = self._is_truthy_scalar(meta.get("finished"))
-            payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
+            if isinstance(payload_data, Mapping):
+                payload_data = unflatten_payload(payload_data)
+            payload_finished, payload_segment_finished = self._payload_terminal_flags(payload_data)
+            meta = payload_data.get("meta", {}) if isinstance(payload_data, Mapping) else {}
+            if not isinstance(meta, Mapping):
+                meta = {}
             resolved_aura_payload = False
             if self.model_mode == "ar" and "aura_asr_transcript" in payload_data:
                 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
@@ -371,52 +731,95 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         list(mm_features)
                     )
             if self.model_mode == "ar":
-                prompt_token_ids = payload_data.get("prompt_token_ids")
-                if prompt_token_ids is None:
-                    prompt_token_ids = payload_data.get("ids", {}).get("prompt")
-                if isinstance(prompt_token_ids, list) and all(
-                    isinstance(token_id, int) for token_id in prompt_token_ids
-                ):
-                    _replace_request_prompt_token_ids(request, prompt_token_ids)
-                prev_info = getattr(request, "additional_information", None)
-                if isinstance(prev_info, dict):
-                    prev_tts_info = {key: value for key, value in prev_info.items() if str(key).startswith("tts_")}
-                    payload_additional_info = payload_data.get("additional_information")
-                    if prev_tts_info and isinstance(payload_additional_info, dict):
-                        payload_data = dict(payload_data)
-                        payload_data["additional_information"] = {**prev_tts_info, **payload_additional_info}
-                request.omni_stage_payload = payload_data
-                if resolved_aura_payload:
-                    # AURA Stage-1 only: keep slim TTS metadata. Putting the full
-                    # ASR connector dict (raw video ndarrays) onto
-                    # request.additional_information re-IPCs pixels every schedule
-                    # (~500ms floor). Talker/TTS payloads stay flat/full below.
-                    slim_info = payload_data.get("additional_information")
-                    request.additional_information = slim_info if isinstance(slim_info, dict) else {}
-                else:
-                    # Qwen3-TTS Talker payloads are flat dicts with top-level
-                    # ``text`` / ``speaker`` / … — preserve previous behavior.
-                    request.additional_information = payload_data
-                    # Prewarm used deploy default max_tokens; clamp from payload.
-                    _apply_max_new_tokens_from_payload(request, payload_data)
-                replace_prompt = meta.get("replace_streaming_prompt") is True
-                if getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt):
-                    # For new streaming input segment, we should update prompt from payload
-                    construct_next_stage_streaming_input_prompt(payload_data, request)
-
-                if payload_finished:
-                    self.upstream_exhausted_requests.add(req_id)
-                    request.resumable = False
-                if payload_segment_finished:
-                    self.segment_finished_requests.add(req_id)
-                if not resolved_aura_payload:
-                    _mark_async_chunk_stage_ready(request)
+                # Any late Stage1 sentence that arrives while Talker has already
+                # produced tokens must not be applied as a same-segment update:
+                # that replaces additional_information (wiping hidden_states['last'])
+                # and clamps max_new_tokens mid-flight (Smoke3 CUDA / RuntimeError).
+                # Queue it. Drain immediately only on true between-segment WAITING
+                # (Talker EOS rearm). WAITING_FOR_CHUNK is mid-decode parking and
+                # must keep the live TTS payload until the segment actually stops.
+                already_generating = self._request_already_generating(request)
+                if already_generating and not resolved_aura_payload:
+                    self._enqueue_pending_upstream_payload(
+                        req_id,
+                        payload_data,
+                        finished=payload_finished,
+                        segment_finished=payload_segment_finished,
+                        chunk_id=chunk_id,
+                    )
+                    logger.info(
+                        "[async_chunk] recv req=%s queue_late_payload finished=%s "
+                        "segment_finished=%s status=%s computed=%s prompt_len=%s pending=%d",
+                        req_id,
+                        payload_finished,
+                        payload_segment_finished,
+                        getattr(request, "status", None),
+                        getattr(request, "num_computed_tokens", None),
+                        len(getattr(request, "prompt_token_ids", []) or []),
+                        len(self._pending_upstream_payloads.get(req_id, ())),
+                    )
+                    if getattr(request, "status", None) == RequestStatus.WAITING:
+                        if self.try_apply_pending_upstream_payload(request):
+                            self._finished_load_reqs.add(req_id)
+                            return True
+                    if getattr(request, "status", None) == RequestStatus.WAITING_FOR_CHUNK:
+                        # Mid-decode WFC + queued sentence: do NOT mark finished_load.
+                        # finished_load → ready_chunks re-admits Talker as
+                        # scheduled_new_reqs with stale prompt/KV lengths
+                        # (Smoke3 CUDA indexSelect). process_chunk_queue resumes
+                        # SAME-segment RUNNING without advertising a new chunk.
+                        return False
+                    # RUNNING: stay on the running queue and keep polling.
+                    return False
+                # After segment EOS, computed may still sit past prompt while
+                # outputs are cleared. Open the next sentence as new_segment so
+                # replace_streaming_prompt resets computed before max_new_tokens.
+                prompt_len = int(getattr(request, "num_prompt_tokens", 0) or 0)
+                if prompt_len <= 0:
+                    prompt_len = len(getattr(request, "prompt_token_ids", None) or [])
+                computed = int(getattr(request, "num_computed_tokens", 0) or 0)
+                open_new_segment = computed > prompt_len > 0
+                applied = self._apply_ar_talker_payload(
+                    request,
+                    payload_data,
+                    finished=payload_finished,
+                    segment_finished=payload_segment_finished,
+                    resolved_aura_payload=resolved_aura_payload,
+                    meta=meta,
+                    chunk_id=chunk_id,
+                    new_segment=open_new_segment,
+                )
+                if not applied:
+                    # Empty finish / refuse paths must not advertise ready_chunks.
+                    # Mark terminal so the AR scheduler finishes the WAITING
+                    # post-EOS request instead of hanging for another chunk.
+                    if payload_finished or req_id in self.upstream_exhausted_requests:
+                        self.upstream_exhausted_requests.add(req_id)
+                        request.resumable = False
+                        self._terminal_empty_finish_reqs.add(req_id)
+                        logger.info(
+                            "[async_chunk] req=%s terminal_empty_finish "
+                            "computed=%s prompt_len=%s (scheduler will finish)",
+                            req_id,
+                            computed,
+                            prompt_len,
+                        )
+                    return False
             else:
                 if payload_finished:
                     self.upstream_exhausted_requests.add(req_id)
                     request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
+                if payload_finished or payload_segment_finished:
+                    logger.info(
+                        "[async_chunk] recv stage=%s req=%s finished=%s segment_finished=%s resumable=%s",
+                        stage_id,
+                        req_id,
+                        payload_finished,
+                        payload_segment_finished,
+                        getattr(request, "resumable", False),
+                    )
 
                 new_ids = payload_data.get("codes", {}).get("audio")
                 has_tensor_codes = isinstance(new_ids, torch.Tensor)
@@ -446,10 +849,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     if isinstance(value, dict):
                         existing_sub = info.get(key)
                         merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
-                        for sk, sv in value.items():
-                            if key == "meta" and sk == "finished":
-                                continue
-                            merged_sub[sk] = sv
+                        # Keep the latest meta.finished. Skipping it left Code2Wav
+                        # additional_information stuck at False, so model outputs
+                        # never finished and generate() hung after spoken leftover.
+                        merged_sub.update(value)
                         info[key] = merged_sub
                         continue
                     info[key] = value
@@ -539,7 +942,26 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if not isinstance(meta, dict):
                 meta = {}
                 payload_data["meta"] = meta
-            meta["finished"] = torch.tensor(is_finished, dtype=torch.bool)
+            # Preserve processor-set terminal marker. Prewarmed Talker/Code2Wav
+            # stay resumable=True until meta.finished arrives; save_async then
+            # computes is_finished=request.is_finished() and not resumable, which
+            # is False for a resumable Stage1 segment stop and would otherwise
+            # stomp aura2tts meta.finished=True. Mid-gen sentence TTS leaves
+            # processor finished=False, so this OR stays False.
+            processor_finished = self._is_truthy_scalar(meta.get("finished"))
+            meta["finished"] = torch.tensor(bool(is_finished or processor_finished), dtype=torch.bool)
+            if processor_name == "aura2tts_async_chunk" or processor_finished or is_finished:
+                logger.info(
+                    "[async_chunk] send stage=%s proc=%s ext=%s task_finished=%s "
+                    "processor_finished=%s wire_finished=%s segment_finished=%s",
+                    stage_id,
+                    processor_name,
+                    external_req_id,
+                    is_finished,
+                    processor_finished,
+                    bool(is_finished or processor_finished),
+                    is_segment_finished,
+                )
             # Respect processor-set segment boundary (#5383) unless AURA mid-gen
             # Sentence TTS forced a complete Talker segment above.
             if force_segment_finished or meta.get("is_segment_finished") is None:
@@ -547,7 +969,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         else:
             if payload_data.meta is None:
                 payload_data.meta = MetaStruct()
-            payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
+            # talker2code2wav emits leftover tails with MetaStruct.finished=True
+            # while save_async may still snapshot is_finished=False. Blind
+            # overwrite left Code2Wav waiting forever after spoken TTS (live:
+            # 4 chunks, last leftover frames=131, then ~180s hang). Keep
+            # processor finished only when Talker is no longer resumable —
+            # mid-gen sentence leftover stays wire False.
+            processor_finished = self._is_truthy_scalar(getattr(payload_data.meta, "finished", None))
+            request_resumable = bool(getattr(request, "resumable", False))
+            wire_finished = bool(is_finished or (processor_finished and not request_resumable))
+            payload_data.meta.finished = torch.tensor(wire_finished, dtype=torch.bool)
+            if processor_name == "talker2code2wav_async_chunk" or processor_finished or is_finished:
+                logger.info(
+                    "[async_chunk] send stage=%s proc=%s ext=%s task_finished=%s "
+                    "processor_finished=%s wire_finished=%s resumable=%s segment_finished=%s",
+                    stage_id,
+                    processor_name,
+                    external_req_id,
+                    is_finished,
+                    processor_finished,
+                    wire_finished,
+                    request_resumable,
+                    is_segment_finished,
+                )
             if force_segment_finished or payload_data.meta.is_segment_finished is None:
                 payload_data.meta.is_segment_finished = torch.tensor(
                     is_segment_finished, dtype=torch.bool
@@ -593,6 +1037,26 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
 
+    @staticmethod
+    def _request_already_generating(request: Any) -> bool:
+        """True only while Talker is mid-segment decode.
+
+        ``computed > prompt`` alone is not enough: after segment EOS the
+        scheduler clears ``_output_token_ids`` but leaves ``num_computed_tokens``
+        past the prompt. Treating that as mid-decode queues the next Stage1
+        sentence under ``WAITING_FOR_CHUNK`` and never drains it (Smoke3 hang).
+        """
+        prompt_len = int(getattr(request, "num_prompt_tokens", 0) or 0)
+        if prompt_len <= 0:
+            prompt_len = len(getattr(request, "prompt_token_ids", None) or [])
+        computed = int(getattr(request, "num_computed_tokens", 0) or 0)
+        if not (computed > prompt_len > 0):
+            return False
+        output_ids = getattr(request, "_output_token_ids", None)
+        if output_ids is not None and len(output_ids) == 0:
+            return False
+        return True
+
     def is_done_receiving_chunks(self, request_id: str) -> bool:
         """Return True if the request should stop polling upstream chunks.
 
@@ -628,6 +1092,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         self._active_streams.pop(request_id, None)
         self.upstream_exhausted_requests.discard(request_id)
+        self._terminal_empty_finish_reqs.discard(request_id)
+        self._pending_upstream_payloads.pop(request_id, None)
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
@@ -820,7 +1286,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # of schedule, but have not scheduled
                     continue
                 if self.is_done_receiving_chunks(request.request_id):
+                    # segment_finished is set when Stage1 emits a sentence; Talker
+                    # may still be decoding that segment. Do not wipe TTS state
+                    # mid-decode (would drop text conditioning / last-hidden).
+                    if self._request_already_generating(request):
+                        if target_status == RequestStatus.RUNNING:
+                            self.load_async(request)
+                        continue
                     request.additional_information = None
+                    continue
+                if target_status == RequestStatus.RUNNING and self._request_already_generating(request):
+                    self.load_async(request)
                     continue
                 # Requests that waiting for chunk
                 self.load_async(request)
@@ -830,6 +1306,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request.status = target_status
                     finished_load_reqs.remove(request.request_id)
                     self.requests_with_ready_chunks.add(request.request_id)
+                    continue
+                # Mid-decode WFC: resume SAME segment without ready_chunks.
+                # finished_load/ready_chunks would re-admit as scheduled_new_reqs
+                # with stale computed (Smoke3 CUDA indexSelect).
+                if self._request_already_generating(request):
+                    request.status = target_status
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
@@ -963,7 +1445,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # of schedule, but have not scheduled
                     continue
                 if self.is_done_receiving_chunks(request.request_id):
+                    # segment_finished is set when Stage1 emits a sentence; Talker
+                    # may still be decoding that segment. Do not wipe TTS state
+                    # mid-decode (would drop text conditioning / last-hidden).
+                    if self._request_already_generating(request):
+                        if target_status == RequestStatus.RUNNING:
+                            self.load_async(request)
+                        continue
                     request.additional_information = None
+                    continue
+                if target_status == RequestStatus.RUNNING and self._request_already_generating(request):
+                    # Stay on the running queue; still poll so the next
+                    # Stage1 sentence can be queued without rescheduling.
+                    self.load_async(request)
                     continue
                 # Requests that waiting for chunk
                 self.load_async(request)
@@ -973,6 +1467,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request.status = target_status
                     finished_load_reqs.remove(request.request_id)
                     self.requests_with_ready_chunks.add(request.request_id)
+                    continue
+                # Mid-decode WFC: resume SAME segment without ready_chunks.
+                # Advertising ready_chunks re-prefills as scheduled_new_reqs
+                # with stale computed (Smoke3 CUDA indexSelect).
+                if self._request_already_generating(request):
+                    request.status = target_status
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
@@ -1025,6 +1525,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._active_streams.pop(req_id, None)
             self.requests_with_ready_chunks.discard(req_id)
             self.upstream_exhausted_requests.discard(req_id)
+            self._terminal_empty_finish_reqs.discard(req_id)
             self._finished_load_reqs.discard(req_id)
             self._cancelled_load_reqs.add(req_id)
 

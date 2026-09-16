@@ -39,7 +39,7 @@ logger = init_logger(__name__)
 
 DEFAULT_TOOL_TIMEOUT_SECONDS = 5.0
 DEFAULT_TOOL_OUTPUT_LIMIT_BYTES = 64 * 1024
-DEFAULT_TOOL_MAX_DEPTH = 3
+DEFAULT_TOOL_MAX_DEPTH = 5
 DEFAULT_TOOL_MAX_CONCURRENCY = 8
 SAFE_HTTP_TIMEOUT_SECONDS = 3.0
 SAFE_HTTP_RESPONSE_LIMIT_BYTES = 256 * 1024
@@ -283,6 +283,15 @@ class CityWeatherArguments(BaseModel):
     city: str = Field(min_length=1, max_length=100)
     country: str = Field(default="", max_length=100)
     lang: str = Field(default="zh", pattern=r"^(zh|en)$")
+
+    @field_validator("city", "country", "lang", mode="before")
+    @classmethod
+    def _strip_weather_strings(cls, value: Any) -> Any:
+        # Models often emit ``lang=" zh "`` / padded city names; strip so the
+        # call succeeds instead of burning tool-depth on invalid retries.
+        if isinstance(value, str):
+            return value.strip()
+        return value
 
 
 class CurrencyArguments(BaseModel):
@@ -1123,6 +1132,37 @@ def _iter_safe_tool_definitions() -> Iterator[tuple[str, str, type[BaseModel], C
             yield name, description, arguments_model, handler
 
 
+def _canonical_tool_name(name: str) -> str:
+    """Map common model aliases onto the registered Safe tool names."""
+    raw = (name or "").strip()
+    if not raw:
+        return raw
+    aliases = {
+        "get_weather": "get_city_weather",
+        "weather": "get_city_weather",
+        "city_weather": "get_city_weather",
+        "getcityweather": "get_city_weather",
+        "get_city_weather": "get_city_weather",
+        "cityweather": "get_city_weather",
+        "lookup_weather": "get_city_weather",
+        "查询天气": "get_city_weather",
+        "查天气": "get_city_weather",
+        "天气查询": "get_city_weather",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    lowered = raw.lower().replace(" ", "_").replace("-", "_")
+    if lowered in aliases:
+        return aliases[lowered]
+    # FunASR / model often emit spaced CamelCase that collapses to getcityweather.
+    collapsed = "".join(ch for ch in lowered if ch.isalnum())
+    if collapsed in aliases:
+        return aliases[collapsed]
+    if "weather" in collapsed and "location" not in collapsed:
+        return "get_city_weather"
+    return raw
+
+
 def parse_aura_tool_output(
     tokenizer: Any,
     raw_output: str,
@@ -1150,7 +1190,12 @@ def parse_aura_tool_output(
             model_output_token_ids=tokenizer.encode(raw_output, add_special_tokens=False),
         )
     except Exception:
-        logger.warning("AURA tool XML parse failed request_id=%s", request_id, exc_info=True)
+        logger.warning(
+            "AURA tool XML parse failed request_id=%s preview=%r",
+            request_id,
+            (raw_output or "")[:240],
+            exc_info=True,
+        )
         if has_tool_marker:
             return ParsedAuraToolTurn(None, None, [], "malformed_tool_xml")
         return ParsedAuraToolTurn(None, raw_output, [])
@@ -1173,7 +1218,7 @@ def parse_aura_tool_output(
         calls.append(
             AuraToolCall(
                 id=f"call_{digest}",
-                name=parsed.name,
+                name=_canonical_tool_name(parsed.name),
                 arguments=arguments,
             )
         )

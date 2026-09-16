@@ -21,7 +21,7 @@ if [[ -f "$AURA_TOOL_KEYS_ENV" ]]; then
   set +a
 fi
 
-MODEL="${MODEL:-/workspace/models/AURA_v2}"
+MODEL="${MODEL:-/workspace/models/AURA_v2new}"
 BASE_TTS_MODEL="/workspace/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/fd4b254389122332181a7c3db7f27e918eec64e3"
 # Do not inherit DEPLOY from a parent 1-GPU shell.
 DEPLOY="${AURA_DEPLOY:-$SCRIPT_DIR/aura_omni_v2_2gpu_base.yaml}"
@@ -32,7 +32,8 @@ PID_FILE="${PID_FILE:-$LOG_DIR/server.pid}"
 BRIDGE_PID_FILE="${BRIDGE_PID_FILE:-$LOG_DIR/bridge.pid}"
 STATIC_DIR="${STATIC_DIR:-$SCRIPT_DIR/static}"
 AURA_GPUS="${AURA_GPUS:-auto}"
-DEFAULT_TTS_INSTRUCT="请用专业、清晰、自然的语气说话，语速稍快，情绪克制，避免夸张和过度热情。"
+# Base voice clone does NOT support instruction control; keep empty for Base.
+DEFAULT_TTS_INSTRUCT=""
 
 if [[ "$AURA_GPUS" == "auto" ]]; then
   if [[ "${CUDA_VISIBLE_DEVICES:-}" == *,* ]]; then
@@ -113,7 +114,7 @@ else
       VLLM_AURA_IM_END_TOKEN_ID=248046 \
       VLLM_AURA_IM_START_TOKEN_ID=248045 \
       VLLM_AURA_ASSISTANT_TOKEN_ID=74455 \
-      VLLM_AURA_SENTENCE_TTS="${VLLM_AURA_SENTENCE_TTS:-0}" \
+      VLLM_AURA_SENTENCE_TTS="${VLLM_AURA_SENTENCE_TTS:-1}" \
       VLLM_AURA_TOOL_EXECUTOR=safe \
       VLLM_AURA_TTS_TOKENIZER="${VLLM_AURA_TTS_TOKENIZER:-$BASE_TTS_MODEL}" \
       ALLOWED_LOCAL_MEDIA_PATH="${ALLOWED_LOCAL_MEDIA_PATH:-$REPO_ROOT/tests/assets/qwen3_tts}" \

@@ -332,6 +332,72 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     assert updates[1]["hidden_states"]["trailing_text"].numel() == 0
 
 
+def test_decode_batch_missing_last_raises():
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad)
+
+    def fake_embed_input_ids(input_ids):
+        return input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
+
+    model.embed_input_ids = fake_embed_input_ids
+    trailing = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    with pytest.raises(RuntimeError, match="Missing hidden_states\\['last'\\]"):
+        model.preprocess_decode_batch(
+            input_ids=torch.tensor([101], dtype=torch.long),
+            req_infos=[
+                {
+                    "text": ["hello"],
+                    "task_type": ["CustomVoice"],
+                    "hidden_states": {"trailing_text": trailing},
+                    "meta": {"talker_text_offset": 0},
+                }
+            ],
+        )
+
+
+def test_decode_batch_rejects_missing_text_conditioning():
+    """Wiping additional_information mid-decode (Smoke3 11:02) must fail loudly."""
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad)
+    model.embed_input_ids = lambda input_ids: input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
+
+    with pytest.raises(ValueError, match="Missing Qwen3-TTS text conditioning"):
+        model.preprocess_decode_batch(
+            input_ids=torch.tensor([101], dtype=torch.long),
+            req_infos=[
+                {
+                    "task_type": ["CustomVoice"],
+                    "hidden_states": {"last": torch.ones(4)},
+                    "meta": {},
+                }
+            ],
+        )
+
+
+def test_decode_batch_accepts_live_sentence_payload_nested_additional_information():
+    """Runner often nests Talker payload under additional_information."""
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad)
+    model.embed_input_ids = lambda input_ids: input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
+    last_hidden = torch.full((4,), 2.0, dtype=torch.float32)
+
+    _out_ids, _out_embeds, past_hidden, _text_step, _updates = model.preprocess_decode_batch(
+        input_ids=torch.tensor([101], dtype=torch.long),
+        req_infos=[
+            {
+                "additional_information": {
+                    "text": ["第一句。"],
+                    "task_type": ["CustomVoice"],
+                    "hidden_states": {"last": last_hidden},
+                }
+            }
+        ],
+    )
+
+    assert torch.equal(past_hidden.cpu(), last_hidden.reshape(1, -1).to(torch.bfloat16))
+
+
 def _stub_text_embedding(device_param: torch.nn.Parameter):
     """Build a lambda that emulates ``nn.Embedding`` for the ``_device()`` helper.
 

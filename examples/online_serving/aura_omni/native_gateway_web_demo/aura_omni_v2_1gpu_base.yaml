@@ -44,7 +44,7 @@ stages:
   max_model_len: 32768
   max_num_batched_tokens: 8192
   devices: '0'
-  model: /workspace/models/AURA_v2
+  model: /workspace/models/AURA_v2new
   model_arch: AuraQwen3_5ForConditionalGeneration
   default_sampling_params:
     temperature: 0.0

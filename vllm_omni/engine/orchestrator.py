@@ -1124,27 +1124,33 @@ class Orchestrator:
                             await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
                             for eco in raw_outputs.outputs:
                                 req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None or not req_state.streaming.enabled:
+                                if req_state is None:
                                     continue
-                                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-                                req_state.streaming.segment_token_ids = (
-                                    self._coerce_int_list(getattr(eco, "new_token_ids", None))
-                                    if req_state.streaming.segment_finished
-                                    else []
-                                )
-                                raw_mm = self._completion_multimodal_output(eco, None)
-                                req_state.streaming.segment_output_metadata = (
-                                    dict(raw_mm)
-                                    if req_state.streaming.segment_finished and isinstance(raw_mm, dict)
-                                    else {}
-                                )
-                                req_state.streaming.new_prompt_len_snapshot = getattr(
-                                    eco,
-                                    "new_prompt_len_snapshot",
-                                    None,
-                                )
                                 if req_state.streaming.enabled:
-                                    await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
+                                    req_state.streaming.segment_finished = bool(
+                                        getattr(eco, "is_segment_finished", False)
+                                    )
+                                    req_state.streaming.segment_token_ids = (
+                                        self._coerce_int_list(getattr(eco, "new_token_ids", None))
+                                        if req_state.streaming.segment_finished
+                                        else []
+                                    )
+                                    raw_mm = self._completion_multimodal_output(eco, None)
+                                    req_state.streaming.segment_output_metadata = (
+                                        dict(raw_mm)
+                                        if req_state.streaming.segment_finished and isinstance(raw_mm, dict)
+                                        else {}
+                                    )
+                                    req_state.streaming.new_prompt_len_snapshot = getattr(
+                                        eco,
+                                        "new_prompt_len_snapshot",
+                                        None,
+                                    )
+                                # Always mark terminal final-output stages from the
+                                # raw ECO — even when streaming is off (tool passes).
+                                # Otherwise Code2Wav can emit audio while
+                                # OutputMessage.finished stays false forever.
+                                await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
                             iteration_stats = (
                                 IterationStats() if (self._stat_logger is not None and raw_outputs.outputs) else None
                             )
@@ -1474,14 +1480,20 @@ class Orchestrator:
             return
 
         request_finished = False
-        if (
-            finished
-            and self.stage_pools[stage_id].final_output
-            and not (req_state.streaming.enabled and req_state.streaming.segment_finished)
-        ):
+        # Mid-turn streaming segments use finished=False + is_segment_finished=True
+        # and never enter this branch. A true request end (finished=True) must count
+        # even when the last chunk is also a segment boundary (silent Code2Wav
+        # sentinel / final spoken sentence) — do not gate on segment_finished.
+        if finished and self.stage_pools[stage_id].final_output:
             req_state.finished_final_output_stage_ids.add(stage_id)
+        # Recompute after raw-ECO stage marks too: Stage3 may arrive with
+        # RequestOutput.finished=False (DELTA audio) while the raw ECO already
+        # recorded the stage finished via _apply_raw_terminal_stage_finish.
+        if self.stage_pools[stage_id].final_output:
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-            request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
+            request_finished = final_output_stage_ids.issubset(
+                req_state.finished_final_output_stage_ids
+            )
         # Duplex stage-0 segment boundaries are not client-visible outputs:
         # direct decisions are emitted by the model runtime extension below,
         # while spoken content flows through the next stage. Forwarding
@@ -2319,6 +2331,12 @@ class Orchestrator:
             return
 
         req_state.stage0_bypassed = True
+        # Stage0 is a final_output (transcript). Vision-only turns never run ASR,
+        # but request completion still waits on every final_output stage id. Mark
+        # the skipped transcript stage finished here so text+audio can close
+        # generate(); otherwise video.done hangs forever on background query tasks.
+        if 0 in (req_state.final_output_stage_ids or set()):
+            req_state.finished_final_output_stage_ids.add(0)
         logger.info(
             "[Orchestrator] Bypassing stage-0 GPU for req=%s (omni_skip_stages, async_chunk=%s)",
             request_id,
@@ -2565,9 +2583,19 @@ class Orchestrator:
 
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
+                # Inherit stage0 resumable for AURA/etc. Force True only for
+                # Talker/Code2Wav: they receive multiple mid-gen sentence
+                # segments before Stage1 finishes. If they stay non-resumable
+                # (one-shot video turns), the first Code2Wav segment_finished
+                # is treated as the whole client turn ending — truncated audio
+                # heard as "garbled" TTS. Stage1 finished payload clears
+                # resumable on the terminal chunk. Do NOT force AURA Stage1
+                # resumable: its EOS must remain a true request finish.
                 downstream_resumable = bool(
                     getattr(stage0_request, "resumable", req_state.streaming.enabled)
                 )
+                if model_stage in {"qwen3_tts", "code2wav"} or worker_type == "generation":
+                    downstream_resumable = True
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,

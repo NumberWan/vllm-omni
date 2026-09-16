@@ -240,7 +240,7 @@ async def _vision_no_abort(
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aura-ws", default="ws://127.0.0.1:8666/v1/video/chat/stream")
-    parser.add_argument("--model", default="/workspace/models/AURA_v2")
+    parser.add_argument("--model", default="/workspace/models/AURA_v2new")
     parser.add_argument("--wav", type=Path, default=None)
     parser.add_argument("--timeout", type=float, default=180)
     args = parser.parse_args()

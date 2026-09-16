@@ -172,6 +172,151 @@ def test_async_chunk_resumable_stop_rearms_connector_polling() -> None:
     assert sched.num_waiting_for_streaming_input == 0
 
 
+def test_async_chunk_exhausted_stop_finishes_code2wav() -> None:
+    sched = _AsyncChunkStopSchedulerStub()
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=True,
+        upstream_exhausted_requests={"req-async-chunk-exhausted"},
+    )
+    session = _make_request(request_id="req-async-chunk-exhausted")
+    session.status = RequestStatus.FINISHED_STOPPED
+    session.resumable = True
+
+    finished = sched._handle_stopped_request(session)
+
+    assert finished is True
+    assert session.resumable is False
+    assert sched.enqueued == []
+
+
+def test_upstream_exhausted_with_mm_output_finishes_despite_computed_lag() -> None:
+    """Talker meta.finished + decoded wav must finish even if computed lags prompt."""
+    session = _make_request(request_id="req-code2wav-lag")
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.prompt_token_ids = [1] * 32
+    session.num_computed_tokens = 8  # lag behind prompt — classic hang
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session}
+    sched.perf_metrics = None
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        is_done_receiving_chunks=lambda _request_id: True,
+        upstream_exhausted_requests={session.request_id},
+        segment_finished_requests=set(),
+        cleanup=MagicMock(),
+    )
+    sched._handle_stopped_request.return_value = True
+    sched._free_request.return_value = (None, None)
+    sched.running = [session]
+    sched.waiting = MagicMock()
+    sched.skipped_waiting = MagicMock()
+    sched.structured_output_manager.should_advance.return_value = False
+    sched._pending_finish_reqs = []
+    sched.recompute_kv_load_failures = False
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.routed_experts = None
+    # Even without multimodal_outputs, upstream_exhausted alone must finish.
+    model_runner_output.multimodal_outputs = None
+
+    outputs = OmniGenerationScheduler.update_from_output(
+        sched,
+        scheduler_output,
+        model_runner_output,
+    )
+
+    output = outputs[session.client_index].outputs[0]
+    assert output.finish_reason is not None
+    assert output.finished is True
+    sched._handle_stopped_request.assert_called_once()
+
+
+def test_upstream_exhausted_running_request_swept_into_pending_finish() -> None:
+    """Exhausted Code2Wav not in this step's batch must still be drained."""
+    session = _make_request(request_id="req-code2wav-parked")
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.prompt_token_ids = [1]
+    session.num_computed_tokens = 1
+
+    other = _make_request(request_id="req-other")
+    other.status = RequestStatus.RUNNING
+    other.prompt_token_ids = [1]
+    other.num_computed_tokens = 0
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session, other.request_id: other}
+    sched.perf_metrics = None
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        is_done_receiving_chunks=lambda rid: rid == session.request_id,
+        upstream_exhausted_requests={session.request_id},
+        segment_finished_requests=set(),
+        cleanup=MagicMock(),
+    )
+    sched._handle_stopped_request.return_value = True
+    sched._free_request.return_value = (None, None)
+    sched.running = [session, other]
+    sched.waiting = MagicMock()
+    sched.skipped_waiting = MagicMock()
+    sched.structured_output_manager.should_advance.return_value = False
+    sched._pending_finish_reqs = []
+    sched.recompute_kv_load_failures = False
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    # Only `other` is in this step; exhausted session must be swept in.
+    scheduler_output.num_scheduled_tokens = {other.request_id: 1}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {other.request_id: 0}
+    model_runner_output.routed_experts = None
+    model_runner_output.multimodal_outputs = None
+
+    outputs = OmniGenerationScheduler.update_from_output(
+        sched,
+        scheduler_output,
+        model_runner_output,
+    )
+
+    finished_ids = {
+        out.request_id
+        for client_outs in outputs.values()
+        for out in client_outs.outputs
+        if out.finished
+    }
+    assert session.request_id in finished_ids
+
+
 class TestReplaceSessionWithStreamingUpdate:
     def test_resets_tokens_and_prompt_from_update(self) -> None:
         sched = _SchedulerStub()

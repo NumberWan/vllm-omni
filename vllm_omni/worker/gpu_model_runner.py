@@ -35,6 +35,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from collections.abc import Mapping
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1518,6 +1519,25 @@ class OmniGPUModelRunner(GPUModelRunner):
         if self._is_fresh_chunk_payload(payload_info):
             req_state = self.requests.get(req_id)
             if req_state is None:
+                return
+            # Late Stage1 next-sentence payloads still carry prompt_token_ids.
+            # Mid-flight (same segment): keep GPU decode state if 'last' exists.
+            # Explicit new segment (replace_streaming_prompt): must wipe so the
+            # next prefill does not reuse the previous sentence's hidden/KV path.
+            meta = payload_info.get("meta")
+            # MetaStruct is msgspec.Struct (not Mapping); read flag via attr or Mapping.
+            if isinstance(meta, Mapping):
+                replace_prompt = meta.get("replace_streaming_prompt") is True
+            else:
+                replace_prompt = getattr(meta, "replace_streaming_prompt", None) is True
+            prev = self.model_intermediate_buffer.get(req_id)
+            prev_last = None
+            if isinstance(prev, dict):
+                hs = prev.get("hidden_states")
+                if isinstance(hs, dict):
+                    prev_last = hs.get("last")
+            if (not replace_prompt) and isinstance(prev_last, torch.Tensor):
+                self._update_intermediate_buffer(req_id, payload_info)
                 return
             self.model_intermediate_buffer[req_id] = {}
             self._update_intermediate_buffer(req_id, payload_info)

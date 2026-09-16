@@ -65,6 +65,9 @@ _DEFAULT_IDLE_TIMEOUT = 60.0
 # While a turn is still running (TTS can take many minutes), do not drop the
 # session for lack of client messages.
 _GENERATION_IDLE_TIMEOUT = 1800.0
+# video.done must still emit session.done if a background generate() is stuck
+# (Talker WAITING_FOR_CHUNK deadlock). Long enough for a last TTS flush.
+_VIDEO_DONE_DRAIN_TIMEOUT = 90.0
 _DEFAULT_CONFIG_TIMEOUT = 10.0
 _MAX_FRAME_SIZE = 10 * 1024 * 1024  # 10MB per frame
 _MAX_BUFFER_FRAMES = 64
@@ -357,8 +360,26 @@ class OmniStreamingVideoHandler:
                 pending = [t for t in background_query_tasks if not t.done()]
                 if query_task is not None and not query_task.done() and query_task not in pending:
                     pending.append(query_task)
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
+                if not pending:
+                    return
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=_VIDEO_DONE_DRAIN_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "video.done: %d query task(s) still running after %.0fs; "
+                        "aborting so session.done can emit",
+                        len(pending),
+                        _VIDEO_DONE_DRAIN_TIMEOUT,
+                    )
+                    await _cancel_active_query(abort_now=True)
+                    leftover = [t for t in pending if not t.done()]
+                    for task in leftover:
+                        task.cancel()
+                    if leftover:
+                        await asyncio.gather(*leftover, return_exceptions=True)
 
             async def _release_turn_lock(
                 *,

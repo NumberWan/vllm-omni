@@ -617,9 +617,20 @@ def _request_output_text(request: Any) -> str:
     return ""
 
 
+_BOX_TTS_PATTERN = re.compile(r"<\|box_start\|>.*?(?:<\|box_end\|>|$)", re.DOTALL)
+
+
 def _clean_tts_text(text: Any) -> str:
+    """Normalize whitespace and strip vision-box markup before TTS.
+
+    Box-only turns must not be spoken: coordinates contain ASCII commas that
+    mid-gen sentence TTS treats as boundaries, producing gibberish audio while
+    the UI correctly draws ``ShowToUser`` boxes from the raw text path.
+    Incomplete ``<|box_start|>`` spans (still streaming) are also dropped.
+    """
     if not isinstance(text, str):
         return ""
+    text = _BOX_TTS_PATTERN.sub("", text)
     return " ".join(text.split()).strip()
 
 
@@ -1687,10 +1698,11 @@ def _aura2tts_empty_finished_payload() -> dict[str, Any]:
 _NATIVE_TTS_SENT_ENDS = frozenset("。！？；.!?;\n")
 _NATIVE_TTS_COMMA_ENDS = frozenset("，,")
 _NATIVE_TTS_MIN_CHARS = 10
-# Hold mid-gen emits shorter than this (content chars) and merge into the next
-# sentence. Prevents solo TTS of "有。" / "好的。" / "收到。" which over-generate
-# filler, while still allowing normal short sentences like "今天天气很好。" to stream.
-_NATIVE_TTS_MIN_EMIT_CHARS = 4
+# Mid-gen TTS batch size (content chars). Larger chunks = fewer Talker
+# segment joins (less audible pop between segments) at the cost of higher
+# TTFP. Override with ``VLLM_AURA_SENTENCE_TTS_MIN_CHARS``. Final Stage1
+# flush always emits the remainder regardless of this floor.
+_NATIVE_TTS_MIN_EMIT_CHARS = 30
 
 
 def _sentence_tts_enabled() -> bool:
@@ -1700,6 +1712,21 @@ def _sentence_tts_enabled() -> bool:
     """
     raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS") or "1").strip().lower()
     return raw not in {"0", "false", "off", "no"}
+
+
+def _sentence_tts_min_emit_chars() -> int:
+    """Minimum content chars before a mid-gen TTS handoff.
+
+    Default ``_NATIVE_TTS_MIN_EMIT_CHARS`` (30). Set
+    ``VLLM_AURA_SENTENCE_TTS_MIN_CHARS`` to tune (clamp 1..200).
+    """
+    raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS_MIN_CHARS") or "").strip()
+    if not raw:
+        return _NATIVE_TTS_MIN_EMIT_CHARS
+    try:
+        return max(1, min(200, int(raw)))
+    except ValueError:
+        return _NATIVE_TTS_MIN_EMIT_CHARS
 
 
 def _tts_content_char_count(text: str) -> int:
@@ -1730,13 +1757,16 @@ def _pop_native_tts_sentence(buf: str) -> tuple[str | None, str]:
 
 def _pop_emit_ready_tts_text(
     buf: str,
-    min_chars: int = _NATIVE_TTS_MIN_EMIT_CHARS,
+    min_chars: int | None = None,
 ) -> tuple[str | None, str]:
     """Pop one or more sentences until content length >= ``min_chars``.
 
-    Short fragments such as ``有。`` stay buffered and merge into the next
-    completed sentence. Final flush (Stage1 finished) bypasses this helper.
+    Batches across sentence/comma boundaries so mid-gen TTS gets a longer
+    utterance (fewer segment joins / pops). Short leftovers stay buffered.
+    Final flush (Stage1 finished) bypasses this helper.
     """
+    if min_chars is None:
+        min_chars = _sentence_tts_min_emit_chars()
     parts: list[str] = []
     rest = buf
     while True:
@@ -1752,9 +1782,23 @@ def _pop_emit_ready_tts_text(
     return None, "".join(parts) + rest
 
 
-def _tts_payload_from_talker_input(tts_input: OmniTokensPrompt) -> dict[str, Any]:
+def _tts_payload_from_talker_input(
+    tts_input: OmniTokensPrompt,
+    *,
+    finished: bool = False,
+) -> dict[str, Any]:
+    """Flatten Talker input for async_chunk.
+
+    Prewarmed Talker/Code2Wav stay ``resumable=True``. Downstream only clears
+    that when the payload has ``meta.finished`` — silent turns already send an
+    empty finished sentinel, but spoken TTS used to omit it, so Code2Wav stayed
+    ``finished=False`` and ``generate()`` never completed.
+    """
     payload = dict(tts_input["additional_information"])
     payload["prompt_token_ids"] = list(tts_input["prompt_token_ids"])
+    meta = dict(payload["meta"]) if isinstance(payload.get("meta"), dict) else {}
+    meta["finished"] = torch.tensor(bool(finished), dtype=torch.bool)
+    payload["meta"] = meta
     return payload
 
 
@@ -1889,10 +1933,10 @@ def aura2tts(
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
         token_ids = _extract_token_ids(source_output)
-        if _first_bool(additional_info.get("aura_tool_enabled"), False) and has_aura_tool_call_marker(
-            text,
-            token_ids,
-        ):
+        # Fail-closed on ANY pass: raw tool XML must never reach Talker, even
+        # during tools-disabled routing (intent gate) when the model hallucinates
+        # a <tool_call>. Only a safe natural-language preamble may be spoken.
+        if has_aura_tool_call_marker(text, token_ids):
             session_id = _first_value(additional_info.get("aura_session_id"), None)
             if session_id:
                 discard_pending_turn(str(session_id), str(getattr(source_output, "request_id", idx)))
@@ -2020,12 +2064,17 @@ def aura2tts_async_chunk(
         request_payload.pop(str(request_id), None)
         return _aura2tts_empty_finished_payload()
 
-    # Tool-enabled passes must be classified from the complete Stage-1 output;
-    # emitting an early sentence could speak before a later <tool_call>.
-    # Defer mid-gen sentence TTS whenever think wrappers appear so reasoning is
-    # never spoken; finish path strips to natural content (or silent).
+    # Defer mid-gen sentence TTS when think wrappers or tool markers appear so
+    # reasoning / raw XML are never spoken. Finish path strips to preamble or
+    # silent. Tool markers are fail-closed on tools-disabled routing too.
     think_pending = "<think>" in full_text or "</think>" in full_text
-    sentence_tts = _sentence_tts_enabled() and not tool_enabled and not think_pending
+    tool_marker_pending = has_aura_tool_call_marker(full_text or request_text, content_ids)
+    sentence_tts = (
+        _sentence_tts_enabled()
+        and not tool_enabled
+        and not think_pending
+        and not tool_marker_pending
+    )
     # Append only newly seen text into the sentence buffer.
     emitted_prefix = str(state.get("aura2tts_emitted_prefix", ""))
     if full_text.startswith(emitted_prefix):
@@ -2079,7 +2128,7 @@ def aura2tts_async_chunk(
 
     # Finished: flush any remainder sentence buffer, then commit history once.
     content_ids = list(state.get("aura2tts_content_ids", content_ids) or [])
-    if tool_enabled and has_aura_tool_call_marker(full_text or request_text, content_ids):
+    if has_aura_tool_call_marker(full_text or request_text, content_ids):
         session_id = _first_value(additional_info.get("aura_session_id"), None)
         if session_id:
             discard_pending_turn(str(session_id), str(request_id))
@@ -2087,8 +2136,10 @@ def aura2tts_async_chunk(
         preamble = extract_aura_tool_preamble(full_text or request_text)
         if not preamble:
             logger.info(
-                "[aura2tts_async_chunk] req=%s withheld empty-preamble tool pass from TTS and history",
+                "[aura2tts_async_chunk] req=%s withheld empty-preamble tool pass "
+                "(tool_enabled=%s) from TTS and history",
                 request_id,
+                tool_enabled,
             )
             return _aura2tts_empty_finished_payload()
         tts_input = build_tts_talker_input(preamble, [], emit_info, pass_token_ids=False)
@@ -2099,11 +2150,13 @@ def aura2tts_async_chunk(
             )
             return _aura2tts_empty_finished_payload()
         logger.info(
-            "[aura2tts_async_chunk] req=%s emitting safe tool preamble TTS text_len=%d",
+            "[aura2tts_async_chunk] req=%s emitting safe tool preamble TTS "
+            "text_len=%d tool_enabled=%s",
             request_id,
             len(preamble),
+            tool_enabled,
         )
-        return _tts_payload_from_talker_input(tts_input)
+        return _tts_payload_from_talker_input(tts_input, finished=True)
     # Always strip think wrappers before silent classification / TTS / commit.
     raw_full_text = full_text
     full_text = aura_natural_content(full_text).strip()
@@ -2149,7 +2202,7 @@ def aura2tts_async_chunk(
                         request_id,
                         len(flush_text),
                     )
-                    return _tts_payload_from_talker_input(tts_input)
+                    return _tts_payload_from_talker_input(tts_input, finished=True)
             logger.info(
                 "[aura2tts_async_chunk] req=%s finish after %d sentence emits; empty finish payload",
                 request_id,
@@ -2177,7 +2230,7 @@ def aura2tts_async_chunk(
         )
         return None
     _commit_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
-    payload = _tts_payload_from_talker_input(tts_input)
+    payload = _tts_payload_from_talker_input(tts_input, finished=True)
     assistant_token_ids = QWEN_ASSISTANT_PREFIX_IDS + content_ids + QWEN_ASSISTANT_SUFFIX_IDS
     if pass_token_ids and assistant_token_ids:
         payload[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids]

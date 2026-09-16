@@ -467,6 +467,22 @@ def test_update_additional_information_deserializes_new_request_payload():
     )
 
 
+def test_fresh_chunk_payload_replaces_buffer_before_prefill():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.requests["r1"].num_computed_tokens = 0
+    runner.model_intermediate_buffer["r1"] = {"hidden_states": {"last": torch.ones(4)}}
+
+    OmniGPUModelRunner._set_or_update_intermediate_buffer(
+        runner,
+        "r1",
+        {"prompt_token_ids": [1, 2, 3], "text": ["hello"]},
+    )
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert buf["prompt_token_ids"] == [1, 2, 3]
+    assert "hidden_states" not in buf
+
+
 def test_update_intermediate_buffer_skips_empty_update():
     """Validate that an empty update dict is a no-op."""
     runner = _make_runner(req_ids=("r1",), hidden_size=4)

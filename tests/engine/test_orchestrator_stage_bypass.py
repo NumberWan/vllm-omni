@@ -241,8 +241,12 @@ async def test_async_chunk_prewarm_uses_empty_prompt_for_qwen3_tts() -> None:
         assert len(stage2.add_request_calls) == 1
         talker_request = stage2.add_request_calls[0][0]
         assert talker_request.prompt_token_ids == []
+        # Non-resumable video turns still prewarm Talker/Code2Wav as resumable
+        # so mid-gen sentence TTS segments do not end the client turn early.
+        assert getattr(talker_request, "resumable", False) is True
         assert len(stage3.add_request_calls) == 1
         codec_request = stage3.add_request_calls[0][0]
         assert codec_request.prompt_token_ids == []
+        assert getattr(codec_request, "resumable", False) is True
     finally:
         await _shutdown_orchestrator(fixture)

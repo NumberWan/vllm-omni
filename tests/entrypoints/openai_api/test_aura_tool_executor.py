@@ -15,6 +15,7 @@ from vllm_omni.entrypoints.openai.aura_tool_executor import (
     AuraToolExecutor,
     aura_any_tool_intent,
     aura_tool_intent_allowed,
+    _canonical_tool_name,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -75,6 +76,13 @@ def test_any_tool_intent_uses_only_exposed_tool_domains():
     assert aura_any_tool_intent(schemas, "請描述你現在看到的畫面") is False
 
 
+def test_canonical_tool_name_maps_weather_aliases():
+    assert _canonical_tool_name("get_weather") == "get_city_weather"
+    assert _canonical_tool_name("weather") == "get_city_weather"
+    assert _canonical_tool_name("get_city_weather") == "get_city_weather"
+    assert _canonical_tool_name("not_a_tool") == "not_a_tool"
+
+
 @pytest.mark.asyncio
 async def test_executor_accepts_allowlisted_strict_schema():
     executor = AuraToolExecutor()
@@ -96,7 +104,8 @@ async def test_executor_accepts_allowlisted_strict_schema():
         (_call(name="not_registered"), 1, "unknown_tool"),
         (_call(arguments={"text": 123}), 1, "invalid_tool_arguments"),
         (_call(arguments={"text": "ok", "extra": True}), 1, "invalid_tool_arguments"),
-        (_call(), 4, "tool_depth_exceeded"),
+        # DEFAULT_TOOL_MAX_DEPTH is 5; depth 6 must fail closed.
+        (_call(), 6, "tool_depth_exceeded"),
     ],
 )
 async def test_executor_fail_closed_boundaries(call, depth, error_code):
@@ -341,7 +350,12 @@ async def test_safe_weather_uses_only_fixed_open_meteo_endpoints(monkeypatch):
     result = await executor.execute(
         session_id="weather",
         request_id="weather",
-        call=_call(name="get_city_weather", arguments={"city": "上海", "country": "CN", "lang": "zh"}),
+        # Padded lang/city previously failed pattern validation and burned
+        # tool-depth on retries (tool_depth_exceeded in the Native demo).
+        call=_call(
+            name="get_city_weather",
+            arguments={"city": " 上海 ", "country": " CN ", "lang": " zh "},
+        ),
         depth=1,
     )
 

@@ -43,7 +43,7 @@ Defaults:
 
 - AURA backend: `:8666`
 - Native frontend/bridge: `:9999`
-- AURA model: `/workspace/models/AURA_v2`
+- AURA model: `/workspace/models/AURA_v2new`
 - one concurrent session
 - `auto_trigger=true` with `auto_trigger_min_frames=2` (default; same as Native
   Gateway always running inference on each video batch). Silence depends on the

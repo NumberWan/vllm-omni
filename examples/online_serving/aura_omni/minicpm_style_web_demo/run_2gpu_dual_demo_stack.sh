@@ -16,7 +16,7 @@ export MODEL="${MODEL:-/workspace/models/AURA}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export LOG_DIR="${LOG_DIR:-/tmp/aura_omni_2gpu_dual_demo}"
 export DEPLOY_SRC="${DEPLOY_SRC:-$REPO_ROOT/vllm_omni/deploy/aura_omni_2gpu_best.yaml}"
-export VLLM_AURA_SENTENCE_TTS="${VLLM_AURA_SENTENCE_TTS:-0}"
+export VLLM_AURA_SENTENCE_TTS="${VLLM_AURA_SENTENCE_TTS:-1}"
 export VLLM_AURA_TTS_TOKENIZER="${VLLM_AURA_TTS_TOKENIZER:-/workspace/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe}"
 
 export VENV_DIR="${VENV_DIR:-/home/wtk/test/.venv}"

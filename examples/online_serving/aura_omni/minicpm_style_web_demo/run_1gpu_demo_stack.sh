@@ -19,7 +19,7 @@ export DEPLOY="${DEPLOY:-$SCRIPT_DIR/aura_omni_1gpu_demo.yaml}"
 # Wait for full AURA text before TTS (CustomVoice one-shot cannot yet chain
 # mid-gen sentence payloads on the same request_id — later clauses get dropped).
 # Set VLLM_AURA_SENTENCE_TTS=1 to try per-sentence handoff / lower TTFP.
-export VLLM_AURA_SENTENCE_TTS="${VLLM_AURA_SENTENCE_TTS:-0}"
+export VLLM_AURA_SENTENCE_TTS="${VLLM_AURA_SENTENCE_TTS:-1}"
 # Stage1 aura2tts prompt_len uses this tokenizer (must match Stage2 Talker embeds).
 export VLLM_AURA_TTS_TOKENIZER="${VLLM_AURA_TTS_TOKENIZER:-/workspace/models/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe}"
 

@@ -12,7 +12,7 @@ playback-stop patch so barge-in can mute leftover TTS.
 Env:
   AURA_WS_URL, AURA_MODEL, BRIDGE_HOST, BRIDGE_PORT, STATIC_DIR
   TTS_SPEAKER (Vivian), TTS_INSTRUCT (empty), TTS_LANGUAGE (Chinese),
-  TTS_TASK_TYPE (Base), TOOL_MODE (auto), MAX_TOOL_DEPTH (3),
+  TTS_TASK_TYPE (Base), TOOL_MODE (auto), MAX_TOOL_DEPTH (5),
   AURA_TTS_DUMP_DIR (/tmp/aura_v2_native_demo_tts)
 """
 
@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import wave
@@ -54,19 +55,17 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_STATIC = ROOT / "static"
 STATIC_DIR = Path(os.environ.get("STATIC_DIR", str(DEFAULT_STATIC))).expanduser()
 AURA_WS_URL = os.environ.get("AURA_WS_URL", "ws://127.0.0.1:8666/v1/video/chat/stream")
-AURA_MODEL = os.environ.get("AURA_MODEL", "/workspace/models/AURA_v2")
+AURA_MODEL = os.environ.get("AURA_MODEL", "/workspace/models/AURA_v2new")
 BRIDGE_HOST = os.environ.get("BRIDGE_HOST", "0.0.0.0")
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "9999"))
 
 TTS_SPEAKER = os.environ.get("TTS_SPEAKER", "Vivian")
-TTS_INSTRUCT = os.environ.get(
-    "TTS_INSTRUCT",
-    "请用专业、清晰、自然的语气说话，语速稍快，情绪克制，避免夸张和过度热情。",
-)
+# Base does not support instruction control — leave empty by default.
+TTS_INSTRUCT = os.environ.get("TTS_INSTRUCT", "")
 TTS_LANGUAGE = os.environ.get("TTS_LANGUAGE", "Chinese")
 TTS_TASK_TYPE = os.environ.get("TTS_TASK_TYPE", "Base")
 TOOL_MODE = os.environ.get("TOOL_MODE", "auto")
-MAX_TOOL_DEPTH = int(os.environ.get("MAX_TOOL_DEPTH", "3"))
+MAX_TOOL_DEPTH = int(os.environ.get("MAX_TOOL_DEPTH", "5"))
 AUTO_TRIGGER = os.environ.get("AUTO_TRIGGER", "1").strip().lower() in {"1", "true", "yes", "on"}
 TTS_DUMP_DIR = Path(os.environ.get("AURA_TTS_DUMP_DIR", "/tmp/aura_v2_native_demo_tts")).expanduser()
 FRAME_DUMP_DIR = Path(
@@ -469,12 +468,14 @@ class _NativeTurn:
     silent: bool = False
     done_sent: bool = False
     suppress_audio: bool = False
+    audio_emitted: bool = False
 
 
 class NativeEventTranslator:
     """Translate AURA stream events into the original Native frontend protocol."""
 
     _LEGACY = "legacy"
+    _BOX_PATTERN = re.compile(r"<\|box_start\|>(.*?)<\|box_end\|>")
 
     def __init__(self) -> None:
         self.turns: dict[str, _NativeTurn] = {}
@@ -508,6 +509,65 @@ class NativeEventTranslator:
             return str(result["summary"])
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
+    @classmethod
+    def _parse_box_tokens(cls, text: str) -> tuple[str, list[list[int]]]:
+        """Parse 0–1000 boxes from ``<|box_start|>...<|box_end|>`` and strip them."""
+        boxes: list[list[int]] = []
+        if not text:
+            return text, boxes
+        for match in cls._BOX_PATTERN.finditer(text):
+            raw = match.group(1).strip()
+            if not raw:
+                continue
+            cleaned = raw.replace("(", "").replace(")", "")
+            try:
+                parts = [int(float(c.strip())) for c in cleaned.split(",") if c.strip()]
+                if len(parts) != 4:
+                    continue
+                x1, y1, x2, y2 = [max(0, min(1000, v)) for v in parts]
+            except (ValueError, TypeError):
+                continue
+            boxes.append([x1, y1, x2, y2])
+        return cls._BOX_PATTERN.sub("", text).strip(), boxes
+
+    @staticmethod
+    def _show_to_user_events(boxes: list[list[int]], session_id: str) -> list[str]:
+        if not boxes:
+            return []
+        tool_id = f"box_{int(time.time() * 1000)}"
+        started = _envelope(
+            "toolcall",
+            {
+                "status": "started",
+                "id": tool_id,
+                "name": "ShowToUser",
+                "arguments": {"boxes": boxes, "duration_ms": 3000},
+            },
+            session_id=session_id,
+        )
+        done = _envelope(
+            "toolcall",
+            {
+                "status": "success",
+                "id": tool_id,
+                "name": "ShowToUser",
+                "output": (
+                    "[BBOX Parser Result] ShowToUser toolcall dispatched "
+                    f"to client with {len(boxes)} box(es)."
+                ),
+                "error": "",
+            },
+            session_id=session_id,
+        )
+        return [started, done]
+
+    def _emit_text(self, text: str, session_id: str) -> list[str]:
+        cleaned, boxes = self._parse_box_tokens(text)
+        output = self._show_to_user_events(boxes, session_id)
+        if cleaned:
+            output.append(_envelope("text", {"text": cleaned}, session_id=session_id))
+        return output
+
     @staticmethod
     def _done(turn: _NativeTurn, session_id: str) -> list[str]:
         if turn.done_sent:
@@ -531,15 +591,19 @@ class NativeEventTranslator:
         elif event_type == "response.tool.preamble.text":
             text = str(event.get("text") or "").strip()
             if text:
-                output.append(_envelope("text", {"text": text}, session_id=session_id))
+                output.extend(self._emit_text(text, session_id))
         elif event_type == "response.text.done":
             text = str(event.get("text") or turn.text_buf).strip()
             turn.text_buf = ""
-            if not text or "<|silent|>" in text:
+            cleaned, boxes = self._parse_box_tokens(text)
+            # Empty text.done is not silent: AURA often emits it on the first
+            # audio chunk before Stage-1 text is copied onto the WS payload.
+            # Closing here drops later TTS (audio.done may never arrive).
+            if "<|silent|>" in text:
                 turn.silent = True
                 output.extend(self._done(turn, session_id))
-            else:
-                output.append(_envelope("text", {"text": text}, session_id=session_id))
+            elif cleaned or boxes:
+                output.extend(self._emit_text(text, session_id))
         elif event_type in {"response.audio.delta", "response.tool.preamble.audio.delta"}:
             if turn.suppress_audio:
                 return output
@@ -560,10 +624,22 @@ class NativeEventTranslator:
                     else:
                         turn.sample_rate = sample_rate or turn.sample_rate
                         turn.audio_chunks.append(pcm)
+                        if not turn.silent:
+                            output.append(
+                                _envelope(
+                                    "audio",
+                                    {
+                                        "audio": _pcm16_wav_b64(pcm, turn.sample_rate),
+                                        "sample_rate": turn.sample_rate,
+                                    },
+                                    session_id=session_id,
+                                )
+                            )
+                            turn.audio_emitted = True
         elif event_type == "response.tool.preamble.audio.done":
             if turn.suppress_audio:
                 turn.audio_chunks.clear()
-            elif turn.audio_chunks and not turn.silent:
+            elif turn.audio_chunks and not turn.silent and not turn.audio_emitted:
                 output.append(
                     _envelope(
                         "audio",
@@ -574,13 +650,29 @@ class NativeEventTranslator:
                         session_id=session_id,
                     )
                 )
+                turn.audio_chunks.clear()
+            else:
                 turn.audio_chunks.clear()
         elif event_type == "response.audio.done":
             if turn.done_sent:
                 return []
             if turn.suppress_audio:
                 turn.audio_chunks.clear()
-            elif turn.audio_chunks and not turn.silent:
+            elif turn.audio_chunks and not turn.silent and not turn.audio_emitted:
+                output.append(
+                    _envelope(
+                        "audio",
+                        {
+                            "audio": _pcm16_wav_b64(b"".join(turn.audio_chunks), turn.sample_rate),
+                            "sample_rate": turn.sample_rate,
+                        },
+                        session_id=session_id,
+                    )
+                )
+            turn.audio_chunks.clear()
+            output.extend(self._done(turn, session_id))
+        elif event_type == "response.done":
+            if turn.audio_chunks and not turn.silent and not turn.audio_emitted and not turn.suppress_audio:
                 output.append(
                     _envelope(
                         "audio",
@@ -593,20 +685,16 @@ class NativeEventTranslator:
                 )
                 turn.audio_chunks.clear()
             output.extend(self._done(turn, session_id))
-        elif event_type == "response.done":
-            output.extend(self._done(turn, session_id))
         elif event_type == "response.tool.started":
-            output.append(
-                _envelope(
-                    "toolcall",
-                    {
-                        "status": "started",
-                        "id": str(event.get("call_id") or ""),
-                        "name": str(event.get("name") or ""),
-                    },
-                    session_id=session_id,
-                )
-            )
+            data = {
+                "status": "started",
+                "id": str(event.get("call_id") or ""),
+                "name": str(event.get("name") or ""),
+            }
+            arguments = event.get("arguments")
+            if isinstance(arguments, dict):
+                data["arguments"] = arguments
+            output.append(_envelope("toolcall", data, session_id=session_id))
         elif event_type == "response.tool.done":
             completed = event.get("status") == "completed"
             data = {
@@ -636,6 +724,7 @@ async def _send_client(ws: WebSocket, payload: str) -> None:
 
 async def _bridge_session(client: WebSocket) -> None:
     session_id = "unknown"
+    last_frames: list[str] = []
     dumper = _TtsTurnDumper(TTS_DUMP_DIR)
     translator = NativeEventTranslator()
     tts_enabled = client.query_params.get("tts", "1") != "0"
@@ -687,6 +776,8 @@ async def _bridge_session(client: WebSocket) -> None:
 
                     if mtype == "video":
                         frames = _parse_video_frames(str(data.get("video_url") or ""))
+                        if frames:
+                            last_frames = frames
                         _dump_incoming_frames(frames)
                         for fr in frames:
                             await aura.send(json.dumps({"type": "video.frame", "data": fr}))
@@ -738,6 +829,9 @@ async def _bridge_session(client: WebSocket) -> None:
                             continue
                         for payload in translator.barge_in(session_id):
                             await _send_client(client, payload)
+                        if last_frames:
+                            for fr in last_frames:
+                                await aura.send(json.dumps({"type": "video.frame", "data": fr}))
                         await aura.send(json.dumps({"type": "video.query", "text": text}))
 
             async def aura_to_client() -> None:

@@ -32,7 +32,7 @@ bash scripts/install_aura_omni.sh
 
 ```bash
 # 模型路径（本地已有权重时）
-export MODEL=/workspace/models/AURA_v2
+export MODEL=/workspace/models/AURA_v2new
 
 # 可选 GPU：指定物理卡编号；不设则自动选择显存占用 <2 GiB 的空闲卡
 # export AURA_GPU=3
@@ -43,7 +43,7 @@ export SERPER_API_KEY='...'        # 未设置则 WebSearch 无法真实检索
 ```
 
 Web Demo 启动脚本已默认启用 `VLLM_AURA_TOOL_EXECUTOR=safe`、`TOOL_MODE=auto`、
-`max_tool_depth=3`，**无需再手动 export**。
+`max_tool_depth=5`，**无需再手动 export**。
 
 ### 3. 启动浏览器 Web Demo（推荐）
 
@@ -72,7 +72,7 @@ ASR 文本、工具气泡与流式 TTS；PTT 可打断当前播放（前端停�
 双卡生产配置（默认 `:8666`）。此路径**不会**自动打开工具，若需要 safe 工具请自行设置：
 
 ```bash
-export MODEL=/workspace/models/AURA_v2
+export MODEL=/workspace/models/AURA_v2new
 export VLLM_AURA_TOOL_EXECUTOR=safe   # 仅 API 路径需要；Web Demo 已内置
 export DEEPSEEK_API_KEY='sk-...'
 export SERPER_API_KEY='...'
@@ -80,7 +80,7 @@ CUDA_VISIBLE_DEVICES=0,1 bash scripts/start_aura_omni.sh
 curl http://127.0.0.1:8666/v1/models
 ```
 
-亦可使用 `vllm serve /workspace/models/AURA_v2 --omni`（默认端口 `8000`；固定端口加
+亦可使用 `vllm serve /workspace/models/AURA_v2new --omni`（默认端口 `8000`；固定端口加
 `--port 8666`）。WebSocket 端点：`/v1/video/chat/stream`；客户端须设置
 `"tool_mode": "auto"`。
 

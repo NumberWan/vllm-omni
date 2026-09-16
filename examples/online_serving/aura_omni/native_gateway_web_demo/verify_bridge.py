@@ -203,8 +203,12 @@ async def _run_bridge_turn(*, bridge_ws: str, wav_path: Path, timeout_s: float) 
 
         got_spoken = False
         while time.time() - t0 < timeout_s:
+            remaining = timeout_s - (time.time() - t0)
+            if remaining <= 0:
+                errors.append("timeout waiting for events")
+                break
             try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=60)
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
             except asyncio.TimeoutError:
                 errors.append("timeout waiting for events")
                 break

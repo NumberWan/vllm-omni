@@ -80,6 +80,7 @@ def test_empty_returns_none():
 
 
 def test_eof_marker_when_finished_empty():
+    """Empty Talker finish must emit a placeholder frame, not zero codes (#5471)."""
     tm = _tm()
     p = talker2code2wav_async_chunk(
         transfer_manager=tm,
@@ -87,8 +88,9 @@ def test_eof_marker_when_finished_empty():
         request=_req("r", finished=True),
         is_finished=True,
     )
-    assert p.codes.audio.tolist() == []
     assert p.meta.finished.item() is True
+    assert p.codes.audio.numel() == _NUM_QUANTIZERS_DEFAULT
+    assert bool(p.codes.audio.any().item()) is True
 
 
 def test_flush_on_finish():

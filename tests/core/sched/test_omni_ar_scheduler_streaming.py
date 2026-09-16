@@ -36,6 +36,97 @@ def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
     return sched
 
 
+def test_handle_stopped_request_finishes_when_upstream_exhausted() -> None:
+    """Stage1 meta.finished must make Talker EOS a real request finish."""
+    sched = _make_scheduler(stage_id=2)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=True,
+        upstream_exhausted_requests={"req-ar-streaming-test"},
+    )
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.FINISHED_STOPPED
+
+    finished = OmniARScheduler._handle_stopped_request(sched, session)
+
+    assert finished is True
+    assert session.resumable is False
+
+
+def test_handle_stopped_request_rearms_connector_for_mid_gen_sentence() -> None:
+    """Without upstream finished, Talker EOS waits for the next Stage1 sentence."""
+    enqueued: list[Request] = []
+    sched = _make_scheduler(stage_id=2)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=True,
+        upstream_exhausted_requests=set(),
+    )
+    sched._enqueue_waiting_request = enqueued.append
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.FINISHED_STOPPED
+
+    finished = OmniARScheduler._handle_stopped_request(sched, session)
+
+    assert finished is False
+    assert session.status == RequestStatus.WAITING
+    assert enqueued == [session]
+    assert session.resumable is True
+
+
+def test_handle_stopped_request_rearms_when_late_sentence_is_only_queued() -> None:
+    """Queued Stage1 sentence drains as real work; Talker EOS rearms to WAITING."""
+    enqueued: list[Request] = []
+    sched = _make_scheduler(stage_id=2)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=True,
+        upstream_exhausted_requests=set(),
+        _pending_upstream_payloads={"req-ar-streaming-test": object()},
+        try_apply_pending_upstream_payload=lambda _req: True,
+    )
+    sched._enqueue_waiting_request = enqueued.append
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.FINISHED_STOPPED
+
+    finished = OmniARScheduler._handle_stopped_request(sched, session)
+
+    assert finished is False
+    assert session.status == RequestStatus.WAITING
+    assert enqueued == [session]
+    assert session.resumable is True
+
+
+def test_handle_stopped_request_finishes_when_pending_is_only_empty_finish() -> None:
+    """Empty finish sentinel pending at EOS must finish, not hang in WAITING."""
+    enqueued: list[Request] = []
+    exhausted: set[str] = set()
+
+    def _drain(req: Request) -> bool:
+        exhausted.add(req.request_id)
+        req.resumable = False
+        return False  # sentinel consumed, no decode work
+
+    sched = _make_scheduler(stage_id=2)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=True,
+        upstream_exhausted_requests=exhausted,
+        _pending_upstream_payloads={"req-ar-streaming-test": object()},
+        try_apply_pending_upstream_payload=_drain,
+    )
+    sched._enqueue_waiting_request = enqueued.append
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.FINISHED_STOPPED
+
+    finished = OmniARScheduler._handle_stopped_request(sched, session)
+
+    assert finished is True
+    assert session.resumable is False
+    assert enqueued == []
+    assert "req-ar-streaming-test" in exhausted
+
+
 def _make_request() -> Request:
     return Request(
         request_id="req-ar-streaming-test",

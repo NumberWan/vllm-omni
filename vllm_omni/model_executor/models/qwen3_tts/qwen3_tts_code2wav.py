@@ -375,6 +375,8 @@ class Qwen3TTSCode2Wav(nn.Module):
                     ref_context_included[i] = _meta_bool(meta["ref_context_included"])
                 if "finished" in meta:
                     finished_flags[i] = _meta_bool(meta["finished"])
+                if "stream_finished" in meta:
+                    finished_flags[i] = finished_flags[i] or _meta_bool(meta["stream_finished"])
         for i, req_ids in enumerate(request_ids_list):
             runtime_info = runtime_infos[i] if i < len(runtime_infos) else None
             req_ids = _codec_ids_from_payload_or_input(req_ids, runtime_info)
@@ -592,7 +594,18 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={
+                "model_outputs": audios,
+                "sr": srs,
+                # Mark last chunk so DELTA output processing keeps finish_reason
+                # (see is_non_final_delta_audio_chunk) and generate() can close.
+                "meta.tts_is_last_chunk": [
+                    torch.tensor(1 if flag else 0, dtype=torch.int32) for flag in finished_flags
+                ],
+                "meta.finished": [
+                    torch.tensor(bool(flag), dtype=torch.bool) for flag in finished_flags
+                ],
+            },
         )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:

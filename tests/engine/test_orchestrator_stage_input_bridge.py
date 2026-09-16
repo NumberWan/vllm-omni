@@ -312,21 +312,70 @@ async def test_async_route_forwards_to_outgoing_only_stage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
+async def test_streaming_segment_without_request_finish_does_not_complete_final_output() -> None:
+    """Mid-turn segment boundaries (finished=False) must not close the request."""
     orchestrator = object.__new__(Orchestrator)
     orchestrator.async_chunk = True
     orchestrator._pd_pair = None
+    orchestrator.duplex_control_plane = None
     orchestrator._cfg_tracker = SimpleNamespace(
         is_companion=lambda _request_id: False,
         has_companions=lambda _request_id: False,
         cleanup_parent=lambda _request_id: [],
+        all_companions_done=lambda _request_id: True,
     )
     orchestrator.stage_pools = [SimpleNamespace(final_output=True)]
     orchestrator.output_async_queue = asyncio.Queue()
     orchestrator._cleanup_request_ids = AsyncMock()
+    orchestrator._active_voice_asr = set()
+    orchestrator._forward_to_next_stage = AsyncMock()
+    orchestrator._stage_receives_async_chunks = lambda _stage_id: True
+    orchestrator._next_stage_already_submitted = lambda *_args, **_kwargs: False
 
     req_state = OrchestratorRequestState(
-        request_id="req-segment-final-output",
+        request_id="req-segment-mid-turn",
+        sampling_params_list=[SamplingParams(max_tokens=1)],
+        final_stage_id=0,
+        final_output_stage_ids={0},
+    )
+    req_state.streaming.enabled = True
+    req_state.streaming.segment_finished = True
+    output = SimpleNamespace(
+        request_id=req_state.request_id,
+        finished=False,
+    )
+
+    await orchestrator._route_output(0, 0, output, req_state, None)
+
+    assert req_state.finished_final_output_stage_ids == set()
+    orchestrator._cleanup_request_ids.assert_not_awaited()
+    routed = orchestrator.output_async_queue.get_nowait()
+    assert routed.finished is False
+
+
+@pytest.mark.asyncio
+async def test_streaming_terminal_segment_with_finished_completes_final_output() -> None:
+    """Silent Code2Wav sentinel: finished=True + segment_finished=True must close."""
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = True
+    orchestrator._pd_pair = None
+    orchestrator.duplex_control_plane = None
+    orchestrator._cfg_tracker = SimpleNamespace(
+        is_companion=lambda _request_id: False,
+        has_companions=lambda _request_id: False,
+        cleanup_parent=lambda _request_id: [],
+        all_companions_done=lambda _request_id: True,
+    )
+    orchestrator.stage_pools = [SimpleNamespace(final_output=True)]
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator._cleanup_request_ids = AsyncMock()
+    orchestrator._active_voice_asr = set()
+    orchestrator._forward_to_next_stage = AsyncMock()
+    orchestrator._stage_receives_async_chunks = lambda _stage_id: True
+    orchestrator._next_stage_already_submitted = lambda *_args, **_kwargs: False
+
+    req_state = OrchestratorRequestState(
+        request_id="req-segment-terminal",
         sampling_params_list=[SamplingParams(max_tokens=1)],
         final_stage_id=0,
         final_output_stage_ids={0},
@@ -340,7 +389,7 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
 
     await orchestrator._route_output(0, 0, output, req_state, None)
 
-    assert req_state.finished_final_output_stage_ids == set()
-    orchestrator._cleanup_request_ids.assert_not_awaited()
+    assert req_state.finished_final_output_stage_ids == {0}
+    orchestrator._cleanup_request_ids.assert_awaited()
     routed = orchestrator.output_async_queue.get_nowait()
-    assert routed.finished is False
+    assert routed.finished is True

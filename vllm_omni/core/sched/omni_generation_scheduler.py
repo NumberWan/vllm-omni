@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -24,6 +25,8 @@ from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.outputs import OmniModelRunnerOutput
+
+logger = init_logger(__name__)
 
 
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
@@ -53,11 +56,17 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
     def _handle_stopped_request(self, request: Request) -> bool:
+        adapter = self.chunk_transfer_adapter
+        if adapter is not None and request.request_id in getattr(adapter, "upstream_exhausted_requests", ()):
+            # Talker already sent meta.finished. Do not park Code2Wav as
+            # WAITING for another segment — generate() would hang.
+            request.resumable = False
+            return True
         if (
             request.resumable
             and not request.streaming_queue
-            and self.chunk_transfer_adapter is not None
-            and self.chunk_transfer_adapter.receives_chunks
+            and adapter is not None
+            and adapter.receives_chunks
         ):
             # Downstream async-chunk stages receive the next segment from the
             # connector, not from an API StreamingUpdate. Enqueue them as
@@ -424,20 +433,45 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             is_segment_finished = False
             routed_experts = None
 
+            adapter = self.chunk_transfer_adapter
+            upstream_exhausted = bool(
+                adapter is not None
+                and request.request_id
+                in getattr(adapter, "upstream_exhausted_requests", ())
+            )
+            done_receiving = bool(
+                adapter is not None and adapter.is_done_receiving_chunks(request.request_id)
+            )
+            prompt_len = len(request.prompt_token_ids or [])
+            computed = int(request.num_computed_tokens or 0)
+
             # One-shot generation request: finish after its current input unit
             # has been fully processed.
             if (
                 request.status == RequestStatus.FINISHED_STOPPED
-                or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
-                or (
-                    self.chunk_transfer_adapter is not None
-                    and self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id)
-                    and request.num_computed_tokens >= len(request.prompt_token_ids)
-                )
+                or (adapter is None and computed >= request.num_prompt_tokens)
+                or (done_receiving and computed >= prompt_len)
             ):
                 request.status = RequestStatus.FINISHED_STOPPED
                 # Optional: set a stop_reason for front-end clarity
                 # (does not affect protocol)
+                stopped = True
+            # Talker terminal meta.finished can leave Code2Wav with upstream
+            # exhausted while computed_tokens still lags prompt length (or async
+            # scheduling parks required_tokens==0 without draining pending
+            # finish). generate() then waits forever for ECO.finished.
+            # Once upstream is exhausted, this decode step is the last — finish.
+            elif not stopped and upstream_exhausted:
+                logger.info(
+                    "[gen_sched] force_finish_upstream_exhausted req=%s "
+                    "computed=%s prompt_len=%s mm=%s done_receiving=%s",
+                    request.request_id,
+                    computed,
+                    prompt_len,
+                    mm_output is not None,
+                    done_receiving,
+                )
+                request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
             if stopped:
@@ -505,6 +539,36 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        # Async scheduling can leave upstream-exhausted Code2Wav requests in
+        # RUNNING with required_tokens==0 without them appearing in this step's
+        # num_scheduled_tokens. Sweep them into the pending-finish drain so
+        # generate() observes ECO.finished instead of hanging after the last
+        # audio.delta. Only sweep when the prompt has already been fully
+        # computed — otherwise we would abort mid-decode (computed=0 while
+        # prompt_len is still large) and drop spoken audio.
+        adapter = self.chunk_transfer_adapter
+        if adapter is not None:
+            scheduled_ids = set(num_scheduled_tokens)
+            exhausted = getattr(adapter, "upstream_exhausted_requests", ())
+            for request in list(self.running):
+                if request.request_id in scheduled_ids or request.is_finished():
+                    continue
+                if request.request_id not in exhausted:
+                    continue
+                prompt_len = len(request.prompt_token_ids or [])
+                computed = int(request.num_computed_tokens or 0)
+                if prompt_len > 0 and computed < prompt_len:
+                    continue
+                if request not in self._pending_finish_reqs:
+                    logger.info(
+                        "[gen_sched] queue_pending_finish_exhausted req=%s "
+                        "computed=%s prompt_len=%s",
+                        request.request_id,
+                        computed,
+                        prompt_len,
+                    )
+                    self._pending_finish_reqs.append(request)
 
         # Finish async_chunk requests that schedule() collected because their
         # upstream completed with no remaining codec tokens.

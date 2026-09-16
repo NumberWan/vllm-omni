@@ -119,6 +119,59 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
 
+    def _handle_stopped_request(self, request: Request) -> bool:
+        """Finish Talker when Stage1 already sent ``meta.finished``.
+
+        Prewarmed Talker is ``resumable=True`` so mid-gen sentence TTS can
+        append another segment. vLLM's default handler then parks EOS as
+        ``WAITING_FOR_STREAMING_REQ`` (API StreamingUpdate). AURA Talker
+        receives the next segment from the connector, not the API.
+
+        If a mid-decode Stage1 sentence was queued, prefer draining it over
+        finishing the turn. If Stage1 already marked the request exhausted,
+        this EOS is the whole turn: clear resumable so ``save_async`` can set
+        Code2Wav ``meta.finished=True``. Otherwise re-arm connector polling.
+        """
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        pending = getattr(adapter, "_pending_upstream_payloads", None) if adapter is not None else None
+        has_pending = bool(pending and pending.get(request.request_id))
+        if has_pending and adapter is not None and getattr(adapter, "receives_chunks", False):
+            # Segment boundary: try draining now. A real next sentence returns
+            # True and needs WAITING rearm. An empty finish sentinel returns
+            # False after marking upstream_exhausted — finish the turn instead
+            # of parking forever / re-admitting with stale KV.
+            request.resumable = True
+            drained = False
+            try_apply = getattr(adapter, "try_apply_pending_upstream_payload", None)
+            if callable(try_apply):
+                drained = bool(try_apply(request))
+            if drained:
+                if not request.streaming_queue:
+                    request.status = RequestStatus.WAITING
+                    self._enqueue_waiting_request(request)
+                return False
+            if request.request_id in getattr(adapter, "upstream_exhausted_requests", ()):
+                request.resumable = False
+                return True
+            # Still has undrained pending (e.g. mid-decode refuse) — rearm poll.
+            if not request.streaming_queue:
+                request.status = RequestStatus.WAITING
+                self._enqueue_waiting_request(request)
+            return False
+        if adapter is not None and request.request_id in getattr(adapter, "upstream_exhausted_requests", ()):
+            request.resumable = False
+            return True
+        if (
+            request.resumable
+            and not request.streaming_queue
+            and adapter is not None
+            and getattr(adapter, "receives_chunks", False)
+        ):
+            request.status = RequestStatus.WAITING
+            self._enqueue_waiting_request(request)
+            return False
+        return super()._handle_stopped_request(request)
+
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
         # Output placeholders are zero when async scheduling isn't used
@@ -160,20 +213,51 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return False
 
     def _finish_empty_prompt_chunk_requests(self) -> None:
-        """Finish async_chunk requests whose upstream sent no tokens before done."""
+        """Finish async_chunk requests that have no more decode-ready work.
+
+        Covers:
+        1. Upstream done with empty prompt (never conditioned).
+        2. Terminal empty Stage1 finish sentinel after Talker segment EOS —
+           upstream exhausted without opening a new segment. Re-scheduling
+           those with stale ``computed >> prompt_len`` triggers CUDA
+           indexSelect (OmniInteract Smoke3 / THERMOS turn).
+        """
         adapter = self.chunk_transfer_adapter
         if adapter is None:
             return
 
         to_finish: list[Request] = []
+        terminal = getattr(adapter, "_terminal_empty_finish_reqs", set())
         for queue in (self.waiting, self.running):
             for req in list(queue):
-                if not adapter.is_done_receiving_chunks(req.request_id):
+                rid = req.request_id
+                empty_prompt_done = (
+                    adapter.is_done_receiving_chunks(rid) and not req.prompt_token_ids
+                )
+                terminal_empty = rid in terminal and rid in getattr(
+                    adapter, "upstream_exhausted_requests", ()
+                )
+                if not empty_prompt_done and not terminal_empty:
                     continue
-                if req.prompt_token_ids:
+                # Never finish a live mid-segment decode as "terminal empty".
+                # After segment EOS Talker is WAITING with stale computed>0, so
+                # already_generating stays true — skipping here leaves Code2Wav
+                # without finished=True (DeepSeek tools-on preamble hang).
+                already_gen = getattr(adapter, "_request_already_generating", None)
+                if (
+                    terminal_empty
+                    and callable(already_gen)
+                    and already_gen(req)
+                    and req.status == RequestStatus.RUNNING
+                ):
+                    continue
+                pending = getattr(adapter, "_pending_upstream_payloads", {}).get(rid)
+                if terminal_empty and pending:
                     continue
                 queue.remove(req)
                 to_finish.append(req)
+                if hasattr(adapter, "_terminal_empty_finish_reqs"):
+                    adapter._terminal_empty_finish_reqs.discard(rid)
         for req in to_finish:
             adapter._send_single_request(
                 {
