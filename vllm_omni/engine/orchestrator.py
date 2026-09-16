@@ -1733,13 +1733,6 @@ class OrchestratorBase:
     def _stage_receives_async_chunks(self, stage_id: int) -> bool:
         """Whether a stage's connector supplies its runtime inputs."""
         pool = self.stage_pools[stage_id]
-        # Stages with an orchestrator input processor (e.g. AURA asr2aura /
-        # aura2tts) must be fed via process_engine_inputs, not zero-prewarm
-        # + connector chunks. Async chunk transport remains for codec edges
-        # that have no custom_process_input_func (Talker→Code2Wav).
-        client = getattr(pool, "stage_client", None)
-        if client is not None and getattr(client, "custom_process_input_func", None) is not None:
-            return False
         model_config = getattr(pool.stage_vllm_config, "model_config", None)
         return stage_receives_chunks(model_config)
 
