@@ -79,7 +79,7 @@ class SilenceContinuationScheduler(Protocol):
 class ModelChannel:
     """Appends out to the model, events back from it, for one session."""
 
-    # One MiniCPM model unit (1 s at 16 kHz) is the compatibility default.
+    # One second of float32 PCM at 16 kHz — default silence continuation unit.
     _SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
     _RESPONSE_MAX_CONTINUATION_UNITS = 8
     _AUTO_RESPONSE_MAX_CONTINUATION_UNITS = 64
@@ -1158,9 +1158,8 @@ class ModelChannel:
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
             model_state.clear_continuation()
             return
-        # Ephemeral turn-commit cannot submit_update on a finished stage0 id
-        # (e.g. r.stage0_tN). Silence continuation is MiniCPM chunking of a
-        # resumable r.stage0.
+        # Non-resumable stage0 cannot submit_update after the request finishes;
+        # clear continuation. Resumable stage0 may still append silence chunks.
         if not session.capabilities.supports_core_resumable_request:
             model_state.clear_continuation()
             return

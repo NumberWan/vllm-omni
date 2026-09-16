@@ -114,9 +114,9 @@ def decide(
         frames = payload.get("video_frames")
         has_vision = isinstance(frames, list) and any(isinstance(frame, str) and frame for frame in frames)
         if has_vision:
-            # Same R1 exception as the idle turn-mode path: OmniInteract
-            # vision-follow is is_speech=False + a frame. Dropping it while
-            # TTS is still playing leaves Stage0 unsubmitted (empty llm).
+            # Same exception as the idle turn-mode path: vision-follow is
+            # is_speech=False + a frame. Dropping it while TTS is still playing
+            # leaves Stage0 unsubmitted (empty llm).
             return {
                 "action": "listen",
                 "reason": "vision_follow",

@@ -78,8 +78,8 @@ class DuplexStageSubmission:
     context: DuplexStageRequestContext
     prompt: Mapping[str, object]
     already_submitted: bool
-    # Default True keeps MiniCPM resident Stage0. AURA turn-commit sets False
-    # (ephemeral NewRequest). Distinct from DuplexCapabilities.supports_core_resumable_request.
+    # True: resume/update an existing stage0 id. False: open a new ephemeral id.
+    # Distinct from DuplexCapabilities.supports_core_resumable_request.
     resumable: bool = True
 
     def __post_init__(self) -> None:

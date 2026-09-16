@@ -1172,7 +1172,7 @@ def note_input_append(
     has_audio = isinstance(audio, str) and bool(audio)
     video_frames = payload.get("video_frames")
     has_video = isinstance(video_frames, list) and any(isinstance(frame, str) and frame for frame in video_frames)
-    # R1: vision-carrying silent appends are real turn content. Without this,
+    # Vision-carrying silent appends are real turn content. Without this,
     # resolve_commit treats the buffer as empty non-speech and forces
     # is_speech=False / response_create=False, so Commit(create_response=True)
     # never submits Stage0.

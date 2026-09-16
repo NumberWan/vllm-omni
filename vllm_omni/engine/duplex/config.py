@@ -94,8 +94,8 @@ class DuplexCapabilities:
     supports_stage_resumption: bool = False
     supports_scheduler_native_append: bool = False
     supports_core_resumable_request: bool = False
-    # Prior TTS may keep draining while a new commit is admitted (AURA R4).
-    # Not barge-in (which aborts prior TTS). Runner gating is a follow-up.
+    # Prior assistant TTS may keep draining while a new user commit is admitted.
+    # Not barge-in (which aborts prior TTS).
     supports_overlapped_input: bool = False
     supports_stage_connector_handoff: bool = False
     supports_independent_io_streams: bool = False

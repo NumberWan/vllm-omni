@@ -95,10 +95,11 @@ def next_commit_allowed(
     *,
     overlapped_input_released: bool,
 ) -> bool:
-    """Whether a new commit may flush/submit (R4 soft-open vs full idle).
+    """Whether a new commit may flush/submit now.
 
-    When ``supports_overlapped_input`` and the plugin has released, a commit is
-    allowed even though prior TTS/playback still counts as ``response_in_progress``.
+    Idle sessions always allow it. When ``supports_overlapped_input`` is on and
+    the plugin has released the input gate, a commit is allowed even though
+    prior assistant TTS/playback still counts as ``response_in_progress``.
     Barge-in remains the abort path; this gate does not cancel anything.
     """
     if not response_in_progress(session, tasks):

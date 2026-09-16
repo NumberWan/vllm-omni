@@ -250,7 +250,7 @@ class DuplexSessionRunner:
         observe = False
         if stage_id < context.final_stage_id:
             decision = self.model.decide_output(stage_id, output, context)
-            # AURA Stage1 thinker text: project to the client without stopping TTS.
+            # Optional mid-pipeline observe: project to client without stopping TTS.
             if decision is None:
                 observe = self.model.observe_stage_output(stage_id, output, context)
         if (
@@ -872,7 +872,7 @@ class DuplexSessionRunner:
                 defer_append = False
         elif not auto_responds and not overlap_policy.input_looks_like_speech(self.session, event, payload):
             # Turn-mode only: skip silent chunks so they don't open a response.
-            # R1 (AURA): vision-carrying silent appends must still buffer — otherwise
+            # Vision-carrying silent appends must still buffer — otherwise
             # answer_time / proactive follow-ups with is_speech=False never reach Stage1.
             if not payload.get("video_frames"):
                 self.emit(
@@ -1781,7 +1781,7 @@ class DuplexSessionRunner:
             or (event_type == "input_audio_buffer.commit" and self._session_auto_responds())
         )
         # Pure silence with nothing buffered: drop and keep listening.
-        # R1: pending silent+video (or an explicit create_response) must flush.
+        # Pending silent+video (or an explicit create_response) must flush.
         if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
             has_pending_turn = (
                 model_state.input_since_commit

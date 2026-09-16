@@ -248,7 +248,7 @@ class DuplexModelPlugin(ABC):
 
         Unlike ``decide_output``, observing does **not** short-circuit the
         pipeline: the stage output is still forwarded to the next stage.
-        Default is off; AURA uses this for Stage1 thinker text.
+        Default is off.
         """
         del stage_id, output, context
         return False
@@ -261,11 +261,11 @@ class DuplexModelPlugin(ABC):
         output: object,
         context: object,
     ) -> bool:
-        """R4: return True when the next commit may start while prior TTS drains.
+        """Return True when the next user commit may start while prior TTS drains.
 
-        Model-neutral milestone — not hard-coded to a stage id in the runner.
-        Default off; AURA releases when Stage1 text/silent is final.
-        Orthogonal to barge-in (abort); this path must not abort the old TTS.
+        The plugin chooses when that is safe. The runner must not hard-code a
+        stage id. Default off. Unlike barge-in, this path must not cancel the
+        old TTS.
         """
         del stage_id, segment_finished, output, context
         return False
