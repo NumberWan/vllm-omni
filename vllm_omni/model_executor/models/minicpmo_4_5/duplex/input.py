@@ -329,7 +329,10 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         """Reserve the terminal payload without invalidating prior appends."""
         had_speech = self._turn_had_speech
         reservation: MiniCPMO45PcmAppendReservation | None = None
-        if had_speech and self._buffer:
+        # Speech OR queued vision must flush: turn-mode silent+video buffers
+        # with is_speech=False / allow_emit=False, and R1 still needs a final
+        # Stage0 unit so Commit(create_response=True) can answer.
+        if self._buffer and (had_speech or self._frame_queue):
             payload: dict[str, object] = {
                 "type": "audio",
                 "audio": "",

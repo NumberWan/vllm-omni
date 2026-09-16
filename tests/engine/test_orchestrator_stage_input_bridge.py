@@ -14,6 +14,7 @@ import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
@@ -251,8 +252,12 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
 
 @pytest.mark.asyncio
 async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> None:
-    """AURA Stage1 has asr2aura: must not be zero-prewarmed under async_chunk."""
-    orchestrator = object.__new__(Orchestrator)
+    """AURA Stage1 has asr2aura: must not be zero-prewarmed under async_chunk.
+
+    The custom-process-input gate lives on DuplexOrchestrator (AURA path), not
+    the turn-based Orchestrator base.
+    """
+    orchestrator = object.__new__(DuplexOrchestrator)
     stage0 = FakePrewarmPool("sender")
     stage1 = FakePrewarmPool("receiver")  # would receive chunks if role alone decided
     stage1.stage_client = SimpleNamespace(custom_process_input_func=lambda *a, **k: None)
