@@ -155,9 +155,9 @@ class AuraPcmAppendBuffer(PcmAppendBuffer):
             "format": "pcm_f32le",
             "sample_rate_hz": sample_rate_hz,
             "final": True,
-            # Do not infer speech from non-empty PCM: R1 vision-follow often
-            # sends 10ms zeros with is_speech=False so Stage0/1 treat it as
-            # vision-only rather than a new spoken utterance.
+            # Do not infer speech from non-empty PCM: vision-follow often sends
+            # 10ms zeros with is_speech=False so Stage0/1 treat it as vision-only
+            # rather than a new spoken utterance.
             "is_speech": self._had_speech,
             "aura_turn_commit": True,
         }

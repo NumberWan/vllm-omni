@@ -216,33 +216,35 @@ class ModelChannel:
         stage_id = 0
         resumable = bool(session.capabilities.supports_core_resumable_request)
         request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=resumable)
-        # R3: AURA ephemeral turn-commit cannot submit_update on a finished
-        # ephemeral id. Bump turn_id and open a fresh ephemeral id instead.
+        # Ephemeral turn-commit cannot submit_update on a finished stage0 id.
+        # Bump turn_id and open a fresh ephemeral request instead.
         if not resumable and session.stage_request_submitted(stage_id, request_id):
             stale_ephemeral_id = request_id
-            stale_entries = list(session.request_resources.items())
-            stale_ids = list(dict.fromkeys(rid for (_, rid) in stale_entries))
-            # R4: snapshot draining TTS turn before bumping identity.
+            # Keys are ``(stage_id, request_id)``; values are DuplexRequestResource.
+            stale_keys = list(session.request_resources.keys())
+            stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
             overlapped = bool(
                 session.capabilities.supports_overlapped_input and self._ctx.run.overlapped_input_released
             )
-            if overlapped and self._ctx.run.draining_model_turn_id is None:
-                self._ctx.run.draining_model_turn_id = session.active_response_turn_id
+            # Prior TTS may still drain under the same response_id; acceptance
+            # is gated by supports_overlapped_input, not a per-turn drain id.
             session.complete_model_turn(fence.turn_id)
             fence = DuplexFence(session.session_id, epoch=session.epoch, turn_id=session.turn_id)
             request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=False)
             session.request_resources.pop((stage_id, stale_ephemeral_id), None)
             if overlapped:
-                # R4 release is Stage1-final: Stage0/1 are already idle. Drop
-                # their session bindings only — do not abort engine work.
-                # Stage2/3 keep draining under the old response_id / epoch.
-                for sid, rid in stale_entries:
+                # Input gate already released after assistant text/silent final,
+                # so Stage0/1 are idle. Drop their session bindings only — do
+                # not abort engine work. Stage2/3 keep draining under the old
+                # response_id / epoch.
+                for sid, rid in stale_keys:
                     if sid < 2:
                         session.request_resources.pop((sid, rid), None)
                 self._ctx.run.overlapped_input_released = False
             elif stale_ids:
-                # No R4 release yet (e.g. commit while Thinker still running):
-                # abort the whole prior ephemeral so Stage2 is not left orphaned.
+                # Input gate not released yet (e.g. commit while Stage1 is still
+                # running): abort the whole prior ephemeral so Stage2 is not
+                # left orphaned.
                 try:
                     await self._ctx.stage_port.cleanup(stale_ids, abort=True)
                 except Exception:
@@ -440,7 +442,7 @@ class ModelChannel:
     def release_overlapped_input(
         self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
     ) -> bool:
-        """R4 plugin milestone: next commit may start while prior TTS drains."""
+        """Ask the plugin whether the next commit may start while TTS drains."""
         return bool(
             self._ctx.plugin.release_overlapped_input(
                 stage_id=stage_id,
@@ -538,7 +540,7 @@ class ModelChannel:
             await self._close_from_runtime(close_reason)
             return
         finished = self._data_plane_outputs_finished(drain_result)
-        # Stage1 observe-only is finished for the thinker, not the duplex turn.
+        # Stage1 observe-only finishing means text is done, not the duplex turn.
         # Closing the stream here drops later Code2Wav chunks / next-turn bind.
         if (
             finished
@@ -669,10 +671,7 @@ class ModelChannel:
         if (
             session.active_response_id is not None
             and model_turn_id is not None
-            and not session.active_response_accepts_model_turn_with_drain(
-                model_turn_id,
-                draining_model_turn_id=self._ctx.run.draining_model_turn_id,
-            )
+            and not session.active_response_accepts_model_turn(model_turn_id)
         ):
             return close_reason, emitted_response
         active_response_id = session.active_response_id
@@ -836,10 +835,7 @@ class ModelChannel:
         if (
             session.active_response_id is not None
             and model_turn_id is not None
-            and not session.active_response_accepts_model_turn_with_drain(
-                model_turn_id,
-                draining_model_turn_id=self._ctx.run.draining_model_turn_id,
-            )
+            and not session.active_response_accepts_model_turn(model_turn_id)
         ):
             return close_reason, emitted_response
         emitted_response = True
@@ -939,17 +935,14 @@ class ModelChannel:
             )
         if end_of_turn:
             data_plane_request_id = model_result.get("data_plane_request_id")
-            draining_turn = self._ctx.run.draining_model_turn_id
-            # R4: prior TTS finished while a newer turn already owns the response —
-            # clear the drain marker and do not emit response.done yet.
+            # Prior TTS finished while a newer turn already owns the response —
+            # do not emit response.done yet (outputs stay keyed by response_id).
             if (
-                model_turn_id is not None
-                and draining_turn is not None
-                and int(model_turn_id) == int(draining_turn)
+                session.capabilities.supports_overlapped_input
+                and model_turn_id is not None
                 and session.active_response_turn_id is not None
                 and int(session.active_response_turn_id) != int(model_turn_id)
             ):
-                self._ctx.run.draining_model_turn_id = None
                 if isinstance(data_plane_request_id, str):
                     data_plane.close_stream(data_plane_request_id)
                     data_plane.mark_terminal(data_plane_request_id)
@@ -1165,8 +1158,9 @@ class ModelChannel:
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
             model_state.clear_continuation()
             return
-        # R3: ephemeral turn-commit (AURA) cannot submit_update on r.stage0_tN.
-        # Silence continuation is MiniCPM chunking of a resumable r.stage0.
+        # Ephemeral turn-commit cannot submit_update on a finished stage0 id
+        # (e.g. r.stage0_tN). Silence continuation is MiniCPM chunking of a
+        # resumable r.stage0.
         if not session.capabilities.supports_core_resumable_request:
             model_state.clear_continuation()
             return

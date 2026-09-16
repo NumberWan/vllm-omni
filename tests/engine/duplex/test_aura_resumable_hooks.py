@@ -14,7 +14,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageSubmission,
     duplex_ephemeral_stage_request_id,
 )
-from vllm_omni.engine.duplex.session_manager import DuplexSessionManager
+from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 
 
 def test_submission_resumable_default_preserves_minicpm() -> None:
@@ -73,7 +73,7 @@ def test_next_commit_allowed_soft_opens_on_r4_release() -> None:
     assert helpers.next_commit_allowed(session_off, tasks, overlapped_input_released=True) is False
 
 
-def test_active_response_accepts_draining_and_newer_turn() -> None:
+def test_active_response_accepts_any_turn_when_overlapped_input() -> None:
     from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
     from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 
@@ -84,7 +84,14 @@ def test_active_response_accepts_draining_and_newer_turn() -> None:
     )
     session.begin_response(turn_id=3)
     assert session.active_response_accepts_model_turn(3)
-    assert not session.active_response_accepts_model_turn(4)
-    assert session.active_response_accepts_model_turn_with_drain(3, draining_model_turn_id=3)
-    assert session.active_response_accepts_model_turn_with_drain(4, draining_model_turn_id=3)
-    assert not session.active_response_accepts_model_turn_with_drain(2, draining_model_turn_id=3)
+    assert session.active_response_accepts_model_turn(4)
+    assert session.active_response_accepts_model_turn(2)
+
+    strict = DuplexEngineSession(
+        session_id="s2",
+        config=DuplexSessionConfig(model="m", modalities=["text"]),
+        capabilities=DuplexCapabilities(supports_overlapped_input=False),
+    )
+    strict.begin_response(turn_id=3)
+    assert strict.active_response_accepts_model_turn(3)
+    assert not strict.active_response_accepts_model_turn(4)

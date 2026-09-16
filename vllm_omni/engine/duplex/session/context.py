@@ -58,11 +58,10 @@ class DuplexRunState:
     runtime_closed: bool = False
     #: Request id of the resumable data-plane stream currently bound to the session.
     stream_request_id: str | None = None
-    #: R4: plugin milestone hit (e.g. Stage1 text/silent final). Next commit may
-    #: start while prior TTS still drains; orthogonal to barge-in (which aborts).
+    #: Plugin signaled that the next user commit may start while the current
+    #: assistant audio is still draining. Cleared on barge-in/cancel, or when
+    #: the next ephemeral turn begins. Orthogonal to barge-in (which aborts).
     overlapped_input_released: bool = False
-    #: Model turn_id whose Stage2/3 TTS is still draining after a newer turn began.
-    draining_model_turn_id: int | None = None
 
 
 class RunnerServices(Protocol):

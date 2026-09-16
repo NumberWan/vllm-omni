@@ -120,7 +120,7 @@ def test_plan_append_commit_builds_stage0_prompt() -> None:
 
 
 def test_plan_append_vision_empty_audio_never_leaves_empty_prompt() -> None:
-    """R2: frames + empty/near-silent audio must still get a Stage0 ASR pad."""
+    """Frames + empty/near-silent audio must still get a Stage0 ASR pad."""
     from io import BytesIO
 
     from PIL import Image

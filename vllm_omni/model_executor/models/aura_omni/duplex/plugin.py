@@ -202,7 +202,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             wav, sample_rate_hz = _decode_pcm_f32le(payload)
         else:
             wav, sample_rate_hz = np.zeros(0, dtype=np.float32), int(payload.get("sample_rate_hz") or 16000)
-        # R1/R2: vision-follow commits often carry empty or near-silent PCM with
+        # Vision-follow commits often carry empty or near-silent PCM with
         # is_speech=False. All-zero audio crashes Qwen3ASRProcessor, and an
         # empty Stage0 prompt is rejected ("decoder prompt cannot be empty").
         # Also guard is_speech=True + empty-audio + frames (prompt was "").
@@ -226,7 +226,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             "session_id": fence.session_id,
             "epoch": fence.epoch,
             "turn_id": fence.turn_id,
-            # R1: asr2aura ignores Stage0 text when False (placeholder zeros).
+            # asr2aura ignores Stage0 text when False (placeholder zeros).
             "is_speech": is_speech,
             "tts_task_type": runtime_config.get("tts_task_type", "CustomVoice"),
             "tts_language": runtime_config.get("tts_language", "Chinese"),
@@ -278,7 +278,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         output: object,
         context: object,
     ) -> bool:
-        """R4: after Stage1 text/silent final, next commit may start while TTS drains."""
+        """After Stage1 text/silent final, next commit may start while TTS drains."""
         del output, context
         return stage_id == 1 and bool(segment_finished)
 

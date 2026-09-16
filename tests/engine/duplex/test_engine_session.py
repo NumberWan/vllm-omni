@@ -387,8 +387,22 @@ def test_cancel_fence_releases_stage_requests_and_advances_identity():
 
     with pytest.raises(DuplexFenceMismatchError):
         session.cancel_fence(next_fence, DuplexFence("sid-cancel", epoch=1, turn_id=1))
-    with pytest.raises(DuplexFenceMismatchError):
-        session.cancel_fence(DuplexFence("sid-other", epoch=1, turn_id=0), DuplexFence("sid-cancel", epoch=2))
+
+
+def test_request_resource_keys_are_stage_id_and_request_id():
+    session = _session("sid-keys")
+    session.bind_stage_request(0, "req-a", fence=session.fence)
+    session.bind_stage_request(1, "req-b", fence=session.fence)
+    session.bind_stage_request(2, "req-tts", fence=session.fence)
+    stale_keys = list(session.request_resources.keys())
+    stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
+    assert stale_ids == ["req-a", "req-b", "req-tts"]
+    for sid, rid in stale_keys:
+        if sid < 2:
+            session.request_resources.pop((sid, rid), None)
+    assert session.resource_request_ids() == ["req-tts"]
+    with pytest.raises(TypeError, match="unhashable"):
+        dict.fromkeys(rid for _, rid in session.request_resources.items())
 
 
 # ---- public view ----

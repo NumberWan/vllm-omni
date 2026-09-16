@@ -587,30 +587,14 @@ class DuplexEngineSession:
             return False
         if turn_id is None:
             return True
+        # Split by response_id / epoch. Models that allow overlapped input keep
+        # prior TTS draining under the same response, so accept any model turn
+        # for that response (newer text + older Talker). Other models still
+        # require an exact turn match.
+        if self.capabilities.supports_overlapped_input:
+            return True
         active_turn_id = self._response.active_response_turn_id
         if active_turn_id is None or int(turn_id) == int(active_turn_id):
-            return True
-        return False
-
-    def active_response_accepts_model_turn_with_drain(
-        self,
-        turn_id: int | None,
-        *,
-        draining_model_turn_id: int | None,
-    ) -> bool:
-        """Like ``active_response_accepts_model_turn``, plus R4 draining / newer turns."""
-        if self.active_response_accepts_model_turn(turn_id):
-            return True
-        if turn_id is None:
-            return False
-        if draining_model_turn_id is not None and int(turn_id) == int(draining_model_turn_id):
-            return True
-        # Newer thinker turn under the same response while prior TTS drains.
-        if (
-            self.capabilities.supports_overlapped_input
-            and draining_model_turn_id is not None
-            and int(turn_id) > int(draining_model_turn_id)
-        ):
             return True
         return False
 

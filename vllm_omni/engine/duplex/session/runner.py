@@ -1006,15 +1006,6 @@ class DuplexSessionRunner:
         if final or precreate_response:
             session.bind_request(request_id)
         if precreate_response:
-            # R4: keep draining TTS turn_id while binding the newer thinker turn
-            # under the same active response (do not abort / do not end_response).
-            if (
-                session.capabilities.supports_overlapped_input
-                and self.run.overlapped_input_released
-                and session.active_response_id is not None
-                and self.run.draining_model_turn_id is None
-            ):
-                self.run.draining_model_turn_id = session.active_response_turn_id
             session.bind_response_turn(append_turn_id)
         if precreate_response and session.active_response_id is None:
             response_id = session.begin_response(turn_id=append_turn_id)
@@ -1367,9 +1358,8 @@ class DuplexSessionRunner:
         old_request_id = session.active_request_id
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
-        # Barge-in / cancel aborts; clear R4 soft-open state.
+        # Barge-in / cancel aborts prior TTS; clear overlapped-input release.
         self.run.overlapped_input_released = False
-        self.run.draining_model_turn_id = None
         committed_message = session.end_response(
             commit_text=self.model.should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
@@ -1874,8 +1864,8 @@ class DuplexSessionRunner:
             should_create_response=should_create_response,
         ):
             return
-        # Nothing flushed (or a response is still in progress without R4 release):
-        # acknowledge the commit without starting a new response.
+        # Nothing flushed (or a response is still in progress without
+        # overlapped-input release): acknowledge without starting a new response.
         had_uncommitted_audio = (
             model_state.input_since_commit
             or model_state.audio_buffer.has_pending()

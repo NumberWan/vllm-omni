@@ -221,7 +221,7 @@ def asr2aura(
         additional_info = src_prompt.get("additional_information") or {}
         system_prompt = _first_value(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT)
         transcript = _normalize_asr_transcript(_extract_text(source_output))
-        # R1 vision-follow: placeholder zeros may ASR into noise; trust client is_speech.
+        # Vision-follow: placeholder zeros may ASR into noise; trust client is_speech.
         if additional_info.get("is_speech") is False:
             transcript = ""
         logger.warning(
@@ -247,7 +247,7 @@ def asr2aura(
             )
 
             history = get_or_create_session_history(session_id)
-            # Vision-only (R1) turns have empty ASR; keep a short marker so
+            # Vision-only turns have empty ASR; keep a short marker so
             # SessionHistory still records the user side of proactive follow-ups.
             history.begin_user_turn(transcript if transcript else "[vision]")
             history_prefix = history.render_prefix()

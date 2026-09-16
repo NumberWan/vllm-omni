@@ -63,7 +63,7 @@ stages:
       stop_token_ids: [151669, 151645]
 
   - stage_id: 2
-    # R4: allow prior TTS to drain while the next Talker starts (not assumed 1).
+    # Allow prior TTS to drain while the next Talker starts (not assumed 1).
     max_num_seqs: 2
     gpu_memory_utilization: 0.12
     enforce_eager: true
