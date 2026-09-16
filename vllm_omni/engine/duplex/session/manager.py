@@ -425,9 +425,8 @@ class DuplexSessionManager:
         if stage_id >= self.stage_port.stage_count:
             return None
         effective_fence = fence or session.fence
-        request_id = self.stage_request_id(
-            effective_fence, stage_id=stage_id, resumable=session.capabilities.supports_core_resumable_request
-        )
+        resumable = bool(session.capabilities.supports_core_resumable_request)
+        request_id = self.stage_request_id(effective_fence, stage_id=stage_id, resumable=resumable)
         session.reserve_stage_request(stage_id, request_id, fence=effective_fence)
         context = DuplexStageRequestContext(
             request_id=request_id,

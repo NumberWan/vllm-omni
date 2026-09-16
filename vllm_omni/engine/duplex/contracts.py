@@ -78,6 +78,9 @@ class DuplexStageSubmission:
     context: DuplexStageRequestContext
     prompt: Mapping[str, object]
     already_submitted: bool
+    # Default True keeps MiniCPM resident Stage0. AURA turn-commit sets False
+    # (ephemeral NewRequest). Distinct from DuplexCapabilities.supports_core_resumable_request.
+    resumable: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
@@ -157,6 +160,11 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
     return f"duplex-s.{encoded_session_id}.e.{fence.epoch}.r.{role}"
 
 
+def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
+    """Turn-scoped Stage request id for non-resumable (ephemeral) duplex models."""
+    return duplex_resource_request_id(fence, f"stage{stage_id}_t{fence.turn_id}")
+
+
 def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
     """Return whether a current-format resource request belongs to a session."""
     parts = request_id.split(".")
@@ -187,6 +195,7 @@ __all__ = [
     "DuplexStageSubmission",
     "DuplexStageSubmissionResult",
     "duplex_data_plane_request_info",
+    "duplex_ephemeral_stage_request_id",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
 ]

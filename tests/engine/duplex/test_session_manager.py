@@ -196,7 +196,11 @@ class FakePlugin(DuplexModelPlugin):
 
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         del max_sessions
-        return DuplexCapabilities(supports_input_append=True, supports_core_resumable_request=True)
+        # Resident Stage0 ids (MiniCPM-shaped); AURA opts out via supports_core_resumable_request=False.
+        return DuplexCapabilities(
+            supports_input_append=True,
+            supports_core_resumable_request=True,
+        )
 
     def validate_client_extra_body(self, extra_body: object) -> None:
         pass
@@ -409,7 +413,8 @@ async def test_open_answers_with_capabilities_and_emits_session_created() -> Non
         assert result.session_id == "sid-open"
         assert result.lease_generation == 0
         assert result.capabilities == DuplexCapabilities(
-            supports_input_append=True, supports_core_resumable_request=True
+            supports_input_append=True,
+            supports_core_resumable_request=True,
         )
         assert result.public_session is not None
         assert result.public_session["id"] == "sid-open"

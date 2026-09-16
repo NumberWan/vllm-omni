@@ -1677,6 +1677,31 @@ class OrchestratorBase:
         if await self._intercept_stage_output(stage_id, replica_id, output, req_state, stage_metrics, submit_ts):
             return
 
+        # Stage0 ASR transcript dump (WARNING): always on finish so we can
+        # align GT even if the Stage0→1 asr2aura bridge was skipped.
+        if stage_id == 0 and finished:
+            _asr_out = None
+            _outs = getattr(output, "outputs", None)
+            if isinstance(_outs, list) and _outs:
+                _asr_out = _outs[0]
+            _asr_text = ""
+            if _asr_out is not None:
+                _asr_text = getattr(_asr_out, "text", None) or getattr(_asr_out, "cumulative_text", None) or ""
+            logger.warning(
+                "[aura.s0.done] req=%s asr_transcript=%r n_chars=%d "
+                "next_receives_chunks=%s will_forward=%s",
+                req_id,
+                (_asr_text[:200] if isinstance(_asr_text, str) else _asr_text),
+                len(_asr_text) if isinstance(_asr_text, str) else -1,
+                self._stage_receives_async_chunks(stage_id + 1)
+                if stage_id < req_state.final_stage_id
+                else None,
+                (
+                    stage_id < req_state.final_stage_id
+                    and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
+                ),
+            )
+
         if (
             (finished or segment_finished)
             and stage_id < req_state.final_stage_id
@@ -1733,6 +1758,13 @@ class OrchestratorBase:
     def _stage_receives_async_chunks(self, stage_id: int) -> bool:
         """Whether a stage's connector supplies its runtime inputs."""
         pool = self.stage_pools[stage_id]
+        # Stages with an orchestrator input processor (e.g. AURA asr2aura /
+        # aura2tts) must be fed via process_engine_inputs, not zero-prewarm
+        # + connector chunks. Async chunk transport remains for codec edges
+        # that have no custom_process_input_func (Talker→Code2Wav).
+        client = getattr(pool, "stage_client", None)
+        if client is not None and getattr(client, "custom_process_input_func", None) is not None:
+            return False
         model_config = getattr(pool.stage_vllm_config, "model_config", None)
         return stage_receives_chunks(model_config)
 

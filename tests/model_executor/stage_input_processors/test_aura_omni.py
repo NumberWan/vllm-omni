@@ -9,6 +9,7 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    _normalize_asr_transcript,
     SILENT_TEXT,
     asr2aura,
     aura2tts,
@@ -196,3 +197,9 @@ def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
 
 def test_aura2tts_drops_silent_response():
     assert aura2tts([_source_output(SILENT_TEXT)]) == []
+
+
+def test_normalize_asr_transcript_strips_qwen3_asr_markup() -> None:
+    raw = "language Chinese<asr_text>出现《古韵》这本书的时候，提醒我。"
+    assert _normalize_asr_transcript(raw) == "出现《古韵》这本书的时候，提醒我。"
+    assert _normalize_asr_transcript("出现古韵这本书的时候提醒我。") == "出现古韵这本书的时候提醒我。"

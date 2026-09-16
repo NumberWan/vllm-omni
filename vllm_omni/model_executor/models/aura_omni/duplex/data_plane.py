@@ -1,0 +1,272 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""Project AURA stage outputs into duplex internal events."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+import torch
+
+from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
+from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
+from vllm_omni.model_executor.stage_input_processors.aura_omni import SILENT_TEXT
+from vllm_omni.outputs.duplex import get_duplex_output_decision
+
+
+@dataclass(frozen=True, slots=True)
+class AuraDataPlaneContext:
+    epoch: int = 0
+    turn_id: int = 0
+    auto_responds: bool = True
+    response_format: str = "wav"
+    speed: float | None = None
+    modalities: tuple[str, ...] = ("text", "audio")
+
+
+@dataclass(slots=True)
+class _RequestState:
+    text_sent: str = ""
+    audio_offset: int = 0
+    silent: bool = False
+    terminal: bool = False
+    stage_seen: set[int] = field(default_factory=set)
+
+
+def _unwrap(output: object) -> tuple[object, object | None, int | None]:
+    stage_id = getattr(output, "stage_id", None)
+    inner = getattr(output, "request_output", None)
+    if inner is not None and inner is not output:
+        output = inner
+    outputs = getattr(output, "outputs", None)
+    completion = outputs[0] if isinstance(outputs, list) and outputs else None
+    if stage_id is None:
+        stage_id = getattr(output, "stage_id", None)
+    return output, completion, int(stage_id) if isinstance(stage_id, int) else None
+
+
+def _strip_think(text: str) -> str:
+    """Drop Qwen3-VL ``<think>...</think>`` wrappers from assistant text."""
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import _strip_assistant_text
+
+    return _strip_assistant_text(text)
+
+
+def _text_from(output: object, completion: object | None) -> str:
+    for candidate in (completion, output):
+        if candidate is None:
+            continue
+        for attr in ("cumulative_text", "text"):
+            value = getattr(candidate, attr, None)
+            if isinstance(value, str) and value:
+                return _strip_think(value)
+    return ""
+
+
+def _multimodal(output: object, completion: object | None) -> dict[str, object]:
+    """Prefer decision metadata, then completion multimodal payload.
+
+    Empty mappings must not short-circuit: OmniRequestOutput.multimodal_output
+    returns ``{}`` when completion payloads are falsy, which would otherwise
+    hide a real MultimodalPayload on the completion (MiniCPM data-plane does
+    the same ``if not mm`` fallthrough).
+    """
+    decision = get_duplex_output_decision(output)
+    metadata = getattr(decision, "metadata", None)
+    if isinstance(metadata, Mapping) and metadata:
+        return dict(metadata)
+    for candidate in (
+        getattr(output, "multimodal_output", None),
+        getattr(completion, "multimodal_output", None) if completion is not None else None,
+    ):
+        if isinstance(candidate, Mapping) and candidate:
+            return dict(candidate)
+    return {}
+
+
+def _audio_value(metadata: Mapping[str, object]) -> object | None:
+    """Extract PCM/latent audio from a multimodal mapping.
+
+    Code2Wav wire payloads use producer key ``model_outputs``; after
+    ``MultimodalPayload.from_raw(..., modality_key)`` that becomes ``audio``
+    when modality is audio, or another modality key (e.g. ``text``/``hidden``)
+    when the stage output_modality was mis-tagged. Accept common aliases and
+    finally the first non-sr tensor so duplex still surfaces Stage3 PCM.
+    """
+    value = next(
+        (
+            metadata[key]
+            for key in ("audio", "model_outputs", "latent", "hidden", "text")
+            if key in metadata
+        ),
+        None,
+    )
+    if value is None:
+        primary = getattr(metadata, "primary_tensor", None)
+        if primary is not None:
+            value = primary
+    if value is None:
+        for key, candidate in metadata.items():
+            if key in {"sr", "sample_rate", "sample_rate_hz", "audio_sample_rate"}:
+                continue
+            if isinstance(candidate, torch.Tensor) or (
+                isinstance(candidate, list) and candidate and isinstance(candidate[0], torch.Tensor)
+            ):
+                value = candidate
+                break
+    if isinstance(value, list) and len(value) == 1:
+        return value[0]
+    return value
+
+
+def _sample_rate(metadata: Mapping[str, object]) -> int:
+    value = metadata.get("sr", metadata.get("sample_rate_hz", 24000))
+    if isinstance(value, list) and value:
+        value = value[0]
+    if hasattr(value, "item"):
+        value = value.item()
+    return int(value) if isinstance(value, int | float) else 24000
+
+
+class AuraDataPlaneSession(DuplexDataPlane):
+    """Map Stage1 text + Stage3 audio (or silent) onto duplex events."""
+
+    def __init__(self, encode_audio: EncodeAudio) -> None:
+        self._encode_audio = encode_audio
+        self._requests: dict[str, _RequestState] = {}
+
+    def begin_request(self, request_id: str) -> None:
+        state = self._requests.setdefault(request_id, _RequestState())
+        state.terminal = False
+
+    def is_terminal(self, request_id: str | None) -> bool:
+        if request_id is None:
+            return False
+        state = self._requests.get(request_id)
+        return state is not None and state.terminal
+
+    def mark_terminal(self, request_id: str) -> None:
+        self._requests.setdefault(request_id, _RequestState()).terminal = True
+
+    def close_stream(self, request_id: str) -> None:
+        state = self._requests.get(request_id)
+        if state is not None:
+            state.audio_offset = 0
+
+    def close_session(self, session_id: str, *, active_request_id: str | None = None) -> None:
+        if active_request_id is not None:
+            self._requests.pop(active_request_id, None)
+        for request_id in list(self._requests):
+            if duplex_resource_request_belongs_to_session(request_id, session_id):
+                self._requests.pop(request_id, None)
+
+    def project(self, result: object, *, context: object | None = None) -> Iterator[dict[str, object]]:
+        if not isinstance(result, dict):
+            return
+        outputs = result.get("data_plane_outputs")
+        if not isinstance(outputs, list):
+            return
+        for output in outputs:
+            yield from self.project_output(output, context=context)
+
+    def project_output(self, result: object, *, context: object | None = None) -> Iterator[dict[str, object]]:
+        del context
+        request_id = getattr(result, "request_id", None)
+        if not isinstance(request_id, str) or not request_id:
+            return
+        outer_finished = bool(getattr(result, "finished", False))
+        output, completion, stage_id = _unwrap(result)
+        state = self._requests.setdefault(request_id, _RequestState())
+        if stage_id is not None:
+            state.stage_seen.add(stage_id)
+
+        decision = get_duplex_output_decision(result)
+        metadata = dict(getattr(decision, "metadata", {}) or {})
+        if metadata.get("model_listen") or metadata.get("duplex_native_decision") == "listen":
+            state.silent = True
+            # Mark terminal after yield: runner._send_one drops is_terminal
+            # requests before emit.
+            yield {
+                "stage_role": "thinker",
+                "is_listen": True,
+                "data_plane_request_id": request_id,
+                "text": "",
+                "end_of_turn": True,
+                "silent": True,
+            }
+            state.terminal = True
+            return
+
+        text = _text_from(output, completion)
+        if text and text != state.text_sent:
+            delta = text[len(state.text_sent) :] if text.startswith(state.text_sent) else text
+            state.text_sent = text
+            if text.strip() == SILENT_TEXT:
+                state.silent = True
+            if delta and not state.silent:
+                yield {
+                    "stage_role": "thinker",
+                    "is_listen": False,
+                    "data_plane_request_id": request_id,
+                    "text": delta,
+                    "end_of_turn": False,
+                }
+
+        # RequestOutput.finished / envelope finished is the stream EOS.
+        # CompletionOutput.finished is true on every Code2Wav chunk and must
+        # not close the duplex turn (runner would then drop via is_terminal).
+        finished = bool(outer_finished or getattr(output, "finished", False))
+        is_final_audio_stage = stage_id is None or stage_id >= 3
+        mm = _multimodal(output, completion)
+        audio = _audio_value(mm)
+        if audio is not None and not state.silent:
+            sample_rate = _sample_rate(mm)
+            encoded = self._encode_audio(audio, sample_rate, "wav", None)
+            if encoded:
+                if isinstance(audio, torch.Tensor):
+                    n = int(audio.numel())
+                else:
+                    try:
+                        n = int(np.asarray(audio, dtype=np.float32).size)
+                    except (TypeError, ValueError):
+                        n = 0
+                state.audio_offset += n
+                end_of_turn = bool(finished and is_final_audio_stage)
+                yield {
+                    "stage_role": "tts",
+                    "is_listen": False,
+                    "data_plane_request_id": request_id,
+                    "audio": encoded,
+                    "sample_rate_hz": sample_rate,
+                    "end_of_turn": end_of_turn,
+                }
+                if end_of_turn:
+                    state.terminal = True
+                    return
+
+        if finished and is_final_audio_stage and not state.terminal:
+            yield {
+                "stage_role": "tts",
+                "is_listen": False,
+                "data_plane_request_id": request_id,
+                "text": "",
+                "end_of_turn": True,
+            }
+            state.terminal = True
+        elif finished and state.silent and not state.terminal:
+            yield {
+                "stage_role": "thinker",
+                "is_listen": True,
+                "data_plane_request_id": request_id,
+                "text": "",
+                "end_of_turn": True,
+                "silent": True,
+            }
+            state.terminal = True
+
+
+__all__ = ["AuraDataPlaneContext", "AuraDataPlaneSession"]

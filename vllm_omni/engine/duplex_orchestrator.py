@@ -181,13 +181,25 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> bool:
         if not req_state.session_owned:
             return False
+        # MiniCPM keeps one resident request = one session. AURA is ephemeral
+        # turn-commit: aborting a runaway Talker (or a failed Stage1→2
+        # forward) must free that turn's stages without tearing the WS down.
+        close_session = bool(self.plugin.capabilities(max_sessions=1).supports_core_resumable_request)
         runner = self.session_manager.runner_for_request_id(req_id)
-        if runner is not None:
+        if runner is not None and close_session:
             runner.on_stage_failure(next_stage_id, exc)
+        elif runner is not None:
+            logger.warning(
+                "[DuplexOrchestrator] ephemeral forward failed req=%s stage-%s: %s: %s",
+                req_id,
+                next_stage_id,
+                type(exc).__name__,
+                exc,
+            )
         await self._cleanup_request_ids(
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
-            release_owners=True,
+            release_owners=close_session,
         )
         return True
 
@@ -292,6 +304,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 fence=context.fence,
                 config_generation=context.config_generation,
             )
+            # MiniCPM keeps a resident Stage0 (resumable chunks). AURA is
+            # turn-commit / ephemeral: streaming.enabled would mark every
+            # downstream stage resumable, and max_num_seqs=1 then parks the
+            # next turn's Stage1 behind a finished-but-still-held request.
             request_state.streaming.enabled = self.plugin.capabilities(
                 max_sessions=self.duplex_session_config.max_sessions
             ).supports_core_resumable_request
@@ -326,9 +342,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         request_state = self.request_states.get(context.request_id)
         if not isinstance(request_state, DuplexOrchestratorRequestState):
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
-        if self.plugin.capabilities(
-            max_sessions=self.duplex_session_config.max_sessions
-        ).supports_core_resumable_request:
+        request_state.streaming.enabled = bool(submission.resumable)
+        # Keep the raw Stage0 prompt (additional_information / multi_modal_data) so
+        # asr2aura / aura2tts can read TTS + vision fields via process_engine_inputs.
+        request_state.prompt = dict(submission.prompt)
+        if submission.resumable:
             request = build_engine_core_request_from_tokens(
                 request_id=context.request_id,
                 prompt=dict(submission.prompt),
@@ -349,10 +367,16 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             )
             if self.request_states.get(context.request_id) is not request_state:
                 raise RuntimeError("duplex request cancelled during input preprocessing")
-            request_state.prompt = dict(submission.prompt)
         request.external_req_id = request.request_id
+        mm_features = getattr(request, "mm_features", None)
+        if mm_features is not None:
+            request_state.mm_features = mm_features
         pool = self.stage_pools[context.stage_id]
         if submission.already_submitted:
+            if not submission.resumable:
+                raise RuntimeError(
+                    f"ephemeral duplex request cannot submit_update: {context.request_id}"
+                )
             replica_id = await pool.submit_update(context.request_id, request_state, request)
         else:
             replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)

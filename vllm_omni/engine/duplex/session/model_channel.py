@@ -214,17 +214,39 @@ class ModelChannel:
         lease_operation_id = f"append:{operation_id or uuid.uuid4().hex}"
         operation_started = False
         stage_id = 0
-        request_id = self._ctx.manager.stage_request_id(
-            fence, stage_id=stage_id, resumable=session.capabilities.supports_core_resumable_request
-        )
+        resumable = bool(session.capabilities.supports_core_resumable_request)
+        request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=resumable)
+        # R3: AURA ephemeral turn-commit cannot submit_update on a finished
+        # ephemeral id. Bump turn_id and open a fresh ephemeral id instead.
+        if not resumable and session.stage_request_submitted(stage_id, request_id):
+            stale_ephemeral_id = request_id
+            stale_ids = list(dict.fromkeys(rid for (_, rid) in session.request_resources))
+            session.complete_model_turn(fence.turn_id)
+            fence = DuplexFence(session.session_id, epoch=session.epoch, turn_id=session.turn_id)
+            request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=False)
+            session.request_resources.pop((stage_id, stale_ephemeral_id), None)
+            # Turn-commit AURA: previous Talker (max_num_seqs=1) must be aborted
+            # or the next Stage2 never starts and the WS eventually drops.
+            if stale_ids:
+                try:
+                    await self._ctx.stage_port.cleanup(stale_ids, abort=True)
+                except Exception:
+                    logger.warning(
+                        "duplex abort of stale ephemeral request failed session=%s ids=%s",
+                        session.session_id,
+                        stale_ids,
+                        exc_info=True,
+                    )
         try:
             session.begin_lease_operation(fence, lease_operation_id)
             operation_started = True
             reservation = session.prepare_append(fence)
-            already_submitted = session.stage_request_submitted(stage_id, request_id)
+            already_submitted = False if not resumable else session.stage_request_submitted(stage_id, request_id)
             request_context = self._ctx.manager.ensure_stage_request(session, stage_id=stage_id, fence=fence)
             if request_context is None:
                 raise RuntimeError("duplex_data_plane_has_no_stage")
+            if request_context.request_id != request_id:
+                request_id = request_context.request_id
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
@@ -253,6 +275,7 @@ class ModelChannel:
                 context=request_context,
                 prompt=append_plan.prompt,
                 already_submitted=already_submitted,
+                resumable=resumable,
             )
             submission_result = await self._ctx.stage_port.submit(submission)
             try:
@@ -273,6 +296,7 @@ class ModelChannel:
                     )
                 raise
             session.touch_lease(DuplexLeaseActivity.APPEND)
+            session.bind_request(request_id)
             return {
                 "ok": True,
                 "operation": "append",
@@ -289,7 +313,7 @@ class ModelChannel:
                             "seq": update.seq,
                             "turn_id": update.turn_id,
                             "turn_seq": update.turn_seq,
-                            "resumable": session.capabilities.supports_core_resumable_request,
+                            "resumable": resumable,
                         },
                     }
                 ],
@@ -386,6 +410,18 @@ class ModelChannel:
             raise TypeError("duplex plugin decide_output() must return DuplexOutputDecision or None")
         return decision
 
+    def observe_stage_output(
+        self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
+    ) -> bool:
+        """Project an intermediate stage without short-circuiting the pipeline."""
+        return bool(
+            self._ctx.plugin.observe_stage_output(
+                stage_id=stage_id,
+                output=output,
+                context=context,
+            )
+        )
+
     @staticmethod
     def stage_metrics_snapshot(stage_id: int, metrics: object, output: object) -> dict[str, dict[str, object]] | None:
         if not isinstance(metrics, StageRequestStats):
@@ -474,12 +510,14 @@ class ModelChannel:
             await self._close_from_runtime(close_reason)
             return
         finished = self._data_plane_outputs_finished(drain_result)
-        if finished and not session.capabilities.supports_core_resumable_request:
-            if self._ctx.run.stream_request_id == item.request_id:
-                self._ctx.run.stream_request_id = None
-            await self._ctx.stage_port.cleanup([item.request_id])
-            return
-        if finished and emitted_response and not self._out.auto_responds():
+        # Stage1 observe-only is finished for the thinker, not the duplex turn.
+        # Closing the stream here drops later Code2Wav chunks / next-turn bind.
+        if (
+            finished
+            and emitted_response
+            and not self._out.auto_responds()
+            and item.stage_id >= item.context.final_stage_id
+        ):
             # A finished, emitted response releases the per-request projector
             # cursor on its way out and offers the model another
             # silence unit.
@@ -1074,6 +1112,11 @@ class ModelChannel:
         model_state = self._ctx.model_state
         response_id = session.active_response_id
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
+            model_state.clear_continuation()
+            return
+        # R3: ephemeral turn-commit (AURA) cannot submit_update on r.stage0_tN.
+        # Silence continuation is MiniCPM chunking of a resumable r.stage0.
+        if not session.capabilities.supports_core_resumable_request:
             model_state.clear_continuation()
             return
         request_id = session.active_request_id

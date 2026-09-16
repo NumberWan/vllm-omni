@@ -237,6 +237,22 @@ class DuplexModelPlugin(ABC):
         output: object,
     ) -> DuplexOutputDecision | None: ...
 
+    def observe_stage_output(
+        self,
+        *,
+        stage_id: int,
+        output: object,
+        context: object,
+    ) -> bool:
+        """Return True to project this intermediate stage to the client.
+
+        Unlike ``decide_output``, observing does **not** short-circuit the
+        pipeline: the stage output is still forwarded to the next stage.
+        Default is off; AURA uses this for Stage1 thinker text.
+        """
+        del stage_id, output, context
+        return False
+
     # ---- session policy (was ServingRuntimeAdapter) ----
 
     @abstractmethod

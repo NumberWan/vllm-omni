@@ -250,6 +250,38 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
 
 
 @pytest.mark.asyncio
+async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> None:
+    """AURA Stage1 has asr2aura: must not be zero-prewarmed under async_chunk."""
+    orchestrator = object.__new__(Orchestrator)
+    stage0 = FakePrewarmPool("sender")
+    stage1 = FakePrewarmPool("receiver")  # would receive chunks if role alone decided
+    stage1.stage_client = SimpleNamespace(custom_process_input_func=lambda *a, **k: None)
+    stage2 = FakePrewarmPool("receiver")
+    orchestrator.stage_pools = [stage0, stage1, stage2]
+    orchestrator._emit_tx_edge = lambda **_kwargs: None
+    orchestrator._on_stage_submitted = MagicMock()
+    req_state = OrchestratorRequestState(
+        request_id="req-prewarm-custom",
+        prompt={"prompt_token_ids": [1, 2]},
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
+        final_stage_id=2,
+    )
+
+    prewarmed = await orchestrator._prewarm_async_chunk_stages(
+        "req-prewarm-custom",
+        SimpleNamespace(prompt_token_ids=[1, 2], resumable=True),
+        req_state,
+    )
+
+    assert prewarmed is True
+    assert stage1.submitted == []
+    assert len(stage2.submitted) == 1
+    assert 1 not in req_state.stage_submit_ts
+    assert 2 in req_state.stage_submit_ts
+
+
+
+@pytest.mark.asyncio
 async def test_async_route_forwards_to_outgoing_only_stage() -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator.async_chunk = True

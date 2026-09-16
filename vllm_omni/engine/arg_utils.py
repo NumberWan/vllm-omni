@@ -310,12 +310,21 @@ class OmniEngineArgs(EngineArgs):
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 
-        # Build stage_connector_config from stage_connector_spec
-        stage_connector_config = {
-            "name": self.stage_connector_spec.get("name", "SharedMemoryConnector"),
-            "extra": self.stage_connector_spec.get("extra", {}).copy(),
-        }
-        stage_connector_config["extra"]["stage_id"] = self.stage_id
+        # Build stage_connector_config from stage_connector_spec.
+        # An empty spec means this stage has no connector data-plane edge;
+        # mark it sender-only so async_chunk prewarm / chunk-wait do not
+        # replace orchestrator process_engine_inputs (e.g. AURA asr2aura).
+        if self.stage_connector_spec:
+            stage_connector_config = {
+                "name": self.stage_connector_spec.get("name", "SharedMemoryConnector"),
+                "extra": self.stage_connector_spec.get("extra", {}).copy(),
+            }
+            stage_connector_config["extra"]["stage_id"] = self.stage_id
+        else:
+            stage_connector_config = {
+                "name": "SharedMemoryConnector",
+                "extra": {"stage_id": self.stage_id, "role": "sender"},
+            }
 
         hf_overrides = cast(dict[str, Any] | Callable[[Any], Any] | None, getattr(self, "hf_overrides", None))
         # If model_arch is specified, inject it into hf_overrides so vLLM can

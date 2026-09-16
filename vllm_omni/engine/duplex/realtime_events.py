@@ -1170,9 +1170,17 @@ def note_input_append(
     audio = payload.get("audio")
     looks_like_speech = bool(vad_result.is_speech) if vad_result is not None else payload.get("is_speech") is not False
     has_audio = isinstance(audio, str) and bool(audio)
-    state.input_audio_buffer_has_audio = state.input_audio_buffer_has_audio or (looks_like_speech and has_audio)
+    video_frames = payload.get("video_frames")
+    has_video = isinstance(video_frames, list) and any(isinstance(frame, str) and frame for frame in video_frames)
+    # R1: vision-carrying silent appends are real turn content. Without this,
+    # resolve_commit treats the buffer as empty non-speech and forces
+    # is_speech=False / response_create=False, so Commit(create_response=True)
+    # never submits Stage0.
+    state.input_audio_buffer_has_audio = state.input_audio_buffer_has_audio or (
+        looks_like_speech and has_audio
+    ) or has_video
     state.input_audio_buffer_had_non_speech = state.input_audio_buffer_had_non_speech or (
-        not looks_like_speech and has_audio
+        not looks_like_speech and has_audio and not has_video
     )
     events: list[DuplexEvent] = []
     stop_ms: object = payload.get("audio_end_ms", payload.get("audio_ms", 0))

@@ -247,11 +247,15 @@ class DuplexSessionRunner:
     ) -> bool:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
         decision: DuplexOutputDecision | None = None
+        observe = False
         if stage_id < context.final_stage_id:
             decision = self.model.decide_output(stage_id, output, context)
+            # AURA Stage1 thinker text: project to the client without stopping TTS.
+            if decision is None:
+                observe = self.model.observe_stage_output(stage_id, output, context)
         consume = decision is not None or stage_id >= context.final_stage_id
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
-        if not consume and not project_intermediate:
+        if not consume and not observe and not project_intermediate:
             # Stage0 text without a direct decision feeds the TTS stage as before.
             # Its metrics still have to reach the client: before sessions moved
             # into the engine the orchestrator published them as a standalone
@@ -274,6 +278,7 @@ class DuplexSessionRunner:
                 decision=decision,
             )
         )
+        # observe-only must still forward to the next stage (return False).
         return consume
 
     def on_stage_failure(self, stage_id: int, exc: BaseException) -> None:
@@ -862,16 +867,19 @@ class DuplexSessionRunner:
                 defer_append = False
         elif not auto_responds and not overlap_policy.input_looks_like_speech(self.session, event, payload):
             # Turn-mode only: skip silent chunks so they don't open a response.
-            self.emit(
-                {
-                    "type": "response.listen",
-                    "session_id": session.session_id,
-                    "epoch": session.epoch,
-                    "reason": "silence_or_noise",
-                }
-            )
-            self._maybe_schedule_vad_commit(vad_result)
-            return
+            # R1 (AURA): vision-carrying silent appends must still buffer — otherwise
+            # answer_time / proactive follow-ups with is_speech=False never reach Stage1.
+            if not payload.get("video_frames"):
+                self.emit(
+                    {
+                        "type": "response.listen",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "reason": "silence_or_noise",
+                    }
+                )
+                self._maybe_schedule_vad_commit(vad_result)
+                return
         if overlap_policy.should_force_listen_for_auto_response_overlap(event, payload, auto_responds=auto_responds):
             payload["force_listen"] = True
         if not buffer_overlap_audio:
@@ -1760,14 +1768,22 @@ class DuplexSessionRunner:
                 event_id=event.get("realtime_event_id"),
             )
             return
-        if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
-            self._commit_silent_input()
-            return
         should_create_response = (
             event_type == "response.create"
             or bool(event.get("response_create", event_type == "input.commit"))
             or (event_type == "input_audio_buffer.commit" and self._session_auto_responds())
         )
+        # Pure silence with nothing buffered: drop and keep listening.
+        # R1: pending silent+video (or an explicit create_response) must flush.
+        if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
+            has_pending_turn = (
+                model_state.input_since_commit
+                or model_state.audio_buffer.has_pending()
+                or model_state.committed_audio_payload is not None
+            )
+            if not has_pending_turn and not should_create_response:
+                self._commit_silent_input()
+                return
         precreate_response_requested = event_type == "response.create" or bool(
             event.get("response_create", event_type == "input.commit")
         )

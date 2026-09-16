@@ -878,6 +878,83 @@ async def test_turn_mode_skips_silent_chunks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_turn_mode_keeps_silent_chunks_with_video_frames() -> None:
+    """R1: vision-carrying silent appends must buffer in turn-commit mode."""
+    h = await open_harness(auto_response=False)
+    try:
+        # Minimal 1x1 JPEG (base64) — wire validation only checks non-empty str.
+        frame = (
+            "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkS"
+            "Ew8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJ"
+            "CQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy"
+            "MjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAA"
+            "AAAAAAAAAAj/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAA"
+            "AAAAAAD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAGfAP/EABQQ"
+            "AQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAQUCf//EABQRAQAAAAAAAAAAAAAAAAAA"
+            "AAD/2gAIAQMBAT8Bf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQIBAT8Bf//E"
+            "ABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEABj8Cf//EABQQAQAAAAAAAAAAAAAA"
+            "AAAAAAD/2gAIAQEAAT8hf//Z"
+        )
+        cmd = commands.AppendAudio(
+            audio=pcm_f32(160, value=0.0),
+            format="pcm_f32le",
+            sample_rate_hz=16000,
+            is_speech=False,
+            video_frames=(frame,),
+        )
+        events = await h.run(cmd)
+        assert "response.listen" not in types(events)
+        assert h.runner.model_state.audio_buffer.has_pending()
+        events = await h.run(commands.Commit(create_response=True))
+        assert "response.created" in types(events), types(events)
+        assert "input_audio_buffer.committed" in types(events), types(events)
+        assert len(h.port.submissions) == 1
+        duplex = h.port.submissions[0].prompt["model_intermediate_buffer"]["duplex"]
+        assert duplex["final"] is True
+        assert duplex["payload"].get("is_speech") is False
+        assert duplex["payload"].get("video_frames")
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_turn_mode_keeps_silent_vision_while_response_in_progress() -> None:
+    """TTS still playing: vision-follow must buffer, not drop as silence_or_noise."""
+    h = await open_harness(auto_response=False)
+    try:
+        h.session._response.active_response_id = "resp-tts"
+        frame = (
+            "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkS"
+            "Ew8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJ"
+            "CQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy"
+            "MjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAA"
+            "AAAAAAAAAAj/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAA"
+            "AAAAAAD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAGfAP/EABQQ"
+            "AQAAAAAAAAAAAAAAAAAAAAD/2gAIAQMBAT8Bf//EABQRAQAAAAAAAAAAAAAAAAAA"
+            "AAD/2gAIAQIBAT8Bf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEABj8Cf//E"
+            "ABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAT8hf//Z"
+        )
+        events = await h.run(
+            commands.AppendAudio(
+                audio=pcm_f32(160, value=0.0),
+                format="pcm_f32le",
+                sample_rate_hz=16000,
+                is_speech=False,
+                video_frames=(frame,),
+            )
+        )
+        listen_reasons = [
+            getattr(event, "details", {}) or {}
+            for event in events
+            if getattr(event, "type", None) == "response.listen"
+        ]
+        assert all(details.get("reason") != "silence_or_noise" for details in listen_reasons)
+        assert h.runner.model_state.audio_buffer.has_pending()
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_turn_mode_commit_with_response_create_starts_one_response() -> None:
     h = await open_harness(auto_response=False)
     try:

@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import logging
 import math
+import re
 import os
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,8 @@ from typing import Any
 import soundfile as sf
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+
+logger = logging.getLogger(__name__)
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
@@ -155,15 +159,53 @@ def _vision_multimodal_data(multi_modal_data: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in multi_modal_data.items() if key in {"image", "video"}}
 
 
-def _aura_prompt(system_prompt: str, transcript: str, multi_modal_data: dict[str, Any]) -> str:
+def _aura_prompt(
+    system_prompt: str,
+    transcript: str,
+    multi_modal_data: dict[str, Any],
+    history_prefix: str = "",
+) -> str:
     vision = _vision_placeholder(multi_modal_data)
     query = transcript.strip()
     user_body = f"{vision}{query}" if query else vision
     return (
         f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"{history_prefix}"
         f"<|im_start|>user\n{user_body}<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
+
+
+def _strip_assistant_text(text: str) -> str:
+    """Remove Qwen3-VL think wrappers (complete or dangling) before TTS / history."""
+    cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL | re.IGNORECASE)
+    # Drop an unclosed leading think block if the model is still inside it.
+    cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.replace("</think>", "").strip()
+    return cleaned
+
+
+def _normalize_asr_transcript(transcript: str) -> str:
+    """Strip Qwen3-ASR markup wrappers so AURA sees plain user text.
+
+    Observed Stage0 text looks like:
+      ``language Chinese<asr_text>出现《古韵》这本书的时候，提醒我。``
+    """
+    text = (transcript or "").strip()
+    if not text:
+        return ""
+    marker = "<asr_text>"
+    if marker in text:
+        text = text.split(marker, 1)[1].strip()
+    # Drop a leading ``language <lang>`` line if still present.
+    if text.lower().startswith("language "):
+        parts = text.split(None, 2)
+        if len(parts) >= 3:
+            text = parts[2].strip()
+        elif len(parts) == 2:
+            text = ""
+    return text
+
 
 
 def asr2aura(
@@ -178,7 +220,16 @@ def asr2aura(
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
         system_prompt = _first_value(additional_info.get("aura_system_prompt"), DEFAULT_AURA_SYSTEM_PROMPT)
-        transcript = _extract_text(source_output)
+        transcript = _normalize_asr_transcript(_extract_text(source_output))
+        # R1 vision-follow: placeholder zeros may ASR into noise; trust client is_speech.
+        if additional_info.get("is_speech") is False:
+            transcript = ""
+        logger.warning(
+            "[aura.s1.in] req=%s asr_transcript=%r n_chars=%d",
+            getattr(source_output, "request_id", idx),
+            transcript[:200],
+            len(transcript),
+        )
         multi_modal_data = {}
         source_multi_modal_data = src_prompt.get("multi_modal_data") or {}
         if isinstance(source_multi_modal_data, dict):
@@ -188,9 +239,34 @@ def asr2aura(
             multi_modal_data.update(deferred_multi_modal_data)
         multi_modal_data = _vision_multimodal_data(multi_modal_data)
 
+        history_prefix = ""
+        session_id = additional_info.get("session_id") or additional_info.get("aura_session_id")
+        if additional_info.get("aura_duplex") and isinstance(session_id, str) and session_id:
+            from vllm_omni.model_executor.models.aura_omni.duplex.history import (
+                get_or_create_session_history,
+            )
+
+            history = get_or_create_session_history(session_id)
+            # Vision-only (R1) turns have empty ASR; keep a short marker so
+            # SessionHistory still records the user side of proactive follow-ups.
+            history.begin_user_turn(transcript if transcript else "[vision]")
+            history_prefix = history.render_prefix()
+
         next_input: dict[str, Any] = {
-            "prompt": _aura_prompt(str(system_prompt), transcript, multi_modal_data),
+            "prompt": _aura_prompt(
+                str(system_prompt),
+                transcript,
+                multi_modal_data,
+                history_prefix=history_prefix,
+            ),
         }
+        if isinstance(session_id, str) and session_id:
+            next_input.setdefault("additional_information", {})
+            # Preserve session id for aura2tts history commit.
+            info = dict(additional_info)
+            info["session_id"] = session_id
+            info["aura_duplex"] = bool(additional_info.get("aura_duplex"))
+            next_input["additional_information"] = info
         if requires_multimodal_data:
             next_input["multi_modal_data"] = multi_modal_data
         if src_prompt.get("mm_processor_kwargs") is not None:
@@ -322,12 +398,32 @@ def aura2tts(
     prompt_by_request_id = _source_prompt_by_request_id(source_outputs, prompt)
     next_inputs: list[OmniTokensPrompt] = []
     for idx, source_output in enumerate(source_outputs):
-        text = _extract_text(source_output).strip()
-        if not text or text == SILENT_TEXT:
-            continue
-
+        raw_text = _extract_text(source_output).strip()
+        text = _strip_assistant_text(raw_text)
+        token_ids = _extract_token_ids(source_output)
+        finish_reason = getattr(_extract_output(source_output), "finish_reason", None)
+        logger.warning(
+            "[aura.s1.out] req=%s n_tokens=%d finish_reason=%s head=%s tail=%s raw=%r tts_text=%r",
+            getattr(source_output, "request_id", idx),
+            len(token_ids),
+            finish_reason,
+            token_ids[:8],
+            token_ids[-8:],
+            raw_text[:300],
+            text[:300],
+        )
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
+        session_id = additional_info.get("session_id") or additional_info.get("aura_session_id")
+        if additional_info.get("aura_duplex") and isinstance(session_id, str) and session_id:
+            from vllm_omni.model_executor.models.aura_omni.duplex.history import (
+                get_or_create_session_history,
+            )
+
+            get_or_create_session_history(session_id).commit_turn(text or SILENT_TEXT)
+
+        if not text or text == SILENT_TEXT:
+            continue
         task_type = _first_value(additional_info.get("tts_task_type"), "Base")
         language = _first_value(additional_info.get("tts_language"), "English")
         instruct = _first_value(additional_info.get("tts_instruct"), "")
@@ -383,6 +479,10 @@ def aura2tts(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * prompt_len,
                 additional_information=tts_info,
+                # Prefer runner data-plane so Talker preprocess still sees
+                # text if legacy additional_information is wiped (e.g. a
+                # mistaken Stage2 chunk-receiver edge).
+                model_intermediate_buffer=dict(tts_info),
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )

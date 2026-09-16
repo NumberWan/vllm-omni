@@ -328,8 +328,12 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
     ) -> MiniCPMO45PcmAppendReservation:
         """Reserve the terminal payload without invalidating prior appends."""
         had_speech = self._turn_had_speech
+        has_video = bool(self._frame_queue)
         reservation: MiniCPMO45PcmAppendReservation | None = None
-        if had_speech and self._buffer:
+        # R1: vision-carrying silent turns still need a terminal flush so
+        # Commit(create_response=True) can submit Stage0. Pure silence with
+        # no frames keeps the old discard path (payload=None).
+        if self._buffer and (had_speech or has_video):
             payload: dict[str, object] = {
                 "type": "audio",
                 "audio": "",
