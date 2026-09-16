@@ -387,6 +387,8 @@ def test_cancel_fence_releases_stage_requests_and_advances_identity():
 
     with pytest.raises(DuplexFenceMismatchError):
         session.cancel_fence(next_fence, DuplexFence("sid-cancel", epoch=1, turn_id=1))
+    with pytest.raises(DuplexFenceMismatchError):
+        session.cancel_fence(DuplexFence("sid-other", epoch=1, turn_id=0), DuplexFence("sid-cancel", epoch=2))
 
 
 def test_request_resource_keys_are_stage_id_and_request_id():

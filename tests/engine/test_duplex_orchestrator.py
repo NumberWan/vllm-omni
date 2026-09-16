@@ -208,6 +208,8 @@ async def test_open_preregisters_the_stage0_request_and_close_releases_it() -> N
     assert closed.ok is True
     assert request_id not in orchestrator.request_states
     assert orchestrator.session_manager.runner_for_request_id(request_id) is None
+    assert counter.value == 0
+    assert orchestrator.session_manager.active_count() == 0
 
 
 @pytest.mark.asyncio

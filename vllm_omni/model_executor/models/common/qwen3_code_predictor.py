@@ -739,31 +739,15 @@ class CodePredictorWrapper(nn.Module):
         # Torch 2.13 XPU Dynamo can double-register built-in handlers when
         # spawned workers compile this predictor. Keep this narrow path eager
         # until the upstream XPU compiler issue is resolved.
-        model_cfg = getattr(self._vllm_config, "model_config", None)
-        enforce_eager = bool(getattr(model_cfg, "enforce_eager", False))
-        if (
-            enforce_eager
-            or current_omni_platform.is_xpu()
-            or not current_omni_platform.supports_torch_inductor()
-        ):
-            # NPU / enforce_eager / platforms without Inductor: stay eager.
-            # Honor stage enforce_eager the same way Code2Wav does — this
-            # path previously always called torch.compile and ignored it.
+        if current_omni_platform.is_xpu() or not current_omni_platform.supports_torch_inductor():
+            # NPU or other platforms without Inductor support
             self._compiled_model_fwd = self.model.forward
 
-            if (
-                not enforce_eager
-                and current_omni_platform.is_npu()
-                and self._wrapper_config.use_cuda_graphs
-            ):
+            if current_omni_platform.is_npu() and self._wrapper_config.use_cuda_graphs:
                 # For NPU, use eager + NPU graphs (no torch.compile)
                 self._warmup_buckets()
                 self._capture_npu_graphs()
                 logger.info("code_predictor: eager mode + NPU graphs")
-            elif enforce_eager:
-                logger.info_once(
-                    "code_predictor: torch.compile disabled because enforce_eager is set"
-                )
             else:
                 logger.warning_once("code_predictor: torch.compile disabled")
             return

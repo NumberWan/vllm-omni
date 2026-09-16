@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import re
 import os
@@ -14,8 +13,6 @@ from typing import Any
 import soundfile as sf
 
 from vllm_omni.inputs.data import OmniTokensPrompt
-
-logger = logging.getLogger(__name__)
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
@@ -224,12 +221,6 @@ def asr2aura(
         # Vision-follow: placeholder zeros may ASR into noise; trust client is_speech.
         if additional_info.get("is_speech") is False:
             transcript = ""
-        logger.warning(
-            "[aura.s1.in] req=%s asr_transcript=%r n_chars=%d",
-            getattr(source_output, "request_id", idx),
-            transcript[:200],
-            len(transcript),
-        )
         multi_modal_data = {}
         source_multi_modal_data = src_prompt.get("multi_modal_data") or {}
         if isinstance(source_multi_modal_data, dict):
@@ -400,18 +391,6 @@ def aura2tts(
     for idx, source_output in enumerate(source_outputs):
         raw_text = _extract_text(source_output).strip()
         text = _strip_assistant_text(raw_text)
-        token_ids = _extract_token_ids(source_output)
-        finish_reason = getattr(_extract_output(source_output), "finish_reason", None)
-        logger.warning(
-            "[aura.s1.out] req=%s n_tokens=%d finish_reason=%s head=%s tail=%s raw=%r tts_text=%r",
-            getattr(source_output, "request_id", idx),
-            len(token_ids),
-            finish_reason,
-            token_ids[:8],
-            token_ids[-8:],
-            raw_text[:300],
-            text[:300],
-        )
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
         session_id = additional_info.get("session_id") or additional_info.get("aura_session_id")
