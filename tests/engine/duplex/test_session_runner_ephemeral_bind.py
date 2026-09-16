@@ -9,7 +9,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_ephemeral_stage_request_id,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.duplex.session_runner import DuplexSessionRunner
+from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
 
 
 def test_stage0_request_id_ephemeral_when_not_resumable() -> None:
