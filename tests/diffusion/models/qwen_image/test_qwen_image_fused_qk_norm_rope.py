@@ -157,6 +157,12 @@ def test_qwen_image_fused_qk_norm_rope_cuda_matches_fp32_rope_reference(
 
     actual_q, actual_k = _run(data)
     expected_q, expected_k = _fused_kernel_reference(data)
+
+    torch.testing.assert_close(actual_q, expected_q, atol=0.0625, rtol=0.02)
+    torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
+
+
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_fused_qk_norm_rope_torch_compile_fullgraph_capture():
     data = _make_input(
