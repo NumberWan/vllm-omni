@@ -220,14 +220,29 @@ class ModelChannel:
         # ephemeral id. Bump turn_id and open a fresh ephemeral id instead.
         if not resumable and session.stage_request_submitted(stage_id, request_id):
             stale_ephemeral_id = request_id
-            stale_ids = list(dict.fromkeys(rid for (_, rid) in session.request_resources))
+            stale_entries = list(session.request_resources.items())
+            stale_ids = list(dict.fromkeys(rid for (_, rid) in stale_entries))
+            # R4: snapshot draining TTS turn before bumping identity.
+            overlapped = bool(
+                session.capabilities.supports_overlapped_input and self._ctx.run.overlapped_input_released
+            )
+            if overlapped and self._ctx.run.draining_model_turn_id is None:
+                self._ctx.run.draining_model_turn_id = session.active_response_turn_id
             session.complete_model_turn(fence.turn_id)
             fence = DuplexFence(session.session_id, epoch=session.epoch, turn_id=session.turn_id)
             request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=False)
             session.request_resources.pop((stage_id, stale_ephemeral_id), None)
-            # Turn-commit AURA: previous Talker (max_num_seqs=1) must be aborted
-            # or the next Stage2 never starts and the WS eventually drops.
-            if stale_ids:
+            if overlapped:
+                # R4 release is Stage1-final: Stage0/1 are already idle. Drop
+                # their session bindings only — do not abort engine work.
+                # Stage2/3 keep draining under the old response_id / epoch.
+                for sid, rid in stale_entries:
+                    if sid < 2:
+                        session.request_resources.pop((sid, rid), None)
+                self._ctx.run.overlapped_input_released = False
+            elif stale_ids:
+                # No R4 release yet (e.g. commit while Thinker still running):
+                # abort the whole prior ephemeral so Stage2 is not left orphaned.
                 try:
                     await self._ctx.stage_port.cleanup(stale_ids, abort=True)
                 except Exception:
@@ -417,6 +432,19 @@ class ModelChannel:
         return bool(
             self._ctx.plugin.observe_stage_output(
                 stage_id=stage_id,
+                output=output,
+                context=context,
+            )
+        )
+
+    def release_overlapped_input(
+        self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
+    ) -> bool:
+        """R4 plugin milestone: next commit may start while prior TTS drains."""
+        return bool(
+            self._ctx.plugin.release_overlapped_input(
+                stage_id=stage_id,
+                segment_finished=bool(context.segment_finished),
                 output=output,
                 context=context,
             )
@@ -641,7 +669,10 @@ class ModelChannel:
         if (
             session.active_response_id is not None
             and model_turn_id is not None
-            and not session.active_response_accepts_model_turn(model_turn_id)
+            and not session.active_response_accepts_model_turn_with_drain(
+                model_turn_id,
+                draining_model_turn_id=self._ctx.run.draining_model_turn_id,
+            )
         ):
             return close_reason, emitted_response
         active_response_id = session.active_response_id
@@ -805,7 +836,10 @@ class ModelChannel:
         if (
             session.active_response_id is not None
             and model_turn_id is not None
-            and not session.active_response_accepts_model_turn(model_turn_id)
+            and not session.active_response_accepts_model_turn_with_drain(
+                model_turn_id,
+                draining_model_turn_id=self._ctx.run.draining_model_turn_id,
+            )
         ):
             return close_reason, emitted_response
         emitted_response = True
@@ -905,6 +939,23 @@ class ModelChannel:
             )
         if end_of_turn:
             data_plane_request_id = model_result.get("data_plane_request_id")
+            draining_turn = self._ctx.run.draining_model_turn_id
+            # R4: prior TTS finished while a newer turn already owns the response —
+            # clear the drain marker and do not emit response.done yet.
+            if (
+                model_turn_id is not None
+                and draining_turn is not None
+                and int(model_turn_id) == int(draining_turn)
+                and session.active_response_turn_id is not None
+                and int(session.active_response_turn_id) != int(model_turn_id)
+            ):
+                self._ctx.run.draining_model_turn_id = None
+                if isinstance(data_plane_request_id, str):
+                    data_plane.close_stream(data_plane_request_id)
+                    data_plane.mark_terminal(data_plane_request_id)
+                    session.request_resources.pop((2, data_plane_request_id), None)
+                    session.request_resources.pop((3, data_plane_request_id), None)
+                return close_reason, emitted_response
             if isinstance(data_plane_request_id, str) and not auto_response:
                 data_plane.close_stream(data_plane_request_id)
             if isinstance(data_plane_request_id, str):

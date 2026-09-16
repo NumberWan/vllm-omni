@@ -253,6 +253,23 @@ class DuplexModelPlugin(ABC):
         del stage_id, output, context
         return False
 
+    def release_overlapped_input(
+        self,
+        *,
+        stage_id: int,
+        segment_finished: bool,
+        output: object,
+        context: object,
+    ) -> bool:
+        """R4: return True when the next commit may start while prior TTS drains.
+
+        Model-neutral milestone — not hard-coded to a stage id in the runner.
+        Default off; AURA releases when Stage1 text/silent is final.
+        Orthogonal to barge-in (abort); this path must not abort the old TTS.
+        """
+        del stage_id, segment_finished, output, context
+        return False
+
     # ---- session policy (was ServingRuntimeAdapter) ----
 
     @abstractmethod

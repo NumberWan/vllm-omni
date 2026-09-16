@@ -32,11 +32,10 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
 )
 
-# AURA v1 silent id; Stage1 may also emit SILENT_TEXT.
+# AURA v1 (Qwen3-VL) silent / ChatML turn-end ids.
 AURA_SILENT_TOKEN_ID = 151669
-# AURA v2 (qwen3_5) silent id used by AURA_v2 / AURA_v2new checkpoints.
-AURA_V2_SILENT_TOKEN_ID = 248070
-AURA_SILENT_TOKEN_IDS = frozenset({AURA_SILENT_TOKEN_ID, AURA_V2_SILENT_TOKEN_ID})
+AURA_IM_END_TOKEN_ID = 151645
+AURA_SILENT_TOKEN_IDS = frozenset({AURA_SILENT_TOKEN_ID})
 
 _PRIVATE_KEYS = frozenset(
     {
@@ -140,9 +139,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         if len(configured) > 1 and isinstance(configured[1], SamplingParams):
             stage1 = configured[1].clone()
             stop_ids = list(stage1.stop_token_ids or [])
-            for silent_id in AURA_SILENT_TOKEN_IDS:
-                if silent_id not in stop_ids:
-                    stop_ids.append(silent_id)
+            for stop_id in (AURA_SILENT_TOKEN_ID, AURA_IM_END_TOKEN_ID):
+                if stop_id not in stop_ids:
+                    stop_ids.append(stop_id)
             stage1.stop_token_ids = stop_ids
             configured[1] = stage1
         # Qwen3-TTS Talker codec EOS (2150). Missing this lets Talker run to
@@ -270,6 +269,18 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         """Project Stage1 thinker text to the client without short-circuiting TTS."""
         del output, context
         return stage_id == 1
+
+    def release_overlapped_input(
+        self,
+        *,
+        stage_id: int,
+        segment_finished: bool,
+        output: object,
+        context: object,
+    ) -> bool:
+        """R4: after Stage1 text/silent final, next commit may start while TTS drains."""
+        del output, context
+        return stage_id == 1 and bool(segment_finished)
 
     def decide_output(
         self,

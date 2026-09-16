@@ -52,6 +52,9 @@ def test_load_aura_duplex_plugin_and_sampling_arity() -> None:
     assert len(configured) == 4
     assert 2150 in (configured[2].stop_token_ids or [])
     assert configured[2].max_tokens == 240
+    stage1_stops = set(configured[1].stop_token_ids or [])
+    assert {151669, 151645}.issubset(stage1_stops)
+    assert 248070 not in stage1_stops
     caps = plugin.capabilities(max_sessions=1)
     assert caps.supports_turn_commit_only is True
     assert caps.supports_core_resumable_request is False
@@ -166,6 +169,19 @@ def test_observe_stage_output_targets_stage1_only() -> None:
     assert plugin.observe_stage_output(stage_id=1, output=object(), context=object()) is True
     assert plugin.observe_stage_output(stage_id=0, output=object(), context=object()) is False
     assert plugin.observe_stage_output(stage_id=3, output=object(), context=object()) is False
+
+
+def test_release_overlapped_input_on_stage1_final() -> None:
+    plugin = AuraDuplexPlugin(_encode_audio)
+    assert plugin.release_overlapped_input(
+        stage_id=1, segment_finished=True, output=object(), context=object()
+    )
+    assert not plugin.release_overlapped_input(
+        stage_id=1, segment_finished=False, output=object(), context=object()
+    )
+    assert not plugin.release_overlapped_input(
+        stage_id=2, segment_finished=True, output=object(), context=object()
+    )
 
 
 def test_decide_output_silent_short_circuits() -> None:

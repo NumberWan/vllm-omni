@@ -140,7 +140,7 @@ async def run(url: str, model: str, wav: Path, timeout_s: float) -> int:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--url", default="ws://127.0.0.1:8099/v1/realtime")
-    p.add_argument("--model", default="/workspace/models/AURA_v2new")
+    p.add_argument("--model", default="/workspace/models/AURA")
     p.add_argument(
         "--wav",
         default=str(REPO_ROOT / "tests/assets/minicpmo_4_5/response_required_16k.wav"),

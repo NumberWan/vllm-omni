@@ -140,6 +140,20 @@ python examples/online_serving/aura_omni/gradio_demo.py \
   --api-base http://localhost:8091/v1
 ```
 
+## Duplex Realtime smoke (AURA v1 / Qwen3-VL)
+
+Local four-stage duplex path (`/v1/realtime?duplex=1`) uses
+`AuraQwen3VLForConditionalGeneration` and silent / ChatML ids `151669` /
+`151645` — not AURA v2 / Qwen3.5-VL.
+
+```bash
+bash examples/online_serving/aura_omni/run_duplex_smoke_serve.sh
+python examples/online_serving/aura_omni/smoke_duplex_realtime_client.py
+```
+
+Deploy file: `examples/online_serving/aura_omni/aura_omni_duplex_smoke.yaml`
+(Stage1 `/workspace/models/AURA`).
+
 ## Offline
 
 For offline inference, see

@@ -253,6 +253,11 @@ class DuplexSessionRunner:
             # AURA Stage1 thinker text: project to the client without stopping TTS.
             if decision is None:
                 observe = self.model.observe_stage_output(stage_id, output, context)
+        if (
+            self.session.capabilities.supports_overlapped_input
+            and self.model.release_overlapped_input(stage_id, output, context)
+        ):
+            self.run.overlapped_input_released = True
         consume = decision is not None or stage_id >= context.final_stage_id
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
         if not consume and not observe and not project_intermediate:
@@ -1001,6 +1006,15 @@ class DuplexSessionRunner:
         if final or precreate_response:
             session.bind_request(request_id)
         if precreate_response:
+            # R4: keep draining TTS turn_id while binding the newer thinker turn
+            # under the same active response (do not abort / do not end_response).
+            if (
+                session.capabilities.supports_overlapped_input
+                and self.run.overlapped_input_released
+                and session.active_response_id is not None
+                and self.run.draining_model_turn_id is None
+            ):
+                self.run.draining_model_turn_id = session.active_response_turn_id
             session.bind_response_turn(append_turn_id)
         if precreate_response and session.active_response_id is None:
             response_id = session.begin_response(turn_id=append_turn_id)
@@ -1353,6 +1367,9 @@ class DuplexSessionRunner:
         old_request_id = session.active_request_id
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
+        # Barge-in / cancel aborts; clear R4 soft-open state.
+        self.run.overlapped_input_released = False
+        self.run.draining_model_turn_id = None
         committed_message = session.end_response(
             commit_text=self.model.should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
@@ -1824,32 +1841,41 @@ class DuplexSessionRunner:
                 )
             )
             if commit_action is CommitAction.DEFER_ACTIVE_RESPONSE:
-                if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
-                    self._discard_short_overlap_ack()
-                    return
-
-                if self._defer_commit_behind_active_response(
-                    event,
-                    realtime_item_id=realtime_item_id,
-                    should_create_response=should_create_response,
-                    precreate_response_requested=precreate_response_requested,
+                if not helpers.next_commit_allowed(
+                    self.session,
+                    self.tasks,
+                    overlapped_input_released=self.run.overlapped_input_released,
                 ):
-                    return
+                    if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
+                        self._discard_short_overlap_ack()
+                        return
+
+                    if self._defer_commit_behind_active_response(
+                        event,
+                        realtime_item_id=realtime_item_id,
+                        should_create_response=should_create_response,
+                        precreate_response_requested=precreate_response_requested,
+                    ):
+                        return
             if commit_action is CommitAction.START_AUTO_RESPONSE:
                 await self._commit_and_start_auto_response(event, realtime_item_id=realtime_item_id)
                 return
         if event_type == "response.create":
             await self._start_response_from_committed_audio()
             return
-        if not helpers.response_in_progress(self.session, self.tasks) and await self._flush_and_submit_committed_turn(
+        if helpers.next_commit_allowed(
+            self.session,
+            self.tasks,
+            overlapped_input_released=self.run.overlapped_input_released,
+        ) and await self._flush_and_submit_committed_turn(
             event,
             event_type=event_type,
             realtime_item_id=realtime_item_id,
             should_create_response=should_create_response,
         ):
             return
-        # Nothing flushed (or a response is still in progress): acknowledge the
-        # commit without starting a new response.
+        # Nothing flushed (or a response is still in progress without R4 release):
+        # acknowledge the commit without starting a new response.
         had_uncommitted_audio = (
             model_state.input_since_commit
             or model_state.audio_buffer.has_pending()

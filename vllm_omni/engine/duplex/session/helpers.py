@@ -89,6 +89,23 @@ def response_in_progress(session: DuplexEngineSession, tasks: DuplexSessionTasks
     return tasks.has_response_bound_append_tasks()
 
 
+def next_commit_allowed(
+    session: DuplexEngineSession,
+    tasks: DuplexSessionTasks,
+    *,
+    overlapped_input_released: bool,
+) -> bool:
+    """Whether a new commit may flush/submit (R4 soft-open vs full idle).
+
+    When ``supports_overlapped_input`` and the plugin has released, a commit is
+    allowed even though prior TTS/playback still counts as ``response_in_progress``.
+    Barge-in remains the abort path; this gate does not cancel anything.
+    """
+    if not response_in_progress(session, tasks):
+        return True
+    return bool(session.capabilities.supports_overlapped_input and overlapped_input_released)
+
+
 def assistant_playback_active(session: DuplexEngineSession) -> bool:
     """Whether the client is still playing audio the session has sent."""
     return (

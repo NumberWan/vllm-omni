@@ -1,5 +1,5 @@
 # AURA duplex Realtime smoke (local weights, session_mode: duplex).
-# Stage1 = AURA_v2new + AuraQwen3_5ForConditionalGeneration.
+# Stage1 = /workspace/models/AURA + AuraQwen3VLForConditionalGeneration (AURA v1 / Qwen3-VL).
 pipeline: aura_omni
 # Qwen3-TTS Stage2→3 codec handoff requires async_chunk=true (same as native /
 # duplex explore). async_chunk=false reaches talker/code_predictor then never
@@ -52,18 +52,19 @@ stages:
     max_model_len: 32768
     max_num_batched_tokens: 8192
     devices: "0"
-    model: /workspace/models/AURA_v2new
-    model_arch: AuraQwen3_5ForConditionalGeneration
+    model: /workspace/models/AURA
+    model_arch: AuraQwen3VLForConditionalGeneration
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
       max_tokens: 256
       repetition_penalty: 1.0
-      stop_token_ids: [248070, 248046]
+      stop_token_ids: [151669, 151645]
 
   - stage_id: 2
-    max_num_seqs: 1
+    # R4: allow prior TTS to drain while the next Talker starts (not assumed 1).
+    max_num_seqs: 2
     gpu_memory_utilization: 0.12
     enforce_eager: true
     trust_remote_code: true
@@ -97,7 +98,7 @@ stages:
       top_p: 1.0
 
   - stage_id: 3
-    max_num_seqs: 1
+    max_num_seqs: 2
     gpu_memory_utilization: 0.12
     enforce_eager: true
     trust_remote_code: true
