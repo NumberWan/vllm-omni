@@ -801,6 +801,46 @@ async def test_listen_decision_on_a_resumable_request_closes_the_bounded_respons
 
 
 @pytest.mark.asyncio
+async def test_direct_response_listen_still_emits_response_done_after_continuation_clear() -> None:
+    """AURA-like silent DIRECT_RESPONSE: after continuation budget is spent, emit response.done.
+
+    Non-resumable turn-commit still closes the active response on a listen/direct
+    decision so the client is not left without a terminal event.
+    """
+    from dataclasses import replace
+
+    h = await open_harness()
+    try:
+        h.session.capabilities = replace(h.session.capabilities, supports_core_resumable_request=False)
+        await h.run(append_audio())
+        assert h.port.submissions, "ephemeral Stage0 must submit"
+        request_id = h.port.submissions[-1].context.request_id
+        assert "-turn" in request_id
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="ok"))
+        response_id = h.session.active_response_id
+        assert response_id is not None
+        model_state = h.runner.model_state
+        model_state.continuation_owner_id = f"response:{response_id}"
+        model_state.continuation_units = h.runner.model._AUTO_RESPONSE_MAX_CONTINUATION_UNITS
+
+        listen = listen_output(request_id)
+        listen.finished = True
+        events = await h.deliver_and_settle(
+            listen,
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        assert "response.listen" in types(events)
+        done = find(events, "response.done")
+        assert done.response_id == response_id
+        assert h.session.active_response_id is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_listen_decision_on_a_resumable_request_keeps_the_turn_going() -> None:
     """Same unfinished listen, budget left: it must schedule the next unit.
 

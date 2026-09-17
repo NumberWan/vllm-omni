@@ -258,7 +258,7 @@ def test_ephemeral_request_id_includes_turn() -> None:
     fence = DuplexFence("s", epoch=1, turn_id=7)
     resumable = duplex_resource_request_id(fence, "stage0")
     ephemeral = duplex_ephemeral_stage_request_id(fence, stage_id=0)
-    assert "-turn7" in ephemeral or "_t7" in ephemeral
+    assert ephemeral.endswith("stage0-turn7")
     assert resumable != ephemeral
     fence2 = DuplexFence("s", epoch=1, turn_id=8)
     assert duplex_ephemeral_stage_request_id(fence, stage_id=0) != duplex_ephemeral_stage_request_id(
