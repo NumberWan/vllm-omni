@@ -82,7 +82,7 @@ def test_an_explicit_client_overlap_action_requests_barge_in() -> None:
 def test_turn_mode_keeps_silent_vision_follow_during_overlap() -> None:
     """Vision-follow is is_speech=False + a frame; must not drop while TTS plays."""
     session = _session()
-    session.capabilities = type(session.capabilities)(supports_vision_follow=True)
+    session.capabilities = type(session.capabilities)(supports_silent_video_input=True)
     payload = {"format": "pcm16", "audio": _pcm16(0.0), "video_frames": ["frame"], "is_speech": False}
     decision = overlap_policy.decide(session, {"is_speech": False}, payload, auto_responds=False)
     assert decision["action"] == "listen"
@@ -94,7 +94,7 @@ def test_turn_mode_keeps_silent_vision_follow_during_overlap() -> None:
 
 def test_turn_mode_drops_silent_vision_without_capability() -> None:
     session = _session()
-    assert session.capabilities.supports_vision_follow is False
+    assert session.capabilities.supports_silent_video_input is False
     payload = {"format": "pcm16", "audio": _pcm16(0.0), "video_frames": ["frame"], "is_speech": False}
     decision = overlap_policy.decide(session, {"is_speech": False}, payload, auto_responds=False)
     assert decision["action"] == "drop"

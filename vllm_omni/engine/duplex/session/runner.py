@@ -820,7 +820,7 @@ class DuplexSessionRunner:
                 projector,
                 event,
                 vad_result=vad_result,
-                supports_vision_follow=session.capabilities.supports_vision_follow,
+                supports_silent_video_input=session.capabilities.supports_silent_video_input,
             )
         )
         if self.run.closing or session.state != DuplexSessionState.OPEN:
@@ -880,10 +880,10 @@ class DuplexSessionRunner:
         elif not auto_responds and not overlap_policy.input_looks_like_speech(self.session, event, payload):
             # Turn-mode only: skip silent chunks so they don't open a response.
             # Vision-carrying silent appends must still buffer when the model
-            # opts into vision-follow.
+            # opts into silent video input.
             frames = payload.get("video_frames")
             has_vision = isinstance(frames, list) and any(isinstance(frame, str) and frame for frame in frames)
-            if not (has_vision and session.capabilities.supports_vision_follow):
+            if not (has_vision and session.capabilities.supports_silent_video_input):
                 self.emit(
                     {
                         "type": "response.listen",

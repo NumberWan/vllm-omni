@@ -97,9 +97,9 @@ class DuplexCapabilities:
     # Prior assistant TTS may keep draining while a new user commit is admitted.
     # Not barge-in (which aborts prior TTS).
     supports_overlapped_input: bool = False
-    #: Silent frames with video during TTS drain. Off by default so
-    #: turn-mode / camera sessions keep empty-turn acks.
-    supports_vision_follow: bool = False
+    #: Non-speech appends with video_frames are real turn content, not noise.
+    #: Off by default so turn-mode / camera sessions keep empty-turn acks.
+    supports_silent_video_input: bool = False
     supports_stage_connector_handoff: bool = False
     supports_independent_io_streams: bool = False
     supports_realtime_endpoint: bool = False
@@ -149,7 +149,7 @@ class DuplexCapabilities:
             "supports_scheduler_native_append": self.supports_scheduler_native_append,
             "supports_core_resumable_request": self.supports_core_resumable_request,
             "supports_overlapped_input": self.supports_overlapped_input,
-            "supports_vision_follow": self.supports_vision_follow,
+            "supports_silent_video_input": self.supports_silent_video_input,
             "supports_stage_connector_handoff": self.supports_stage_connector_handoff,
             "supports_independent_io_streams": self.supports_independent_io_streams,
             "supports_realtime_endpoint": self.supports_realtime_endpoint,

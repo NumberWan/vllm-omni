@@ -906,7 +906,7 @@ async def test_turn_mode_keeps_silent_chunks_with_video_frames() -> None:
 
     h = await open_harness(auto_response=False)
     try:
-        h.session.capabilities = replace(h.session.capabilities, supports_vision_follow=True)
+        h.session.capabilities = replace(h.session.capabilities, supports_silent_video_input=True)
         # Minimal 1x1 JPEG (base64) — wire validation only checks non-empty str.
         frame = (
             "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkS"
@@ -945,7 +945,7 @@ async def test_turn_mode_keeps_silent_vision_while_response_in_progress() -> Non
 
     h = await open_harness(auto_response=False)
     try:
-        h.session.capabilities = replace(h.session.capabilities, supports_vision_follow=True)
+        h.session.capabilities = replace(h.session.capabilities, supports_silent_video_input=True)
         h.session._response.active_response_id = "resp-tts"
         frame = (
             "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkS"
