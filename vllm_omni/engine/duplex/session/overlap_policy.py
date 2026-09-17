@@ -113,7 +113,7 @@ def decide(
     if not is_speech:
         frames = payload.get("video_frames")
         has_vision = isinstance(frames, list) and any(isinstance(frame, str) and frame for frame in frames)
-        if has_vision:
+        if has_vision and session.capabilities.supports_vision_follow:
             # Same exception as the idle turn-mode path: vision-follow is
             # is_speech=False + a frame. Dropping it while TTS is still playing
             # leaves Stage0 unsubmitted (empty llm).

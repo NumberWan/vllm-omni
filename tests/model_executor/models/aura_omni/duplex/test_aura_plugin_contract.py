@@ -59,6 +59,7 @@ def test_load_aura_duplex_plugin_and_sampling_arity() -> None:
     assert caps.supports_turn_commit_only is True
     assert caps.supports_core_resumable_request is False
     assert caps.supports_overlapped_input is True
+    assert caps.supports_vision_follow is True
 
 
 def test_commit_only_buffer_emits_on_commit() -> None:
@@ -179,9 +180,29 @@ def test_release_overlapped_input_on_stage1_final() -> None:
     assert not plugin.release_overlapped_input(
         stage_id=1, segment_finished=False, output=object(), context=object()
     )
+    finished = type("Out", (), {"finished": True})()
+    assert plugin.release_overlapped_input(
+        stage_id=1, segment_finished=False, output=finished, context=object()
+    )
     assert not plugin.release_overlapped_input(
         stage_id=2, segment_finished=True, output=object(), context=object()
     )
+
+
+def test_configure_sampling_keeps_silent_stop_visible() -> None:
+    plugin = AuraDuplexPlugin(_encode_audio)
+    defaults = (
+        SamplingParams(max_tokens=16),
+        SamplingParams(max_tokens=16),
+        SamplingParams(max_tokens=4096),
+        SamplingParams(max_tokens=16),
+    )
+    configured = plugin.configure_sampling_params(runtime_config={}, defaults=defaults)
+    stage1 = configured[1]
+    assert isinstance(stage1, SamplingParams)
+    assert stage1.include_stop_str_in_output is True
+    assert stage1.skip_special_tokens is False
+    assert AURA_SILENT_TOKEN_ID in (stage1.stop_token_ids or [])
 
 
 def test_decide_output_silent_short_circuits() -> None:
@@ -205,6 +226,30 @@ def test_decide_output_silent_short_circuits() -> None:
     )
     assert decision is not None
     assert decision.metadata.get("model_listen") is True
+
+
+def test_decide_output_chinese_silence_is_not_special_token() -> None:
+    plugin = AuraDuplexPlugin(_encode_audio)
+
+    class _Completion:
+        text = "[沉默]"
+        token_ids = [58, 107107, 60]
+        finished = True
+
+    class _Output:
+        outputs = [_Completion()]
+
+    assert (
+        plugin.decide_output(
+            stage_id=1,
+            final_stage_id=3,
+            segment_finished=True,
+            segment_token_ids=(58, 107107, 60),
+            segment_output_metadata={},
+            output=_Output(),
+        )
+        is None
+    )
 
 
 def test_ephemeral_request_id_includes_turn() -> None:
@@ -235,6 +280,18 @@ def test_stage_submission_defaults_resumable_true() -> None:
         already_submitted=False,
     )
     assert submission.resumable is True
+
+
+def test_data_plane_close_session_drops_history() -> None:
+    from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import AuraDataPlaneSession
+    from vllm_omni.model_executor.models.aura_omni.duplex.history import get_or_create_session_history
+
+    drop_session_history("close-hist")
+    get_or_create_session_history("close-hist", max_turns=2).begin_user_turn("hi")
+    AuraDataPlaneSession(encode_audio=_encode_audio).close_session("close-hist")
+    from vllm_omni.model_executor.models.aura_omni.duplex.history import _STORE
+
+    assert "close-hist" not in _STORE
 
 
 def test_session_history_commit_and_prune() -> None:

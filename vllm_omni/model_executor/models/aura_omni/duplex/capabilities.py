@@ -23,6 +23,7 @@ def aura_duplex_capabilities(*, max_sessions: int = 1) -> DuplexCapabilities:
         supports_scheduler_native_append=False,
         supports_core_resumable_request=False,
         supports_overlapped_input=True,
+        supports_vision_follow=True,
         supports_stage_connector_handoff=False,
         supports_independent_io_streams=True,
         supports_realtime_endpoint=True,

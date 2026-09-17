@@ -423,6 +423,7 @@ async def test_aura_forward_failure_keeps_the_session() -> None:
     assert SESSION_ID in orchestrator.session_manager.runners
     assert session.state != DuplexSessionState.CLOSED
     types = [message.event.type for message in [output_q.get_nowait() for _ in range(output_q.qsize())]]
+    assert "error" in types
     assert "session.expired" not in types
     await orchestrator.session_manager.shutdown()
 

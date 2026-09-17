@@ -5,11 +5,11 @@
 from __future__ import annotations
 
 import math
-import re
 import os
 from pathlib import Path
 from typing import Any
 
+import regex as re
 import soundfile as sf
 
 from vllm_omni.inputs.data import OmniTokensPrompt
@@ -174,12 +174,40 @@ def _aura_prompt(
 
 
 def _strip_assistant_text(text: str) -> str:
-    """Remove Qwen3-VL think wrappers (complete or dangling) before TTS / history."""
+    """Remove think wrappers and ChatML specials before TTS / client text.
+
+    Stage1 uses ``skip_special_tokens=False`` so ``<|silent|>`` / ``<|im_end|>``
+    remain visible for silent detection; strip ChatML markers (not silent)
+    before spoken TTS / transcript emission.
+    """
     cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL | re.IGNORECASE)
     # Drop an unclosed leading think block if the model is still inside it.
     cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = cleaned.replace("</think>", "").strip()
-    return cleaned
+    cleaned = cleaned.replace("</think>", "")
+    cleaned = re.sub(r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>", "", cleaned)
+    return cleaned.strip()
+
+
+def is_effectively_silent(text: str | None) -> bool:
+    """True for empty / whitespace-only / exact ``<|silent|>`` Stage1 text."""
+    if not isinstance(text, str):
+        return False
+    stripped = _strip_assistant_text(text)
+    return not stripped or stripped == SILENT_TEXT
+
+
+def is_silent_text_prefix(text: str | None) -> bool:
+    """True while streamed text is still a prefix of ``<|silent|>``.
+
+    Holds Stage1 transcript deltas until the turn finishes (or diverges), so
+    partial ``<|sil`` fragments do not leak before a silent short-circuit.
+    """
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return SILENT_TEXT.startswith(stripped)
 
 
 def _normalize_asr_transcript(transcript: str) -> str:
@@ -401,7 +429,7 @@ def aura2tts(
 
             get_or_create_session_history(session_id).commit_turn(text or SILENT_TEXT)
 
-        if not text or text == SILENT_TEXT:
+        if is_effectively_silent(text):
             continue
         task_type = _first_value(additional_info.get("tts_task_type"), "Base")
         language = _first_value(additional_info.get("tts_language"), "English")

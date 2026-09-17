@@ -235,12 +235,20 @@ class ModelChannel:
             if overlapped:
                 # Input gate already released after assistant text/silent final,
                 # so Stage0/1 are idle. Drop their session bindings only — do
-                # not abort engine work. Stage2/3 keep draining under the old
-                # response_id / epoch.
+                # not abort engine work. Stage2/3 keep draining under the prior
+                # response_id; open a fresh response for this turn.
+                prior_response_id = session.active_response_id
                 for sid, rid in stale_keys:
                     if sid < 2:
                         session.request_resources.pop((sid, rid), None)
+                    elif prior_response_id is not None:
+                        session.register_draining_request_response(rid, prior_response_id)
                 self._ctx.run.overlapped_input_released = False
+                if prior_response_id is not None:
+                    new_response_id = session.begin_response(turn_id=fence.turn_id)
+                    self._out.emit(self.response_created_payload(new_response_id, epoch=session.epoch))
+                else:
+                    session.bind_response_turn(fence.turn_id)
             elif stale_ids:
                 # Input gate not released yet (e.g. commit while Stage1 is still
                 # running): abort the whole prior ephemeral so Stage2 is not
@@ -530,7 +538,11 @@ class ModelChannel:
         if self._out.auto_responds():
             active_request_id = session.active_request_id
             if active_request_id is not None and active_request_id != item.request_id:
-                return
+                if not (
+                    session.capabilities.supports_overlapped_input
+                    and session.is_draining_request(item.request_id)
+                ):
+                    return
         engine_output = self._build_stage_output(item)
         drain_result = {"data_plane_outputs": [engine_output]}
         close_reason, emitted_response = await self._send_model_output_events(
@@ -755,10 +767,13 @@ class ModelChannel:
         if isinstance(data_plane_request_id, str) and data_plane.is_terminal(data_plane_request_id):
             return close_reason, emitted_response
         auto_response = self._out.auto_responds()
+        draining = session.is_draining_request(
+            data_plane_request_id if isinstance(data_plane_request_id, str) else None
+        )
         active_request_matches = session.active_request_id == data_plane_request_id or (
             auto_response and session.active_request_id is None
         )
-        if isinstance(data_plane_request_id, str) and not active_request_matches:
+        if isinstance(data_plane_request_id, str) and not active_request_matches and not draining:
             return close_reason, emitted_response
         if isinstance(model_result.get("error_code"), str):
             self._fail_response_from_model_error(model_result)
@@ -831,16 +846,22 @@ class ModelChannel:
         if session.active_response_id is None and model_turn_id is not None and model_turn_id < session.turn_id:
             # Late audio of a completed model turn must not reserve a second response.
             return close_reason, emitted_response
-        self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
+        request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
+        draining_response_id = (
+            session.response_id_for_request(request_key) if session.is_draining_request(request_key) else None
+        )
+        if draining_response_id is None:
+            self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
         if (
-            session.active_response_id is not None
+            draining_response_id is None
+            and session.active_response_id is not None
             and model_turn_id is not None
             and not session.active_response_accepts_model_turn(model_turn_id)
         ):
             return close_reason, emitted_response
         emitted_response = True
         response_created = False
-        response_id = session.active_response_id
+        response_id = draining_response_id or session.active_response_id
         if response_id is None:
             response_id = session.begin_response(turn_id=model_turn_id)
             response_created = True
@@ -935,19 +956,30 @@ class ModelChannel:
             )
         if end_of_turn:
             data_plane_request_id = model_result.get("data_plane_request_id")
-            # Prior TTS finished while a newer turn already owns the response —
-            # do not emit response.done yet (outputs stay keyed by response_id).
+            # Prior TTS finished under its own draining response_id while a
+            # newer turn already owns active_response_id — close that response.
             if (
                 session.capabilities.supports_overlapped_input
-                and model_turn_id is not None
-                and session.active_response_turn_id is not None
-                and int(session.active_response_turn_id) != int(model_turn_id)
+                and isinstance(data_plane_request_id, str)
+                and session.is_draining_request(data_plane_request_id)
             ):
-                if isinstance(data_plane_request_id, str):
-                    data_plane.close_stream(data_plane_request_id)
-                    data_plane.mark_terminal(data_plane_request_id)
-                    session.request_resources.pop((2, data_plane_request_id), None)
-                    session.request_resources.pop((3, data_plane_request_id), None)
+                drained_response_id = session.pop_draining_request_response(data_plane_request_id)
+                data_plane.close_stream(data_plane_request_id)
+                data_plane.mark_terminal(data_plane_request_id)
+                session.request_resources.pop((2, data_plane_request_id), None)
+                session.request_resources.pop((3, data_plane_request_id), None)
+                if drained_response_id is not None:
+                    self._out.emit(
+                        {
+                            "type": "response.done",
+                            "session_id": session.session_id,
+                            "response_id": drained_response_id,
+                            "epoch": session.epoch,
+                            "committed": False,
+                            "status": "completed",
+                            "playback": session.playback.as_dict(),
+                        }
+                    )
                 return close_reason, emitted_response
             if isinstance(data_plane_request_id, str) and not auto_response:
                 data_plane.close_stream(data_plane_request_id)

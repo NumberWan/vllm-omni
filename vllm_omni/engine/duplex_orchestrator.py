@@ -160,7 +160,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 fence=req_state.stage_fences.get(stage_id, req_state.fence),
             ),
             final_stage_id=req_state.final_stage_id,
-            segment_finished=req_state.streaming.enabled and segment.finished,
+            segment_finished=bool(getattr(output, "finished", False))
+            or (req_state.streaming.enabled and segment.finished),
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
         )
@@ -185,16 +186,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         # Ephemeral turn-commit: free this turn's stages without tearing down WS.
         close_session = bool(self.plugin.capabilities(max_sessions=1).supports_core_resumable_request)
         runner = self.session_manager.runner_for_request_id(req_id)
-        if runner is not None and close_session:
+        if runner is not None:
             runner.on_stage_failure(next_stage_id, exc)
-        elif runner is not None:
-            logger.warning(
-                "[DuplexOrchestrator] ephemeral forward failed req=%s stage-%s: %s: %s",
-                req_id,
-                next_stage_id,
-                type(exc).__name__,
-                exc,
-            )
         await self._cleanup_request_ids(
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,

@@ -42,14 +42,20 @@ def test_stage_request_id_respects_resumable_flag() -> None:
     assert ephemeral_id == duplex_ephemeral_stage_request_id(fence, stage_id=0)
     assert resumable_id != ephemeral_id
     assert "t9" in ephemeral_id
+    from vllm_omni.engine.duplex.contracts import duplex_turn_id_from_request_id
+
+    assert duplex_turn_id_from_request_id(ephemeral_id) == 9
+    assert duplex_turn_id_from_request_id(resumable_id) is None
 
 
 def test_capabilities_expose_overlapped_input_default_false() -> None:
     caps = DuplexCapabilities()
     assert caps.supports_overlapped_input is False
+    assert caps.supports_vision_follow is False
     assert caps.supports_core_resumable_request is False
     payload = caps.as_dict()
     assert payload["supports_overlapped_input"] is False
+    assert payload["supports_vision_follow"] is False
 
 
 def test_next_commit_allowed_soft_opens_on_r4_release() -> None:
@@ -73,7 +79,8 @@ def test_next_commit_allowed_soft_opens_on_r4_release() -> None:
     assert helpers.next_commit_allowed(session_off, tasks, overlapped_input_released=True) is False
 
 
-def test_active_response_accepts_any_turn_when_overlapped_input() -> None:
+def test_active_response_accepts_own_turn_when_overlapped_input() -> None:
+    """Approach A: each response owns its turn; draining TTS uses request→response map."""
     from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
     from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 
@@ -84,8 +91,11 @@ def test_active_response_accepts_any_turn_when_overlapped_input() -> None:
     )
     session.begin_response(turn_id=3)
     assert session.active_response_accepts_model_turn(3)
-    assert session.active_response_accepts_model_turn(4)
-    assert session.active_response_accepts_model_turn(2)
+    assert not session.active_response_accepts_model_turn(4)
+    assert not session.active_response_accepts_model_turn(2)
+    session.register_draining_request_response("req-old", "resp-old")
+    assert session.response_id_for_request("req-old") == "resp-old"
+    assert session.is_draining_request("req-old")
 
     strict = DuplexEngineSession(
         session_id="s2",

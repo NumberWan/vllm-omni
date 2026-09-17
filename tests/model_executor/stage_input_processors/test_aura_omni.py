@@ -197,6 +197,29 @@ def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
 
 def test_aura2tts_drops_silent_response():
     assert aura2tts([_source_output(SILENT_TEXT)]) == []
+    assert aura2tts([_source_output(f"{SILENT_TEXT}<|im_end|>")]) == []
+
+
+def test_aura2tts_strips_im_end_from_spoken_text():
+    prompt = {
+        "additional_information": {
+            "tts_ref_audio": ["ref.wav"],
+            "tts_ref_text": ["Reference transcript sample."],
+        }
+    }
+    [tts_input] = aura2tts([_source_output("你好。<|im_end|>")], prompt=[prompt])
+    assert tts_input["additional_information"]["text"] == ["你好。"]
+
+
+def test_aura2tts_does_not_treat_chinese_silence_as_special_token():
+    # [沉默] is not <|silent|>; prompt/session must instruct the real token.
+    prompt = {
+        "additional_information": {
+            "tts_ref_audio": ["ref.wav"],
+            "tts_ref_text": ["Reference transcript sample."],
+        }
+    }
+    assert len(aura2tts([_source_output("[沉默]")], prompt=[prompt])) == 1
 
 
 def test_normalize_asr_transcript_strips_qwen3_asr_markup() -> None:

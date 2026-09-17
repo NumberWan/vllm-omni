@@ -1158,6 +1158,7 @@ def note_input_append(
     payload: dict[str, object],
     *,
     vad_result: TurnDetectionResult | None = None,
+    supports_vision_follow: bool = False,
 ) -> list[DuplexEvent]:
     """Update the input-buffer projection for one appended chunk; returns typed events.
 
@@ -1172,15 +1173,14 @@ def note_input_append(
     has_audio = isinstance(audio, str) and bool(audio)
     video_frames = payload.get("video_frames")
     has_video = isinstance(video_frames, list) and any(isinstance(frame, str) and frame for frame in video_frames)
-    # Vision-carrying silent appends are real turn content. Without this,
-    # resolve_commit treats the buffer as empty non-speech and forces
-    # is_speech=False / response_create=False, so Commit(create_response=True)
-    # never submits Stage0.
+    # Vision-carrying silent appends are real turn content only when the model
+    # opts into vision-follow (AURA). Without this gate MiniCPM camera sessions
+    # would treat silent+frames as buffer content and open a response.
     state.input_audio_buffer_has_audio = state.input_audio_buffer_has_audio or (
         looks_like_speech and has_audio
-    ) or has_video
+    ) or (has_video and supports_vision_follow)
     state.input_audio_buffer_had_non_speech = state.input_audio_buffer_had_non_speech or (
-        not looks_like_speech and has_audio and not has_video
+        not looks_like_speech and has_audio and not (has_video and supports_vision_follow)
     )
     events: list[DuplexEvent] = []
     stop_ms: object = payload.get("audio_end_ms", payload.get("audio_ms", 0))

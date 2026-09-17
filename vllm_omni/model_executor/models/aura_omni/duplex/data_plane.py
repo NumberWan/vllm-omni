@@ -12,9 +12,15 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
+from vllm_omni.engine.duplex.contracts import (
+    duplex_resource_request_belongs_to_session,
+    duplex_turn_id_from_request_id,
+)
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
-from vllm_omni.model_executor.stage_input_processors.aura_omni import SILENT_TEXT
+from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    is_effectively_silent,
+    is_silent_text_prefix,
+)
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 
@@ -31,6 +37,7 @@ class AuraDataPlaneContext:
 @dataclass(slots=True)
 class _RequestState:
     text_sent: str = ""
+    text_emitted: str = ""
     audio_offset: int = 0
     silent: bool = False
     terminal: bool = False
@@ -163,6 +170,9 @@ class AuraDataPlaneSession(DuplexDataPlane):
         for request_id in list(self._requests):
             if duplex_resource_request_belongs_to_session(request_id, session_id):
                 self._requests.pop(request_id, None)
+        from vllm_omni.model_executor.models.aura_omni.duplex.history import drop_session_history
+
+        drop_session_history(session_id)
 
     def project(self, result: object, *, context: object | None = None) -> Iterator[dict[str, object]]:
         if not isinstance(result, dict):
@@ -178,11 +188,18 @@ class AuraDataPlaneSession(DuplexDataPlane):
         request_id = getattr(result, "request_id", None)
         if not isinstance(request_id, str) or not request_id:
             return
+        model_turn_id = duplex_turn_id_from_request_id(request_id)
         outer_finished = bool(getattr(result, "finished", False))
         output, completion, stage_id = _unwrap(result)
         state = self._requests.setdefault(request_id, _RequestState())
         if stage_id is not None:
             state.stage_seen.add(stage_id)
+
+        def _event(**fields: object) -> dict[str, object]:
+            payload = dict(fields)
+            if model_turn_id is not None:
+                payload["model_turn_id"] = model_turn_id
+            return payload
 
         decision = get_duplex_output_decision(result)
         metadata = dict(getattr(decision, "metadata", {}) or {})
@@ -190,31 +207,38 @@ class AuraDataPlaneSession(DuplexDataPlane):
             state.silent = True
             # Mark terminal after yield: runner._send_one drops is_terminal
             # requests before emit.
-            yield {
-                "stage_role": "thinker",
-                "is_listen": True,
-                "data_plane_request_id": request_id,
-                "text": "",
-                "end_of_turn": True,
-                "silent": True,
-            }
+            yield _event(
+                stage_role="thinker",
+                is_listen=True,
+                data_plane_request_id=request_id,
+                text="",
+                end_of_turn=True,
+                silent=True,
+            )
             state.terminal = True
             return
 
         text = _text_from(output, completion)
         if text and text != state.text_sent:
-            delta = text[len(state.text_sent) :] if text.startswith(state.text_sent) else text
             state.text_sent = text
-            if text.strip() == SILENT_TEXT:
+            if is_effectively_silent(text):
                 state.silent = True
-            if delta and not state.silent:
-                yield {
-                    "stage_role": "thinker",
-                    "is_listen": False,
-                    "data_plane_request_id": request_id,
-                    "text": delta,
-                    "end_of_turn": False,
-                }
+            # Hold deltas that are still a <|silent|> prefix until short-circuit.
+            if not state.silent and not is_silent_text_prefix(text):
+                emit = (
+                    text
+                    if not state.text_emitted
+                    else (text[len(state.text_emitted) :] if text.startswith(state.text_emitted) else text)
+                )
+                if emit:
+                    state.text_emitted = text
+                    yield _event(
+                        stage_role="thinker",
+                        is_listen=False,
+                        data_plane_request_id=request_id,
+                        text=emit,
+                        end_of_turn=False,
+                    )
 
         # RequestOutput.finished / envelope finished is the stream EOS.
         # CompletionOutput.finished is true on every Code2Wav chunk and must
@@ -236,36 +260,36 @@ class AuraDataPlaneSession(DuplexDataPlane):
                         n = 0
                 state.audio_offset += n
                 end_of_turn = bool(finished and is_final_audio_stage)
-                yield {
-                    "stage_role": "tts",
-                    "is_listen": False,
-                    "data_plane_request_id": request_id,
-                    "audio": encoded,
-                    "sample_rate_hz": sample_rate,
-                    "end_of_turn": end_of_turn,
-                }
+                yield _event(
+                    stage_role="tts",
+                    is_listen=False,
+                    data_plane_request_id=request_id,
+                    audio=encoded,
+                    sample_rate_hz=sample_rate,
+                    end_of_turn=end_of_turn,
+                )
                 if end_of_turn:
                     state.terminal = True
                     return
 
         if finished and is_final_audio_stage and not state.terminal:
-            yield {
-                "stage_role": "tts",
-                "is_listen": False,
-                "data_plane_request_id": request_id,
-                "text": "",
-                "end_of_turn": True,
-            }
+            yield _event(
+                stage_role="tts",
+                is_listen=False,
+                data_plane_request_id=request_id,
+                text="",
+                end_of_turn=True,
+            )
             state.terminal = True
         elif finished and state.silent and not state.terminal:
-            yield {
-                "stage_role": "thinker",
-                "is_listen": True,
-                "data_plane_request_id": request_id,
-                "text": "",
-                "end_of_turn": True,
-                "silent": True,
-            }
+            yield _event(
+                stage_role="thinker",
+                is_listen=True,
+                data_plane_request_id=request_id,
+                text="",
+                end_of_turn=True,
+                silent=True,
+            )
             state.terminal = True
 
 

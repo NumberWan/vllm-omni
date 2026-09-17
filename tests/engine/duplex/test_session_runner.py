@@ -521,6 +521,28 @@ async def test_commit_without_audio_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_silent_commit_acks_without_opening_response() -> None:
+    """#3: empty is_speech=False commit keeps the silent-ack pair, even auto-respond."""
+    h = await open_harness(auto_response=True)
+    try:
+        # resolve_commit only admits empty silent commits after non-speech was seen.
+        projector = h.runner._require_projector()
+        projector.input_audio_buffer_had_non_speech = True
+        events = await h.run(commands.Commit())
+        assert "error" not in types(events), types(events)
+        assert "input_audio_buffer.committed" in types(events), types(events)
+        assert "response.listen" in types(events), types(events)
+        listen = next(event for event in events if event.type == "response.listen")
+        assert listen.details["reason"] == "silence_or_noise"
+        committed = next(event for event in events if event.type == "input_audio_buffer.committed")
+        assert committed.details.get("empty") is True
+        assert committed.details.get("no_response") is True
+        assert h.port.submissions == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_commit_projects_the_user_item_and_does_not_resubmit_consumed_audio() -> None:
     h = await open_harness()
     try:
@@ -879,9 +901,12 @@ async def test_turn_mode_skips_silent_chunks() -> None:
 
 @pytest.mark.asyncio
 async def test_turn_mode_keeps_silent_chunks_with_video_frames() -> None:
-    """R1: vision-carrying silent appends must buffer in turn-commit mode."""
+    """Engine vision-follow buffers silent+frames; MiniCPM commit stays speech-gated."""
+    from dataclasses import replace
+
     h = await open_harness(auto_response=False)
     try:
+        h.session.capabilities = replace(h.session.capabilities, supports_vision_follow=True)
         # Minimal 1x1 JPEG (base64) — wire validation only checks non-empty str.
         frame = (
             "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkS"
@@ -906,13 +931,9 @@ async def test_turn_mode_keeps_silent_chunks_with_video_frames() -> None:
         assert "response.listen" not in types(events)
         assert h.runner.model_state.audio_buffer.has_pending()
         events = await h.run(commands.Commit(create_response=True))
-        assert "response.created" in types(events), types(events)
+        # MiniCPM prepare_commit is speech-gated (no frames-only Stage0).
         assert "input_audio_buffer.committed" in types(events), types(events)
-        assert len(h.port.submissions) == 1
-        duplex = h.port.submissions[0].prompt["model_intermediate_buffer"]["duplex"]
-        assert duplex["final"] is True
-        assert duplex["payload"].get("is_speech") is False
-        assert duplex["payload"].get("video_frames")
+        assert h.port.submissions == []
     finally:
         await close_harness(h)
 
@@ -920,8 +941,11 @@ async def test_turn_mode_keeps_silent_chunks_with_video_frames() -> None:
 @pytest.mark.asyncio
 async def test_turn_mode_keeps_silent_vision_while_response_in_progress() -> None:
     """TTS still playing: vision-follow must buffer, not drop as silence_or_noise."""
+    from dataclasses import replace
+
     h = await open_harness(auto_response=False)
     try:
+        h.session.capabilities = replace(h.session.capabilities, supports_vision_follow=True)
         h.session._response.active_response_id = "resp-tts"
         frame = (
             "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkS"

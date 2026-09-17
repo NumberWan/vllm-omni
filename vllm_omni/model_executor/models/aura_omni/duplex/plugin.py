@@ -5,12 +5,12 @@
 
 from __future__ import annotations
 
-import base64
 import binascii
 from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
+import pybase64 as base64
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
@@ -30,6 +30,7 @@ from vllm_omni.model_executor.models.aura_omni.duplex.session import AuraServing
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     DEFAULT_AURA_SYSTEM_PROMPT,
     SILENT_TEXT,
+    is_effectively_silent,
 )
 
 # AURA v1 (Qwen3-VL) silent / ChatML turn-end ids.
@@ -143,6 +144,10 @@ class AuraDuplexPlugin(DuplexModelPlugin):
                 if stop_id not in stop_ids:
                     stop_ids.append(stop_id)
             stage1.stop_token_ids = stop_ids
+            # 151669 is a stop id: keep it in the completion so decide_output /
+            # aura2tts can see <|silent|> instead of an empty detokenized string.
+            stage1.include_stop_str_in_output = True
+            stage1.skip_special_tokens = False
             configured[1] = stage1
         # Qwen3-TTS Talker codec EOS (2150). Missing this lets Talker run to
         # max_tokens and emit ~26s garbage WAV while Stage1 text was fine.
@@ -279,8 +284,12 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         context: object,
     ) -> bool:
         """After Stage1 text/silent final, next commit may start while TTS drains."""
-        del output, context
-        return stage_id == 1 and bool(segment_finished)
+        del context
+        if stage_id != 1:
+            return False
+        if segment_finished:
+            return True
+        return bool(getattr(output, "finished", False))
 
     def decide_output(
         self,
@@ -301,7 +310,16 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         text = getattr(completion, "text", None) if completion is not None else None
         cumulative = getattr(completion, "cumulative_text", None) if completion is not None else None
         text_blob = " ".join(part for part in (text, cumulative) if isinstance(part, str))
-        is_silent = any(sid in token_ids for sid in AURA_SILENT_TOKEN_IDS) or SILENT_TEXT in text_blob
+        # Empty finished Stage1 is silent: stop_token 151669 is often omitted from
+        # token_ids/text unless include_stop_str_in_output is set.
+        is_silent = (
+            any(sid in token_ids for sid in AURA_SILENT_TOKEN_IDS)
+            or (isinstance(text, str) and is_effectively_silent(text))
+            or (isinstance(cumulative, str) and is_effectively_silent(cumulative))
+            or SILENT_TEXT in text_blob
+        )
+        if not is_silent and not token_ids and not text_blob.strip():
+            is_silent = True
         if not is_silent and token_ids:
             is_silent = token_ids[0] in AURA_SILENT_TOKEN_IDS or (
                 len(token_ids) > 3 and any(sid in token_ids[:6] for sid in AURA_SILENT_TOKEN_IDS)

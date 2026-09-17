@@ -165,6 +165,23 @@ def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> s
     return duplex_resource_request_id(fence, f"stage{stage_id}_t{fence.turn_id}")
 
 
+def duplex_turn_id_from_request_id(request_id: str | None) -> int | None:
+    """Parse ``…r.stage{N}_t{turn}`` ephemeral ids; ``None`` if not that shape."""
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    parts = request_id.split(".")
+    if len(parts) != 6 or parts[0] != "duplex-s" or parts[2] != "e" or parts[4] != "r":
+        return None
+    role = parts[5]
+    marker = "_t"
+    if marker not in role:
+        return None
+    try:
+        return int(role.rsplit(marker, 1)[1])
+    except ValueError:
+        return None
+
+
 def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
     """Return whether a current-format resource request belongs to a session."""
     parts = request_id.split(".")
@@ -196,6 +213,7 @@ __all__ = [
     "DuplexStageSubmissionResult",
     "duplex_data_plane_request_info",
     "duplex_ephemeral_stage_request_id",
+    "duplex_turn_id_from_request_id",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
 ]

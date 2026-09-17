@@ -311,9 +311,10 @@ class OmniEngineArgs(EngineArgs):
         self._ensure_omni_models_registered()
 
         # Build stage_connector_config from stage_connector_spec.
-        # An empty spec means this stage has no connector data-plane edge;
-        # mark it sender-only so async_chunk prewarm / chunk-wait do not
-        # replace orchestrator process_engine_inputs (e.g. AURA asr2aura).
+        # An empty spec means this stage has no connector data-plane edge —
+        # leave it role-less so Stage0 keeps the RequestOutput path under
+        # async_chunk. Outgoing edges get ``role: sender`` from
+        # get_stage_connector_spec instead.
         if self.stage_connector_spec:
             stage_connector_config = {
                 "name": self.stage_connector_spec.get("name", "SharedMemoryConnector"),
@@ -323,7 +324,7 @@ class OmniEngineArgs(EngineArgs):
         else:
             stage_connector_config = {
                 "name": "SharedMemoryConnector",
-                "extra": {"stage_id": self.stage_id, "role": "sender"},
+                "extra": {"stage_id": self.stage_id},
             }
 
         hf_overrides = cast(dict[str, Any] | Callable[[Any], Any] | None, getattr(self, "hf_overrides", None))

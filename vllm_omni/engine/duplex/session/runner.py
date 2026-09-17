@@ -815,7 +815,14 @@ class DuplexSessionRunner:
             # turn models already buffer speech; it must not suppress barge-in.
             event.pop("force_listen", None)
         projector = self._require_projector()
-        self._emit_events(note_input_append(projector, event, vad_result=vad_result))
+        self._emit_events(
+            note_input_append(
+                projector,
+                event,
+                vad_result=vad_result,
+                supports_vision_follow=session.capabilities.supports_vision_follow,
+            )
+        )
         if self.run.closing or session.state != DuplexSessionState.OPEN:
             return
 
@@ -872,9 +879,11 @@ class DuplexSessionRunner:
                 defer_append = False
         elif not auto_responds and not overlap_policy.input_looks_like_speech(self.session, event, payload):
             # Turn-mode only: skip silent chunks so they don't open a response.
-            # Vision-carrying silent appends must still buffer — otherwise
-            # answer_time / proactive follow-ups with is_speech=False never reach Stage1.
-            if not payload.get("video_frames"):
+            # Vision-carrying silent appends must still buffer when the model
+            # opts into vision-follow (AURA).
+            frames = payload.get("video_frames")
+            has_vision = isinstance(frames, list) and any(isinstance(frame, str) and frame for frame in frames)
+            if not (has_vision and session.capabilities.supports_vision_follow):
                 self.emit(
                     {
                         "type": "response.listen",
@@ -1788,7 +1797,7 @@ class DuplexSessionRunner:
                 or model_state.audio_buffer.has_pending()
                 or model_state.committed_audio_payload is not None
             )
-            if not has_pending_turn and not should_create_response:
+            if not has_pending_turn:
                 self._commit_silent_input()
                 return
         precreate_response_requested = event_type == "response.create" or bool(
