@@ -40,6 +40,23 @@ Connect clients to `/v1/realtime?duplex=1`. Silent Stage1 outputs gate TTS (no
 audio for that turn). Overlapped input and vision-follow are AURA duplex
 capabilities; see the PR / RFC for behaviour.
 
+### Browser UI (push-to-talk)
+
+AURA has no client VAD. Use the AURA-owned Realtime page (not MiniCPM’s demo):
+hold to stream PCM (`is_speech=true`), release to `commit`. Camera frames ride
+speech; during assistant playback, pending frames go as vision-follow with
+`is_speech=false`.
+
+```bash
+python -m examples.online_serving.aura_omni.realtime_web \
+    --port 7862 \
+    --ws-backend ws://127.0.0.1:8091 \
+    --model aurateam/AURA
+```
+
+Open `http://<host>:7862/`. This UI lives under `aura_omni/realtime_web/` so
+`minicpmo/realtime_web` stays unchanged for MiniCPM.
+
 ### Per-stage models
 
 Edit `model` on each stage in `vllm_omni/deploy/aura_omni.yaml` (or the smoke
