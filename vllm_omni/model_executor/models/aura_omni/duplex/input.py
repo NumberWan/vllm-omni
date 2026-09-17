@@ -77,7 +77,9 @@ class AuraPcmAppendBuffer(PcmAppendBuffer):
 
     @property
     def pending_byte_count(self) -> int:
-        return len(self._buffer)
+        # Include retained video frame wire sizes so admission/release accounting
+        # stays balanced after the mailbox releases the full append reservation.
+        return len(self._buffer) + sum(len(frame) for frame in self._frame_queue)
 
     def clear(self) -> None:
         self._buffer.clear()

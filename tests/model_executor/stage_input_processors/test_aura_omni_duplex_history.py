@@ -87,3 +87,51 @@ def test_aura2tts_duplex_commits_silent_into_history() -> None:
     assert aura2tts([_source_output(SILENT_TEXT)], prompt=[prompt]) == []
     assert history.messages[-1]["content"] == SILENT_TEXT
     drop_session_history("duplex-silent")
+
+
+def test_duplex_interception_commits_silent_history_without_aura2tts() -> None:
+    """Silent Stage1 uses DIRECT_RESPONSE; history must commit on the data-plane path."""
+    from vllm.outputs import CompletionOutput
+
+    from vllm_omni.engine.duplex.contracts import (
+        DuplexFence,
+        DuplexOutputAction,
+        DuplexOutputDecision,
+        duplex_ephemeral_stage_request_id,
+    )
+    from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import AuraDataPlaneSession
+    from vllm_omni.outputs import OmniRequestOutput
+    from vllm_omni.outputs.duplex import attach_duplex_output_decision
+
+    drop_session_history("duplex-silent-dp")
+    history = get_or_create_session_history("duplex-silent-dp")
+    history.begin_user_turn("look")
+    fence = DuplexFence("duplex-silent-dp", epoch=0, turn_id=1)
+    request_id = duplex_ephemeral_stage_request_id(fence, stage_id=1)
+    output = OmniRequestOutput(
+        request_id=request_id,
+        finished=True,
+        stage_id=1,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text=SILENT_TEXT,
+                token_ids=[151669],
+                cumulative_logprob=None,
+                logprobs=None,
+            )
+        ],
+    )
+    attach_duplex_output_decision(
+        output,
+        DuplexOutputDecision(
+            action=DuplexOutputAction.DIRECT_RESPONSE,
+            metadata={"model_listen": True, "duplex_direct_response": True},
+        ),
+    )
+    plane = AuraDataPlaneSession(encode_audio=lambda *_a, **_k: None)
+    events = list(plane.project_output(output))
+    assert events and events[0].get("silent") is True
+    assert history.pending_user is None
+    assert history.messages[-1]["content"] == SILENT_TEXT
+    drop_session_history("duplex-silent-dp")

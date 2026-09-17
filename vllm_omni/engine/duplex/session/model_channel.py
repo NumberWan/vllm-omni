@@ -848,13 +848,19 @@ class ModelChannel:
                 data_plane_request_id=data_plane_request_id,
             )
             return close_reason, emitted_response
-        if session.active_response_id is None and model_turn_id is not None and model_turn_id < session.turn_id:
-            # Late audio of a completed model turn must not reserve a second response.
-            return close_reason, emitted_response
         request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
         draining_response_id = (
             session.response_id_for_request(request_key) if session.is_draining_request(request_key) else None
         )
+        if (
+            draining_response_id is None
+            and session.active_response_id is None
+            and model_turn_id is not None
+            and model_turn_id < session.turn_id
+        ):
+            # Late audio of a completed model turn must not reserve a second response.
+            # Draining requests are exempt: resolve ownership before this filter.
+            return close_reason, emitted_response
         if draining_response_id is None:
             self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
         if (

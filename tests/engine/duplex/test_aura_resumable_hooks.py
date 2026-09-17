@@ -119,3 +119,35 @@ def test_active_response_accepts_own_turn_when_overlapped_input() -> None:
     strict.begin_response(turn_id=3)
     assert strict.active_response_accepts_model_turn(3)
     assert not strict.active_response_accepts_model_turn(4)
+
+
+def test_draining_request_exempt_from_completed_turn_filter() -> None:
+    """Draining ownership must win over the model_turn_id < turn_id late-audio guard."""
+    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+
+    session = DuplexEngineSession(
+        session_id="s-drain",
+        config=DuplexSessionConfig(model="m", modalities=["text", "audio"]),
+        capabilities=DuplexCapabilities(supports_overlapped_input=True),
+    )
+    session.begin_response(turn_id=1)
+    r1 = session.active_response_id
+    assert r1 is not None
+    session.register_draining_request_response("req-r1-tts", r1)
+    # Overlapping R2 becomes active, then finishes — must not wipe R1 draining.
+    session.begin_response(turn_id=2)
+    session.end_response(commit_text=False)
+    session.turn_id = 2
+    assert session.active_response_id is None
+    assert session.is_draining_request("req-r1-tts")
+    assert session.response_id_for_request("req-r1-tts") == r1
+    draining_response_id = session.response_id_for_request("req-r1-tts")
+    model_turn_id = 1
+    drop = (
+        draining_response_id is None
+        and session.active_response_id is None
+        and model_turn_id is not None
+        and model_turn_id < session.turn_id
+    )
+    assert drop is False

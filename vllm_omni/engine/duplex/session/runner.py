@@ -540,8 +540,9 @@ class DuplexSessionRunner:
         session = self.session
         projector = self._require_projector()
         if isinstance(command, AppendAudio):
-            # The manager reserved the wire size at admission; the handler
-            # re-reserves the decoded size around its PCM reservation.
+            # The manager reserved the wire size (audio + video) at admission.
+            # Release that full amount as the command leaves the mailbox; the
+            # handler re-reserves whatever the input buffer actually retains.
             admission = len(command.audio) + sum(len(frame) for frame in command.video_frames)
             session.release_input_bytes(admission)
             await self._on_append_audio(command.payload())
@@ -950,6 +951,7 @@ class DuplexSessionRunner:
             self.session, event, payload
         )
         raw_audio_bytes = helpers.audio_payload_size_bytes(payload)
+        pending_before = model_state.audio_buffer.pending_byte_count
         try:
             if not session.reserve_input_bytes(
                 raw_audio_bytes,
@@ -971,6 +973,19 @@ class DuplexSessionRunner:
             self._emit_error("bad_event", str(exc))
             return
         if pcm_reservation is None:
+            # Commit-only buffers (AURA) accumulate in place and return None.
+            # Undo the speculative audio reserve and re-apply the exact pending
+            # delta so retained video frames are counted (and later released).
+            session.release_input_bytes(raw_audio_bytes)
+            pending_delta = model_state.audio_buffer.pending_byte_count - pending_before
+            if pending_delta > 0 and not session.reserve_input_bytes(
+                pending_delta,
+                limit=int(self.manager.runtime_config.max_pending_input_bytes_per_session),
+            ):
+                self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")
+                return
+            if pending_delta < 0:
+                session.release_input_bytes(-pending_delta)
             self._maybe_schedule_vad_commit(vad_result)
             return
         if pcm_reservation.byte_count == 0:

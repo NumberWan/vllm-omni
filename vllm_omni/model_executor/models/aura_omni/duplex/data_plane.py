@@ -18,11 +18,39 @@ from vllm_omni.engine.duplex.contracts import (
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+    SILENT_TEXT,
     is_effectively_silent,
     is_silent_text_prefix,
 )
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
+
+def _session_id_from_request_id(request_id: str) -> str | None:
+    """Decode ``duplex-s.<b64url(session)>.e.…`` into the session id, or None."""
+    import base64
+
+    parts = request_id.split(".")
+    if len(parts) != 6 or parts[0] != "duplex-s" or parts[2] != "e" or parts[4] != "r":
+        return None
+    encoded = parts[1]
+    pad = "=" * (-len(encoded) % 4)
+    try:
+        return base64.urlsafe_b64decode(encoded + pad).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _commit_silent_history(request_id: str) -> None:
+    """Commit pending user turn when Stage1 silent short-circuits past aura2tts."""
+    session_id = _session_id_from_request_id(request_id)
+    if not session_id:
+        return
+    from vllm_omni.model_executor.models.aura_omni.duplex.history import get_or_create_session_history
+
+    history = get_or_create_session_history(session_id)
+    if history.pending_user is None:
+        return
+    history.commit_turn(SILENT_TEXT)
 
 @dataclass(frozen=True, slots=True)
 class AuraDataPlaneContext:
@@ -205,6 +233,8 @@ class AuraDataPlaneSession(DuplexDataPlane):
         metadata = dict(getattr(decision, "metadata", {}) or {})
         if metadata.get("model_listen") or metadata.get("duplex_native_decision") == "listen":
             state.silent = True
+            # DIRECT_RESPONSE skips aura2tts; commit history here on the duplex path.
+            _commit_silent_history(request_id)
             # Mark terminal after yield: runner._send_one drops is_terminal
             # requests before emit.
             yield _event(

@@ -50,7 +50,9 @@
   let captureRate = INPUT_RATE;
   let cameraStream = null;
   let cameraTimer = null;
+  // Pending = unused since last send; last = sticky reuse for AURA video-required appends.
   let cameraPendingFrame = null;
+  let cameraLastFrame = null;
   const cameraCanvas = document.createElement('canvas');
   let playbackRate = OUTPUT_RATE;
   let pendingCapture = [];
@@ -258,9 +260,10 @@
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
 
     // Vision-follow while TTS drains: silent PCM + frames, never speech.
-    if (!pttHeld && assistantActive && cameraPendingFrame) {
+    const visionFrame = cameraPendingFrame || cameraLastFrame;
+    if (!pttHeld && assistantActive && visionFrame) {
       const silent = new Int16Array(SILENT_PCM_SAMPLES);
-      const frames = [cameraPendingFrame];
+      const frames = [visionFrame];
       cameraPendingFrame = null;
       sendAppend(silent, { isSpeech: false, frames });
       sendCommit();
@@ -281,8 +284,11 @@
     }
     pendingCapture = [];
     const pcm = resampleInt16(merged, captureRate, INPUT_RATE);
-    const frames = cameraPendingFrame ? [cameraPendingFrame] : null;
-    if (cameraPendingFrame) cameraPendingFrame = null;
+    // AURA requires video on every append; audio ticks (200ms) outpace camera (1s),
+    // so reuse the latest frame instead of clearing it after a single send.
+    const frame = cameraPendingFrame || cameraLastFrame;
+    const frames = frame ? [frame] : null;
+    cameraPendingFrame = null;
     sendAppend(pcm, { isSpeech: true, frames });
   }
 
@@ -523,15 +529,19 @@
 
   function setPttHeld(held) {
     if (!running || pttHeld === held) return;
-    pttHeld = held;
-    pttButton.classList.toggle('is-active', held);
-    pttButton.textContent = held ? 'Release to send' : 'Hold to talk';
     if (held) {
+      pttHeld = true;
+      pttButton.classList.add('is-active');
+      pttButton.textContent = 'Release to send';
       setModel('Talking');
       appendLog('PTT down · sending speech PCM');
       return;
     }
+    // Flush while still treated as PTT input, then clear held and commit.
     flushCapture();
+    pttHeld = false;
+    pttButton.classList.remove('is-active');
+    pttButton.textContent = 'Hold to talk';
     sendCommit();
     setModel('Ready (PTT)');
     appendLog('PTT up · commit');
@@ -580,6 +590,7 @@
       cameraCanvas.height = cameraPreview.videoHeight;
       cameraCanvas.getContext('2d').drawImage(cameraPreview, 0, 0);
       cameraPendingFrame = cameraCanvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+      cameraLastFrame = cameraPendingFrame;
     }, 1000);
     cameraButton.textContent = 'Camera off';
     cameraButton.classList.add('is-active');
@@ -594,6 +605,7 @@
     }
     cameraStream = null;
     cameraPendingFrame = null;
+    cameraLastFrame = null;
     cameraPreview.srcObject = null;
     cameraPreview.style.display = 'none';
     cameraButton.textContent = 'Camera';
