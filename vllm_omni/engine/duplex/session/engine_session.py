@@ -615,6 +615,14 @@ class DuplexEngineSession:
     def is_draining_request(self, request_id: str | None) -> bool:
         return isinstance(request_id, str) and request_id in self._response.draining_request_responses
 
+    def clear_draining_for_response(self, response_id: str | None) -> None:
+        """Drop draining bindings owned by ``response_id``; leave other responses intact."""
+        if response_id is None:
+            return
+        self._response.draining_request_responses = {
+            rid: resp for rid, resp in self._response.draining_request_responses.items() if resp != response_id
+        }
+
     def append_history_message(self, message: dict[str, object]) -> None:
         self._conversation.messages.append(message)
 
@@ -1035,7 +1043,8 @@ class DuplexEngineSession:
         self._response.active_response_turn_id = None
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
-        self._response.draining_request_responses.clear()
+        # Keep draining bindings for other responses (older TTS may still play).
+        self.clear_draining_for_response(response_id)
         self._clear_response_metrics()
         self.turn_state = DuplexTurnState.IDLE
         self._restore_response_config()

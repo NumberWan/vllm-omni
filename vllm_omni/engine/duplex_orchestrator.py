@@ -187,7 +187,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         close_session = bool(self.plugin.capabilities(max_sessions=1).supports_core_resumable_request)
         runner = self.session_manager.runner_for_request_id(req_id)
         if runner is not None:
-            runner.on_stage_failure(next_stage_id, exc)
+            runner.on_stage_failure(next_stage_id, exc, request_id=req_id)
         await self._cleanup_request_ids(
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,

@@ -100,6 +100,17 @@ def test_active_response_accepts_own_turn_when_overlapped_input() -> None:
     assert session.response_id_for_request("req-old") == "resp-old"
     assert session.is_draining_request("req-old")
 
+    # Ending the active response must not wipe older draining bindings.
+    session.register_draining_request_response("req-newer-tts", session.active_response_id or "resp-active")
+    ended = session.active_response_id
+    session.end_response(commit_text=False)
+    assert session.is_draining_request("req-old")
+    assert session.response_id_for_request("req-old") == "resp-old"
+    assert not session.is_draining_request("req-newer-tts")
+    session.clear_draining_for_response("resp-old")
+    assert not session.is_draining_request("req-old")
+    del ended
+
     strict = DuplexEngineSession(
         session_id="s2",
         config=DuplexSessionConfig(model="m", modalities=["text"]),

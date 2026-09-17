@@ -286,8 +286,12 @@ class DuplexSessionRunner:
         # observe-only must still forward to the next stage (return False).
         return consume
 
-    def on_stage_failure(self, stage_id: int, exc: BaseException) -> None:
-        """A stage rejected this session's request: fail the active response now.
+    def on_stage_failure(self, stage_id: int, exc: BaseException, *, request_id: str | None = None) -> None:
+        """A stage rejected this session's request: fail the owning response.
+
+        Under overlapped input the failing request may belong to a draining
+        older response; resolve via ``response_id_for_request`` before falling
+        back to ``active_response_id``.
 
         Runs synchronously on the loop (no mailbox hop): the orchestrator
         expires the session right after this call, so a queued item could be
@@ -302,21 +306,32 @@ class DuplexSessionRunner:
             "runtime_data_plane_stream_failed",
             f"Stage-{stage_id} input processor failed: {type(exc).__name__}: {exc}",
         )
-        response_id = session.active_response_id
-        if response_id is not None:
+        draining_response_id = (
+            session.response_id_for_request(request_id)
+            if isinstance(request_id, str) and session.is_draining_request(request_id)
+            else None
+        )
+        response_id = draining_response_id or session.active_response_id
+        if response_id is None:
+            return
+        if draining_response_id is not None:
+            session.clear_draining_for_response(draining_response_id)
+            if isinstance(request_id, str):
+                session.request_resources.pop((stage_id, request_id), None)
+        elif response_id == session.active_response_id:
             session.end_response(commit_text=False)
-            self.emit(
-                {
-                    "type": "response.done",
-                    "session_id": session.session_id,
-                    "response_id": response_id,
-                    "epoch": session.epoch,
-                    "committed": False,
-                    "status": "failed",
-                    "status_details": {"type": "failed", "reason": "runtime_data_plane_stream_failed"},
-                    "playback": session.playback.as_dict(),
-                }
-            )
+        self.emit(
+            {
+                "type": "response.done",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "committed": False,
+                "status": "failed",
+                "status_details": {"type": "failed", "reason": "runtime_data_plane_stream_failed"},
+                "playback": session.playback.as_dict(),
+            }
+        )
 
     @property
     def closed_emitted(self) -> bool:
@@ -1519,6 +1534,18 @@ class DuplexSessionRunner:
         if commit_reservation is not None:
             commit_reservation.commit()
         if flushed is None:
+            # Non-speech residual: prepare_commit refused a Stage0 unit. Clear
+            # the PCM and its byte reservation so silence does not leak into
+            # the next turn (MiniCPM-o / auto-response silent commit).
+            if (
+                event_type in {"input.commit", "input_audio_buffer.commit"}
+                and not model_state.speech_since_commit
+            ):
+                pending_bytes = model_state.audio_buffer.pending_byte_count
+                model_state.audio_buffer.clear()
+                if pending_bytes:
+                    session.release_input_bytes(pending_bytes)
+                model_state.input_since_commit = False
             return False
         if overlap_policy.should_force_listen_for_short_commit(self.session, event, flushed):
             flushed = dict(flushed)

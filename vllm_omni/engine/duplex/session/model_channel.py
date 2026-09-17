@@ -241,7 +241,8 @@ class ModelChannel:
                 for sid, rid in stale_keys:
                     if sid < 2:
                         session.request_resources.pop((sid, rid), None)
-                    elif prior_response_id is not None:
+                    elif prior_response_id is not None and not session.is_draining_request(rid):
+                        # Already-draining ids keep their original response_id.
                         session.register_draining_request_response(rid, prior_response_id)
                 self._ctx.run.overlapped_input_released = False
                 if prior_response_id is not None:
@@ -322,6 +323,10 @@ class ModelChannel:
                 raise
             session.touch_lease(DuplexLeaseActivity.APPEND)
             session.bind_request(request_id)
+            # Consuming a Stage0 bind closes the overlapped-input gate even when
+            # this turn used a fresh ephemeral id (not the reuse branch above).
+            if stage_id == 0:
+                self._ctx.run.overlapped_input_released = False
             return {
                 "ok": True,
                 "operation": "append",
@@ -1187,13 +1192,31 @@ class ModelChannel:
         session = self._ctx.session
         model_state = self._ctx.model_state
         response_id = session.active_response_id
+        auto_response = self._out.auto_responds()
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
             model_state.clear_continuation()
             return
         # Non-resumable stage0 cannot submit_update after the request finishes;
-        # clear continuation. Resumable stage0 may still append silence chunks.
+        # clear continuation and close the response (silent / listen final).
         if not session.capabilities.supports_core_resumable_request:
             model_state.clear_continuation()
+            if response_id is not None:
+                should_commit = self.should_commit_response_to_history(session, response_id)
+                committed_message = session.end_response(
+                    commit_text=should_commit, preserve_request=auto_response
+                )
+                if should_commit and committed_message is not None:
+                    session.register_history_item(f"item_{response_id}", committed_message)
+                self._out.emit(
+                    {
+                        "type": "response.done",
+                        "session_id": session.session_id,
+                        "response_id": response_id,
+                        "epoch": session.epoch,
+                        "committed": committed_message is not None if should_commit else False,
+                        "playback": session.playback.as_dict(),
+                    }
+                )
             return
         request_id = session.active_request_id
         if request_id is None:
@@ -1201,7 +1224,6 @@ class ModelChannel:
             return
         if expected_epoch is not None and session.epoch != expected_epoch:
             return
-        auto_response = self._out.auto_responds()
         response_owned = response_id is not None
         if response_owned:
             owner_id = f"response:{response_id}"
