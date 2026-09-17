@@ -468,7 +468,8 @@ class DuplexSessionRunner:
             if isinstance(item, Commit):
                 session.release_pending_turn()
             elif isinstance(item, AppendAudio):
-                session.release_input_bytes(len(item.audio))
+                admission = len(item.audio) + sum(len(frame) for frame in item.video_frames)
+                session.release_input_bytes(admission)
             return
         await self._on_command(item)
 
@@ -526,7 +527,8 @@ class DuplexSessionRunner:
         if isinstance(command, AppendAudio):
             # The manager reserved the wire size at admission; the handler
             # re-reserves the decoded size around its PCM reservation.
-            session.release_input_bytes(len(command.audio))
+            admission = len(command.audio) + sum(len(frame) for frame in command.video_frames)
+            session.release_input_bytes(admission)
             await self._on_append_audio(command.payload())
         elif isinstance(command, AppendText):
             session.mark_user_input_activity()
@@ -771,9 +773,21 @@ class DuplexSessionRunner:
         model_state = self.model_state
         session.mark_user_input_activity()
         audio = event.get("audio") or event.get("data")
-        if not isinstance(audio, str):
-            self._emit_error("bad_event", "input_audio_buffer.append requires audio")
+        video_frames_raw = event.get("video_frames")
+        video_frames = (
+            [frame for frame in video_frames_raw if isinstance(frame, str) and frame]
+            if isinstance(video_frames_raw, list)
+            else []
+        )
+        has_audio = isinstance(audio, str) and bool(audio)
+        has_video = bool(video_frames)
+        modality_error = session.capabilities.validate_append_modalities(
+            has_audio=has_audio, has_video=has_video
+        )
+        if modality_error is not None:
+            self._emit_error("invalid_input_modality", modality_error)
             return
+        video_only = has_video and not has_audio
         if not session.capabilities.supports_barge_in and overlap_policy.event_requests_barge_in(event):
             self._emit_events([helpers.barge_in_unsupported_error()])
             event = dict(event)
@@ -785,42 +799,54 @@ class DuplexSessionRunner:
         fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
         sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
         sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else 16000
-        try:
-            converted: tuple[object, object, int | float | None] = await self.offload(
-                convert_input_audio_with_rate,
-                audio,
-                fmt,
-                sample_rate_hz=sample_rate_hz,
-            )
-        except ValueError as exc:
-            self._emit_error("bad_event", str(exc))
-            return
-        audio, fmt, converted_rate = converted
-        if converted_rate is not None:
-            sample_rate_hz = converted_rate
-        if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
-            self._emit_error("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded")
-            return
-        event["audio"] = audio
-        event["format"] = fmt
-        event["sample_rate_hz"] = sample_rate_hz
         client_force_listen = bool(event.get("force_listen", False))
-        vad_result = await self.control.run_turn_detection(event)
-        if (
-            vad_result is not None
-            and not session.capabilities.supports_core_resumable_request
-            and not client_force_listen
-        ):
-            # VAD's force_listen hint controls native model decoding. Committed
-            # turn models already buffer speech; it must not suppress barge-in.
-            event.pop("force_listen", None)
+        if video_only:
+            # No PCM to decode; frames alone are the turn content under R1.
+            fmt = "pcm_f32le"
+            event = dict(event)
+            event.pop("audio", None)
+            event.pop("data", None)
+            event["format"] = fmt
+            event["sample_rate_hz"] = sample_rate_hz
+            event["is_speech"] = False
+            event["video_frames"] = video_frames
+            vad_result = None
+        else:
+            try:
+                converted: tuple[object, object, int | float | None] = await self.offload(
+                    convert_input_audio_with_rate,
+                    audio,
+                    fmt,
+                    sample_rate_hz=sample_rate_hz,
+                )
+            except ValueError as exc:
+                self._emit_error("bad_event", str(exc))
+                return
+            audio, fmt, converted_rate = converted
+            if converted_rate is not None:
+                sample_rate_hz = converted_rate
+            if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
+                self._emit_error("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded")
+                return
+            event["audio"] = audio
+            event["format"] = fmt
+            event["sample_rate_hz"] = sample_rate_hz
+            vad_result = await self.control.run_turn_detection(event)
+            if (
+                vad_result is not None
+                and not session.capabilities.supports_core_resumable_request
+                and not client_force_listen
+            ):
+                # VAD's force_listen hint controls native model decoding. Committed
+                # turn models already buffer speech; it must not suppress barge-in.
+                event.pop("force_listen", None)
         projector = self._require_projector()
         self._emit_events(
             note_input_append(
                 projector,
                 event,
                 vad_result=vad_result,
-                supports_silent_video_input=session.capabilities.supports_silent_video_input,
+                allows_video_without_audio=session.capabilities.allows_video_without_audio(),
             )
         )
         if self.run.closing or session.state != DuplexSessionState.OPEN:
@@ -829,17 +855,21 @@ class DuplexSessionRunner:
         force_listen = bool(event.get("force_listen", False))
         payload: dict[str, object] = {
             "type": "audio",
-            "audio": audio,
-            "format": fmt,
-            "sample_rate_hz": sample_rate_hz,
             "force_listen": force_listen,
         }
-        video_frames = event.get("video_frames")
-        if isinstance(video_frames, list):
-            frames = [frame for frame in video_frames if isinstance(frame, str) and frame]
-            if frames:
-                payload["video_frames"] = frames
-        payload["is_speech"] = overlap_policy.input_looks_like_speech(self.session, event, payload)
+        if video_only:
+            payload["format"] = fmt
+            payload["sample_rate_hz"] = sample_rate_hz
+            payload["is_speech"] = False
+        else:
+            payload["audio"] = audio
+            payload["format"] = fmt
+            payload["sample_rate_hz"] = sample_rate_hz
+        if video_frames:
+            payload["video_frames"] = video_frames
+        payload["is_speech"] = (
+            False if video_only else overlap_policy.input_looks_like_speech(self.session, event, payload)
+        )
         auto_responds = self._session_auto_responds()
         defer_append = False
         buffer_overlap_audio = True
@@ -880,10 +910,10 @@ class DuplexSessionRunner:
         elif not auto_responds and not overlap_policy.input_looks_like_speech(self.session, event, payload):
             # Turn-mode only: skip silent chunks so they don't open a response.
             # Vision-carrying silent appends must still buffer when the model
-            # opts into silent video input.
+            # allows video without required audio (R1).
             frames = payload.get("video_frames")
             has_vision = isinstance(frames, list) and any(isinstance(frame, str) and frame for frame in frames)
-            if not (has_vision and session.capabilities.supports_silent_video_input):
+            if not (has_vision and session.capabilities.allows_video_without_audio()):
                 self.emit(
                     {
                         "type": "response.listen",

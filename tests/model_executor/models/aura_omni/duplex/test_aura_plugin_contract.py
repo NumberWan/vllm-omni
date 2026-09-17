@@ -59,7 +59,9 @@ def test_load_aura_duplex_plugin_and_sampling_arity() -> None:
     assert caps.supports_turn_commit_only is True
     assert caps.supports_core_resumable_request is False
     assert caps.supports_overlapped_input is True
-    assert caps.supports_silent_video_input is True
+    assert caps.required_input_modalities == frozenset({"video"})
+    assert caps.optional_input_modalities == frozenset({"audio"})
+    assert caps.allows_video_without_audio() is True
 
 
 def test_commit_only_buffer_emits_on_commit() -> None:

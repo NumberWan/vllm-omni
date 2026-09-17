@@ -51,11 +51,14 @@ def test_stage_request_id_respects_resumable_flag() -> None:
 def test_capabilities_expose_overlapped_input_default_false() -> None:
     caps = DuplexCapabilities()
     assert caps.supports_overlapped_input is False
-    assert caps.supports_silent_video_input is False
+    assert caps.allows_video_without_audio() is False
+    assert caps.required_input_modalities == frozenset({"audio"})
+    assert caps.optional_input_modalities == frozenset({"video"})
     assert caps.supports_core_resumable_request is False
     payload = caps.as_dict()
     assert payload["supports_overlapped_input"] is False
-    assert payload["supports_silent_video_input"] is False
+    assert payload["required_input_modalities"] == ["audio"]
+    assert payload["optional_input_modalities"] == ["video"]
 
 
 def test_next_commit_allowed_soft_opens_on_r4_release() -> None:

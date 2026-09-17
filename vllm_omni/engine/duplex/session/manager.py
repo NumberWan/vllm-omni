@@ -286,8 +286,20 @@ class DuplexSessionManager:
             )
             return
         if isinstance(command, AppendAudio):
+            has_audio = bool(command.audio)
+            has_video = bool(command.video_frames)
+            modality_error = session.capabilities.validate_append_modalities(
+                has_audio=has_audio, has_video=has_video
+            )
+            if modality_error is not None:
+                self.emit(
+                    session,
+                    self._error_event("invalid_input_modality", modality_error, command=command),
+                )
+                return
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
-            if not session.reserve_input_bytes(len(command.audio), limit=limit):
+            pending_bytes = len(command.audio) + sum(len(frame) for frame in command.video_frames)
+            if not session.reserve_input_bytes(pending_bytes, limit=limit):
                 self.emit(
                     session,
                     self._error_event(
