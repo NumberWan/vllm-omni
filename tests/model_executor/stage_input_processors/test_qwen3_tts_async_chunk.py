@@ -111,7 +111,6 @@ def test_eof_marker_when_finished_empty():
     )
     assert p.codes.audio.tolist() == []
     assert p.meta.finished.item() is True
-    assert p.meta.codec_streaming is True
 
 
 def test_flush_on_finish():
@@ -125,7 +124,6 @@ def test_flush_on_finish():
     )
     assert p is not None
     assert p.meta.finished.item() is True
-    assert p.meta.codec_streaming is True
     assert len(p.codes.audio) == _Q * 24
 
 
@@ -206,35 +204,6 @@ def test_voicedesign_prompt_mode_with_streaming_keeps_windowed_emit():
     )
     assert p is not None
     assert len(p.codes.audio) == _Q * 25
-
-
-def test_async_chunk_marks_codec_streaming_so_duplex_preserves_finished():
-    """Talker→Code2Wav owns codec lifetime; duplex Stage-2 is resumable.
-
-    Without ``codec_streaming=True``, ChunkTransferAdapter overwrites
-    ``meta.finished`` with ``request.is_finished() and not request.resumable``
-    (always False for duplex), and Stage-3 waits forever after the first chunk.
-    """
-    tm = _tm(chunk_frames=25, left_context=25)
-    # First IC emit (smoke uses initial_codec_chunk_frames=8).
-    payload = _call(tm, "r", n_frames=8, finished=False, req_ic=8)
-    assert payload is not None
-    assert payload.meta.codec_streaming is True
-    assert payload.meta.finished.item() is False
-
-    # Adapter increments put_req_chunk after a successful put.
-    tm.put_req_chunk["r"] = 1
-    # Accumulate a few more frames then Talker EOS flush.
-    tm.code_prompt_token_ids["r"] = [_FRAME[:] for _ in range(20)]
-    payload = talker2code2wav_async_chunk(
-        transfer_manager=tm,
-        multimodal_output=None,
-        request=_req("r", finished=True, initial_codec_chunk_frames=8),
-        is_finished=True,
-    )
-    assert payload is not None
-    assert payload.meta.codec_streaming is True
-    assert payload.meta.finished.item() is True
 
 
 _CASES = [

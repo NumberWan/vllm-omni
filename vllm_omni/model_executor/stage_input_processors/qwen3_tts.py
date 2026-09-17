@@ -201,10 +201,6 @@ def talker2code2wav_async_chunk(
                     request_id=request_id,
                     left_context_size=0,
                     finished=torch.tensor(True, dtype=torch.bool),
-                    # Keep processor-owned codec lifetime under duplex/
-                    # resumable Stage-2 (chunk adapter would otherwise
-                    # overwrite finished=False when request.resumable).
-                    codec_streaming=True,
                 ),
             )
         return None
@@ -273,7 +269,6 @@ def talker2code2wav_async_chunk(
                         request_id=request_id,
                         left_context_size=0,
                         finished=torch.tensor(True, dtype=torch.bool),
-                        codec_streaming=True,
                     ),
                 )
 
@@ -290,7 +285,6 @@ def talker2code2wav_async_chunk(
                     request_id=request_id,
                     left_context_size=0,
                     finished=torch.tensor(True, dtype=torch.bool),
-                    codec_streaming=True,
                 ),
             )
     else:
@@ -371,16 +365,10 @@ def talker2code2wav_async_chunk(
         dtype=torch.long,
     )
 
-    # codec_streaming=True: this processor owns codec lifetime. Duplex marks
-    # Stage-2 Talker requests resumable (streaming.enabled), so the chunk
-    # adapter's scheduler-derived finished is always False at Talker EOS —
-    # without this flag it would overwrite meta.finished and Stage-3 Code2Wav
-    # would wait forever after the first codec chunk.
     meta = MetaStruct(
         request_id=request_id,
         left_context_size=left_context_size,
         finished=torch.tensor(finished, dtype=torch.bool),
-        codec_streaming=True,
     )
     if ref_context_size > 0 and ref_context_request_id is not None:
         meta.ref_context_size = ref_context_size
