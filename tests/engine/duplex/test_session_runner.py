@@ -882,6 +882,38 @@ async def test_stage_failure_fails_the_active_response() -> None:
         await close_harness(h)
 
 
+@pytest.mark.asyncio
+async def test_stage_failure_on_draining_request_fails_that_response_only() -> None:
+    """Overlapped: a draining older request failure must not wipe the active response."""
+    from dataclasses import replace
+
+    h = await open_harness()
+    try:
+        h.session.capabilities = replace(h.session.capabilities, supports_overlapped_input=True)
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        r1 = h.session.active_response_id
+        assert r1 is not None
+        draining_req = "req-r1-talker-drain"
+        h.session.register_draining_request_response(draining_req, r1)
+        # Open a newer active response while R1 TTS is still draining.
+        r2 = h.session.begin_response(turn_id=(h.session.turn_id or 0) + 1)
+        assert h.session.active_response_id == r2
+        assert r2 != r1
+
+        h.runner.on_stage_failure(2, RuntimeError("drain-boom"), request_id=draining_req)
+        events = await h.settle()
+        assert types(events)[0] == "error"
+        done = find(events, "response.done")
+        assert done.response_id == r1
+        assert done.status == "failed"
+        assert h.session.active_response_id == r2
+        assert not h.session.is_draining_request(draining_req)
+    finally:
+        await close_harness(h)
+
+
 # --------------------------------------------------------------------------- #
 # Turn mode (no auto response)                                                #
 # --------------------------------------------------------------------------- #

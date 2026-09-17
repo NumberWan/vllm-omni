@@ -1033,6 +1033,40 @@ async def test_append_bytes_are_reserved_at_admission_until_the_runner_dequeues(
         gate.set()
 
 
+async def test_append_admission_counts_audio_and_video_frame_bytes() -> None:
+    """Manager reserves len(audio)+Σlen(frame); video bytes count toward the same limit."""
+    async with Harness.create(max_sessions=1, max_pending_input_bytes_per_session=20) as harness:
+        await harness.open("sid-av")
+        harness.events()
+        session = harness.session("sid-av")
+        runner = harness.manager.runners["sid-av"]
+        gate = asyncio.Event()
+        runner._mailbox.put_nowait(_Internal("wait", {"gate": gate}))
+        runner._on_internal = lambda item: gate.wait()  # type: ignore[method-assign]
+        await asyncio.sleep(0)
+
+        # Default caps require audio; attach video to a non-empty audio unit.
+        frame_a = "aaaa"
+        frame_b = "bbbbbb"
+        audio = b"1234"
+        expected = len(audio) + len(frame_a) + len(frame_b)
+        harness.command(
+            "sid-av",
+            AppendAudio(audio=audio, video_frames=(frame_a, frame_b), event_id="evt-av"),
+        )
+        assert session.pending_input_bytes == expected
+        # Second append that would exceed the limit is backpressured.
+        harness.command(
+            "sid-av",
+            AppendAudio(audio=b"x" * 10, video_frames=("yyyyyyyyyy",), event_id="evt-over"),
+        )
+        errors = [event for event in harness.events("sid-av") if isinstance(event, ErrorEvent)]
+        assert [error.code for error in errors] == ["input_backpressure"]
+        assert errors[0].related_event_id == "evt-over"
+        assert session.pending_input_bytes == expected
+        gate.set()
+
+
 async def test_expired_session_retains_the_admission_slot_until_cleanup_succeeds() -> None:
     async with Harness.create(max_sessions=1, idle_ttl_s=1.0) as harness:
         await harness.open("sid-expired")

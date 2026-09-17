@@ -163,14 +163,15 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
 
 def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
     """Turn-scoped Stage request id for non-resumable (ephemeral) duplex models."""
-    return duplex_resource_request_id(fence, f"stage{stage_id}_t{fence.turn_id}")
+    return duplex_resource_request_id(fence, f"stage{stage_id}-turn{fence.turn_id}")
 
 
-_EPHEMERAL_TURN_IN_REQUEST_ID = re.compile(r"\.r\.stage\d+_t(\d+)$")
+# Main format ``stage{N}-turn{T}``; also accept legacy PR ``stage{N}_t{T}``.
+_EPHEMERAL_TURN_IN_REQUEST_ID = re.compile(r"\.r\.stage\d+(?:-turn|_t)(\d+)$")
 
 
 def duplex_turn_id_from_request_id(request_id: str | None) -> int | None:
-    """Parse ``…r.stage{N}_t{turn}`` ephemeral ids; ``None`` if not that shape."""
+    """Parse ephemeral ``…r.stage{N}-turn{T}`` (or legacy ``_t{T}``) ids."""
     if not isinstance(request_id, str):
         return None
     match = _EPHEMERAL_TURN_IN_REQUEST_ID.search(request_id)

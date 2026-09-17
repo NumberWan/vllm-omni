@@ -54,7 +54,7 @@ def test_multimodal_skips_empty_outer_dict_and_reads_completion() -> None:
 
 def test_project_emits_audio_from_multimodal_completion() -> None:
     plane = AuraDataPlaneSession(_encode)
-    request_id = "duplex-s.test.e.0.r.stage0_t0"
+    request_id = "duplex-s.test.e.0.r.stage0-turn0"
     plane.begin_request(request_id)
     mm = MultimodalPayload.from_raw(
         {"model_outputs": [torch.zeros(16)], "sr": [torch.tensor(24000)]},
@@ -86,7 +86,7 @@ def test_streaming_chunk_completion_finished_is_not_turn_eos() -> None:
     WS response.* never leave the engine.
     """
     plane = AuraDataPlaneSession(_encode)
-    request_id = "duplex-s.test.e.0.r.stage0_t0"
+    request_id = "duplex-s.test.e.0.r.stage0-turn0"
     plane.begin_request(request_id)
     mm = MultimodalPayload.from_raw(
         {"model_outputs": [torch.zeros(16)], "sr": [torch.tensor(24000)]},

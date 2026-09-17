@@ -21,7 +21,7 @@ def _encode_audio(audio: object, sample_rate: int, fmt: str, speed: float | None
 
 def test_project_unwraps_data_plane_outputs_and_emits_audio_then_done() -> None:
     plane = AuraDataPlaneSession(_encode_audio)
-    request_id = "duplex-s.abc.e.0.r.stage0_t1"
+    request_id = "duplex-s.abc.e.0.r.stage0-turn1"
     plane.begin_request(request_id)
     audio = np.zeros(16, dtype=np.float32)
     output = SimpleNamespace(
@@ -47,7 +47,7 @@ def test_project_unwraps_data_plane_outputs_and_emits_audio_then_done() -> None:
 
 def test_project_holds_silent_token_prefix() -> None:
     plane = AuraDataPlaneSession(_encode_audio)
-    request_id = "duplex-s.abc.e.0.r.stage1_t1"
+    request_id = "duplex-s.abc.e.0.r.stage1-turn1"
     plane.begin_request(request_id)
     partial = SimpleNamespace(
         request_id=request_id,
@@ -76,7 +76,7 @@ def test_project_emits_chinese_brackets_immediately() -> None:
 
 def test_project_flushes_held_silent_prefix_when_text_becomes_speech() -> None:
     plane = AuraDataPlaneSession(_encode_audio)
-    request_id = "duplex-s.abc.e.0.r.stage1_t3"
+    request_id = "duplex-s.abc.e.0.r.stage1-turn3"
     plane.begin_request(request_id)
     partial = SimpleNamespace(
         request_id=request_id,

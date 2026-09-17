@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ephemeral Stage0 bind uses r.stage0_t{N}, not resumable r.stage0."""
+"""Ephemeral Stage0 bind uses r.stage0-turn{N}, not resumable r.stage0."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def test_stage0_request_id_ephemeral_when_not_resumable() -> None:
     rid = DuplexSessionManager.stage_request_id(fence, stage_id=0, resumable=False)
     expected = duplex_ephemeral_stage_request_id(fence, stage_id=0)
     assert rid == expected
-    assert rid.endswith(".r.stage0_t3")
+    assert rid.endswith(".r.stage0-turn3")
     assert not rid.endswith(".r.stage0")
 
 

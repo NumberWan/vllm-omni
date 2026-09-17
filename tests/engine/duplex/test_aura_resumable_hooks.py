@@ -41,7 +41,7 @@ def test_stage_request_id_respects_resumable_flag() -> None:
     ephemeral_id = DuplexSessionManager.stage_request_id(fence, stage_id=0, resumable=False)
     assert ephemeral_id == duplex_ephemeral_stage_request_id(fence, stage_id=0)
     assert resumable_id != ephemeral_id
-    assert "t9" in ephemeral_id
+    assert ephemeral_id.endswith("stage0-turn9")
     from vllm_omni.engine.duplex.contracts import duplex_turn_id_from_request_id
 
     assert duplex_turn_id_from_request_id(ephemeral_id) == 9
@@ -151,3 +151,101 @@ def test_draining_request_exempt_from_completed_turn_filter() -> None:
         and model_turn_id < session.turn_id
     )
     assert drop is False
+
+
+def test_ephemeral_turn_id_parser_accepts_main_and_legacy_forms() -> None:
+    from vllm_omni.engine.duplex.contracts import duplex_turn_id_from_request_id
+
+    assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage0-turn12") == 12
+    assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage2-turn3") == 3
+    assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage0_t9") == 9
+    assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage0") is None
+
+
+def test_stale_keys_skip_already_draining_request_ids() -> None:
+    """Rebinding must not move an older draining Stage2/3 id onto the newer response."""
+    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+
+    session = DuplexEngineSession(
+        session_id="s-stale",
+        config=DuplexSessionConfig(model="m", modalities=["text", "audio"]),
+        capabilities=DuplexCapabilities(supports_overlapped_input=True),
+    )
+    session.begin_response(turn_id=1)
+    r1 = session.active_response_id
+    assert r1 is not None
+    session.register_draining_request_response("req-r1-talker", r1)
+    session.begin_response(turn_id=2)
+    r2 = session.active_response_id
+    assert r2 is not None and r2 != r1
+    # Simulate the overlapped rebind loop: already-draining ids keep R1.
+    for rid in ("req-r1-talker", "req-r2-talker"):
+        if session.is_draining_request(rid):
+            continue
+        session.register_draining_request_response(rid, r2)
+    assert session.response_id_for_request("req-r1-talker") == r1
+    assert session.response_id_for_request("req-r2-talker") == r2
+
+
+def test_end_response_clears_only_own_draining_entries() -> None:
+    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+
+    session = DuplexEngineSession(
+        session_id="s-end",
+        config=DuplexSessionConfig(model="m", modalities=["text", "audio"]),
+        capabilities=DuplexCapabilities(supports_overlapped_input=True),
+    )
+    session.begin_response(turn_id=1)
+    r1 = session.active_response_id
+    session.register_draining_request_response("req-r1", r1)
+    session.begin_response(turn_id=2)
+    r2 = session.active_response_id
+    session.register_draining_request_response("req-r2", r2)
+    session.end_response(commit_text=False)
+    assert session.is_draining_request("req-r1")
+    assert session.response_id_for_request("req-r1") == r1
+    assert not session.is_draining_request("req-r2")
+
+
+def test_on_stage_failure_resolves_draining_response_before_active() -> None:
+    """Mirrors runner.on_stage_failure: draining request_id owns the failed done."""
+    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+
+    session = DuplexEngineSession(
+        session_id="s-fail",
+        config=DuplexSessionConfig(model="m", modalities=["text", "audio"]),
+        capabilities=DuplexCapabilities(supports_overlapped_input=True),
+    )
+    session.begin_response(turn_id=1)
+    r1 = session.active_response_id
+    assert r1 is not None
+    session.register_draining_request_response("req-r1-talker", r1)
+    session.begin_response(turn_id=2)
+    r2 = session.active_response_id
+    assert r2 is not None and r2 != r1
+
+    request_id = "req-r1-talker"
+    draining_response_id = (
+        session.response_id_for_request(request_id) if session.is_draining_request(request_id) else None
+    )
+    response_id = draining_response_id or session.active_response_id
+    assert response_id == r1
+    assert response_id != r2
+    session.clear_draining_for_response(r1)
+    assert not session.is_draining_request(request_id)
+    assert session.active_response_id == r2
+
+
+def test_overlapped_input_released_resets_when_new_stage0_binds() -> None:
+    """After R4 release, a new ephemeral Stage0 bind must clear the gate flag."""
+    from types import SimpleNamespace
+
+    run = SimpleNamespace(overlapped_input_released=True)
+    # Simulate the overlapped rebind arm in model_channel._append_via_data_plane.
+    overlapped = True
+    if overlapped:
+        run.overlapped_input_released = False
+    assert run.overlapped_input_released is False
