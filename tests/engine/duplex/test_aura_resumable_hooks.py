@@ -96,12 +96,12 @@ def test_active_response_accepts_own_turn_when_overlapped_input() -> None:
     assert session.active_response_accepts_model_turn(3)
     assert not session.active_response_accepts_model_turn(4)
     assert not session.active_response_accepts_model_turn(2)
-    session.register_draining_request_response("req-old", "resp-old")
+    session.bind_draining_request("req-old", "resp-old")
     assert session.response_id_for_request("req-old") == "resp-old"
     assert session.is_draining_request("req-old")
 
     # Ending the active response must not wipe older draining bindings.
-    session.register_draining_request_response("req-newer-tts", session.active_response_id or "resp-active")
+    session.bind_draining_request("req-newer-tts", session.active_response_id or "resp-active")
     ended = session.active_response_id
     session.end_response(commit_text=False)
     assert session.is_draining_request("req-old")
@@ -134,7 +134,7 @@ def test_draining_request_exempt_from_completed_turn_filter() -> None:
     session.begin_response(turn_id=1)
     r1 = session.active_response_id
     assert r1 is not None
-    session.register_draining_request_response("req-r1-tts", r1)
+    session.bind_draining_request("req-r1-tts", r1)
     # Overlapping R2 becomes active, then finishes — must not wipe R1 draining.
     session.begin_response(turn_id=2)
     session.end_response(commit_text=False)
@@ -175,7 +175,7 @@ def test_stale_keys_skip_already_draining_request_ids() -> None:
     session.begin_response(turn_id=1)
     r1 = session.active_response_id
     assert r1 is not None
-    session.register_draining_request_response("req-r1-talker", r1)
+    session.bind_draining_request("req-r1-talker", r1)
     session.begin_response(turn_id=2)
     r2 = session.active_response_id
     assert r2 is not None and r2 != r1
@@ -183,7 +183,7 @@ def test_stale_keys_skip_already_draining_request_ids() -> None:
     for rid in ("req-r1-talker", "req-r2-talker"):
         if session.is_draining_request(rid):
             continue
-        session.register_draining_request_response(rid, r2)
+        session.bind_draining_request(rid, r2)
     assert session.response_id_for_request("req-r1-talker") == r1
     assert session.response_id_for_request("req-r2-talker") == r2
 
@@ -199,10 +199,10 @@ def test_end_response_clears_only_own_draining_entries() -> None:
     )
     session.begin_response(turn_id=1)
     r1 = session.active_response_id
-    session.register_draining_request_response("req-r1", r1)
+    session.bind_draining_request("req-r1", r1)
     session.begin_response(turn_id=2)
     r2 = session.active_response_id
-    session.register_draining_request_response("req-r2", r2)
+    session.bind_draining_request("req-r2", r2)
     session.end_response(commit_text=False)
     assert session.is_draining_request("req-r1")
     assert session.response_id_for_request("req-r1") == r1
@@ -222,7 +222,7 @@ def test_on_stage_failure_resolves_draining_response_before_active() -> None:
     session.begin_response(turn_id=1)
     r1 = session.active_response_id
     assert r1 is not None
-    session.register_draining_request_response("req-r1-talker", r1)
+    session.bind_draining_request("req-r1-talker", r1)
     session.begin_response(turn_id=2)
     r2 = session.active_response_id
     assert r2 is not None and r2 != r1

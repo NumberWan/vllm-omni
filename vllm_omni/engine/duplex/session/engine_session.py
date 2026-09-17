@@ -107,7 +107,7 @@ class ResponseState:
     last_response_id: str | None = None
     #: Overlapped-input: prior-turn Stage2/3 request ids still draining under
     #: their own ``response_id`` after the next turn opened a new response.
-    draining_request_responses: dict[str, str] = field(default_factory=dict)
+    draining_response_by_request: dict[str, str] = field(default_factory=dict)
     assistant_text_buffer: list[str] = field(default_factory=list)
     assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
     pending_options: ResponseCreateOptions | None = None
@@ -598,29 +598,30 @@ class DuplexEngineSession:
             return True
         return False
 
-    def register_draining_request_response(self, request_id: str, response_id: str) -> None:
+    def bind_draining_request(self, request_id: str, response_id: str) -> None:
+        """Map a still-playing Stage2/3 request onto the response that owns it."""
         if request_id and response_id:
-            self._response.draining_request_responses[request_id] = response_id
+            self._response.draining_response_by_request[request_id] = response_id
 
     def response_id_for_request(self, request_id: str | None) -> str | None:
-        if isinstance(request_id, str) and request_id in self._response.draining_request_responses:
-            return self._response.draining_request_responses[request_id]
+        if isinstance(request_id, str) and request_id in self._response.draining_response_by_request:
+            return self._response.draining_response_by_request[request_id]
         return self._response.active_response_id
 
-    def pop_draining_request_response(self, request_id: str | None) -> str | None:
+    def pop_draining_request(self, request_id: str | None) -> str | None:
         if not isinstance(request_id, str):
             return None
-        return self._response.draining_request_responses.pop(request_id, None)
+        return self._response.draining_response_by_request.pop(request_id, None)
 
     def is_draining_request(self, request_id: str | None) -> bool:
-        return isinstance(request_id, str) and request_id in self._response.draining_request_responses
+        return isinstance(request_id, str) and request_id in self._response.draining_response_by_request
 
     def clear_draining_for_response(self, response_id: str | None) -> None:
         """Drop draining bindings owned by ``response_id``; leave other responses intact."""
         if response_id is None:
             return
-        self._response.draining_request_responses = {
-            rid: resp for rid, resp in self._response.draining_request_responses.items() if resp != response_id
+        self._response.draining_response_by_request = {
+            rid: resp for rid, resp in self._response.draining_response_by_request.items() if resp != response_id
         }
 
     def append_history_message(self, message: dict[str, object]) -> None:
@@ -1370,7 +1371,7 @@ class DuplexEngineSession:
         self._response.active_response_turn_id = None
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
-        self._response.draining_request_responses.clear()
+        self._response.draining_response_by_request.clear()
         self._clear_response_metrics()
         self._restore_response_config()
         self.turn_state = DuplexTurnState.BARGE_IN

@@ -936,7 +936,7 @@ async def test_stage_failure_on_draining_request_fails_that_response_only() -> N
         r1 = h.session.active_response_id
         assert r1 is not None
         draining_req = "req-r1-talker-drain"
-        h.session.register_draining_request_response(draining_req, r1)
+        h.session.bind_draining_request(draining_req, r1)
         # Open a newer active response while R1 TTS is still draining.
         r2 = h.session.begin_response(turn_id=(h.session.turn_id or 0) + 1)
         assert h.session.active_response_id == r2

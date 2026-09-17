@@ -243,7 +243,7 @@ class ModelChannel:
                         session.request_resources.pop((sid, rid), None)
                     elif prior_response_id is not None and not session.is_draining_request(rid):
                         # Already-draining ids keep their original response_id.
-                        session.register_draining_request_response(rid, prior_response_id)
+                        session.bind_draining_request(rid, prior_response_id)
                 self._ctx.run.overlapped_input_released = False
                 if prior_response_id is not None:
                     new_response_id = session.begin_response(turn_id=fence.turn_id)
@@ -974,7 +974,7 @@ class ModelChannel:
                 and isinstance(data_plane_request_id, str)
                 and session.is_draining_request(data_plane_request_id)
             ):
-                drained_response_id = session.pop_draining_request_response(data_plane_request_id)
+                drained_response_id = session.pop_draining_request(data_plane_request_id)
                 data_plane.close_stream(data_plane_request_id)
                 data_plane.mark_terminal(data_plane_request_id)
                 session.request_resources.pop((2, data_plane_request_id), None)
