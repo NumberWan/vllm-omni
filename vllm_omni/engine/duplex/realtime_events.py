@@ -1174,7 +1174,7 @@ def note_input_append(
     video_frames = payload.get("video_frames")
     has_video = isinstance(video_frames, list) and any(isinstance(frame, str) and frame for frame in video_frames)
     # Vision-carrying silent appends are real turn content only when the model
-    # opts into vision-follow (AURA). Without this gate MiniCPM camera sessions
+    # opts into vision-follow. Without this gate, turn-mode camera sessions
     # would treat silent+frames as buffer content and open a response.
     state.input_audio_buffer_has_audio = state.input_audio_buffer_has_audio or (
         looks_like_speech and has_audio

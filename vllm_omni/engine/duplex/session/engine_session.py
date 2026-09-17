@@ -590,7 +590,7 @@ class DuplexEngineSession:
             return False
         if turn_id is None:
             return True
-        # Overlapped AURA opens a new response_id per released turn; each
+        # Overlapped input opens a new response_id per released turn; each
         # response only accepts its own turn. Draining prior TTS is keyed by
         # request_id → response_id, not by this guard.
         active_turn_id = self._response.active_response_turn_id

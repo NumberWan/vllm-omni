@@ -97,8 +97,8 @@ class DuplexCapabilities:
     # Prior assistant TTS may keep draining while a new user commit is admitted.
     # Not barge-in (which aborts prior TTS).
     supports_overlapped_input: bool = False
-    #: Silent frames with video during TTS drain (AURA vision-follow). Off by
-    #: default so MiniCPM turn-mode / camera sessions keep empty-turn acks.
+    #: Silent frames with video during TTS drain. Off by default so
+    #: turn-mode / camera sessions keep empty-turn acks.
     supports_vision_follow: bool = False
     supports_stage_connector_handoff: bool = False
     supports_independent_io_streams: bool = False

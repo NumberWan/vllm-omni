@@ -880,7 +880,7 @@ class DuplexSessionRunner:
         elif not auto_responds and not overlap_policy.input_looks_like_speech(self.session, event, payload):
             # Turn-mode only: skip silent chunks so they don't open a response.
             # Vision-carrying silent appends must still buffer when the model
-            # opts into vision-follow (AURA).
+            # opts into vision-follow.
             frames = payload.get("video_frames")
             has_vision = isinstance(frames, list) and any(isinstance(frame, str) and frame for frame in frames)
             if not (has_vision and session.capabilities.supports_vision_follow):
