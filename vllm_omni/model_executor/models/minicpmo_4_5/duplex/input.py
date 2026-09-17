@@ -329,9 +329,7 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         """Reserve the terminal payload without invalidating prior appends."""
         had_speech = self._turn_had_speech
         reservation: MiniCPMO45PcmAppendReservation | None = None
-        # Speech must flush. Frames-only flush is AURA vision-follow; MiniCPM
-        # keeps empty-turn acks unless it opts into supports_vision_follow.
-        if self._buffer and had_speech:
+        if had_speech and self._buffer:
             payload: dict[str, object] = {
                 "type": "audio",
                 "audio": "",
