@@ -18,6 +18,15 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
+# AURA-only: tolerate spurious Process.sentinel during colocated Stage0–3 init
+# without changing shared stage_engine_core_proc_manager.py.
+# Gated by VLLM_AURA_STAGE_LIVENESS_PATCH=1 (run_duplex_smoke_serve.sh).
+from vllm_omni.model_executor.models.aura_omni.duplex.stage_liveness_patch import (
+    maybe_install_aura_stage_liveness_patch,
+)
+
+maybe_install_aura_stage_liveness_patch()
+
 _AURA_PROC = "vllm_omni.model_executor.stage_input_processors.aura_omni"
 _QWEN3_TTS_PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
 

@@ -13,9 +13,8 @@ own ZMQ allocation from :class:`OmniMasterServer` and (when an
 ``omni_coordinator_address`` is provided) its own
 :class:`OmniCoordClientForStage` reporting heartbeat / status.
 
-Liveness monitoring overrides upstream :meth:`CoreEngineProcManager.monitor_engine_liveness`
-so a spurious Process sentinel cannot SIGTERM a still-alive stage engine during
-multi-stage colocated init.
+Liveness monitoring and shutdown are inherited from
+:class:`CoreEngineProcManager` unchanged.
 """
 
 from __future__ import annotations
@@ -167,78 +166,3 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         finally:
             if self.finished_procs():
                 self.shutdown()
-
-    def monitor_engine_liveness(self) -> None:
-        """Monitor engine core process liveness.
-
-        Upstream treats Process.sentinel readiness as "child exited" and always
-        ``shutdown()``s. During multi-stage colocated init, an earlier stage's
-        sentinel can become permanently readable while that OS process is still
-        alive; SIGTERM'ing on that signal kills healthy engines ~20s into the
-        next stage's init.
-
-        When a sentinel is ready but ``is_alive()`` is still true, drop that
-        sentinel and fall back to polling ``is_alive()`` for that proc.
-        """
-        import multiprocessing.connection as connection
-        from typing import cast
-
-        sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
-        sentinels = set(sentinel_to_proc.keys())
-        # Procs whose sentinel became unreliable; poll is_alive() instead.
-        poll_procs: set[BaseProcess] = set()
-
-        while not self.manager_stopped.is_set():
-            if sentinels:
-                died_sentinels = connection.wait(list(sentinels), timeout=1.0)
-            else:
-                self.manager_stopped.wait(timeout=1.0)
-                died_sentinels = []
-
-            confirmed_dead = False
-            for sentinel in died_sentinels:
-                proc = sentinel_to_proc.get(cast(int, sentinel))
-                if proc is None:
-                    sentinels.discard(sentinel)
-                    continue
-                proc.join(timeout=0)
-                if proc.is_alive():
-                    logger.warning(
-                        "[StageEngineCoreProcManager] spurious sentinel for still-alive "
-                        "%s (pid=%s); switching to is_alive polling",
-                        proc.name,
-                        proc.pid,
-                    )
-                    sentinels.discard(sentinel)
-                    poll_procs.add(proc)
-                    continue
-                sentinel_to_proc.pop(cast(int, sentinel), None)
-                sentinels.discard(sentinel)
-                poll_procs.discard(proc)
-                if proc.exitcode not in (None, 0) and not self.manager_stopped.is_set():
-                    self.failed_proc_name = proc.name
-                confirmed_dead = True
-
-            still_polling: set[BaseProcess] = set()
-            for proc in poll_procs:
-                if proc.is_alive():
-                    still_polling.add(proc)
-                    continue
-                if proc.exitcode not in (None, 0) and not self.manager_stopped.is_set():
-                    self.failed_proc_name = proc.name
-                confirmed_dead = True
-            poll_procs = still_polling
-
-            if confirmed_dead:
-                break
-            if not sentinels and not poll_procs:
-                break
-
-        if self.manager_stopped.is_set() or any(not p.is_alive() for p in self.processes):
-            self.shutdown()
-        else:
-            logger.error(
-                "[StageEngineCoreProcManager] monitor ended without dead procs; "
-                "not shutting down. procs=%s",
-                [(p.name, p.pid, p.is_alive(), p.exitcode) for p in self.processes],
-            )

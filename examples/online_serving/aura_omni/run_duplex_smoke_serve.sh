@@ -18,6 +18,8 @@ export VLLM_AURA_ASSISTANT_TOKEN_ID="${VLLM_AURA_ASSISTANT_TOKEN_ID:-77091}"
 # Multi-stage colocated init can make earlier stages' Process.sentinel spuriously
 # readable; prefer spawn for stage engine subprocesses (override if needed).
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+# Enable AURA-local monitor patch (aura_omni/duplex/stage_liveness_patch.py).
+export VLLM_AURA_STAGE_LIVENESS_PATCH="${VLLM_AURA_STAGE_LIVENESS_PATCH:-1}"
 # Do NOT set TORCHDYNAMO_DISABLE here: it breaks Stage0/1 AOT when those
 # stages are not enforce_eager. Stage2/3 use enforce_eager; code_predictor
 # honors that and skips its own torch.compile.
