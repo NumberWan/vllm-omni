@@ -31,16 +31,6 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_empty_stage_connector_spec_is_role_less():
-    """Empty connector edge must stay role-less (MiniCPM Stage0 async_chunk bridge)."""
-    from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
-
-    cfg = OmniEngineArgs(stage_id=0, stage_connector_spec={}).create_model_config()
-    assert cfg.stage_connector_config["extra"] == {"stage_id": 0}
-    assert "role" not in cfg.stage_connector_config["extra"]
-    assert stage_sends_async_output(cfg) is False
-
-
 def test_sync_config_is_omni():
     """Ensure create_model_config gives the right type."""
     cfg = OmniEngineArgs().create_model_config()

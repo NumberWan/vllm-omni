@@ -310,22 +310,12 @@ class OmniEngineArgs(EngineArgs):
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 
-        # Build stage_connector_config from stage_connector_spec.
-        # An empty spec means this stage has no connector data-plane edge —
-        # leave it role-less so Stage0 keeps the RequestOutput path under
-        # async_chunk. Outgoing edges get ``role: sender`` from
-        # get_stage_connector_spec instead.
-        if self.stage_connector_spec:
-            stage_connector_config = {
-                "name": self.stage_connector_spec.get("name", "SharedMemoryConnector"),
-                "extra": self.stage_connector_spec.get("extra", {}).copy(),
-            }
-            stage_connector_config["extra"]["stage_id"] = self.stage_id
-        else:
-            stage_connector_config = {
-                "name": "SharedMemoryConnector",
-                "extra": {"stage_id": self.stage_id},
-            }
+        # Build stage_connector_config from stage_connector_spec
+        stage_connector_config = {
+            "name": self.stage_connector_spec.get("name", "SharedMemoryConnector"),
+            "extra": self.stage_connector_spec.get("extra", {}).copy(),
+        }
+        stage_connector_config["extra"]["stage_id"] = self.stage_id
 
         hf_overrides = cast(dict[str, Any] | Callable[[Any], Any] | None, getattr(self, "hf_overrides", None))
         # If model_arch is specified, inject it into hf_overrides so vLLM can
