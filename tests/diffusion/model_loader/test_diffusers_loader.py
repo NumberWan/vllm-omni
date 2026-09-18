@@ -1118,6 +1118,46 @@ def test_cpu_offload_keeps_autoround_w4a16_construction_on_cpu(monkeypatch):
     assert device.type == "cpu"
 
 
+def test_cpu_offload_autoround_w4a16_prepack_target_is_cuda(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            use_hsdp=False,
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            sequence_parallel_size=1,
+        ),
+        quantization_config=SimpleNamespace(
+            data_type="int",
+            packing_format="auto_round:auto_gptq",
+            is_checkpoint_quantized=False,
+        ),
+        enable_cpu_offload=True,
+        enable_distributed_layerwise_offload=False,
+        dlo_use_allgather=False,
+        model="unused",
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    process_devices: list[torch.device] = []
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader.load_weights = lambda _model, **_kwargs: None  # type: ignore[method-assign]
+    loader._process_weights_after_loading = lambda _model, dev: process_devices.append(dev)  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(None, "skip mmap"),
+    )
+    loader.load_model(load_device="cpu", device=torch.device("cuda"))
+    assert process_devices and process_devices[0].type == "cuda"
+    assert model.transformer.weight.device.type == "cpu"
+
+
 def test_cpu_offload_online_quant_still_constructs_on_accelerator(monkeypatch):
     device = _cpu_offload_init_device(
         monkeypatch,

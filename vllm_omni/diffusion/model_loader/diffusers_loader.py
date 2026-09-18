@@ -95,10 +95,10 @@ def is_offline_checkpoint_quant_config(quant_cfg: object | None) -> bool:
     """True when packed weights already live in the checkpoint.
 
     CPU offload otherwise treats any ``quant_config`` as online quantization and
-    rebuilds modules on CUDA. AutoRound INT W4A16 (``packing_format``
+    rebuilds the whole pipeline on CUDA. AutoRound INT W4A16 (``packing_format``
     ``auto_round:auto_gptq``) is packed on disk but is not ``data_type=mx_fp``
-    and often lacks ``is_checkpoint_quantized``, which OOMs Qwen-Image on 22 GiB
-    L4 (#7555).
+    and often lacks ``is_checkpoint_quantized``. That mis-label puts the DiT on
+    CUDA beside the BF16 text encoder and OOMs a 22 GiB L4 (#7555).
     """
     if quant_cfg is None:
         return False
@@ -107,6 +107,20 @@ def is_offline_checkpoint_quant_config(quant_cfg: object | None) -> bool:
     data_type = getattr(quant_cfg, "data_type", None)
     if data_type == "mx_fp":
         return True
+    packing = getattr(quant_cfg, "packing_format", None)
+    return isinstance(packing, str) and packing.startswith("auto_round:")
+
+
+def autoround_int_needs_cuda_prepack(quant_cfg: object | None) -> bool:
+    """True when post-load packing is CUDA-only (Machete), so the DiT cannot stay on CPU.
+
+    MXFP8 (``data_type=mx_fp``) is already packed and does not take this path.
+    Callers still keep the text encoder and VAE on CPU under model-level offload;
+    only ``process_weights_after_loading`` runs on the accelerator, then the DiT
+    returns to CPU before the offload backend brings the encoder up (#7555).
+    """
+    if quant_cfg is None or getattr(quant_cfg, "data_type", None) == "mx_fp":
+        return False
     packing = getattr(quant_cfg, "packing_format", None)
     return isinstance(packing, str) and packing.startswith("auto_round:")
 
@@ -674,9 +688,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # For online quantization, load on device so quantization can run on accelerator,
         # then move back to CPU afterward.
         offload_after_quant = False
+        cuda_prepack = False
         if load_device == "cpu" and self.quant_config is not None and device is not None:
             is_offline = is_offline_checkpoint_quant_config(self.quant_config)
-            if not is_offline:
+            # Packed AutoRound INT still needs Machete on CUDA. Do not rebuild the
+            # whole pipeline there (that stacks the BF16 encoder on the DiT).
+            if autoround_int_needs_cuda_prepack(self.quant_config):
+                cuda_prepack = True
+                logger.info(
+                    "AutoRound INT with CPU offload: DiT prepack on %s; encoder/VAE stay on CPU",
+                    device,
+                )
+            elif not is_offline:
                 load_device = device.type
                 offload_after_quant = True
                 logger.info(
@@ -833,7 +856,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         else:
                             self.load_weights(model)
                     self._maybe_fuse_distilled_lora(model)
-                    self._process_weights_after_loading(model, target_device)
+                    process_device = device if cuda_prepack else target_device
+                    self._process_weights_after_loading(model, process_device)
+                    if cuda_prepack and hasattr(model, "transformer"):
+                        # Free the accelerator before model-level offload moves the encoder on.
+                        model.transformer.to("cpu")
 
                 # A warm final-layout hit has already completed all
                 # byte-changing work through the restorer.  Shared runtime
