@@ -1174,7 +1174,7 @@ def note_input_append(
     video_frames = payload.get("video_frames")
     has_video = isinstance(video_frames, list) and any(isinstance(frame, str) and frame for frame in video_frames)
     # Vision-carrying silent appends are real turn content only when the model
-    # allows video without required audio (R1). Without this gate, turn-mode
+    # allows video without required audio. Without this gate, turn-mode
     # camera sessions would treat silent+frames as buffer content and open a response.
     state.input_audio_buffer_has_audio = (
         state.input_audio_buffer_has_audio

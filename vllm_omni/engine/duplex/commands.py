@@ -94,7 +94,7 @@ class UpdateSession(DuplexCommand, _duplex_wire.UpdateSession):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
     type: ClassVar[str] = "input_audio_buffer.append"
-    #: Empty ``audio`` with ``video_frames`` is legal under R1 capabilities.
+    #: Empty ``audio`` with ``video_frames`` is legal when capabilities allow video without audio.
     audio: bytes = b""
 
     def payload(self) -> dict[str, object]:

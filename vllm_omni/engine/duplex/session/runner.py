@@ -814,7 +814,7 @@ class DuplexSessionRunner:
         sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else 16000
         client_force_listen = bool(event.get("force_listen", False))
         if video_only:
-            # No PCM to decode; frames alone are the turn content under R1.
+            # No PCM to decode; frames alone are the turn content.
             fmt = "pcm_f32le"
             event = dict(event)
             event.pop("audio", None)
@@ -923,7 +923,7 @@ class DuplexSessionRunner:
         elif not auto_responds and not overlap_policy.input_looks_like_speech(self.session, event, payload):
             # Turn-mode only: skip silent chunks so they don't open a response.
             # Vision-carrying silent appends must still buffer when the model
-            # allows video without required audio (R1).
+            # allows video without required audio.
             frames = payload.get("video_frames")
             has_vision = isinstance(frames, list) and any(isinstance(frame, str) and frame for frame in frames)
             if not (has_vision and session.capabilities.allows_video_without_audio()):

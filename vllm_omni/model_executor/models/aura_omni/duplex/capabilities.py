@@ -23,7 +23,7 @@ def aura_duplex_capabilities(*, max_sessions: int = 1) -> DuplexCapabilities:
         supports_scheduler_native_append=False,
         supports_core_resumable_request=False,
         supports_overlapped_commit=True,
-        # R1: video-compulsory, audio-optional (vision-only / silent+frames legal).
+        # Video required, audio optional (vision-only / silent+frames legal).
         required_input_modalities=frozenset({"video"}),
         optional_input_modalities=frozenset({"audio"}),
         supports_stage_connector_handoff=False,

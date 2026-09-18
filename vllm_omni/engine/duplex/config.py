@@ -97,7 +97,7 @@ class DuplexCapabilities:
     # Prior assistant TTS may keep draining while a new user commit is admitted.
     # Not barge-in (which aborts prior TTS).
     supports_overlapped_commit: bool = False
-    #: Input modality contract (R1). Defaults match audio-primary duplex (e.g. MiniCPM):
+    #: Input modality contract. Defaults match audio-primary duplex (e.g. MiniCPM):
     #: audio required, video optional when attached to an audio unit.
     required_input_modalities: frozenset[str] = field(default_factory=lambda: frozenset({"audio"}))
     optional_input_modalities: frozenset[str] = field(default_factory=lambda: frozenset({"video"}))

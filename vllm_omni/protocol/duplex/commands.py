@@ -55,7 +55,7 @@ class AppendAudio(realtime_commands.AppendAudio):
     speech, camera frames captured alongside it, and its timing --- all
     additive, all ignored by a stock client. Empty ``audio`` with
     ``video_frames`` is legal when session capabilities allow video without
-    required audio (R1).
+    required audio.
     """
 
     #: Model-neutral hints carried through from the wire (rms, vad, transcript hints ...).
