@@ -273,6 +273,21 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         del output, context
         return stage_id == 1
 
+    async def forward_partial_stage_output(
+        self,
+        orchestrator: Any,
+        stage_id: int,
+        replica_id: int,
+        output: Any,
+        req_state: Any,
+    ) -> None:
+        """Stage1 sentence handoff. Other duplex models do not implement this."""
+        from vllm_omni.model_executor.models.aura_omni.duplex.sentence_tts import (
+            forward_partial_stage_output,
+        )
+
+        await forward_partial_stage_output(orchestrator, stage_id, replica_id, output, req_state)
+
     def release_overlapped_commit(
         self,
         *,
