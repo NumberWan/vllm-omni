@@ -309,9 +309,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 fence=context.fence,
                 config_generation=context.config_generation,
             )
-            # Resumable resident Stage0 keeps streaming.enabled. Ephemeral
-            # turn-commit must leave it off: otherwise downstream stages look
-            # still-held after finish and max_num_seqs=1 parks the next turn.
             request_state.streaming.enabled = self.plugin.capabilities(
                 max_sessions=self.duplex_session_config.max_sessions
             ).supports_core_resumable_request
