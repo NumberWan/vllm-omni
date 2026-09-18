@@ -214,7 +214,7 @@ class ModelChannel:
         lease_operation_id = f"append:{operation_id or uuid.uuid4().hex}"
         operation_started = False
         stage_id = 0
-        resumable = bool(session.capabilities.supports_core_resumable_request)
+        resumable = session.capabilities.supports_core_resumable_request
         request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=resumable)
         # Ephemeral turn-commit cannot submit_update on a finished stage0 id.
         # Bump turn_id and open a fresh ephemeral request instead.
@@ -223,7 +223,7 @@ class ModelChannel:
             # Keys are ``(stage_id, request_id)``; values are DuplexRequestResource.
             stale_keys = list(session.request_resources.keys())
             stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
-            overlapped = bool(
+            overlapped = (
                 session.capabilities.supports_overlapped_input and self._ctx.run.overlapped_input_released
             )
             # Prior TTS may still drain under the same response_id; acceptance
@@ -444,25 +444,21 @@ class ModelChannel:
         self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
     ) -> bool:
         """Project an intermediate stage without short-circuiting the pipeline."""
-        return bool(
-            self._ctx.plugin.observe_stage_output(
-                stage_id=stage_id,
-                output=output,
-                context=context,
-            )
+        return self._ctx.plugin.observe_stage_output(
+            stage_id=stage_id,
+            output=output,
+            context=context,
         )
 
     def release_overlapped_input(
         self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
     ) -> bool:
         """Ask the plugin whether the next commit may start while TTS drains."""
-        return bool(
-            self._ctx.plugin.release_overlapped_input(
-                stage_id=stage_id,
-                segment_finished=bool(context.segment_finished),
-                output=output,
-                context=context,
-            )
+        return self._ctx.plugin.release_overlapped_input(
+            stage_id=stage_id,
+            segment_finished=context.segment_finished,
+            output=output,
+            context=context,
         )
 
     @staticmethod

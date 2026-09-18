@@ -184,7 +184,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             return False
         # Resumable resident Stage0: stage failure closes the session.
         # Ephemeral turn-commit: free this turn's stages without tearing down WS.
-        close_session = bool(self.plugin.capabilities(max_sessions=1).supports_core_resumable_request)
+        close_session = self.plugin.capabilities(max_sessions=1).supports_core_resumable_request
         runner = self.session_manager.runner_for_request_id(req_id)
         if runner is not None:
             runner.on_stage_failure(next_stage_id, exc, request_id=req_id)
@@ -312,11 +312,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # Resumable resident Stage0 keeps streaming.enabled. Ephemeral
             # turn-commit must leave it off: otherwise downstream stages look
             # still-held after finish and max_num_seqs=1 parks the next turn.
-            request_state.streaming.enabled = bool(
-                self.plugin.capabilities(
-                    max_sessions=self.duplex_session_config.max_sessions
-                ).supports_core_resumable_request
-            )
+            request_state.streaming.enabled = self.plugin.capabilities(
+                max_sessions=self.duplex_session_config.max_sessions
+            ).supports_core_resumable_request
             self.request_states[context.request_id] = request_state
         elif isinstance(request_state, DuplexOrchestratorRequestState):
             if request_state.config_generation != context.config_generation:
@@ -348,7 +346,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         request_state = self.request_states.get(context.request_id)
         if not isinstance(request_state, DuplexOrchestratorRequestState):
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
-        request_state.streaming.enabled = bool(submission.resumable)
+        request_state.streaming.enabled = submission.resumable
         # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
         # stage input processors via process_engine_inputs.
         request_state.prompt = dict(submission.prompt)

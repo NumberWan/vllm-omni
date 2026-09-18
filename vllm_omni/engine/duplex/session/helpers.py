@@ -104,7 +104,7 @@ def next_commit_allowed(
     """
     if not response_in_progress(session, tasks):
         return True
-    return bool(session.capabilities.supports_overlapped_input and overlapped_input_released)
+    return session.capabilities.supports_overlapped_input and overlapped_input_released
 
 
 def assistant_playback_active(session: DuplexEngineSession) -> bool:
