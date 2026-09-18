@@ -226,3 +226,44 @@ def test_normalize_asr_transcript_strips_qwen3_asr_markup() -> None:
     raw = "language Chinese<asr_text>出现《古韵》这本书的时候，提醒我。"
     assert _normalize_asr_transcript(raw) == "出现《古韵》这本书的时候，提醒我。"
     assert _normalize_asr_transcript("出现古韵这本书的时候提醒我。") == "出现古韵这本书的时候提醒我。"
+
+
+def test_next_duplex_sentence_chunk_batches_until_min_chars(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_AURA_SENTENCE_TTS", raising=False)
+    monkeypatch.delenv("VLLM_AURA_SENTENCE_TTS_MIN_CHARS", raising=False)
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    state: dict[str, object] = {}
+    first = "甲" * 12 + "。"
+    assert next_duplex_sentence_chunk(state, first, finished=False) is None
+    second = first + "乙" * 20 + "。"
+    chunk = next_duplex_sentence_chunk(state, second, finished=False)
+    assert chunk is not None
+    assert chunk.startswith("甲" * 12)
+    assert "乙" * 20 in chunk
+
+
+def test_next_duplex_sentence_chunk_holds_think_silent_and_flushes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    assert next_duplex_sentence_chunk({}, "<think>still thinking", finished=False) is None
+    assert next_duplex_sentence_chunk({}, "<|silent|>", finished=True) is None
+    assert next_duplex_sentence_chunk({}, '<tool_call>{"a":1}</tool_call>', finished=False) is None
+
+    state: dict[str, object] = {}
+    assert next_duplex_sentence_chunk(state, "你好。", finished=False) is None
+    assert next_duplex_sentence_chunk(state, "你好。", finished=True) == "你好。"
+
+
+def test_next_duplex_sentence_chunk_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "0")
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    assert next_duplex_sentence_chunk({}, "甲" * 40 + "。", finished=False) is None

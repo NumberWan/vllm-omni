@@ -89,6 +89,24 @@ def test_aura2tts_duplex_commits_silent_into_history() -> None:
     drop_session_history("duplex-silent")
 
 
+def test_aura2tts_skips_history_on_sentence_partial() -> None:
+    drop_session_history("duplex-partial")
+    history = get_or_create_session_history("duplex-partial")
+    history.begin_user_turn("look")
+    prompt = {
+        "additional_information": {
+            "aura_duplex": True,
+            "aura_tts_partial": True,
+            "session_id": "duplex-partial",
+            "tts_task_type": "CustomVoice",
+            "tts_speaker": "Vivian",
+        }
+    }
+    assert len(aura2tts([_source_output("你好，这是一句测试。")], prompt=[prompt])) == 1
+    assert all(message.get("role") != "assistant" for message in history.messages)
+    drop_session_history("duplex-partial")
+
+
 def test_duplex_interception_commits_silent_history_without_aura2tts() -> None:
     """Silent Stage1 uses DIRECT_RESPONSE; history must commit on the data-plane path."""
     from vllm.outputs import CompletionOutput

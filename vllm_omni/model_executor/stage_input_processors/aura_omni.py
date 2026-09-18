@@ -196,6 +196,155 @@ def is_effectively_silent(text: str | None) -> bool:
     return not stripped or stripped == SILENT_TEXT
 
 
+# Native AURA sentence boundaries for incremental Stage1→TTS handoff.
+# Same rule as AURA_026 ``aura2tts_async_chunk``. Duplex applies it in the
+# orchestrator (not SHM ``from_stage_1``, which clears Talker text).
+_NATIVE_TTS_SENT_ENDS = frozenset("。！？；.!?;\n")
+_NATIVE_TTS_COMMA_ENDS = frozenset("，,")
+_NATIVE_TTS_MIN_CHARS = 10
+_NATIVE_TTS_MIN_EMIT_CHARS = 30
+
+
+def _sentence_tts_enabled() -> bool:
+    """Emit TTS per sentence while Stage1 still generates.
+
+    Default on. Disable with ``VLLM_AURA_SENTENCE_TTS=0``.
+    """
+    raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS") or "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _sentence_tts_min_emit_chars() -> int:
+    """Minimum content chars before a mid-generation TTS handoff."""
+    raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS_MIN_CHARS") or "").strip()
+    if not raw:
+        return _NATIVE_TTS_MIN_EMIT_CHARS
+    try:
+        return max(1, min(200, int(raw)))
+    except ValueError:
+        return _NATIVE_TTS_MIN_EMIT_CHARS
+
+
+def _tts_content_char_count(text: str) -> int:
+    """Count alphanumeric / CJK content chars (ignore punctuation/whitespace)."""
+    return sum(1 for ch in text if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+
+
+def _pop_native_tts_sentence(buf: str) -> tuple[str | None, str]:
+    """Pop one sentence from ``buf``; return (sentence_or_None, rest)."""
+    if not buf:
+        return None, buf
+    split_pos = -1
+    for i, ch in enumerate(buf):
+        if ch in _NATIVE_TTS_SENT_ENDS:
+            split_pos = i + 1
+            break
+        if ch in _NATIVE_TTS_COMMA_ENDS and i + 1 >= _NATIVE_TTS_MIN_CHARS:
+            split_pos = i + 1
+            break
+    if split_pos < 0:
+        return None, buf
+    sentence = buf[:split_pos]
+    rest = buf[split_pos:]
+    if not sentence.strip():
+        return _pop_native_tts_sentence(rest)
+    return sentence, rest
+
+
+def _pop_emit_ready_tts_text(
+    buf: str,
+    min_chars: int | None = None,
+) -> tuple[str | None, str]:
+    """Pop sentences until content length >= ``min_chars``."""
+    if min_chars is None:
+        min_chars = _sentence_tts_min_emit_chars()
+    parts: list[str] = []
+    rest = buf
+    while True:
+        sentence, rest = _pop_native_tts_sentence(rest)
+        if sentence is None:
+            break
+        parts.append(sentence)
+        if _tts_content_char_count("".join(parts)) >= min_chars:
+            return "".join(parts), rest
+    if not parts:
+        return None, buf
+    return None, "".join(parts) + rest
+
+
+def _tool_marker_pending(text: str) -> bool:
+    lowered = text.lower()
+    return "<tool_call" in lowered or "</tool_call" in lowered
+
+
+def next_duplex_sentence_chunk(state: dict[str, Any], raw_text: str, *, finished: bool) -> str | None:
+    """Return the next Talker sentence, or None when this output must not start TTS.
+
+    ``state`` is per Stage1 request and is mutated. Stage1 finish flushes any
+    leftover even under the min-char floor. Silent, an unclosed ``<think>``,
+    and tool markers do not emit mid-generation. A silent finish returns None
+    so the legacy full-text path can drop TTS.
+    """
+    if not _sentence_tts_enabled():
+        return None
+    raw = raw_text or ""
+    already = int(state.get("emits", 0))
+    if already == 0 and (is_silent_text_prefix(raw) or is_effectively_silent(raw)):
+        return None
+    think_open = "<think>" in raw.lower() and "</think>" not in raw.lower()
+    tool_pending = _tool_marker_pending(raw)
+    if (think_open or tool_pending) and not finished:
+        return None
+
+    text = _strip_assistant_text(raw)
+    if is_effectively_silent(text) and already == 0:
+        return None
+
+    emitted_prefix = str(state.get("emitted_prefix", ""))
+    pending = str(state.get("pending", ""))
+    if text.startswith(emitted_prefix):
+        new_tail = text[len(emitted_prefix) :]
+    else:
+        new_tail = text
+        pending = ""
+        emitted_prefix = ""
+    if new_tail:
+        pending = pending + new_tail
+        emitted_prefix = text
+        state["emitted_prefix"] = emitted_prefix
+
+    if not finished:
+        sentence, pending = _pop_emit_ready_tts_text(pending)
+        state["pending"] = pending
+        if sentence is None:
+            return None
+        state["emits"] = already + 1
+        state["last"] = sentence.strip()
+        return state["last"]
+
+    state["pending"] = ""
+    remainder = _strip_assistant_text(pending).strip()
+    if not remainder or is_effectively_silent(remainder):
+        return None
+    state["emits"] = already + 1
+    state["last"] = remainder
+    return remainder
+
+
+def commit_duplex_stage1_history(additional_info: dict[str, Any], text: str) -> None:
+    """Commit one Stage1 turn into duplex SessionHistory, if this prompt owns one."""
+    if additional_info.get("aura_tts_partial"):
+        return
+    session_id = additional_info.get("session_id") or additional_info.get("aura_session_id")
+    if not (additional_info.get("aura_duplex") and isinstance(session_id, str) and session_id):
+        return
+    from vllm_omni.model_executor.models.aura_omni.duplex.history import (
+        get_or_create_session_history,
+    )
+
+    get_or_create_session_history(session_id).commit_turn(text or SILENT_TEXT)
+
+
 def is_silent_text_prefix(text: str | None) -> bool:
     """True while streamed text is still a prefix of ``<|silent|>``.
 
@@ -420,13 +569,7 @@ def aura2tts(
         text = _strip_assistant_text(raw_text)
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
-        session_id = additional_info.get("session_id") or additional_info.get("aura_session_id")
-        if additional_info.get("aura_duplex") and isinstance(session_id, str) and session_id:
-            from vllm_omni.model_executor.models.aura_omni.duplex.history import (
-                get_or_create_session_history,
-            )
-
-            get_or_create_session_history(session_id).commit_turn(text or SILENT_TEXT)
+        commit_duplex_stage1_history(additional_info, text or SILENT_TEXT)
 
         if is_effectively_silent(text):
             continue
