@@ -13,8 +13,10 @@ own ZMQ allocation from :class:`OmniMasterServer` and (when an
 ``omni_coordinator_address`` is provided) its own
 :class:`OmniCoordClientForStage` reporting heartbeat / status.
 
-Liveness monitoring and shutdown are inherited from
-:class:`CoreEngineProcManager` unchanged.
+Shutdown is inherited from :class:`CoreEngineProcManager`. Liveness
+monitoring is overridden so a readable ``Process.sentinel`` is not treated
+as death until ``is_alive()`` confirms it (colocated multi-stage init can
+make an earlier stage's sentinel fire while that OS process is still alive).
 """
 
 from __future__ import annotations
@@ -22,8 +24,10 @@ from __future__ import annotations
 import contextlib
 import threading
 import weakref
+from multiprocessing import connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
+from typing import cast
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -79,7 +83,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
     ) -> None:
         # NOTE: we intentionally do not call ``super().__init__`` — the
         # parent's body hardcodes the wrong target. We re-implement it here
-        # while reusing the parent's instance methods (shutdown, monitor).
+        # while reusing the parent's shutdown(); liveness is overridden below.
         if local_engine_count <= 0:
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
 
@@ -166,3 +170,69 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         finally:
             if self.finished_procs():
                 self.shutdown()
+
+    def monitor_engine_liveness(self) -> None:
+        """Same contract as vLLM: exit of an engine core shuts the manager down.
+
+        Unlike the parent, a ready sentinel is ignored while ``is_alive()`` is
+        still true (switch that proc to polling). Spurious sentinels during
+        colocated multi-stage bring-up must not SIGTERM healthy later stages.
+        """
+        sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
+        sentinels = set(sentinel_to_proc.keys())
+        poll_procs: set[BaseProcess] = set()
+
+        while not self.manager_stopped.is_set():
+            if sentinels:
+                died_sentinels = connection.wait(list(sentinels), timeout=1.0)
+            else:
+                self.manager_stopped.wait(timeout=1.0)
+                died_sentinels = []
+
+            confirmed_dead = False
+            for sentinel in died_sentinels:
+                proc = sentinel_to_proc.get(cast(int, sentinel))
+                if proc is None:
+                    sentinels.discard(sentinel)
+                    continue
+                proc.join(timeout=0)
+                if proc.is_alive():
+                    logger.warning(
+                        "Spurious Process.sentinel for still-alive %s (pid=%s); "
+                        "switching to is_alive polling",
+                        proc.name,
+                        proc.pid,
+                    )
+                    sentinels.discard(sentinel)
+                    poll_procs.add(proc)
+                    continue
+                sentinel_to_proc.pop(cast(int, sentinel), None)
+                sentinels.discard(sentinel)
+                poll_procs.discard(proc)
+                if proc.exitcode not in (None, 0) and not self.manager_stopped.is_set():
+                    self.failed_proc_name = proc.name
+                confirmed_dead = True
+
+            still_polling: set[BaseProcess] = set()
+            for proc in poll_procs:
+                if proc.is_alive():
+                    still_polling.add(proc)
+                    continue
+                if proc.exitcode not in (None, 0) and not self.manager_stopped.is_set():
+                    self.failed_proc_name = proc.name
+                confirmed_dead = True
+            poll_procs = still_polling
+
+            if confirmed_dead:
+                break
+            if not sentinels and not poll_procs:
+                break
+
+        if self.manager_stopped.is_set() or any(not p.is_alive() for p in self.processes):
+            self.shutdown()
+        else:
+            logger.error(
+                "Stage engine liveness monitor ended without a dead process; "
+                "not shutting down. procs=%s",
+                [(p.name, p.pid, p.is_alive(), p.exitcode) for p in self.processes],
+            )
