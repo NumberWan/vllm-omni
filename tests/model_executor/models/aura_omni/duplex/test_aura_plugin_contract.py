@@ -8,8 +8,10 @@ from __future__ import annotations
 import base64
 
 import numpy as np
+import pytest
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexStageRequestContext,
@@ -18,6 +20,10 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_id,
 )
 from vllm_omni.engine.duplex.plugin import load_duplex_plugin
+from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import (
+    AuraDataPlaneContext,
+    AuraDataPlaneSession,
+)
 from vllm_omni.model_executor.models.aura_omni.duplex.history import (
     drop_session_history,
     get_or_create_session_history,
@@ -28,6 +34,8 @@ from vllm_omni.model_executor.models.aura_omni.duplex.plugin import (
     AuraDuplexPlugin,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import SILENT_TEXT
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _encode_audio(audio: object, sample_rate: int, fmt: str, speed: float | None) -> str | None:
@@ -58,7 +66,7 @@ def test_load_aura_duplex_plugin_and_sampling_arity() -> None:
     caps = plugin.capabilities(max_sessions=1)
     assert caps.supports_turn_commit_only is True
     assert caps.supports_core_resumable_request is False
-    assert caps.supports_overlapped_input is True
+    assert caps.supports_overlapped_commit is True
     assert caps.required_input_modalities == frozenset({"video"})
     assert caps.optional_input_modalities == frozenset({"audio"})
     assert caps.allows_video_without_audio() is True
@@ -167,20 +175,20 @@ def test_plan_append_vision_empty_audio_never_leaves_empty_prompt() -> None:
         assert "deferred_multi_modal_data" in plan.prompt["additional_information"]
 
 
-def test_observe_stage_output_targets_stage1_only() -> None:
+def test_project_intermediate_output_targets_stage1_only() -> None:
     plugin = AuraDuplexPlugin(_encode_audio)
-    assert plugin.observe_stage_output(stage_id=1, output=object(), context=object()) is True
-    assert plugin.observe_stage_output(stage_id=0, output=object(), context=object()) is False
-    assert plugin.observe_stage_output(stage_id=3, output=object(), context=object()) is False
+    assert plugin.project_intermediate_output(stage_id=1, output=object(), context=object()) is True
+    assert plugin.project_intermediate_output(stage_id=0, output=object(), context=object()) is False
+    assert plugin.project_intermediate_output(stage_id=3, output=object(), context=object()) is False
 
 
-def test_release_overlapped_input_on_stage1_final() -> None:
+def test_release_overlapped_commit_on_stage1_final() -> None:
     plugin = AuraDuplexPlugin(_encode_audio)
-    assert plugin.release_overlapped_input(stage_id=1, segment_finished=True, output=object(), context=object())
-    assert not plugin.release_overlapped_input(stage_id=1, segment_finished=False, output=object(), context=object())
+    assert plugin.release_overlapped_commit(stage_id=1, segment_finished=True, output=object(), context=object())
+    assert not plugin.release_overlapped_commit(stage_id=1, segment_finished=False, output=object(), context=object())
     finished = type("Out", (), {"finished": True})()
-    assert plugin.release_overlapped_input(stage_id=1, segment_finished=False, output=finished, context=object())
-    assert not plugin.release_overlapped_input(stage_id=2, segment_finished=True, output=object(), context=object())
+    assert plugin.release_overlapped_commit(stage_id=1, segment_finished=False, output=finished, context=object())
+    assert not plugin.release_overlapped_commit(stage_id=2, segment_finished=True, output=object(), context=object())
 
 
 def test_configure_sampling_keeps_silent_stop_visible() -> None:
@@ -307,3 +315,57 @@ def test_pipeline_declares_aura_duplex_plugin() -> None:
     assert AURA_OMNI_PIPELINE.duplex_plugin == (
         "vllm_omni.model_executor.models.aura_omni.duplex.plugin.AuraDuplexPlugin"
     )
+
+
+def test_project_output_uses_requested_format_and_chunk_duration() -> None:
+    seen: dict[str, object] = {}
+
+    def encode(audio: object, sample_rate: int, fmt: str, speed: float | None) -> str:
+        seen["fmt"] = fmt
+        seen["rate"] = sample_rate
+        seen["speed"] = speed
+        del audio
+        return "AAAA"
+
+    plane = AuraDataPlaneSession(encode)
+
+    class _Output:
+        request_id = "aura-turn"
+        finished = False
+        stage_id = 3
+        multimodal_output = {"audio": np.zeros(4800, dtype=np.float32), "sr": 24000}
+
+    events = list(plane.project_output(_Output(), context=AuraDataPlaneContext(response_format="pcm16", speed=1.0)))
+    assert seen["fmt"] == "pcm16"
+    assert events[0]["audio_format"] == "pcm16"
+    assert events[0]["audio_duration_ms"] == 200
+    assert events[0]["sample_rate_hz"] == 24000
+
+    def encode_wav(audio: object, sample_rate: int, fmt: str, speed: float | None) -> str:
+        del audio, sample_rate, speed
+        assert fmt == "wav"
+        return "V0FW"
+
+    plane_wav = AuraDataPlaneSession(encode_wav)
+    wav_events = list(plane_wav.project_output(_Output(), context=AuraDataPlaneContext(response_format="wav")))
+    assert wav_events[0]["audio_format"] == "wav"
+
+
+def test_instructions_update_replaces_effective_prompt() -> None:
+    plugin = AuraDuplexPlugin(_encode_audio)
+    current = {"aura_system_prompt": "creation default", "instructions": "creation default"}
+    updated = plugin.runtime_config_for_update(
+        DuplexSessionConfig(model="aurateam/AURA", instructions="be brief"),
+        current,
+    )
+    assert updated["aura_system_prompt"] == "be brief"
+    assert updated["instructions"] == "be brief"
+    kept = plugin.runtime_config_for_update(
+        DuplexSessionConfig(
+            model="aurateam/AURA",
+            extra_body={"aura_system_prompt": "explicit"},
+            instructions="ignored when explicit",
+        ),
+        updated,
+    )
+    assert kept["aura_system_prompt"] == "explicit"

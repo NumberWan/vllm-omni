@@ -180,7 +180,10 @@ class Harness:
             segment_token_ids=tuple(segment_token_ids),
             segment_output_metadata=dict(segment_output_metadata or {}),
         )
-        return self.runner.on_stage_output(stage_id, output, metrics, request_id=output.request_id, context=context)
+        request_id = getattr(output, "request_id", None)
+        if not isinstance(request_id, str):
+            raise AssertionError("stage output is missing request_id")
+        return self.runner.on_stage_output(stage_id, output, metrics, request_id=request_id, context=context)
 
     async def deliver_and_settle(self, output: object, **kwargs: Any) -> list[DuplexEvent]:
         self.deliver(output, **kwargs)
@@ -929,7 +932,7 @@ async def test_stage_failure_on_draining_request_fails_that_response_only() -> N
 
     h = await open_harness()
     try:
-        h.session.capabilities = replace(h.session.capabilities, supports_overlapped_input=True)
+        h.session.capabilities = replace(h.session.capabilities, supports_overlapped_commit=True)
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
@@ -1212,7 +1215,7 @@ async def test_conversation_items_can_be_injected_and_deleted() -> None:
         await close_harness(h)
 
 
-def _stage_metrics_of(event: object) -> dict[str, dict[str, object]]:
+def _stage_metrics_of(event: DuplexEvent) -> dict[str, dict[str, object]]:
     """Per-stage engine metrics as the client reads them off one wire event."""
     payload = event.to_realtime()
     metadata = payload.get("metadata")

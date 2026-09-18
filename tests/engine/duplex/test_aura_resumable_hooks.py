@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import pytest
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities
@@ -15,6 +16,8 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_ephemeral_stage_request_id,
 )
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_submission_resumable_default_preserves_minicpm() -> None:
@@ -50,13 +53,13 @@ def test_stage_request_id_respects_resumable_flag() -> None:
 
 def test_capabilities_expose_overlapped_input_default_false() -> None:
     caps = DuplexCapabilities()
-    assert caps.supports_overlapped_input is False
+    assert caps.supports_overlapped_commit is False
     assert caps.allows_video_without_audio() is False
     assert caps.required_input_modalities == frozenset({"audio"})
     assert caps.optional_input_modalities == frozenset({"video"})
     assert caps.supports_core_resumable_request is False
     payload = caps.as_dict()
-    assert payload["supports_overlapped_input"] is False
+    assert payload["supports_overlapped_commit"] is False
     assert payload["required_input_modalities"] == ["audio"]
     assert payload["optional_input_modalities"] == ["video"]
 
@@ -66,7 +69,7 @@ def test_next_commit_allowed_soft_opens_on_r4_release() -> None:
 
     from vllm_omni.engine.duplex.session import helpers
 
-    caps = DuplexCapabilities(supports_overlapped_input=True)
+    caps = DuplexCapabilities(supports_overlapped_commit=True)
     session = SimpleNamespace(active_response_id="resp", capabilities=caps)
     tasks = SimpleNamespace(
         active_response_task=None,
@@ -74,12 +77,12 @@ def test_next_commit_allowed_soft_opens_on_r4_release() -> None:
     )
     # Monkeypatch assistant_playback_active via response_in_progress path: active_response_id set.
     assert helpers.response_in_progress(session, tasks) is True
-    assert helpers.next_commit_allowed(session, tasks, overlapped_input_released=False) is False
-    assert helpers.next_commit_allowed(session, tasks, overlapped_input_released=True) is True
+    assert helpers.next_commit_allowed(session, tasks, overlapped_commit_released=False) is False
+    assert helpers.next_commit_allowed(session, tasks, overlapped_commit_released=True) is True
 
-    caps_off = DuplexCapabilities(supports_overlapped_input=False)
+    caps_off = DuplexCapabilities(supports_overlapped_commit=False)
     session_off = SimpleNamespace(active_response_id="resp", capabilities=caps_off)
-    assert helpers.next_commit_allowed(session_off, tasks, overlapped_input_released=True) is False
+    assert helpers.next_commit_allowed(session_off, tasks, overlapped_commit_released=True) is False
 
 
 def test_active_response_accepts_own_turn_when_overlapped_input() -> None:
@@ -90,7 +93,7 @@ def test_active_response_accepts_own_turn_when_overlapped_input() -> None:
     session = DuplexEngineSession(
         session_id="s",
         config=DuplexSessionConfig(model="m", modalities=["text"]),
-        capabilities=DuplexCapabilities(supports_overlapped_input=True),
+        capabilities=DuplexCapabilities(supports_overlapped_commit=True),
     )
     session.begin_response(turn_id=3)
     assert session.active_response_accepts_model_turn(3)
@@ -114,7 +117,7 @@ def test_active_response_accepts_own_turn_when_overlapped_input() -> None:
     strict = DuplexEngineSession(
         session_id="s2",
         config=DuplexSessionConfig(model="m", modalities=["text"]),
-        capabilities=DuplexCapabilities(supports_overlapped_input=False),
+        capabilities=DuplexCapabilities(supports_overlapped_commit=False),
     )
     strict.begin_response(turn_id=3)
     assert strict.active_response_accepts_model_turn(3)
@@ -129,7 +132,7 @@ def test_draining_request_exempt_from_completed_turn_filter() -> None:
     session = DuplexEngineSession(
         session_id="s-drain",
         config=DuplexSessionConfig(model="m", modalities=["text", "audio"]),
-        capabilities=DuplexCapabilities(supports_overlapped_input=True),
+        capabilities=DuplexCapabilities(supports_overlapped_commit=True),
     )
     session.begin_response(turn_id=1)
     r1 = session.active_response_id
@@ -170,7 +173,7 @@ def test_stale_keys_skip_already_draining_request_ids() -> None:
     session = DuplexEngineSession(
         session_id="s-stale",
         config=DuplexSessionConfig(model="m", modalities=["text", "audio"]),
-        capabilities=DuplexCapabilities(supports_overlapped_input=True),
+        capabilities=DuplexCapabilities(supports_overlapped_commit=True),
     )
     session.begin_response(turn_id=1)
     r1 = session.active_response_id
@@ -195,7 +198,7 @@ def test_end_response_clears_only_own_draining_entries() -> None:
     session = DuplexEngineSession(
         session_id="s-end",
         config=DuplexSessionConfig(model="m", modalities=["text", "audio"]),
-        capabilities=DuplexCapabilities(supports_overlapped_input=True),
+        capabilities=DuplexCapabilities(supports_overlapped_commit=True),
     )
     session.begin_response(turn_id=1)
     r1 = session.active_response_id
@@ -217,7 +220,7 @@ def test_on_stage_failure_resolves_draining_response_before_active() -> None:
     session = DuplexEngineSession(
         session_id="s-fail",
         config=DuplexSessionConfig(model="m", modalities=["text", "audio"]),
-        capabilities=DuplexCapabilities(supports_overlapped_input=True),
+        capabilities=DuplexCapabilities(supports_overlapped_commit=True),
     )
     session.begin_response(turn_id=1)
     r1 = session.active_response_id
@@ -239,13 +242,13 @@ def test_on_stage_failure_resolves_draining_response_before_active() -> None:
     assert session.active_response_id == r2
 
 
-def test_overlapped_input_released_resets_when_new_stage0_binds() -> None:
+def test_overlapped_commit_released_resets_when_new_stage0_binds() -> None:
     """After R4 release, a new ephemeral Stage0 bind must clear the gate flag."""
     from types import SimpleNamespace
 
-    run = SimpleNamespace(overlapped_input_released=True)
+    run = SimpleNamespace(overlapped_commit_released=True)
     # Simulate the overlapped rebind arm in model_channel._append_via_data_plane.
     overlapped = True
     if overlapped:
-        run.overlapped_input_released = False
-    assert run.overlapped_input_released is False
+        run.overlapped_commit_released = False
+    assert run.overlapped_commit_released is False

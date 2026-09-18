@@ -93,18 +93,18 @@ def next_commit_allowed(
     session: DuplexEngineSession,
     tasks: DuplexSessionTasks,
     *,
-    overlapped_input_released: bool,
+    overlapped_commit_released: bool,
 ) -> bool:
     """Whether a new commit may flush/submit now.
 
-    Idle sessions always allow it. When ``supports_overlapped_input`` is on and
-    the plugin has released the input gate, a commit is allowed even though
+    Idle sessions always allow it. When ``supports_overlapped_commit`` is on and
+    the plugin has released the commit gate, a commit is allowed even though
     prior assistant TTS/playback still counts as ``response_in_progress``.
     Barge-in remains the abort path; this gate does not cancel anything.
     """
     if not response_in_progress(session, tasks):
         return True
-    return session.capabilities.supports_overlapped_input and overlapped_input_released
+    return session.capabilities.supports_overlapped_commit and overlapped_commit_released
 
 
 def assistant_playback_active(session: DuplexEngineSession) -> bool:

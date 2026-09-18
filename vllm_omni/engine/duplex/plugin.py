@@ -237,7 +237,7 @@ class DuplexModelPlugin(ABC):
         output: object,
     ) -> DuplexOutputDecision | None: ...
 
-    def observe_stage_output(
+    def project_intermediate_output(
         self,
         *,
         stage_id: int,
@@ -246,14 +246,15 @@ class DuplexModelPlugin(ABC):
     ) -> bool:
         """Return True to project this intermediate stage to the client.
 
-        Unlike ``decide_output``, observing does **not** short-circuit the
+        Unlike ``decide_output``, projecting does **not** short-circuit the
         pipeline: the stage output is still forwarded to the next stage.
-        Default is off.
+        Default is off. Orthogonal to ``projects_intermediate_outputs``
+        (Qwen3 Stage0); this hook is per-stage.
         """
         del stage_id, output, context
         return False
 
-    def release_overlapped_input(
+    def release_overlapped_commit(
         self,
         *,
         stage_id: int,

@@ -61,7 +61,7 @@ class DuplexRunState:
     #: Plugin signaled that the next user commit may start while the current
     #: assistant audio is still draining. Cleared on barge-in/cancel, or when
     #: the next ephemeral turn begins. Orthogonal to barge-in (which aborts).
-    overlapped_input_released: bool = False
+    overlapped_commit_released: bool = False
 
 
 class RunnerServices(Protocol):

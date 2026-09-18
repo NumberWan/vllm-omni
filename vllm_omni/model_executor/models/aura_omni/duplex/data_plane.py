@@ -163,6 +163,26 @@ def _sample_rate(metadata: Mapping[str, object]) -> int:
     return int(value) if isinstance(value, int | float) else 24000
 
 
+def _pcm_sample_count(audio: object) -> int:
+    if isinstance(audio, torch.Tensor):
+        return int(audio.detach().reshape(-1).numel())
+    try:
+        return int(np.asarray(audio, dtype=np.float32).reshape(-1).size)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _requested_audio_format(context: object | None) -> tuple[str, float | None]:
+    """Honor the session response format. Missing context stays PCM16 (Realtime default)."""
+    fmt = getattr(context, "response_format", None)
+    speed = getattr(context, "speed", None)
+    if not isinstance(fmt, str) or not fmt:
+        fmt = "pcm16"
+    if not isinstance(speed, int | float):
+        speed = None
+    return fmt, float(speed) if speed is not None else None
+
+
 class AuraDataPlaneSession(DuplexDataPlane):
     """Map Stage1 text + Stage3 audio (or silent) onto duplex events."""
 
@@ -208,7 +228,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
             yield from self.project_output(output, context=context)
 
     def project_output(self, result: object, *, context: object | None = None) -> Iterator[dict[str, object]]:
-        del context
+        response_format, speed = _requested_audio_format(context)
         request_id = getattr(result, "request_id", None)
         if not isinstance(request_id, str) or not request_id:
             return
@@ -275,23 +295,21 @@ class AuraDataPlaneSession(DuplexDataPlane):
         audio = _audio_value(mm)
         if audio is not None and not state.silent:
             sample_rate = _sample_rate(mm)
-            encoded = self._encode_audio(audio, sample_rate, "wav", None)
+            encoded = self._encode_audio(audio, sample_rate, response_format, speed)
             if encoded:
-                if isinstance(audio, torch.Tensor):
-                    n = int(audio.numel())
-                else:
-                    try:
-                        n = int(np.asarray(audio, dtype=np.float32).size)
-                    except (TypeError, ValueError):
-                        n = 0
+                n = _pcm_sample_count(audio)
                 state.audio_offset += n
+                # Delta for this chunk. model_channel adds it onto sent_ms.
+                duration_ms = round(n * 1000 / max(1, sample_rate))
                 end_of_turn = bool(finished and is_final_audio_stage)
                 yield _event(
                     stage_role="tts",
                     is_listen=False,
                     data_plane_request_id=request_id,
                     audio=encoded,
+                    audio_format=response_format,
                     sample_rate_hz=sample_rate,
+                    audio_duration_ms=duration_ms,
                     end_of_turn=end_of_turn,
                 )
                 if end_of_turn:

@@ -247,19 +247,19 @@ class DuplexSessionRunner:
     ) -> bool:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
         decision: DuplexOutputDecision | None = None
-        observe = False
+        project = False
         if stage_id < context.final_stage_id:
             decision = self.model.decide_output(stage_id, output, context)
-            # Optional mid-pipeline observe: project to client without stopping TTS.
+            # Optional mid-pipeline projection: client sees this stage; TTS still runs.
             if decision is None:
-                observe = self.model.observe_stage_output(stage_id, output, context)
-        if self.session.capabilities.supports_overlapped_input and self.model.release_overlapped_input(
+                project = self.model.project_intermediate_output(stage_id, output, context)
+        if self.session.capabilities.supports_overlapped_commit and self.model.release_overlapped_commit(
             stage_id, output, context
         ):
-            self.run.overlapped_input_released = True
+            self.run.overlapped_commit_released = True
         consume = decision is not None or stage_id >= context.final_stage_id
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
-        if not consume and not observe and not project_intermediate:
+        if not consume and not project and not project_intermediate:
             # Stage0 text without a direct decision feeds the TTS stage as before.
             # Its metrics still have to reach the client: before sessions moved
             # into the engine the orchestrator published them as a standalone
@@ -282,7 +282,7 @@ class DuplexSessionRunner:
                 decision=decision,
             )
         )
-        # observe-only must still forward to the next stage (return False).
+        # Projection-only must still forward to the next stage (return False).
         return consume
 
     def on_stage_failure(self, stage_id: int, exc: BaseException, *, request_id: str | None = None) -> None:
@@ -1425,7 +1425,7 @@ class DuplexSessionRunner:
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
         # Barge-in / cancel aborts prior TTS; clear overlapped-input release.
-        self.run.overlapped_input_released = False
+        self.run.overlapped_commit_released = False
         committed_message = session.end_response(
             commit_text=self.model.should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
@@ -1909,7 +1909,7 @@ class DuplexSessionRunner:
                 if not helpers.next_commit_allowed(
                     self.session,
                     self.tasks,
-                    overlapped_input_released=self.run.overlapped_input_released,
+                    overlapped_commit_released=self.run.overlapped_commit_released,
                 ):
                     if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
                         self._discard_short_overlap_ack()
@@ -1931,7 +1931,7 @@ class DuplexSessionRunner:
         if helpers.next_commit_allowed(
             self.session,
             self.tasks,
-            overlapped_input_released=self.run.overlapped_input_released,
+            overlapped_commit_released=self.run.overlapped_commit_released,
         ) and await self._flush_and_submit_committed_turn(
             event,
             event_type=event_type,

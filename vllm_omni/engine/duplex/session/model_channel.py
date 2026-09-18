@@ -223,9 +223,9 @@ class ModelChannel:
             # Keys are ``(stage_id, request_id)``; values are DuplexRequestResource.
             stale_keys = list(session.request_resources.keys())
             stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
-            overlapped = session.capabilities.supports_overlapped_input and self._ctx.run.overlapped_input_released
+            overlapped = session.capabilities.supports_overlapped_commit and self._ctx.run.overlapped_commit_released
             # Prior TTS may still drain under the same response_id; acceptance
-            # is gated by supports_overlapped_input, not a per-turn drain id.
+            # is gated by supports_overlapped_commit, not a per-turn drain id.
             session.complete_model_turn(fence.turn_id)
             fence = DuplexFence(session.session_id, epoch=session.epoch, turn_id=session.turn_id)
             request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=False)
@@ -242,8 +242,9 @@ class ModelChannel:
                     elif prior_response_id is not None and not session.is_draining_request(rid):
                         # Already-draining ids keep their original response_id.
                         session.bind_draining_request(rid, prior_response_id)
-                self._ctx.run.overlapped_input_released = False
+                self._ctx.run.overlapped_commit_released = False
                 if prior_response_id is not None:
+                    session.snapshot_active_response_for_drain()
                     new_response_id = session.begin_response(turn_id=fence.turn_id)
                     self._out.emit(self.response_created_payload(new_response_id, epoch=session.epoch))
                 else:
@@ -324,7 +325,7 @@ class ModelChannel:
             # Consuming a Stage0 bind closes the overlapped-input gate even when
             # this turn used a fresh ephemeral id (not the reuse branch above).
             if stage_id == 0:
-                self._ctx.run.overlapped_input_released = False
+                self._ctx.run.overlapped_commit_released = False
             return {
                 "ok": True,
                 "operation": "append",
@@ -438,17 +439,17 @@ class ModelChannel:
             raise TypeError("duplex plugin decide_output() must return DuplexOutputDecision or None")
         return decision
 
-    def observe_stage_output(self, stage_id: int, output: RequestOutput, context: DuplexOutputContext) -> bool:
+    def project_intermediate_output(self, stage_id: int, output: RequestOutput, context: DuplexOutputContext) -> bool:
         """Project an intermediate stage without short-circuiting the pipeline."""
-        return self._ctx.plugin.observe_stage_output(
+        return self._ctx.plugin.project_intermediate_output(
             stage_id=stage_id,
             output=output,
             context=context,
         )
 
-    def release_overlapped_input(self, stage_id: int, output: RequestOutput, context: DuplexOutputContext) -> bool:
+    def release_overlapped_commit(self, stage_id: int, output: RequestOutput, context: DuplexOutputContext) -> bool:
         """Ask the plugin whether the next commit may start while TTS drains."""
-        return self._ctx.plugin.release_overlapped_input(
+        return self._ctx.plugin.release_overlapped_commit(
             stage_id=stage_id,
             segment_finished=context.segment_finished,
             output=output,
@@ -534,7 +535,7 @@ class ModelChannel:
             active_request_id = session.active_request_id
             if active_request_id is not None and active_request_id != item.request_id:
                 if not (
-                    session.capabilities.supports_overlapped_input and session.is_draining_request(item.request_id)
+                    session.capabilities.supports_overlapped_commit and session.is_draining_request(item.request_id)
                 ):
                     return
         engine_output = self._build_stage_output(item)
@@ -546,7 +547,7 @@ class ModelChannel:
             await self._close_from_runtime(close_reason)
             return
         finished = self._data_plane_outputs_finished(drain_result)
-        # Stage1 observe-only finishing means text is done, not the duplex turn.
+        # Intermediate-stage projection finishing means text is done, not the duplex turn.
         # Closing the stream here drops later Code2Wav chunks / next-turn bind.
         if (
             finished
@@ -882,12 +883,16 @@ class ModelChannel:
             }
             self._attach_runtime_metadata(speak_payload, model_result, stage_metrics=response_stage_metrics)
             self._out.emit(speak_payload)
-        previous_sent_ms = session.playback.sent_ms
-        text_chars_before_append = len("".join(session.assistant_text_buffer))
-        if isinstance(text, str):
-            session.append_assistant_text(text)
+        target_id = draining_response_id if draining_response_id not in (None, session.active_response_id) else None
+        previous_sent_ms = session.playback_for_response(target_id).sent_ms
+        text_chars_before_append = len(session.assistant_transcript(target_id))
+        if isinstance(text, str) and text:
+            if target_id is not None:
+                session.append_draining_assistant_text(target_id, text)
+            else:
+                session.append_assistant_text(text)
         duration_ms = model_result.get("audio_duration_ms")
-        text_chars = len("".join(session.assistant_text_buffer))
+        text_chars = len(session.assistant_transcript(target_id))
         mark_duration_ms = None
         mark_text_chars: int | None = text_chars
         if model_result.get("audio_text_mark") is False:
@@ -895,7 +900,10 @@ class ModelChannel:
         if isinstance(duration_ms, int | float):
             mark_duration_ms = int(duration_ms)
             if model_result.get("audio_duration_is_cumulative") is not True:
-                mark_duration_ms += session.playback.sent_ms
+                # Deltas accumulate on the response that owns this chunk.
+                # session.playback is the active cursor and is 0 after overlap
+                # opens the next response.
+                mark_duration_ms += previous_sent_ms
         audio_text_marks = model_result.get("audio_text_marks")
         audio_text_marks = self._normalize_audio_text_marks(
             audio_text_marks if isinstance(audio_text_marks, list) else None,
@@ -915,6 +923,7 @@ class ModelChannel:
             audio_text_marks=audio_text_marks,
             text_requires_complete_audio=model_result.get("text_requires_complete_audio") is True,
             audio_complete=model_result.get("audio_complete") is True,
+            response_id=target_id,
         )
         payload = {
             "type": "response.output_audio.delta",
@@ -939,7 +948,7 @@ class ModelChannel:
             payload["audio_text_marks"] = [
                 {"text_chars": max(0, int(mark_text_chars)), "audio_end_ms": max(0, int(mark_duration_ms))}
             ]
-        payload["playback"] = session.playback.as_dict()
+        payload["playback"] = session.playback_for_response(target_id).as_dict()
         sample_rate_hz = model_result.get("sample_rate_hz") or model_result.get("audio_sample_rate_hz")
         if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
             payload["sample_rate_hz"] = int(sample_rate_hz)
@@ -959,7 +968,7 @@ class ModelChannel:
             # Prior TTS finished under its own draining response_id while a
             # newer turn already owns active_response_id — close that response.
             if (
-                session.capabilities.supports_overlapped_input
+                session.capabilities.supports_overlapped_commit
                 and isinstance(data_plane_request_id, str)
                 and session.is_draining_request(data_plane_request_id)
             ):
@@ -977,7 +986,7 @@ class ModelChannel:
                             "epoch": session.epoch,
                             "committed": False,
                             "status": "completed",
-                            "playback": session.playback.as_dict(),
+                            "playback": session.playback_for_response(drained_response_id).as_dict(),
                         }
                     )
                 return close_reason, emitted_response

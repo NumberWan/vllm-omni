@@ -262,7 +262,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         }
         return DuplexAppendPlan(prompt=prompt)
 
-    def observe_stage_output(
+    def project_intermediate_output(
         self,
         *,
         stage_id: int,
@@ -273,7 +273,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         del output, context
         return stage_id == 1
 
-    def release_overlapped_input(
+    def release_overlapped_commit(
         self,
         *,
         stage_id: int,
@@ -373,11 +373,24 @@ class AuraDuplexPlugin(DuplexModelPlugin):
     ) -> dict[str, object]:
         updated = dict(current)
         extra = config.extra_body if isinstance(config.extra_body, dict) else {}
-        if "aura_system_prompt" in extra:
-            updated["aura_system_prompt"] = str(extra["aura_system_prompt"])
-        if config.instructions:
-            updated["instructions"] = config.instructions
-            updated.setdefault("aura_system_prompt", config.instructions)
+        # Same precedence as prepare_runtime_config: explicit extra, then
+        # instructions, then the prompt already installed (or the default).
+        # setdefault would keep the creation-time prompt and ignore a later
+        # session.update.instructions.
+        explicit = extra.get("aura_system_prompt") if "aura_system_prompt" in extra else None
+        if isinstance(explicit, str) and explicit:
+            prompt = explicit
+        elif config.instructions:
+            prompt = str(config.instructions)
+        else:
+            current_prompt = current.get("aura_system_prompt")
+            prompt = (
+                str(current_prompt)
+                if isinstance(current_prompt, str) and current_prompt
+                else DEFAULT_AURA_SYSTEM_PROMPT
+            )
+        updated["aura_system_prompt"] = prompt
+        updated["instructions"] = str(config.instructions) if config.instructions else prompt
         for key in _TTS_EXTRA_KEYS:
             if key in extra and extra[key] is not None:
                 updated[key] = extra[key]
