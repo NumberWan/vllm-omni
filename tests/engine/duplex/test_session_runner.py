@@ -1048,9 +1048,7 @@ async def test_turn_mode_keeps_silent_vision_while_response_in_progress() -> Non
             )
         )
         listen_reasons = [
-            getattr(event, "details", {}) or {}
-            for event in events
-            if getattr(event, "type", None) == "response.listen"
+            getattr(event, "details", {}) or {} for event in events if getattr(event, "type", None) == "response.listen"
         ]
         assert all(details.get("reason") != "silence_or_noise" for details in listen_reasons)
         assert h.runner.model_state.audio_buffer.has_pending()

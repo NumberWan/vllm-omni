@@ -176,19 +176,11 @@ def test_observe_stage_output_targets_stage1_only() -> None:
 
 def test_release_overlapped_input_on_stage1_final() -> None:
     plugin = AuraDuplexPlugin(_encode_audio)
-    assert plugin.release_overlapped_input(
-        stage_id=1, segment_finished=True, output=object(), context=object()
-    )
-    assert not plugin.release_overlapped_input(
-        stage_id=1, segment_finished=False, output=object(), context=object()
-    )
+    assert plugin.release_overlapped_input(stage_id=1, segment_finished=True, output=object(), context=object())
+    assert not plugin.release_overlapped_input(stage_id=1, segment_finished=False, output=object(), context=object())
     finished = type("Out", (), {"finished": True})()
-    assert plugin.release_overlapped_input(
-        stage_id=1, segment_finished=False, output=finished, context=object()
-    )
-    assert not plugin.release_overlapped_input(
-        stage_id=2, segment_finished=True, output=object(), context=object()
-    )
+    assert plugin.release_overlapped_input(stage_id=1, segment_finished=False, output=finished, context=object())
+    assert not plugin.release_overlapped_input(stage_id=2, segment_finished=True, output=object(), context=object())
 
 
 def test_configure_sampling_keeps_silent_stop_visible() -> None:
@@ -261,9 +253,7 @@ def test_ephemeral_request_id_includes_turn() -> None:
     assert ephemeral.endswith("stage0-turn7")
     assert resumable != ephemeral
     fence2 = DuplexFence("s", epoch=1, turn_id=8)
-    assert duplex_ephemeral_stage_request_id(fence, stage_id=0) != duplex_ephemeral_stage_request_id(
-        fence2, stage_id=0
-    )
+    assert duplex_ephemeral_stage_request_id(fence, stage_id=0) != duplex_ephemeral_stage_request_id(fence2, stage_id=0)
 
 
 def test_stage_submission_defaults_resumable_true() -> None:

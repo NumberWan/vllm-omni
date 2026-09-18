@@ -79,7 +79,7 @@ class SilenceContinuationScheduler(Protocol):
 class ModelChannel:
     """Appends out to the model, events back from it, for one session."""
 
-    # One second of float32 PCM at 16 kHz — default silence continuation unit.
+    # One MiniCPM model unit (1 s at 16 kHz) is the compatibility default.
     _SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
     _RESPONSE_MAX_CONTINUATION_UNITS = 8
     _AUTO_RESPONSE_MAX_CONTINUATION_UNITS = 64
@@ -223,9 +223,7 @@ class ModelChannel:
             # Keys are ``(stage_id, request_id)``; values are DuplexRequestResource.
             stale_keys = list(session.request_resources.keys())
             stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
-            overlapped = (
-                session.capabilities.supports_overlapped_input and self._ctx.run.overlapped_input_released
-            )
+            overlapped = session.capabilities.supports_overlapped_input and self._ctx.run.overlapped_input_released
             # Prior TTS may still drain under the same response_id; acceptance
             # is gated by supports_overlapped_input, not a per-turn drain id.
             session.complete_model_turn(fence.turn_id)
@@ -440,9 +438,7 @@ class ModelChannel:
             raise TypeError("duplex plugin decide_output() must return DuplexOutputDecision or None")
         return decision
 
-    def observe_stage_output(
-        self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
-    ) -> bool:
+    def observe_stage_output(self, stage_id: int, output: RequestOutput, context: DuplexOutputContext) -> bool:
         """Project an intermediate stage without short-circuiting the pipeline."""
         return self._ctx.plugin.observe_stage_output(
             stage_id=stage_id,
@@ -450,9 +446,7 @@ class ModelChannel:
             context=context,
         )
 
-    def release_overlapped_input(
-        self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
-    ) -> bool:
+    def release_overlapped_input(self, stage_id: int, output: RequestOutput, context: DuplexOutputContext) -> bool:
         """Ask the plugin whether the next commit may start while TTS drains."""
         return self._ctx.plugin.release_overlapped_input(
             stage_id=stage_id,
@@ -540,8 +534,7 @@ class ModelChannel:
             active_request_id = session.active_request_id
             if active_request_id is not None and active_request_id != item.request_id:
                 if not (
-                    session.capabilities.supports_overlapped_input
-                    and session.is_draining_request(item.request_id)
+                    session.capabilities.supports_overlapped_input and session.is_draining_request(item.request_id)
                 ):
                     return
         engine_output = self._build_stage_output(item)
@@ -1204,9 +1197,7 @@ class ModelChannel:
             model_state.clear_continuation()
             if response_id is not None:
                 should_commit = self.should_commit_response_to_history(session, response_id)
-                committed_message = session.end_response(
-                    commit_text=should_commit, preserve_request=auto_response
-                )
+                committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
                 if should_commit and committed_message is not None:
                     session.register_history_item(f"item_{response_id}", committed_message)
                 self._out.emit(

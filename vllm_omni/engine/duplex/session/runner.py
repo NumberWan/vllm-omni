@@ -253,9 +253,8 @@ class DuplexSessionRunner:
             # Optional mid-pipeline observe: project to client without stopping TTS.
             if decision is None:
                 observe = self.model.observe_stage_output(stage_id, output, context)
-        if (
-            self.session.capabilities.supports_overlapped_input
-            and self.model.release_overlapped_input(stage_id, output, context)
+        if self.session.capabilities.supports_overlapped_input and self.model.release_overlapped_input(
+            stage_id, output, context
         ):
             self.run.overlapped_input_released = True
         consume = decision is not None or stage_id >= context.final_stage_id
@@ -797,9 +796,7 @@ class DuplexSessionRunner:
         )
         has_audio = isinstance(audio, str) and bool(audio)
         has_video = bool(video_frames)
-        modality_error = session.capabilities.validate_append_modalities(
-            has_audio=has_audio, has_video=has_video
-        )
+        modality_error = session.capabilities.validate_append_modalities(has_audio=has_audio, has_video=has_video)
         if modality_error is not None:
             self._emit_error("invalid_input_modality", modality_error)
             return
@@ -1552,10 +1549,7 @@ class DuplexSessionRunner:
             # Non-speech residual: prepare_commit refused a Stage0 unit. Clear
             # the PCM and its byte reservation so silence does not leak into
             # the next turn (MiniCPM-o / auto-response silent commit).
-            if (
-                event_type in {"input.commit", "input_audio_buffer.commit"}
-                and not model_state.speech_since_commit
-            ):
+            if event_type in {"input.commit", "input_audio_buffer.commit"} and not model_state.speech_since_commit:
                 pending_bytes = model_state.audio_buffer.pending_byte_count
                 model_state.audio_buffer.clear()
                 if pending_bytes:

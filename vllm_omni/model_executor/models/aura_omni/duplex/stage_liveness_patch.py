@@ -49,8 +49,7 @@ def _monitor_engine_liveness(self) -> None:
             proc.join(timeout=0)
             if proc.is_alive():
                 logger.warning(
-                    "[AURA] spurious sentinel for still-alive %s (pid=%s); "
-                    "switching to is_alive polling",
+                    "[AURA] spurious sentinel for still-alive %s (pid=%s); switching to is_alive polling",
                     proc.name,
                     proc.pid,
                 )
@@ -99,10 +98,7 @@ def install_aura_stage_liveness_patch() -> bool:
     patched = _monitor_engine_liveness
     setattr(patched, _PATCH_ATTR, True)
     StageEngineCoreProcManager.monitor_engine_liveness = patched  # type: ignore[method-assign]
-    logger.info(
-        "[AURA] installed StageEngineCoreProcManager.monitor_engine_liveness "
-        "spurious-sentinel patch"
-    )
+    logger.info("[AURA] installed StageEngineCoreProcManager.monitor_engine_liveness spurious-sentinel patch")
     return True
 
 

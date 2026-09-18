@@ -9,8 +9,8 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
-    _normalize_asr_transcript,
     SILENT_TEXT,
+    _normalize_asr_transcript,
     asr2aura,
     aura2tts,
 )

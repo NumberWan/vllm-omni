@@ -288,9 +288,7 @@ class DuplexSessionManager:
         if isinstance(command, AppendAudio):
             has_audio = bool(command.audio)
             has_video = bool(command.video_frames)
-            modality_error = session.capabilities.validate_append_modalities(
-                has_audio=has_audio, has_video=has_video
-            )
+            modality_error = session.capabilities.validate_append_modalities(has_audio=has_audio, has_video=has_video)
             if modality_error is not None:
                 self.emit(
                     session,

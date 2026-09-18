@@ -5,9 +5,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 import torch
@@ -27,7 +26,7 @@ from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 def _session_id_from_request_id(request_id: str) -> str | None:
     """Decode ``duplex-s.<b64url(session)>.e.…`` into the session id, or None."""
-    import base64
+    import pybase64 as base64
 
     parts = request_id.split(".")
     if len(parts) != 6 or parts[0] != "duplex-s" or parts[2] != "e" or parts[4] != "r":
@@ -51,6 +50,7 @@ def _commit_silent_history(request_id: str) -> None:
     if history.pending_user is None:
         return
     history.commit_turn(SILENT_TEXT)
+
 
 @dataclass(frozen=True, slots=True)
 class AuraDataPlaneContext:
@@ -129,15 +129,11 @@ def _audio_value(metadata: Mapping[str, object]) -> object | None:
     Code2Wav wire payloads use producer key ``model_outputs``; after
     ``MultimodalPayload.from_raw(..., modality_key)`` that becomes ``audio``
     when modality is audio, or another modality key (e.g. ``text``/``hidden``)
-    when the stage output_modality was mis-tagged. Accept common aliases and
+    when the stage output_modality was wrongly tagged. Accept common aliases and
     finally the first non-sr tensor so duplex still surfaces Stage3 PCM.
     """
     value = next(
-        (
-            metadata[key]
-            for key in ("audio", "model_outputs", "latent", "hidden", "text")
-            if key in metadata
-        ),
+        (metadata[key] for key in ("audio", "model_outputs", "latent", "hidden", "text") if key in metadata),
         None,
     )
     if value is None:

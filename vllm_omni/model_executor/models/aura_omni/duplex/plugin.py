@@ -212,9 +212,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         # empty Stage0 prompt is rejected ("decoder prompt cannot be empty").
         # Also guard is_speech=True + empty-audio + frames (prompt was "").
         sample_rate_hz = int(sample_rate_hz or payload.get("sample_rate_hz") or 16000)
-        wav_rms = (
-            float(np.sqrt(np.mean(np.square(wav.astype(np.float32, copy=False))))) if wav.size else 0.0
-        )
+        wav_rms = float(np.sqrt(np.mean(np.square(wav.astype(np.float32, copy=False))))) if wav.size else 0.0
         near_silent = wav.size == 0 or not np.any(wav) or wav_rms < 1e-3
         if mm and (not has_audio or (not is_speech and near_silent)):
             n = max(1600, int(sample_rate_hz) // 10)

@@ -1176,9 +1176,11 @@ def note_input_append(
     # Vision-carrying silent appends are real turn content only when the model
     # allows video without required audio (R1). Without this gate, turn-mode
     # camera sessions would treat silent+frames as buffer content and open a response.
-    state.input_audio_buffer_has_audio = state.input_audio_buffer_has_audio or (
-        looks_like_speech and has_audio
-    ) or (has_video and allows_video_without_audio)
+    state.input_audio_buffer_has_audio = (
+        state.input_audio_buffer_has_audio
+        or (looks_like_speech and has_audio)
+        or (has_video and allows_video_without_audio)
+    )
     state.input_audio_buffer_had_non_speech = state.input_audio_buffer_had_non_speech or (
         not looks_like_speech and has_audio and not (has_video and allows_video_without_audio)
     )

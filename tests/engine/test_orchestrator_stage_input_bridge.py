@@ -285,7 +285,6 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
     assert 2 in req_state.stage_submit_ts
 
 
-
 @pytest.mark.asyncio
 async def test_async_route_forwards_to_outgoing_only_stage() -> None:
     orchestrator = object.__new__(Orchestrator)

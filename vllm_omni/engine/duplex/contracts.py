@@ -10,12 +10,13 @@ implements for the session manager/runner.
 from __future__ import annotations
 
 import base64
-import re
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
+
+import regex as re
 
 
 @dataclass(frozen=True, slots=True)

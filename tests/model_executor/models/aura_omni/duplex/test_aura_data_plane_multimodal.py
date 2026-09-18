@@ -34,7 +34,7 @@ def test_audio_value_accepts_from_raw_audio_key() -> None:
     assert int(audio.numel()) == 8
 
 
-def test_audio_value_accepts_mis_tagged_text_key() -> None:
+def test_audio_value_accepts_wrongly_tagged_text_key() -> None:
     # If stage output_modality is wrong, from_raw remaps model_outputs → "text".
     raw = {"model_outputs": torch.zeros(4), "sr": torch.tensor(24000)}
     mm = MultimodalPayload.from_raw(raw, "text")

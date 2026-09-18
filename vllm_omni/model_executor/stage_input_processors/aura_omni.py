@@ -232,7 +232,6 @@ def _normalize_asr_transcript(transcript: str) -> str:
     return text
 
 
-
 def asr2aura(
     source_outputs: list[Any],
     prompt: Any = None,
