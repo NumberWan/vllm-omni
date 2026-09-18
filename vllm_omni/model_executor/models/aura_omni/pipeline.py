@@ -18,33 +18,6 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
-# AURA-only: tolerate spurious Process.sentinel during colocated Stage0–3 init
-# without changing shared stage_engine_core_proc_manager.py.
-# Must NOT install at import time: pipeline_registry imports this module while
-# stage_init_utils is still loading, and the patch pulls stage_engine_core_proc
-# → circular ImportError. Defer until the import stack unwinds.
-from vllm_omni.model_executor.models.aura_omni.duplex.stage_liveness_patch import (
-    maybe_install_aura_stage_liveness_patch,
-)
-
-
-def _schedule_aura_stage_liveness_patch() -> None:
-    import threading
-    import time
-
-    def _worker() -> None:
-        time.sleep(0)
-        maybe_install_aura_stage_liveness_patch()
-
-    threading.Thread(
-        target=_worker,
-        daemon=True,
-        name="aura-stage-liveness-patch",
-    ).start()
-
-
-_schedule_aura_stage_liveness_patch()
-
 _AURA_PROC = "vllm_omni.model_executor.stage_input_processors.aura_omni"
 _QWEN3_TTS_PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
 
