@@ -40,16 +40,21 @@ Connect clients to `/v1/realtime?duplex=1`. Silent Stage1 outputs gate TTS (no
 audio for that turn). Overlapped input and vision-follow are AURA duplex
 capabilities; see the PR / RFC for behaviour.
 
-### Browser UI (follow-up)
+### Browser UI
 
-AURA has no client VAD: the intended control is **push-to-talk** (hold =
-`is_speech=true` PCM + frames; release = `commit`; silent+frames for
-vision-follow). After [#7585](https://github.com/vllm-project/vllm-omni/pull/7585),
-browser demos should use the **shared** shell in
-[`examples/online_serving/realtime_web/`](../realtime_web/README.md) with an
-AURA PTT profile (same pattern as MiniCPM / Qwen3 thin wrappers)—not a
-forked `aura_omni/realtime_web` tree. That profile is a follow-up; for this
-PR use the CLI smoke client above.
+AURA has no client VAD: control is **push-to-talk** on the shared shell from
+[#7585](https://github.com/vllm-project/vllm-omni/pull/7585)
+([`examples/online_serving/realtime_web/`](../realtime_web/README.md)), profile
+`aura-ptt` (hold = `is_speech=true` PCM + sticky frames; release = `commit`;
+silent+frames for vision-follow). Thin wrapper:
+
+```bash
+python -m examples.online_serving.aura_omni.realtime_web \
+    --ws-backend ws://127.0.0.1:8099 --model aurateam/AURA --port 7862
+```
+
+Do **not** fork a separate `aura_omni/realtime_web` asset tree; MiniCPM / Qwen
+profiles are unchanged and hide the PTT control.
 
 ### Per-stage models
 
