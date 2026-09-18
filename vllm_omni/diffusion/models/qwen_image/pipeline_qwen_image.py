@@ -26,10 +26,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
-from vllm_omni.diffusion.model_loader.diffusers_loader import (
-    DiffusersPipelineLoader,
-    autoround_int_needs_cuda_prepack,
-)
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -340,31 +337,26 @@ class QwenImagePipeline(
             del visual_owner.visual
         else:
             logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
-        # Model-level CPU offload must not park the BF16 encoder/VAE on CUDA while
-        # the W4A16 DiT is constructed. Machete prepack is CUDA-only, so the DiT
-        # is created on the accelerator even when the loader default device is CPU.
+        # Under model-level CPU offload, keep the BF16 encoder/VAE on CPU so they
+        # do not share VRAM with DiT construction (#7555). The DiT follows the
+        # loader's default-device context (CUDA for online / AutoRound INT under
+        # offload, CPU for layerwise / unquantized HSDP defer).
         cpu_offload = bool(getattr(self.od_config, "enable_cpu_offload", False))
-        host_device = torch.device("cpu") if cpu_offload else self.device
-        self.text_encoder = self.text_encoder.to(host_device)
+        enc_vae_device = torch.device("cpu") if cpu_offload else self.device
+        self.text_encoder = self.text_encoder.to(enc_vae_device)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage.from_pretrained,
             model,
             subfolder="vae",
             prefetch_list=qwen_subfolders,
             local_files_only=local_files_only,
-        ).to(host_device)
+        ).to(enc_vae_device)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
-        dit_device = (
-            self.device
-            if (not cpu_offload or autoround_int_needs_cuda_prepack(od_config.quantization_config))
-            else host_device
+        self.transformer = QwenImageTransformer2DModel(
+            od_config=od_config,
+            quant_config=od_config.quantization_config,
+            **transformer_kwargs,
         )
-        with torch.device(dit_device):
-            self.transformer = QwenImageTransformer2DModel(
-                od_config=od_config,
-                quant_config=od_config.quantization_config,
-                **transformer_kwargs,
-            )
 
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 

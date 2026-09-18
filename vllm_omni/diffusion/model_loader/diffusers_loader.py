@@ -91,40 +91,6 @@ def download_gguf(
 logger = init_logger(__name__)
 
 
-def is_offline_checkpoint_quant_config(quant_cfg: object | None) -> bool:
-    """True when packed weights already live in the checkpoint.
-
-    CPU offload otherwise treats any ``quant_config`` as online quantization and
-    rebuilds the whole pipeline on CUDA. AutoRound INT W4A16 (``packing_format``
-    ``auto_round:auto_gptq``) is packed on disk but is not ``data_type=mx_fp``
-    and often lacks ``is_checkpoint_quantized``. That mis-label puts the DiT on
-    CUDA beside the BF16 text encoder and OOMs a 22 GiB L4 (#7555).
-    """
-    if quant_cfg is None:
-        return False
-    if bool(getattr(quant_cfg, "is_checkpoint_quantized", False)):
-        return True
-    data_type = getattr(quant_cfg, "data_type", None)
-    if data_type == "mx_fp":
-        return True
-    packing = getattr(quant_cfg, "packing_format", None)
-    return isinstance(packing, str) and packing.startswith("auto_round:")
-
-
-def autoround_int_needs_cuda_prepack(quant_cfg: object | None) -> bool:
-    """True when post-load packing is CUDA-only (Machete), so the DiT cannot stay on CPU.
-
-    MXFP8 (``data_type=mx_fp``) is already packed and does not take this path.
-    Callers still keep the text encoder and VAE on CPU under model-level offload;
-    only ``process_weights_after_loading`` runs on the accelerator, then the DiT
-    returns to CPU before the offload backend brings the encoder up (#7555).
-    """
-    if quant_cfg is None or getattr(quant_cfg, "data_type", None) == "mx_fp":
-        return False
-    packing = getattr(quant_cfg, "packing_format", None)
-    return isinstance(packing, str) and packing.startswith("auto_round:")
-
-
 def _natural_sort_key(filepath: str) -> list:
     """Natural sort key for filenames with numeric components, e.g.
     model-00001-of-00005.safetensors -> ['model-', 1, '-of-', 5, '.safetensors']."""
@@ -694,18 +660,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # For online quantization, load on device so quantization can run on accelerator,
         # then move back to CPU afterward.
         offload_after_quant = False
-        cuda_prepack = False
         if load_device == "cpu" and self.quant_config is not None and device is not None:
-            is_offline = is_offline_checkpoint_quant_config(self.quant_config)
-            # Packed AutoRound INT still needs Machete on CUDA. Do not rebuild the
-            # whole pipeline there (that stacks the BF16 encoder on the DiT).
-            if autoround_int_needs_cuda_prepack(self.quant_config):
-                cuda_prepack = True
-                logger.info(
-                    "AutoRound INT with CPU offload: DiT prepack on %s; encoder/VAE stay on CPU",
-                    device,
-                )
-            elif not is_offline:
+            quant_cfg = self.quant_config
+            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
+                quant_cfg, "is_checkpoint_quantized", False
+            )
+            if not is_offline:
                 load_device = device.type
                 offload_after_quant = True
                 logger.info(
@@ -874,11 +834,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         else:
                             self.load_weights(model)
                     self._maybe_fuse_distilled_lora(model)
-                    process_device = device if cuda_prepack else target_device
-                    self._process_weights_after_loading(model, process_device)
-                    if cuda_prepack and hasattr(model, "transformer"):
-                        # Free the accelerator before model-level offload moves the encoder on.
-                        model.transformer.to("cpu")
+                    self._process_weights_after_loading(model, target_device)
 
                 # A warm final-layout hit has already completed all
                 # byte-changing work through the restorer.  Shared runtime
@@ -1316,7 +1272,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 rank = torch.distributed.get_rank()
 
             has_online_quant = self._has_online_quant(model) or (
-                self.quant_config is not None and not is_offline_checkpoint_quant_config(self.quant_config)
+                self.quant_config is not None and not getattr(self.quant_config, "is_checkpoint_quantized", False)
             )
             enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", False)) and world_size > 1
 
