@@ -88,11 +88,7 @@ def build_app(
     aura = profile == "aura-ptt"
     ws_backend = ws_backend or ("ws://127.0.0.1:8099" if native or aura else "ws://127.0.0.1:8091")
     model = model or (
-        "openbmb/MiniCPM-o-4_5"
-        if native
-        else "aurateam/AURA"
-        if aura
-        else "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+        "openbmb/MiniCPM-o-4_5" if native else "aurateam/AURA" if aura else "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     )
     app = FastAPI(title="Omni Realtime Web UI")
     index_path = APP_DIR / "index.html"
@@ -217,15 +213,9 @@ def main(default_profile: str = "minicpm-native") -> None:
     if not native and args.ref_audio:
         parser.error("--ref-audio is only supported by minicpm-native")
     args.model = args.model or (
-        "openbmb/MiniCPM-o-4_5"
-        if native
-        else "aurateam/AURA"
-        if aura
-        else "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+        "openbmb/MiniCPM-o-4_5" if native else "aurateam/AURA" if aura else "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     )
-    args.ws_backend = args.ws_backend or (
-        "ws://127.0.0.1:8099" if native or aura else "ws://127.0.0.1:8091"
-    )
+    args.ws_backend = args.ws_backend or ("ws://127.0.0.1:8099" if native or aura else "ws://127.0.0.1:8091")
 
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(
