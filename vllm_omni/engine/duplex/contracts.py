@@ -167,12 +167,11 @@ def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> s
     return duplex_resource_request_id(fence, f"stage{stage_id}-turn{fence.turn_id}")
 
 
-# Main format ``stage{N}-turn{T}``; also accept legacy PR ``stage{N}_t{T}``.
-_EPHEMERAL_TURN_IN_REQUEST_ID = re.compile(r"\.r\.stage\d+(?:-turn|_t)(\d+)$")
+_EPHEMERAL_TURN_IN_REQUEST_ID = re.compile(r"\.r\.stage\d+-turn(\d+)$")
 
 
 def duplex_turn_id_from_request_id(request_id: str | None) -> int | None:
-    """Parse ephemeral ``…r.stage{N}-turn{T}`` (or legacy ``_t{T}``) ids."""
+    """Parse ephemeral ``…r.stage{N}-turn{T}`` ids."""
     if not isinstance(request_id, str):
         return None
     match = _EPHEMERAL_TURN_IN_REQUEST_ID.search(request_id)

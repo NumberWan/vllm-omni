@@ -156,12 +156,12 @@ def test_draining_request_exempt_from_completed_turn_filter() -> None:
     assert drop is False
 
 
-def test_ephemeral_turn_id_parser_accepts_main_and_legacy_forms() -> None:
+def test_ephemeral_turn_id_parser_accepts_stage_turn_ids() -> None:
     from vllm_omni.engine.duplex.contracts import duplex_turn_id_from_request_id
 
     assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage0-turn12") == 12
     assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage2-turn3") == 3
-    assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage0_t9") == 9
+    assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage0_t9") is None
     assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage0") is None
     from vllm_omni.engine.duplex.contracts import duplex_session_id_from_request_id
 
@@ -447,6 +447,7 @@ def test_draining_completion_drops_finished_response_books_only() -> None:
     assert session.active_response_id == r2
     done = [event for event in out.events if event.get("type") == "response.done"]
     assert done and done[-1].get("response_id") == r1
+
 
 def test_stale_continue_does_not_close_the_new_response() -> None:
     import asyncio
