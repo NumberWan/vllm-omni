@@ -6,32 +6,27 @@
 ASR -> AURA -> Qwen3-TTS Talker -> Code2Wav
 ```
 
-**Primary online path:** Realtime duplex at `/v1/realtime?duplex=1`.
+**Supported online path:** Realtime duplex at `/v1/realtime?duplex=1`.
 
 The default deploy profile (`vllm_omni/deploy/aura_omni.yaml`) sets
 `session_mode: duplex`. The `aura_omni` pipeline declares `duplex_plugin`, and
 `DuplexOmniEngine` requires that mode (same pattern as MiniCPM-o duplex
-deploys). Do not treat turn-based `chat/completions` as the primary AURA
-online serve path with this profile.
+deploys). Turn-based `chat/completions` is not a supported AURA online mode
+against this profile.
 
-```bash
-vllm serve aurateam/AURA \
-  --omni \
-  --deploy-config vllm_omni/deploy/aura_omni.yaml \
-  --served-model-name aurateam/AURA \
-  --trust-remote-code
-```
-
-Configure local checkpoints by editing per-stage `model` values in the deploy
-YAML. The file sets `pipeline: aura_omni`, so the four-stage topology is used
-even if the command-line `--model` points at one component checkpoint.
-
-For a local-weight smoke serve + WS client:
+`async_chunk` defaults to `false` in that file (safer if a turn-based
+`OmniOrchestrator` ever loads it). Duplex Realtime Stage2→3 still needs
+async chunks — use the smoke deploy below, or set `async_chunk: true`
+yourself.
 
 ```bash
 bash examples/online_serving/aura_omni/run_duplex_smoke_serve.sh
 python examples/online_serving/aura_omni/smoke_duplex_realtime_client.py
 ```
+
+Configure local checkpoints by editing per-stage `model` values in the deploy
+or smoke YAML. The file sets `pipeline: aura_omni`, so the four-stage topology
+is used even if the command-line `--model` points at one component checkpoint.
 
 Silent Stage1 outputs (`<|silent|>` / id `151669`) skip TTS for that turn.
 
@@ -56,9 +51,10 @@ When the duplex session supplies TTS extras, AURA text can feed Qwen3-TTS as:
 Optional `tts_pass_token_ids` passes AURA assistant token ids into Talker
 instead of detokenized text.
 
-## Turn-based examples (not primary)
+## Old chat / Gradio / curl scripts (unsupported)
 
 `examples/online_serving/aura_omni/` still contains chat-completions, curl, and
-Gradio helpers from the older turn-based online path. They are **not** the
-supported primary path for the duplex deploy profile; use the Realtime duplex
-smoke client for online verification.
+Gradio helpers from an older turn-based path. They do **not** work against the
+shipped duplex profile. That path was an incomplete stand-in before streaming
+I/O and session history were available; it is not a supported AURA mode. Use
+the Realtime duplex smoke client for online verification.

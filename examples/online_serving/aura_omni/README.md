@@ -6,28 +6,20 @@
 Qwen3-ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Qwen3-TTS Code2Wav
 ```
 
-**Primary online path is Realtime duplex** (`/v1/realtime?duplex=1`), not
-turn-based `chat/completions`. The default deploy profile sets
-`session_mode: duplex` because the pipeline declares `duplex_plugin` and
-`DuplexOmniEngine` requires that mode.
+**AURA's supported online path is Realtime duplex** (`/v1/realtime?duplex=1`).
+The default deploy profile sets `session_mode: duplex` because the pipeline
+declares `duplex_plugin` and `DuplexOmniEngine` requires that mode.
 
 This is AURA v1 / Qwen3-VL (silent / ChatML ids `151669` / `151645`), not
 AURA v2 / Qwen3.5-VL.
 
-## Duplex Realtime (primary)
+## Duplex Realtime (only supported online path)
 
-Start with the default deploy profile:
-
-```bash
-vllm serve aurateam/AURA \
-  --omni \
-  --port 8091 \
-  --deploy-config vllm_omni/deploy/aura_omni.yaml \
-  --served-model-name aurateam/AURA \
-  --trust-remote-code
-```
-
-Local-weight smoke (Stage1 path baked into the smoke YAML):
+Stage2→3 codec handoff needs `async_chunk: true`. The default
+`vllm_omni/deploy/aura_omni.yaml` keeps `async_chunk: false` as a safer
+baseline (turn-based `OmniOrchestrator` never sees the duplex async-chunk
+gate). For Realtime, use the smoke deploy (already `async_chunk: true`) or
+set that flag yourself:
 
 ```bash
 bash examples/online_serving/aura_omni/run_duplex_smoke_serve.sh
@@ -36,9 +28,21 @@ python examples/online_serving/aura_omni/smoke_duplex_realtime_client.py
 
 Smoke deploy file: `examples/online_serving/aura_omni/aura_omni_duplex_smoke.yaml`.
 
+Equivalent serve with the default topology and async chunks enabled:
+
+```bash
+# Copy or edit so async_chunk: true, then:
+vllm serve aurateam/AURA \
+  --omni \
+  --port 8091 \
+  --deploy-config examples/online_serving/aura_omni/aura_omni_duplex_smoke.yaml \
+  --served-model-name aurateam/AURA \
+  --trust-remote-code
+```
+
 Connect clients to `/v1/realtime?duplex=1`. Silent Stage1 outputs gate TTS (no
 audio for that turn). Overlapped input and vision-follow are AURA duplex
-capabilities; see the PR / RFC for behaviour.
+capabilities.
 
 ### Browser UI
 
@@ -74,22 +78,17 @@ Tune `gpu_memory_utilization` per stage. Baseline on one large GPU:
 - Stage 2 (Talker): `0.20`
 - Stage 3 (Code2Wav): `0.20`
 
-## Turn-based chat / Gradio / curl (not primary)
+## Old chat / Gradio / curl scripts (unsupported)
 
-The OpenAI chat-completions client, curl helper, and Gradio demo were written
-for the older **turn-based** Omni serve path (one HTTP request ≈ one turn).
-They are **not** the supported primary online path for this duplex profile:
-with `session_mode: duplex`, serve is Realtime-oriented.
+`openai_chat_completion_client.py`, `run_curl_multimodal_generation.sh`, and
+`run_gradio_demo.sh` target the older turn-based Omni path. They do **not**
+work against the shipped `session_mode: duplex` profile.
 
-Keep these scripts for offline-adjacent debugging or historical reference only.
-Prefer the duplex smoke client above for online checks.
-
-```bash
-# Legacy / debug only — not the duplex Realtime path
-python examples/online_serving/aura_omni/openai_chat_completion_client.py --help
-bash examples/online_serving/aura_omni/run_curl_multimodal_generation.sh
-bash examples/online_serving/aura_omni/run_gradio_demo.sh
-```
+That turn-based path was an incomplete June-era stand-in: vLLM-Omni did not
+yet support streaming I/O for this stack, and adding session history then would
+have required a much larger orchestrator change. It is not a supported AURA
+mode. Do not run those scripts against the default deploy. Prefer the duplex
+smoke client above.
 
 ## Offline
 
