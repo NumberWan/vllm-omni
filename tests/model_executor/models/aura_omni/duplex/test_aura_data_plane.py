@@ -45,6 +45,43 @@ def test_project_unwraps_data_plane_outputs_and_emits_audio_then_done() -> None:
     assert events[0].get("data_plane_request_id") == request_id
 
 
+def test_project_sends_only_the_new_tail_of_a_growing_waveform() -> None:
+    seen: list[int] = []
+
+    def encode(audio: object, sample_rate: int, fmt: str, speed: float | None) -> str:
+        del sample_rate, fmt, speed
+        count = int(np.asarray(audio).reshape(-1).size)
+        seen.append(count)
+        return f"pcm-{count}"
+
+    plane = AuraDataPlaneSession(encode)
+    request_id = "duplex-s.abc.e.0.r.stage3-turn1"
+    plane.begin_request(request_id)
+
+    def chunk(n: int, *, finished: bool) -> SimpleNamespace:
+        audio = np.arange(n, dtype=np.float32)
+        return SimpleNamespace(
+            request_id=request_id,
+            finished=finished,
+            stage_id=3,
+            outputs=[
+                SimpleNamespace(
+                    text="",
+                    cumulative_text="",
+                    finished=False,
+                    multimodal_output={"audio": audio, "sr": 24000},
+                )
+            ],
+        )
+
+    first = list(plane.project_output(chunk(8, finished=False)))
+    second = list(plane.project_output(chunk(12, finished=True)))
+    assert seen == [8, 4]
+    assert first[0]["audio_duration_ms"] == round(8 * 1000 / 24000)
+    assert second[0]["audio_duration_ms"] == round(4 * 1000 / 24000)
+    assert second[-1].get("end_of_turn") is True
+
+
 def test_project_holds_silent_token_prefix() -> None:
     plane = AuraDataPlaneSession(_encode_audio)
     request_id = "duplex-s.abc.e.0.r.stage1-turn1"

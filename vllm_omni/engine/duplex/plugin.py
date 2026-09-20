@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -170,6 +171,19 @@ class DuplexDataPlane(ABC):
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
 
+@dataclass(frozen=True, slots=True)
+class PartialStageForward:
+    """One downstream update the orchestrator should submit.
+
+    ``close_only`` is a final update with no new sentence. ``output`` is the
+    model-built payload; the orchestrator does not interpret its text.
+    """
+
+    output: object
+    is_final_update: bool
+    close_only: bool = False
+
+
 class DuplexModelPlugin(ABC):
     """Everything vLLM-Omni needs to know about one full-duplex model.
 
@@ -253,6 +267,30 @@ class DuplexModelPlugin(ABC):
         """
         del stage_id, output, context
         return False
+
+    def plan_partial_stage_output(
+        self,
+        orchestrator: object,
+        stage_id: int,
+        replica_id: int,
+        output: object,
+        req_state: object,
+    ) -> PartialStageForward | None:
+        """Return a Talker update the orchestrator should submit, or None.
+
+        Default models do not split Stage1 text. The orchestrator owns the
+        actual ``_forward_to_next_stage`` call.
+        """
+        del orchestrator, stage_id, replica_id, output, req_state
+        return None
+
+    def commit_model_context(self, *, session_id: str | None, assistant_text: str) -> None:
+        """Persist model-context history at a turn boundary. Default is a no-op.
+
+        This is not playback-ACK history. A model that keeps its own prompt
+        transcript implements this; the session runner only decides when.
+        """
+        del session_id, assistant_text
 
     def release_overlapped_commit(
         self,

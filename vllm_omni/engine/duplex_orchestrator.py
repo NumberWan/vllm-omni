@@ -409,9 +409,17 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         req_state: OrchestratorRequestState,
         stage_metrics: Any,
     ) -> None:
-        forward_partial = getattr(self.plugin, "forward_partial_stage_output", None)
-        if forward_partial is not None:
-            await forward_partial(self, stage_id, replica_id, output, req_state)
+        plan = self.plugin.plan_partial_stage_output(self, stage_id, replica_id, output, req_state)
+        if plan is not None:
+            await self._forward_to_next_stage(
+                req_state.request_id,
+                stage_id,
+                plan.output,
+                req_state,
+                src_replica_id=replica_id,
+                is_streaming_session=True,
+                is_final_update=plan.is_final_update,
+            )
         await super()._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:

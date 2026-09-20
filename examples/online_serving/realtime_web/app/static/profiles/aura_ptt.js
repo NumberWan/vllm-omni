@@ -16,6 +16,7 @@
     pushToTalk: true,
     stickyCamera: true,
     visionFollowWhileSpeaking: true,
+    deduplicateTranscript: true,
     halfDuplex: false,
     closeSession: true,
     reconnectEachTurn: false,
@@ -23,7 +24,7 @@
     instructions: true,
     sendIntervalMs: 200,
     presets: {
-      omni: 'You are AURA, a helpful multimodal assistant. Answer clearly in the user\'s language.',
+      omni: 'You are receiving a live video stream where the final frame is the present moment. Respond only when a response is needed based on the user\'s message or the visual context. Otherwise, output `<|silent|>` to signify silence.',
     },
     url(config, location) {
       const url = profiles.url(config, location);

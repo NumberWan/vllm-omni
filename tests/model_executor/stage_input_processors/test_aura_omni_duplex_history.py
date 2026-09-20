@@ -49,6 +49,26 @@ def test_asr2aura_supports_video_only_observation() -> None:
     assert next_input["multi_modal_data"].get("image") == ["frame"]
 
 
+def test_asr2aura_duplex_empty_transcript_is_not_a_vision_user_turn() -> None:
+    drop_session_history("duplex-vision")
+    prompt = {
+        "additional_information": {
+            "aura_duplex": True,
+            "session_id": "duplex-vision",
+            "is_speech": False,
+            "deferred_multi_modal_data": {"image": ["frame"]},
+        },
+        "multi_modal_data": {},
+    }
+    [next_input] = asr2aura([_source_output("noise")], prompt=[prompt])
+    assert "[vision]" not in next_input["prompt"]
+    history = get_or_create_session_history("duplex-vision")
+    history.commit_turn("saw a book")
+    assert all(message.get("content") != "[vision]" for message in history.messages)
+    assert [message["role"] for message in history.messages] == ["assistant"]
+    drop_session_history("duplex-vision")
+
+
 def test_asr2aura_duplex_uses_session_history_prefix() -> None:
     drop_session_history("duplex-hist")
     history = get_or_create_session_history("duplex-hist")
@@ -150,6 +170,14 @@ def test_duplex_interception_commits_silent_history_without_aura2tts() -> None:
     plane = AuraDataPlaneSession(encode_audio=lambda *_a, **_k: None)
     events = list(plane.project_output(output))
     assert events and events[0].get("silent") is True
+    assert events[0].get("model_context_text") == SILENT_TEXT
+    assert history.pending_user == "look"
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
+
+    AuraDuplexPlugin(encode_audio=lambda *_a, **_k: None).commit_model_context(
+        session_id="duplex-silent-dp",
+        assistant_text=str(events[0]["model_context_text"]),
+    )
     assert history.pending_user is None
     assert history.messages[-1]["content"] == SILENT_TEXT
     drop_session_history("duplex-silent-dp")

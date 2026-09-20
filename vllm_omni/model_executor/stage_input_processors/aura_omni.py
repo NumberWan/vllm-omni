@@ -20,7 +20,7 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 DEFAULT_AURA_SYSTEM_PROMPT = (
     "You are receiving a live video stream where the final frame is the present moment. "
     "Respond only when a response is needed based on the user's message or the visual context. "
-    "Otherwise, output '<|silent|>' to signify silence. Respond in Chinese."
+    "Otherwise, output `<|silent|>` to signify silence."
 )
 
 SILENT_TEXT = "<|silent|>"
@@ -414,9 +414,7 @@ def asr2aura(
             )
 
             history = get_or_create_session_history(session_id)
-            # Vision-only turns have empty ASR; keep a short marker so
-            # SessionHistory still records the user side of proactive follow-ups.
-            history.begin_user_turn(transcript if transcript else "[vision]")
+            history.begin_user_turn(transcript)
             history_prefix = history.render_prefix()
 
         next_input: dict[str, Any] = {

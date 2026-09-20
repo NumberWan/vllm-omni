@@ -179,6 +179,21 @@ def duplex_turn_id_from_request_id(request_id: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def duplex_session_id_from_request_id(request_id: str | None) -> str | None:
+    """Decode the session id from ``duplex-s.<b64url>.e.<epoch>.r.<role>``."""
+    if not isinstance(request_id, str):
+        return None
+    parts = request_id.split(".")
+    if len(parts) != 6 or parts[0] != "duplex-s" or parts[2] != "e" or parts[4] != "r":
+        return None
+    encoded = parts[1]
+    pad = "=" * (-len(encoded) % 4)
+    try:
+        return base64.urlsafe_b64decode(encoded + pad).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
 def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
     """Return whether a current-format resource request belongs to a session."""
     parts = request_id.split(".")
@@ -213,4 +228,5 @@ __all__ = [
     "duplex_turn_id_from_request_id",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
+    "duplex_session_id_from_request_id",
 ]

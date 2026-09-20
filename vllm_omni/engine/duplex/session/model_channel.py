@@ -40,6 +40,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputDecision,
     DuplexStageSubmission,
     duplex_data_plane_request_info,
+    duplex_session_id_from_request_id,
 )
 from vllm_omni.engine.duplex.plugin import (
     DuplexRuntimeConfigError,
@@ -654,6 +655,19 @@ class ModelChannel:
         self._out.emit(payload)
         return True
 
+    async def _release_ephemeral_request(self, request_id: object) -> None:
+        """Drop orchestrator state for a finished non-resumable stage request.
+
+        Resident Stage0 stays bound. Intermediate text must not call this;
+        only a completed turn (final stage, silent short-circuit, or a
+        draining TTS request) does.
+        """
+        if not isinstance(request_id, str) or not request_id:
+            return
+        if self._ctx.session.capabilities.supports_core_resumable_request:
+            return
+        await self._ctx.stage_port.cleanup([request_id])
+
     async def _on_model_listen(
         self,
         model_result: dict[str, object],
@@ -805,6 +819,12 @@ class ModelChannel:
             self._out.emit(payload)
             return close_reason, emitted_response
         if is_listen is True:
+            context_text = model_result.get("model_context_text")
+            if isinstance(context_text, str) and isinstance(data_plane_request_id, str):
+                self._ctx.plugin.commit_model_context(
+                    session_id=duplex_session_id_from_request_id(data_plane_request_id),
+                    assistant_text=context_text,
+                )
             return await self._on_model_listen(
                 model_result,
                 model_turn_id=model_turn_id,
@@ -831,17 +851,24 @@ class ModelChannel:
                     name="duplex-continue",
                 )
             return close_reason, emitted_response
-        if end_of_turn and not has_text and not has_audio and session.active_response_id is None:
+        request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
+        draining_response_id = (
+            session.response_id_for_request(request_key) if session.is_draining_request(request_key) else None
+        )
+        if (
+            end_of_turn
+            and not has_text
+            and not has_audio
+            and session.active_response_id is None
+            and draining_response_id is None
+        ):
             emitted_response = self._complete_model_turn_without_output(
                 model_result,
                 model_turn_id=model_turn_id,
                 data_plane_request_id=data_plane_request_id,
             )
+            await self._release_ephemeral_request(data_plane_request_id)
             return close_reason, emitted_response
-        request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
-        draining_response_id = (
-            session.response_id_for_request(request_key) if session.is_draining_request(request_key) else None
-        )
         if (
             draining_response_id is None
             and session.active_response_id is None
@@ -977,6 +1004,7 @@ class ModelChannel:
                 data_plane.mark_terminal(data_plane_request_id)
                 session.request_resources.pop((2, data_plane_request_id), None)
                 session.request_resources.pop((3, data_plane_request_id), None)
+                await self._release_ephemeral_request(data_plane_request_id)
                 if drained_response_id is not None:
                     self._out.emit(
                         {
@@ -1014,6 +1042,7 @@ class ModelChannel:
                     "playback": session.playback.as_dict(),
                 }
             )
+            await self._release_ephemeral_request(data_plane_request_id)
         return close_reason, emitted_response
 
     def _end_active_response_before_future_model_turn(self, *, model_turn_id: int | None) -> None:

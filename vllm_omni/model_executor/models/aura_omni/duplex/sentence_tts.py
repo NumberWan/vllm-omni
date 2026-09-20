@@ -8,6 +8,8 @@ from typing import Any
 
 from vllm.logger import init_logger
 
+from vllm_omni.engine.duplex.plugin import PartialStageForward
+
 logger = init_logger(__name__)
 
 
@@ -53,20 +55,21 @@ def stage1_tts_text(orchestrator: Any, output: Any) -> str:
     return _extract_text(output)
 
 
-async def forward_partial_stage_output(
+def plan_partial_stage_output(
     orchestrator: Any,
     stage_id: int,
     replica_id: int,
     output: Any,
     req_state: Any,
-) -> None:
+) -> PartialStageForward | None:
     """Hand a finished sentence to Talker before Stage1 finishes.
 
     Same request id as the turn (Code2Wav was prewarmed on it). Text goes
     through ``aura2tts`` in the orchestrator, not the ``from_stage_1`` SHM
     edge that clears ``additional_information.text``. Talker stays resumable
-    until Stage1 finishes.
+    until Stage1 finishes. The orchestrator submits the returned plan.
     """
+    del replica_id
     if not req_state.session_owned or stage_id != 1:
         return
     if stage_id + 1 > req_state.final_stage_id:
@@ -81,7 +84,6 @@ async def forward_partial_stage_output(
     from vllm_omni.model_executor.stage_input_processors.aura_omni import (
         _sentence_tts_enabled,
         _strip_assistant_text,
-        commit_duplex_stage1_history,
         next_duplex_sentence_chunk,
     )
 
@@ -118,7 +120,11 @@ async def forward_partial_stage_output(
         raw_info["aura_tts_partial"] = True
         if finished and not bridge.get("history_committed"):
             raw_info["aura_tts_partial"] = False
-            commit_duplex_stage1_history(raw_info, _strip_assistant_text(raw_text) or raw_text)
+            session_id = raw_info.get("session_id") or raw_info.get("aura_session_id")
+            orchestrator.plugin.commit_model_context(
+                session_id=session_id if isinstance(session_id, str) else None,
+                assistant_text=_strip_assistant_text(raw_text) or raw_text,
+            )
             raw_info["aura_tts_partial"] = True
             bridge["history_committed"] = True
 
@@ -130,14 +136,6 @@ async def forward_partial_stage_output(
         close_only,
         len(chunk),
     )
-    await orchestrator._forward_to_next_stage(
-        req_state.request_id,
-        stage_id,
-        view,
-        req_state,
-        src_replica_id=replica_id,
-        is_streaming_session=True,
-        is_final_update=finished,
-    )
     if finished:
         bridge["closed"] = True
+    return PartialStageForward(output=view, is_final_update=finished, close_only=close_only)

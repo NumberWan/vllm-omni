@@ -24,34 +24,6 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 
-def _session_id_from_request_id(request_id: str) -> str | None:
-    """Decode ``duplex-s.<b64url(session)>.e.…`` into the session id, or None."""
-    import pybase64 as base64
-
-    parts = request_id.split(".")
-    if len(parts) != 6 or parts[0] != "duplex-s" or parts[2] != "e" or parts[4] != "r":
-        return None
-    encoded = parts[1]
-    pad = "=" * (-len(encoded) % 4)
-    try:
-        return base64.urlsafe_b64decode(encoded + pad).decode("utf-8")
-    except (ValueError, UnicodeDecodeError):
-        return None
-
-
-def _commit_silent_history(request_id: str) -> None:
-    """Commit pending user turn when Stage1 silent short-circuits past aura2tts."""
-    session_id = _session_id_from_request_id(request_id)
-    if not session_id:
-        return
-    from vllm_omni.model_executor.models.aura_omni.duplex.history import get_or_create_session_history
-
-    history = get_or_create_session_history(session_id)
-    if history.pending_user is None:
-        return
-    history.commit_turn(SILENT_TEXT)
-
-
 @dataclass(frozen=True, slots=True)
 class AuraDataPlaneContext:
     epoch: int = 0
@@ -172,6 +144,33 @@ def _pcm_sample_count(audio: object) -> int:
         return 0
 
 
+def _flat_audio(audio: object) -> torch.Tensor | np.ndarray | None:
+    if isinstance(audio, torch.Tensor):
+        return audio.detach().reshape(-1)
+    try:
+        return np.asarray(audio, dtype=np.float32).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _new_audio_samples(audio: object, already_sent: int) -> tuple[torch.Tensor | np.ndarray, int] | None:
+    """Return only samples not yet sent.
+
+    Code2Wav hands back a growing waveform. A longer buffer is a cumulative
+    snapshot: send the tail. An equal buffer is a duplicate. A shorter buffer
+    is a real delta (or a restart) and is sent whole.
+    """
+    flat = _flat_audio(audio)
+    if flat is None:
+        return None
+    count = int(flat.numel()) if isinstance(flat, torch.Tensor) else int(flat.size)
+    if count > already_sent:
+        return flat[already_sent:], count
+    if count == already_sent:
+        return None
+    return flat, already_sent + count
+
+
 def _requested_audio_format(context: object | None) -> tuple[str, float | None]:
     """Honor the session response format. Missing context stays PCM16 (Realtime default)."""
     fmt = getattr(context, "response_format", None)
@@ -249,10 +248,8 @@ class AuraDataPlaneSession(DuplexDataPlane):
         metadata = dict(getattr(decision, "metadata", {}) or {})
         if metadata.get("model_listen") or metadata.get("duplex_native_decision") == "listen":
             state.silent = True
-            # DIRECT_RESPONSE skips aura2tts; commit history here on the duplex path.
-            _commit_silent_history(request_id)
-            # Mark terminal after yield: runner._send_one drops is_terminal
-            # requests before emit.
+            # DIRECT_RESPONSE skips aura2tts. The session runner commits
+            # model context from model_context_text; this projector does not.
             yield _event(
                 stage_role="thinker",
                 is_listen=True,
@@ -260,6 +257,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 text="",
                 end_of_turn=True,
                 silent=True,
+                model_context_text=SILENT_TEXT,
             )
             state.terminal = True
             return
@@ -295,11 +293,16 @@ class AuraDataPlaneSession(DuplexDataPlane):
         audio = _audio_value(mm)
         if audio is not None and not state.silent:
             sample_rate = _sample_rate(mm)
-            encoded = self._encode_audio(audio, sample_rate, response_format, speed)
+            delta = _new_audio_samples(audio, state.audio_offset)
+            encoded = None
+            n = 0
+            if delta is not None:
+                samples, new_offset = delta
+                encoded = self._encode_audio(samples, sample_rate, response_format, speed)
+                if encoded:
+                    n = _pcm_sample_count(samples)
+                    state.audio_offset = new_offset
             if encoded:
-                n = _pcm_sample_count(audio)
-                state.audio_offset += n
-                # Delta for this chunk. model_channel adds it onto sent_ms.
                 duration_ms = round(n * 1000 / max(1, sample_rate))
                 end_of_turn = bool(finished and is_final_audio_stage)
                 yield _event(
@@ -333,6 +336,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 text="",
                 end_of_turn=True,
                 silent=True,
+                model_context_text=SILENT_TEXT,
             )
             state.terminal = True
 
