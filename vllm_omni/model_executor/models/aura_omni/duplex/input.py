@@ -9,6 +9,10 @@ import binascii
 
 import pybase64 as base64
 
+from vllm_omni.engine.duplex.pcm_reservation import (
+    commit_ordered_reservation,
+    rollback_ordered_reservation,
+)
 from vllm_omni.engine.duplex.plugin import PcmAppendBuffer, PcmAppendReservation
 
 _SAMPLE_BYTES = 4
@@ -43,28 +47,15 @@ class AuraPcmAppendReservation(PcmAppendReservation):
         return self._reserved_bytes
 
     def commit(self) -> None:
-        if not self._active:
-            return
-        self._active = False
-        if self in self._owner._reservations:
-            self._owner._reservations.remove(self)
+        commit_ordered_reservation(self._owner._reservations, self, head_only=False)
 
     def rollback(self) -> None:
-        if not self._active:
-            return
-        try:
-            index = self._owner._reservations.index(self)
-        except ValueError:
-            self._active = False
-            return
-        restore = bytearray()
-        for reservation in self._owner._reservations[index:]:
-            if reservation._active:
-                restore.extend(reservation._raw)
-                reservation._active = False
-        del self._owner._reservations[index:]
-        self._owner._buffer[:0] = restore
-        self._active = False
+        rollback_ordered_reservation(
+            self._owner._reservations,
+            self,
+            self._owner._buffer,
+            active_only=True,
+        )
 
 
 class AuraPcmAppendBuffer(PcmAppendBuffer):
