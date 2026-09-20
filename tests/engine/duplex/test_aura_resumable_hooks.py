@@ -448,3 +448,68 @@ def test_draining_completion_drops_finished_response_books_only() -> None:
     done = [event for event in out.events if event.get("type") == "response.done"]
     assert done and done[-1].get("response_id") == r1
 
+def test_stale_continue_does_not_close_the_new_response() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+    from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+
+    session = DuplexEngineSession(
+        session_id="s-stale-continue",
+        config=DuplexSessionConfig(model="m", modalities=["text", "audio"], extra_body={"auto_response": True}),
+        capabilities=DuplexCapabilities(supports_overlapped_commit=True, supports_core_resumable_request=False),
+    )
+    session.begin_response(turn_id=2)
+    live = session.active_response_id
+    session.epoch = 1
+
+    class _Out:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def auto_responds(self) -> bool:
+            return True
+
+        def emit(self, payload: dict[str, object]) -> None:
+            self.events.append(payload)
+
+    out = _Out()
+    cleared: list[bool] = []
+
+    async def _noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def _schedule(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    channel = ModelChannel(
+        SimpleNamespace(
+            session=session,
+            plugin=SimpleNamespace(data_plane=SimpleNamespace()),
+            stage_port=SimpleNamespace(),
+            model_state=SimpleNamespace(clear_continuation=lambda: cleared.append(True)),
+            services=SimpleNamespace(spawn=lambda *_a, **_k: None),
+            run=SimpleNamespace(closing=False),
+        ),
+        out,
+        close_from_runtime=_noop,
+        schedule_silence_continuation=_schedule,
+        abort_request=_noop,
+    )
+    asyncio.run(channel.maybe_continue_response(expected_epoch=0))
+    assert session.active_response_id == live
+    assert out.events == []
+    assert cleared == []
+
+    session.bind_draining_request("duplex-s.x.e.1.r.stage3-turn2", live or "")
+    asyncio.run(channel.maybe_continue_response(expected_epoch=1))
+    assert session.active_response_id == live
+    assert out.events == []
+
+    session.clear_draining_requests()
+    asyncio.run(channel.maybe_continue_response(expected_epoch=1))
+    assert session.active_response_id is None
+    assert [event.get("type") for event in out.events] == ["response.done"]
+    assert out.events[0].get("response_id") == live

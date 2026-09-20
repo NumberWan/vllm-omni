@@ -1232,11 +1232,15 @@ class ModelChannel:
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
             model_state.clear_continuation()
             return
+        if expected_epoch is not None and session.epoch != expected_epoch:
+            return
         # Non-resumable stage0 cannot submit_update after the request finishes;
         # clear continuation and close the response (silent / listen final).
+        # A continue for a response that still has draining TTS must not emit
+        # response.done here; that finish owns the done event.
         if not session.capabilities.supports_core_resumable_request:
             model_state.clear_continuation()
-            if response_id is not None:
+            if response_id is not None and not session.response_has_draining_request(response_id):
                 should_commit = self.should_commit_response_to_history(session, response_id)
                 committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
                 if should_commit and committed_message is not None:
