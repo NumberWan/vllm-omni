@@ -758,6 +758,7 @@ class ModelChannel:
                     "playback": session.playback.as_dict(),
                 }
             )
+        await self._release_ephemeral_request(data_plane_request_id)
         return close_reason, emitted_response
 
     async def _send_one_model_output_event(
