@@ -179,14 +179,22 @@ def duplex_turn_id_from_request_id(request_id: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def duplex_session_id_from_request_id(request_id: str | None) -> str | None:
-    """Decode the session id from ``duplex-s.<b64url>.e.<epoch>.r.<role>``."""
+def _duplex_resource_request_fields(request_id: str | None) -> tuple[str, str, str] | None:
+    """Split ``duplex-s.<b64url>.e.<epoch>.r.<role>`` or return None."""
     if not isinstance(request_id, str):
         return None
     parts = request_id.split(".")
     if len(parts) != 6 or parts[0] != "duplex-s" or parts[2] != "e" or parts[4] != "r":
         return None
-    encoded = parts[1]
+    return parts[1], parts[3], parts[5]
+
+
+def duplex_session_id_from_request_id(request_id: str | None) -> str | None:
+    """Decode the session id from ``duplex-s.<b64url>.e.<epoch>.r.<role>``."""
+    fields = _duplex_resource_request_fields(request_id)
+    if fields is None:
+        return None
+    encoded, _, _ = fields
     pad = "=" * (-len(encoded) % 4)
     try:
         return base64.urlsafe_b64decode(encoded + pad).decode("utf-8")
@@ -196,20 +204,20 @@ def duplex_session_id_from_request_id(request_id: str | None) -> str | None:
 
 def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
     """Return whether a current-format resource request belongs to a session."""
-    parts = request_id.split(".")
-    if len(parts) != 6 or parts[0] != "duplex-s" or parts[2] != "e" or parts[4] != "r":
+    fields = _duplex_resource_request_fields(request_id)
+    if fields is None:
         return False
+    encoded, epoch, role = fields
     try:
-        int(parts[3])
+        int(epoch)
     except ValueError:
         return False
-    role = parts[5]
     if not role or any(
         character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in role
     ):
         return False
     encoded_session_id = base64.urlsafe_b64encode(session_id.encode("utf-8")).decode("ascii").rstrip("=")
-    return parts[1] == encoded_session_id
+    return encoded == encoded_session_id
 
 
 __all__ = [
