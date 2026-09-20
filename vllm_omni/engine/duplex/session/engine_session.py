@@ -1100,6 +1100,21 @@ class DuplexEngineSession:
             return
         self._playback.by_response.pop(response_id, None)
 
+    def release_finished_drain_response(self, response_id: str | None) -> None:
+        """Drop books for a response whose TTS just finished.
+
+        Overlap leaves the next turn active, so this must not call
+        ``end_response``. The live response keeps its snapshot, playback
+        cursor, and history placeholder.
+        """
+        if response_id is None or response_id == self.active_response_id:
+            return
+        self._conversation.assistant_response_snapshots.pop(response_id, None)
+        self.release_response_playback(response_id)
+        item_id = f"item_{response_id}"
+        if item_id not in self._conversation.item_ids:
+            self._discard_history_item_placeholder(item_id)
+
     def clear_playback_cursor(self) -> None:
         self._playback.current = DuplexPlaybackCursor()
         if self.active_response_id is not None:

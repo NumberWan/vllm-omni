@@ -354,3 +354,97 @@ def test_draining_empty_eos_completes_owning_response_before_shortcut() -> None:
     assert port.cleanups == [[r1_request]]
     assert all(still_running not in ids for ids in port.cleanups)
     assert not session.is_draining_request(r1_request)
+
+
+def test_draining_completion_drops_finished_response_books_only() -> None:
+    """R1 drain finish drops R1 books and leaves the live R2 snapshot."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+    from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+
+    session = DuplexEngineSession(
+        session_id="s-drain-books",
+        config=DuplexSessionConfig(model="m", modalities=["text", "audio"], extra_body={"auto_response": True}),
+        capabilities=DuplexCapabilities(supports_overlapped_commit=True, supports_core_resumable_request=False),
+    )
+    session.begin_response(turn_id=1)
+    r1 = session.active_response_id
+    assert r1 is not None
+    session.append_assistant_text("from-r1")
+    session.snapshot_active_response_for_drain()
+    r1_request = "duplex-s.x.e.0.r.stage3-turn1"
+    session.bind_draining_request(r1_request, r1)
+    session.begin_response(turn_id=2)
+    r2 = session.active_response_id
+    assert r2 is not None and r2 != r1
+    session.append_assistant_text("from-r2")
+    session.snapshot_active_response_for_drain()
+
+    class _Plane:
+        def is_terminal(self, request_id: str | None) -> bool:
+            del request_id
+            return False
+
+        def close_stream(self, request_id: str) -> None:
+            del request_id
+
+        def mark_terminal(self, request_id: str) -> None:
+            del request_id
+
+    class _Port:
+        async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
+            del request_ids, abort
+
+    class _Out:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def auto_responds(self) -> bool:
+            return True
+
+        def emit(self, payload: dict[str, object]) -> None:
+            self.events.append(payload)
+
+    out = _Out()
+
+    async def _noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def _schedule(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    channel = ModelChannel(
+        SimpleNamespace(
+            session=session,
+            plugin=SimpleNamespace(data_plane=_Plane()),
+            stage_port=_Port(),
+            model_state=SimpleNamespace(clear_continuation=lambda: None),
+            services=SimpleNamespace(spawn=lambda *_a, **_k: None),
+        ),
+        out,
+        close_from_runtime=_noop,
+        schedule_silence_continuation=_schedule,
+        abort_request=_noop,
+    )
+    asyncio.run(
+        channel._send_one_model_output_event(
+            {
+                "data_plane_request_id": r1_request,
+                "end_of_turn": True,
+                "model_turn_id": 1,
+                "text": "",
+                "stage_role": "tts",
+            }
+        )
+    )
+    assert r1 not in session._conversation.assistant_response_snapshots
+    assert r1 not in session._playback.by_response
+    assert f"item_{r1}" not in session._conversation.history_item_placeholders
+    assert r2 in session._conversation.assistant_response_snapshots
+    assert session.active_response_id == r2
+    done = [event for event in out.events if event.get("type") == "response.done"]
+    assert done and done[-1].get("response_id") == r1
+

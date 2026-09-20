@@ -1007,6 +1007,8 @@ class ModelChannel:
                 session.request_resources.pop((3, data_plane_request_id), None)
                 await self._release_ephemeral_request(data_plane_request_id)
                 if drained_response_id is not None:
+                    playback = session.playback_for_response(drained_response_id).as_dict()
+                    session.release_finished_drain_response(drained_response_id)
                     self._out.emit(
                         {
                             "type": "response.done",
@@ -1015,7 +1017,7 @@ class ModelChannel:
                             "epoch": session.epoch,
                             "committed": False,
                             "status": "completed",
-                            "playback": session.playback_for_response(drained_response_id).as_dict(),
+                            "playback": playback,
                         }
                     )
                 return close_reason, emitted_response
