@@ -30,6 +30,7 @@ PROGRESS_TYPES = {
     "response.created",
     "response.done",
     "response.audio.delta",
+    "response.output_audio.delta",
     "response.audio_transcript.delta",
     "response.output_text.delta",
     "response.text.delta",
