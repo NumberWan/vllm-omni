@@ -1417,11 +1417,14 @@ class DuplexSessionRunner:
     ) -> bool:
         session = self.session
         has_running_task = active_task is not None and not active_task.done()
-        if not has_running_task and session.active_request_id is None and session.active_response_id is None:
+        old_request_id = session.active_request_id
+        draining_ids = [
+            request_id for request_id in session.draining_request_ids() if request_id and request_id != old_request_id
+        ]
+        if not has_running_task and old_request_id is None and session.active_response_id is None and not draining_ids:
             return False
 
         old_epoch = session.epoch
-        old_request_id = session.active_request_id
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
         # Barge-in / cancel aborts prior TTS; clear overlapped-input release.
@@ -1444,7 +1447,12 @@ class DuplexSessionRunner:
             # Release projector/parser cursors so cancelled epochs do not
             # accumulate until the whole session closes.
             self.plugin.data_plane.close_stream(old_request_id)
-            await self._abort_request_background(old_request_id, notify=notify)
+        for request_id in draining_ids:
+            self.plugin.data_plane.close_stream(request_id)
+        session.clear_draining_requests()
+        abort_ids = [request_id for request_id in (old_request_id, *draining_ids) if request_id]
+        if abort_ids:
+            await self._abort_request_background(abort_ids, notify=notify)
         if has_running_task and active_task is not None:
             active_task.cancel()
             try:
@@ -1466,13 +1474,13 @@ class DuplexSessionRunner:
             )
         return True
 
-    async def _abort_request_background(self, request_id: str, *, notify: bool) -> None:
+    async def _abort_request_background(self, request_ids: list[str], *, notify: bool) -> None:
         try:
-            await self.stage_port.abort_requests([request_id])
+            await self.stage_port.abort_requests(request_ids)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.exception("Failed to abort duplex request %s: %s", request_id, exc)
+            logger.exception("Failed to abort duplex request %s: %s", request_ids, exc)
             if notify and self.session.state != DuplexSessionState.CLOSED:
                 self.model.send_runtime_error("runtime_abort_failed", exc)
 

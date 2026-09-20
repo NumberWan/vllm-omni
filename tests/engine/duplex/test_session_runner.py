@@ -699,6 +699,20 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
         await close_harness(h)
 
 
+async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> None:
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="he"))
+        h.session.bind_draining_request("duplex-drain-tts", "resp-old")
+        await h.run(commands.BargeIn())
+        assert h.port.aborts == [[request_id, "duplex-drain-tts"]]
+        assert not h.session.is_draining_request("duplex-drain-tts")
+    finally:
+        await close_harness(h)
+
+
 @pytest.mark.asyncio
 async def test_cancel_response_without_active_response_is_rejected() -> None:
     h = await open_harness()

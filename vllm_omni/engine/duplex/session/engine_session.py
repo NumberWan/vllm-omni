@@ -616,6 +616,13 @@ class DuplexEngineSession:
     def is_draining_request(self, request_id: str | None) -> bool:
         return isinstance(request_id, str) and request_id in self._response.draining_response_by_request
 
+    def draining_request_ids(self) -> list[str]:
+        """Request ids whose TTS is still running under a previous response."""
+        return list(self._response.draining_response_by_request)
+
+    def clear_draining_requests(self) -> None:
+        self._response.draining_response_by_request.clear()
+
     def clear_draining_for_response(self, response_id: str | None) -> None:
         """Drop draining bindings owned by ``response_id``; leave other responses intact."""
         if response_id is None:
