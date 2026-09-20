@@ -83,7 +83,6 @@ def plan_partial_stage_output(
 
     from vllm_omni.model_executor.stage_input_processors.aura_omni import (
         _sentence_tts_enabled,
-        _strip_assistant_text,
         next_duplex_sentence_chunk,
     )
 
@@ -102,11 +101,11 @@ def plan_partial_stage_output(
     chunk = next_duplex_sentence_chunk(bridge, raw_text, finished=finished)
     close_only = False
     if chunk is None:
-        if not (finished and int(bridge.get("emits", 0)) and bridge.get("last")):
+        if not (finished and int(bridge.get("emits", 0))):
             return
-        chunk = str(bridge.get("last") or "")
+        chunk = ""
         close_only = True
-    if not chunk:
+    if not chunk and not close_only:
         return
 
     prompt = req_state.prompt if isinstance(req_state.prompt, dict) else None
@@ -115,18 +114,10 @@ def plan_partial_stage_output(
         if not isinstance(raw_info, dict):
             raw_info = {}
             prompt["additional_information"] = raw_info
-        # Partial chunks must not commit history. The finish path commits
-        # the full stripped turn once, then aura2tts sees this flag.
+        # History is committed by the session runner from model_context_text.
+        # Partial and close-only updates must not commit inside aura2tts.
         raw_info["aura_tts_partial"] = True
-        if finished and not bridge.get("history_committed"):
-            raw_info["aura_tts_partial"] = False
-            session_id = raw_info.get("session_id") or raw_info.get("aura_session_id")
-            orchestrator.plugin.commit_model_context(
-                session_id=session_id if isinstance(session_id, str) else None,
-                assistant_text=_strip_assistant_text(raw_text) or raw_text,
-            )
-            raw_info["aura_tts_partial"] = True
-            bridge["history_committed"] = True
+        raw_info["aura_tts_close_only"] = close_only
 
     view = SentenceTtsOutput(str(getattr(output, "request_id", req_state.request_id)), chunk)
     logger.info(

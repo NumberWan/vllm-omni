@@ -41,6 +41,7 @@ class _RequestState:
     audio_offset: int = 0
     silent: bool = False
     terminal: bool = False
+    context_committed: bool = False
     stage_seen: set[int] = field(default_factory=set)
 
 
@@ -288,6 +289,23 @@ class AuraDataPlaneSession(DuplexDataPlane):
         # CompletionOutput.finished is true on every Code2Wav chunk and must
         # not close the duplex turn (runner would then drop via is_terminal).
         finished = bool(outer_finished or getattr(output, "finished", False))
+        if (
+            finished
+            and stage_id == 1
+            and not state.silent
+            and not state.context_committed
+            and state.text_sent
+            and not is_effectively_silent(state.text_sent)
+        ):
+            state.context_committed = True
+            yield _event(
+                stage_role="thinker",
+                is_listen=False,
+                data_plane_request_id=request_id,
+                text="",
+                end_of_turn=False,
+                model_context_text=state.text_sent,
+            )
         is_final_audio_stage = stage_id is None or stage_id >= 3
         mm = _multimodal(output, completion)
         audio = _audio_value(mm)

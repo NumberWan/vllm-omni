@@ -818,13 +818,13 @@ class ModelChannel:
             self._attach_runtime_metadata(payload, model_result)
             self._out.emit(payload)
             return close_reason, emitted_response
+        context_text = model_result.get("model_context_text")
+        if isinstance(context_text, str) and isinstance(data_plane_request_id, str):
+            self._ctx.plugin.commit_model_context(
+                session_id=duplex_session_id_from_request_id(data_plane_request_id),
+                assistant_text=context_text,
+            )
         if is_listen is True:
-            context_text = model_result.get("model_context_text")
-            if isinstance(context_text, str) and isinstance(data_plane_request_id, str):
-                self._ctx.plugin.commit_model_context(
-                    session_id=duplex_session_id_from_request_id(data_plane_request_id),
-                    assistant_text=context_text,
-                )
             return await self._on_model_listen(
                 model_result,
                 model_turn_id=model_turn_id,

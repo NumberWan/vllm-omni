@@ -568,9 +568,11 @@ def aura2tts(
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
         commit_duplex_stage1_history(additional_info, text or SILENT_TEXT)
-
-        if is_effectively_silent(text):
+        close_only = bool(additional_info.get("aura_tts_close_only"))
+        if is_effectively_silent(text) and not close_only:
             continue
+        if close_only:
+            text = ""
         task_type = _first_value(additional_info.get("tts_task_type"), "Base")
         language = _first_value(additional_info.get("tts_language"), "English")
         instruct = _first_value(additional_info.get("tts_instruct"), "")
@@ -591,7 +593,7 @@ def aura2tts(
             "task_type": [task_type],
             "language": [language],
             "instruct": [instruct],
-            "max_new_tokens": [int(_first_value(additional_info.get("tts_max_new_tokens"), 2048))],
+            "max_new_tokens": [1 if close_only else int(_first_value(additional_info.get("tts_max_new_tokens"), 2048))],
         }
         if pass_token_ids and assistant_token_ids_for_len:
             tts_info[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_token_ids_for_len]
@@ -624,7 +626,7 @@ def aura2tts(
             ]
         next_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=[0] * prompt_len,
+                prompt_token_ids=[0] if close_only else [0] * prompt_len,
                 additional_information=tts_info,
                 # Prefer runner data-plane so Talker preprocess still sees
                 # text if legacy additional_information is wiped (e.g. a

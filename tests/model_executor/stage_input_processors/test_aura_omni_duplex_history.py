@@ -127,6 +127,22 @@ def test_aura2tts_skips_history_on_sentence_partial() -> None:
     drop_session_history("duplex-partial")
 
 
+def test_aura2tts_close_only_does_not_repeat_the_sentence() -> None:
+    prompt = {
+        "additional_information": {
+            "aura_tts_partial": True,
+            "aura_tts_close_only": True,
+            "tts_task_type": "CustomVoice",
+            "tts_speaker": "Vivian",
+        }
+    }
+    [request] = aura2tts([_source_output("上一句不該再送。")], prompt=[prompt])
+    info = request["additional_information"]
+    assert info["text"] == [""]
+    assert info["max_new_tokens"] == [1]
+    assert request["prompt_token_ids"] == [0]
+
+
 def test_duplex_interception_commits_silent_history_without_aura2tts() -> None:
     """Silent Stage1 uses DIRECT_RESPONSE; history must commit on the data-plane path."""
     from vllm.outputs import CompletionOutput

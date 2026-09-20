@@ -145,3 +145,20 @@ def test_project_marks_finished_silent_text_as_listen() -> None:
     )
     events = list(plane.project({"data_plane_outputs": [final]}))
     assert any(e.get("silent") and e.get("is_listen") for e in events)
+
+
+def test_project_finished_spoken_turn_carries_model_context() -> None:
+    plane = AuraDataPlaneSession(_encode_audio)
+    request_id = "duplex-s.abc.e.0.r.stage1-turn5"
+    plane.begin_request(request_id)
+    final = SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        stage_id=1,
+        outputs=[SimpleNamespace(text="你好。", cumulative_text="你好。", finished=True)],
+    )
+    events = list(plane.project({"data_plane_outputs": [final]}))
+    context = [event for event in events if event.get("model_context_text")]
+    assert context and context[-1]["model_context_text"] == "你好。"
+    assert context[-1].get("is_listen") is False
+    assert context[-1].get("text") == ""
