@@ -373,7 +373,9 @@
     }
     // Flush remaining speech while still held, then commit.
     flushCapture();
-    for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+    }
     pttHeld = false;
     pttButton.classList.toggle('is-active', false);
     pttButton.textContent = 'Hold to talk';
