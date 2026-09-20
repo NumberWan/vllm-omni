@@ -197,3 +197,17 @@ def test_duplex_interception_commits_silent_history_without_aura2tts() -> None:
     assert history.pending_user is None
     assert history.messages[-1]["content"] == SILENT_TEXT
     drop_session_history("duplex-silent-dp")
+
+
+def test_proactive_silent_ticks_do_not_evict_a_real_turn() -> None:
+    drop_session_history("duplex-silent-ticks")
+    history = get_or_create_session_history("duplex-silent-ticks")
+    history.begin_user_turn("真正的問題")
+    history.commit_turn("真正的回答")
+    for _ in range(20):
+        history.begin_user_turn("")
+        history.commit_turn("<|silent|>")
+    assert history.messages[0]["content"] == "真正的問題"
+    assert history.messages[1]["content"] == "真正的回答"
+    assert len(history.messages) == 2
+    drop_session_history("duplex-silent-ticks")

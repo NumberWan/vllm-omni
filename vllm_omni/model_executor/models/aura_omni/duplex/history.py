@@ -38,9 +38,13 @@ class SessionHistory:
     def commit_turn(self, assistant_text: str) -> None:
         user = self.pending_user
         self.pending_user = None
+        text = assistant_text.strip()
+        # A vision tick with no user speech must not occupy a history slot.
+        # A real user turn that the model answers with silence is kept.
+        if not user and (not text or text == "<|silent|>"):
+            return
         if user:
             self.messages.append({"role": "user", "content": user})
-        text = assistant_text.strip()
         if text:
             self.messages.append({"role": "assistant", "content": text})
         self.prune()
