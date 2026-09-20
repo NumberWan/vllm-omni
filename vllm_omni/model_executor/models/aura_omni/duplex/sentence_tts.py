@@ -25,7 +25,51 @@ class SentenceTtsOutput:
         self.token_ids: list[int] = []
 
 
-def stage1_tts_text(orchestrator: Any, output: Any) -> str:
+def _call_decode(decode: Any, token_ids: list[int]) -> str:
+    try:
+        decoded = decode(token_ids, skip_special_tokens=False)
+    except TypeError:
+        decoded = decode(token_ids)
+    return decoded if isinstance(decoded, str) else ""
+
+
+def decode_growing_token_ids(decode: Any, token_ids: list[int], cache: dict[str, object]) -> str:
+    """Decode a growing id list, re-decoding only the unstable tail.
+
+    The returned text matches ``decode(token_ids)`` when the tail window is a
+    suffix of that string. Otherwise the full id list is decoded.
+    """
+    ids = list(token_ids)
+    prev_ids = cache.get("decoded_ids")
+    prev_text = cache.get("decoded_text")
+    overlap_text = cache.get("decoded_overlap_text")
+    candidate: str | None = None
+    if (
+        isinstance(prev_ids, list)
+        and isinstance(prev_text, str)
+        and isinstance(overlap_text, str)
+        and prev_ids
+        and len(ids) > len(prev_ids)
+        and ids[: len(prev_ids)] == prev_ids
+        and prev_text.endswith(overlap_text)
+        and overlap_text
+    ):
+        extended = _call_decode(decode, [*prev_ids[-1:], *ids[len(prev_ids) :]])
+        if extended.startswith(overlap_text):
+            candidate = prev_text[: len(prev_text) - len(overlap_text)] + extended
+            window_ids = [*prev_ids[-2:], *ids[len(prev_ids) :]] if len(prev_ids) >= 2 else ids
+            window_text = _call_decode(decode, window_ids)
+            if window_text and not candidate.endswith(window_text):
+                candidate = None
+    if candidate is None:
+        candidate = _call_decode(decode, ids)
+    cache["decoded_ids"] = ids
+    cache["decoded_text"] = candidate
+    cache["decoded_overlap_text"] = _call_decode(decode, ids[-1:]) if ids else ""
+    return candidate
+
+
+def stage1_tts_text(orchestrator: Any, output: Any, *, cache: dict[str, object] | None = None) -> str:
     """Stage1 text for sentence TTS.
 
     ``cumulative_text`` is attached only when the request finishes.
@@ -46,11 +90,11 @@ def stage1_tts_text(orchestrator: Any, output: Any) -> str:
         tokenizer = getattr(processor, "tokenizer", None)
         decode = getattr(tokenizer, "decode", None)
         if callable(decode):
-            try:
-                decoded = decode(list(token_ids), skip_special_tokens=False)
-            except TypeError:
-                decoded = decode(list(token_ids))
-            if isinstance(decoded, str) and decoded:
+            if cache is None:
+                decoded = _call_decode(decode, list(token_ids))
+            else:
+                decoded = decode_growing_token_ids(decode, list(token_ids), cache)
+            if decoded:
                 return decoded
     return _extract_text(output)
 
@@ -97,7 +141,7 @@ def plan_partial_stage_output(
         return
 
     finished = bool(getattr(output, "finished", False))
-    raw_text = stage1_tts_text(orchestrator, output)
+    raw_text = stage1_tts_text(orchestrator, output, cache=bridge)
     chunk = next_duplex_sentence_chunk(bridge, raw_text, finished=finished)
     close_only = False
     if chunk is None:
