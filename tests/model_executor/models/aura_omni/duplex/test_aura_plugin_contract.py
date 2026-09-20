@@ -99,6 +99,37 @@ def test_commit_only_buffer_emits_on_commit() -> None:
     commit.commit()
 
 
+def test_commit_reservation_includes_video_bytes() -> None:
+    buf = AuraPcmAppendBuffer()
+    pcm = np.zeros(1600, dtype="<f4").tobytes()
+    frames = ["aGVsbG8=", "d29ybGQ="]
+    payload = {
+        "type": "audio",
+        "format": "pcm_f32le",
+        "sample_rate_hz": 16000,
+        "audio": base64.b64encode(pcm).decode("ascii"),
+        "is_speech": True,
+        "video_frames": frames,
+    }
+    assert (
+        buf.prepare_append(
+            payload,
+            operation_id="op1",
+            chunk_period_ms=1000,
+            allow_emit=True,
+        )
+        is None
+    )
+    pending = buf.pending_byte_count
+    assert pending == len(pcm) + sum(len(frame) for frame in frames)
+    commit = buf.prepare_commit(operation_id="c1", chunk_period_ms=1000)
+    assert buf.pending_byte_count == 0
+    assert commit.byte_count == pending
+    commit.commit()
+    assert buf.pending_byte_count == 0
+    assert not buf.has_reserved()
+
+
 def test_plan_append_commit_builds_stage0_prompt() -> None:
     plugin = AuraDuplexPlugin(_encode_audio)
     samples = np.zeros(800, dtype="<f4")

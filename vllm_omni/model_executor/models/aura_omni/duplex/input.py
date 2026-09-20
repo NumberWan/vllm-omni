@@ -16,7 +16,7 @@ _DEFAULT_SAMPLE_RATE_HZ = 16000
 
 
 class AuraPcmAppendReservation(PcmAppendReservation):
-    __slots__ = ("_active", "_owner", "_raw", "operation_id", "payload")
+    __slots__ = ("_active", "_owner", "_raw", "_reserved_bytes", "operation_id", "payload")
 
     def __init__(
         self,
@@ -25,11 +25,13 @@ class AuraPcmAppendReservation(PcmAppendReservation):
         operation_id: str,
         payload: dict[str, object] | None,
         raw: bytes,
+        reserved_bytes: int | None = None,
     ) -> None:
         self._owner = owner
         self.operation_id = operation_id
         self.payload = payload
         self._raw = raw
+        self._reserved_bytes = len(raw) if reserved_bytes is None else reserved_bytes
         self._active = True
 
     @property
@@ -38,7 +40,7 @@ class AuraPcmAppendReservation(PcmAppendReservation):
 
     @property
     def byte_count(self) -> int:
-        return len(self._raw)
+        return self._reserved_bytes
 
     def commit(self) -> None:
         if not self._active:
@@ -145,6 +147,7 @@ class AuraPcmAppendBuffer(PcmAppendBuffer):
                 operation_id=operation_id,
                 payload=None,
                 raw=b"",
+                reserved_bytes=0,
             )
             self._reservations.append(reservation)
             return reservation
@@ -164,8 +167,10 @@ class AuraPcmAppendBuffer(PcmAppendBuffer):
             "is_speech": self._had_speech,
             "aura_turn_commit": True,
         }
+        video_bytes = 0
         if self._frame_queue:
             payload["video_frames"] = list(self._frame_queue)
+            video_bytes = sum(len(frame) for frame in self._frame_queue)
             self._frame_queue.clear()
         self._had_speech = False
         reservation = AuraPcmAppendReservation(
@@ -173,6 +178,7 @@ class AuraPcmAppendBuffer(PcmAppendBuffer):
             operation_id=operation_id,
             payload=payload,
             raw=raw,
+            reserved_bytes=len(raw) + video_bytes,
         )
         self._reservations.append(reservation)
         return reservation
