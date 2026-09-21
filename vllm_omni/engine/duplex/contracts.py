@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import base64
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -178,6 +178,25 @@ def duplex_turn_id_from_request_id(request_id: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def duplex_same_turn_request_ids(request_id: str, candidate_ids: Iterable[str]) -> list[str]:
+    """Other ephemeral stage ids from the same session, epoch, and turn.
+
+    ``request_id`` itself is not included. Non-ephemeral ids are ignored.
+    """
+    turn_id = duplex_turn_id_from_request_id(request_id)
+    if turn_id is None or ".r." not in request_id:
+        return []
+    prefix = request_id.rsplit(".r.", 1)[0] + ".r."
+    return [
+        candidate
+        for candidate in candidate_ids
+        if candidate != request_id
+        and isinstance(candidate, str)
+        and candidate.startswith(prefix)
+        and duplex_turn_id_from_request_id(candidate) == turn_id
+    ]
+
+
 def _duplex_resource_request_fields(request_id: str | None) -> tuple[str, str, str] | None:
     """Split ``duplex-s.<b64url>.e.<epoch>.r.<role>`` or return None."""
     if not isinstance(request_id, str):
@@ -235,5 +254,6 @@ __all__ = [
     "duplex_turn_id_from_request_id",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
+    "duplex_same_turn_request_ids",
     "duplex_session_id_from_request_id",
 ]

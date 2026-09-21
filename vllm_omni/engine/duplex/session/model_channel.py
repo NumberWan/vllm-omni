@@ -40,6 +40,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputDecision,
     DuplexStageSubmission,
     duplex_data_plane_request_info,
+    duplex_same_turn_request_ids,
     duplex_session_id_from_request_id,
 )
 from vllm_omni.engine.duplex.plugin import (
@@ -669,18 +670,30 @@ class ModelChannel:
         self._out.emit(payload)
         return True
 
-    async def _release_ephemeral_request(self, request_id: object) -> None:
+    async def _release_ephemeral_request(self, request_id: object, *, whole_turn: bool = False) -> None:
         """Drop orchestrator state for a finished non-resumable stage request.
 
         Resident Stage0 stays bound. Intermediate text must not call this;
         only a completed turn (final stage, silent short-circuit, or a
-        draining TTS request) does.
+        draining TTS request) does. ``whole_turn`` also drops the other stage
+        ids of this turn. A request still marked draining is left registered.
         """
         if not isinstance(request_id, str) or not request_id:
             return
-        if self._ctx.session.capabilities.supports_core_resumable_request:
+        session = self._ctx.session
+        if session.capabilities.supports_core_resumable_request:
             return
-        await self._ctx.stage_port.cleanup([request_id])
+        if session.is_draining_request(request_id):
+            await self._ctx.stage_port.cleanup([request_id])
+            return
+        release_ids = [request_id]
+        if whole_turn:
+            candidate_ids = [rid for _stage_id, rid in session.request_resources]
+            for candidate in duplex_same_turn_request_ids(request_id, candidate_ids):
+                if candidate not in release_ids and not session.is_draining_request(candidate):
+                    release_ids.append(candidate)
+        session.release_resources_for_request_ids(release_ids)
+        await self._ctx.stage_port.cleanup(release_ids)
 
     async def _on_model_listen(
         self,
@@ -778,7 +791,7 @@ class ModelChannel:
                     "playback": session.playback.as_dict(),
                 }
             )
-        await self._release_ephemeral_request(data_plane_request_id)
+        await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
 
     async def _send_one_model_output_event(
@@ -888,7 +901,7 @@ class ModelChannel:
                 model_turn_id=model_turn_id,
                 data_plane_request_id=data_plane_request_id,
             )
-            await self._release_ephemeral_request(data_plane_request_id)
+            await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
             return close_reason, emitted_response
         if (
             draining_response_id is None
@@ -1025,7 +1038,7 @@ class ModelChannel:
                 data_plane.mark_terminal(data_plane_request_id)
                 for stage_id in self._draining_stage_ids():
                     session.request_resources.pop((stage_id, data_plane_request_id), None)
-                await self._release_ephemeral_request(data_plane_request_id)
+                await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
                 if drained_response_id is not None:
                     playback = session.playback_for_response(drained_response_id).as_dict()
                     session.release_finished_drain_response(drained_response_id)
@@ -1065,7 +1078,7 @@ class ModelChannel:
                     "playback": session.playback.as_dict(),
                 }
             )
-            await self._release_ephemeral_request(data_plane_request_id)
+            await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
 
     def _end_active_response_before_future_model_turn(self, *, model_turn_id: int | None) -> None:

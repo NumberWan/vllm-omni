@@ -163,6 +163,28 @@ def test_ephemeral_turn_id_parser_accepts_stage_turn_ids() -> None:
     assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage2-turn3") == 3
     assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage0_t9") is None
     assert duplex_turn_id_from_request_id("duplex-s.x.e.0.r.stage0") is None
+
+
+def test_same_turn_request_ids_skip_other_turns_and_epochs() -> None:
+    from vllm_omni.engine.duplex.contracts import duplex_same_turn_request_ids
+
+    stage3 = "duplex-s.x.e.0.r.stage3-turn4"
+    found = duplex_same_turn_request_ids(
+        stage3,
+        [
+            "duplex-s.x.e.0.r.stage0-turn4",
+            "duplex-s.x.e.0.r.stage1-turn4",
+            "duplex-s.x.e.0.r.stage2-turn4",
+            stage3,
+            "duplex-s.x.e.0.r.stage2-turn5",
+            "duplex-s.x.e.1.r.stage0-turn4",
+        ],
+    )
+    assert found == [
+        "duplex-s.x.e.0.r.stage0-turn4",
+        "duplex-s.x.e.0.r.stage1-turn4",
+        "duplex-s.x.e.0.r.stage2-turn4",
+    ]
     from vllm_omni.engine.duplex.contracts import duplex_session_id_from_request_id
 
     fence_session = "sess id"
@@ -534,7 +556,9 @@ def test_stale_continue_does_not_close_the_new_response() -> None:
 
 def test_silent_listen_with_continuation_releases_ephemeral_request() -> None:
     import asyncio
+    from collections.abc import Coroutine
     from types import SimpleNamespace
+    from typing import Any
 
     from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
     from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
@@ -580,7 +604,7 @@ def test_silent_listen_with_continuation_releases_ephemeral_request() -> None:
 
     port = _Port()
     out = _Out()
-    spawned: list[object] = []
+    spawned: list[Coroutine[Any, Any, None]] = []
 
     async def _noop(*_args: object, **_kwargs: object) -> None:
         return None
