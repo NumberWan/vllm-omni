@@ -15,6 +15,8 @@
     clientCommit: false,
     pushToTalk: true,
     stickyCamera: true,
+    // OmniInteract / Native AURA clock: 2 fps. Other profiles omit this and stay at 1 s.
+    cameraIntervalMs: 500,
     visionFollowWhileSpeaking: true,
     deduplicateTranscript: true,
     halfDuplex: false,
