@@ -198,7 +198,8 @@ async def test_open_preregisters_the_stage0_request_and_close_releases_it() -> N
     assert request_state.session_owned is True
     assert request_state.session_id == SESSION_ID
     assert request_state.fence == DuplexFence(SESSION_ID)
-    assert request_state.streaming.enabled is True
+    # Set on submit from submission.resumable, not again at preregister.
+    assert request_state.streaming.enabled is False
     # Preregistration reserves the id; nothing is running until an append submits.
     assert counter.value == 0
     assert clients[0].add_request_calls == []
@@ -288,6 +289,7 @@ async def test_append_submits_the_resumable_stage0_request_and_counts_it_running
     assert submitted.resumable is True
     assert submitted.sampling_params.max_tokens == 20
     request_state = orchestrator.request_states[request_id]
+    assert request_state.streaming.enabled is True
     assert request_state.stage_fences[0] == DuplexFence(SESSION_ID)
     assert 0 in request_state.stage_submit_ts
     assert counter.value == 1
