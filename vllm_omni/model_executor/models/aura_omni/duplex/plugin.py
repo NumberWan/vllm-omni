@@ -149,17 +149,14 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             stage1.include_stop_str_in_output = True
             stage1.skip_special_tokens = False
             configured[1] = stage1
-        # Qwen3-TTS Talker codec EOS (2150). Missing this lets Talker run to
-        # max_tokens and emit ~26s garbage WAV while Stage1 text was fine.
-        # English/quotes often miss 2150; cap below the 25s smoke audio gate
-        # (12Hz × 240 ≈ 20s) so the next vision-follow is not overlapped.
+        # Codec EOS (2150) and the 240-token cap are defaults for an unset
+        # Talker config. A value already set by yaml or the caller is kept,
+        # even when max_tokens is longer than 240.
         if len(configured) > 2 and isinstance(configured[2], SamplingParams):
             stage2 = configured[2].clone()
-            stop_ids = list(stage2.stop_token_ids or [])
-            if 2150 not in stop_ids:
-                stop_ids.append(2150)
-            stage2.stop_token_ids = stop_ids
-            if stage2.max_tokens is None or int(stage2.max_tokens) > 240:
+            if not stage2.stop_token_ids:
+                stage2.stop_token_ids = [2150]
+            if stage2.max_tokens is None:
                 stage2.max_tokens = 240
             configured[2] = stage2
         return tuple(configured)

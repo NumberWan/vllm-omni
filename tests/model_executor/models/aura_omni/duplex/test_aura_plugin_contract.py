@@ -59,8 +59,8 @@ def test_load_aura_duplex_plugin_and_sampling_arity() -> None:
     )
     configured = plugin.configure_sampling_params(runtime_config={}, defaults=defaults)
     assert len(configured) == 4
-    assert 2150 in (configured[2].stop_token_ids or [])
-    assert configured[2].max_tokens == 240
+    assert configured[2].stop_token_ids == [2150]
+    assert configured[2].max_tokens == 4096
     stage1_stops = set(configured[1].stop_token_ids or [])
     assert {151669, 151645}.issubset(stage1_stops)
     assert 248070 not in stage1_stops
@@ -242,6 +242,32 @@ def test_configure_sampling_keeps_silent_stop_visible() -> None:
     assert stage1.include_stop_str_in_output is True
     assert stage1.skip_special_tokens is False
     assert AURA_SILENT_TOKEN_ID in (stage1.stop_token_ids or [])
+
+
+def test_configure_sampling_keeps_explicit_talker_limits() -> None:
+    plugin = AuraDuplexPlugin(_encode_audio)
+    defaults = (
+        SamplingParams(max_tokens=16),
+        SamplingParams(max_tokens=16),
+        SamplingParams(max_tokens=500, stop_token_ids=[7]),
+        SamplingParams(max_tokens=16),
+    )
+    configured = plugin.configure_sampling_params(runtime_config={}, defaults=defaults)
+    stage2 = configured[2]
+    assert isinstance(stage2, SamplingParams)
+    assert stage2.max_tokens == 500
+    assert stage2.stop_token_ids == [7]
+    unset = plugin.configure_sampling_params(
+        runtime_config={},
+        defaults=(
+            SamplingParams(max_tokens=16),
+            SamplingParams(max_tokens=16),
+            SamplingParams(max_tokens=None),
+            SamplingParams(max_tokens=16),
+        ),
+    )
+    assert unset[2].max_tokens == 240
+    assert unset[2].stop_token_ids == [2150]
 
 
 def test_decide_output_silent_short_circuits() -> None:
