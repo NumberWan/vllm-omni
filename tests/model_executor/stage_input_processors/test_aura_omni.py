@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -236,7 +236,6 @@ def test_aura2tts_customvoice_uses_official_prompt_len_not_aura_token_count():
     )
     assert len(tts_input["prompt_token_ids"]) == official
     assert tts_input["additional_information"]["instruct"] == [""]
-
 
 
 def test_aura2tts_strips_im_end_from_spoken_text():

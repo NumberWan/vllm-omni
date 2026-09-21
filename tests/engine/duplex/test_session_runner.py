@@ -1303,6 +1303,40 @@ async def test_stage0_metrics_reach_the_response_even_though_its_output_feeds_tt
 
 
 @pytest.mark.asyncio
+async def test_projected_stage1_metrics_reach_the_spoken_audio_event() -> None:
+    """Thinker text is projected, but its TTFT/TPOT still have to ride the audio event."""
+    h = await open_harness(stage_count=3)
+    try:
+        plugin = h.runner.model._ctx.plugin
+
+        def project_stage1(*, stage_id: int, output: object, context: object) -> bool:
+            del output, context
+            return stage_id == 1
+
+        plugin.project_intermediate_output = project_stage1
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        thinker = SimpleNamespace(
+            request_id=request_id,
+            finished=True,
+            outputs=[SimpleNamespace(text="hello", token_ids=[7, 8], multimodal_output={})],
+            multimodal_output={},
+        )
+        forwarded = h.deliver(
+            thinker,
+            stage_id=1,
+            segment_finished=False,
+            metrics=stage_stats(stage_id=1, request_id=request_id, num_tokens_out=2, itls_ms=[6.0]),
+        )
+        assert forwarded is False
+        events = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"), stage_id=2)
+        stage_metrics = _stage_metrics_of(find(events, "response.output_audio.delta"))
+        assert stage_metrics["1"]["num_tokens_out"] == 2
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_stage0_metrics_from_several_units_are_summed_into_one_response() -> None:
     """Two pass-through segments before the first audio are one response's tokens."""
     h = await open_harness()

@@ -266,10 +266,14 @@ class DuplexSessionRunner:
             # ``StageMetricsMessage``, a path session-owned requests no longer
             # take. Hand them to the session instead of dropping them, on the
             # mailbox so they stay ordered with this session's other work.
-            snapshot = self.model.stage_metrics_snapshot(stage_id, metrics, output)
-            if snapshot is not None and not self.run.closing and self.session.state != DuplexSessionState.CLOSED:
-                self._mailbox.put_nowait(_Internal("stage_metrics", {"stage_metrics": snapshot}))
+            self._stash_stage_metrics(stage_id, metrics, output)
             return False
+        if project and not consume:
+            # Stage1 thinker text is projected to the client, but that event
+            # does not carry engine metrics. Stash them on the same mailbox as
+            # a pass-through stage so the spoken-turn audio events include
+            # Stage1 TTFT/TPOT.
+            self._stash_stage_metrics(stage_id, metrics, output)
         if self.run.closing or self.session.state == DuplexSessionState.CLOSED:
             return True
         self._mailbox.put_nowait(
@@ -284,6 +288,12 @@ class DuplexSessionRunner:
         )
         # Projection-only must still forward to the next stage (return False).
         return consume
+
+    def _stash_stage_metrics(self, stage_id: int, metrics: StageRequestStats | None, output: object) -> None:
+        snapshot = self.model.stage_metrics_snapshot(stage_id, metrics, output)
+        if snapshot is None or self.run.closing or self.session.state == DuplexSessionState.CLOSED:
+            return
+        self._mailbox.put_nowait(_Internal("stage_metrics", {"stage_metrics": snapshot}))
 
     def on_stage_failure(self, stage_id: int, exc: BaseException, *, request_id: str | None = None) -> None:
         """A stage rejected this session's request: fail the owning response.
