@@ -514,3 +514,97 @@ def test_stale_continue_does_not_close_the_new_response() -> None:
     assert session.active_response_id is None
     assert [event.get("type") for event in out.events] == ["response.done"]
     assert out.events[0].get("response_id") == live
+
+
+def test_silent_listen_with_continuation_releases_ephemeral_request() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+    from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+
+    session = DuplexEngineSession(
+        session_id="s-silent-continue",
+        config=DuplexSessionConfig(model="m", modalities=["text", "audio"]),
+        capabilities=DuplexCapabilities(supports_overlapped_commit=True, supports_core_resumable_request=False),
+    )
+    session.begin_response(turn_id=1)
+    response_id = session.active_response_id
+    request_id = "duplex-s.x.e.0.r.stage1-turn1"
+    session.bind_request(request_id)
+
+    class _Plane:
+        def __init__(self) -> None:
+            self.terminal: list[str] = []
+
+        def is_terminal(self, request_id: str | None) -> bool:
+            return request_id in self.terminal
+
+        def mark_terminal(self, request_id: str) -> None:
+            self.terminal.append(request_id)
+
+    class _Port:
+        def __init__(self) -> None:
+            self.cleanups: list[list[str]] = []
+
+        async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
+            del abort
+            self.cleanups.append(list(request_ids))
+
+    class _Out:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def auto_responds(self) -> bool:
+            return False
+
+        def emit(self, payload: dict[str, object]) -> None:
+            self.events.append(payload)
+
+    port = _Port()
+    out = _Out()
+    spawned: list[object] = []
+
+    async def _noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def _schedule(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    channel = ModelChannel(
+        SimpleNamespace(
+            session=session,
+            plugin=SimpleNamespace(data_plane=_Plane()),
+            stage_port=port,
+            model_state=SimpleNamespace(
+                continuation_owner_id=None, continuation_units=0, clear_continuation=lambda: None
+            ),
+            services=SimpleNamespace(spawn=lambda coro, **_k: spawned.append(coro)),
+            run=SimpleNamespace(closing=False),
+        ),
+        out,
+        close_from_runtime=_noop,
+        schedule_silence_continuation=_schedule,
+        abort_request=_noop,
+    )
+    asyncio.run(
+        channel._send_one_model_output_event(
+            {
+                "data_plane_request_id": request_id,
+                "is_listen": True,
+                "end_of_turn": True,
+                "model_turn_id": 1,
+                "reason": "model_listen",
+            }
+        )
+    )
+    assert port.cleanups == [[request_id]]
+    assert session.active_request_id is None
+    assert spawned, "silent listen with unused continuation must schedule maybe_continue"
+    asyncio.run(spawned[0])
+    assert port.cleanups == [[request_id]]
+    assert session.active_response_id is None
+    assert [event.get("type") for event in out.events] == ["response.listen", "response.done"]
+    assert out.events[0].get("response_id") == response_id
+    assert out.events[1].get("response_id") == response_id

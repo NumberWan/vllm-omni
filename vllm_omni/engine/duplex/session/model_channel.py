@@ -738,6 +738,10 @@ class ModelChannel:
                 self._ctx.services.spawn(
                     self.maybe_continue_response(expected_epoch=expected_epoch), name="duplex-continue"
                 )
+                # Continuation closes the response; it does not release the
+                # finished non-resumable request. Do that here so this early
+                # return does not leak orchestrator / manager state.
+                await self._release_ephemeral_request(data_plane_request_id)
                 return close_reason, emitted_response
             if auto_response:
                 model_state.clear_continuation()
