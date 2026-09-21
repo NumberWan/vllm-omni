@@ -976,6 +976,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 # Match scalar preprocess(): EOS / async-scheduling races can
                 # arrive before postprocess has written last; zeros are filtered
                 # downstream the same way as the single-request path.
+                logger.warning_once(
+                    "Qwen3-TTS batched decode missing last hidden; zero-filling past_hidden "
+                    "to match scalar preprocess()"
+                )
                 past_hidden = torch.zeros_like(text_step)
             past_hidden_list.append(past_hidden)
             text_step_list.append(text_step)

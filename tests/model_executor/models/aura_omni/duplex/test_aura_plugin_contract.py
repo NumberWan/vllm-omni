@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import base64
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -70,6 +71,11 @@ def test_load_aura_duplex_plugin_and_sampling_arity() -> None:
     assert caps.required_input_modalities == frozenset({"video"})
     assert caps.optional_input_modalities == frozenset({"audio"})
     assert caps.allows_video_without_audio() is True
+    assert caps.validate_append_modalities(has_audio=True, has_video=False) == (
+        "This duplex model requires video_frames on input_audio_buffer.append"
+    )
+    assert caps.validate_append_modalities(has_audio=True, has_video=True) is None
+    assert caps.validate_append_modalities(has_audio=False, has_video=True) is None
 
 
 def test_commit_only_buffer_emits_on_commit() -> None:
@@ -400,3 +406,38 @@ def test_instructions_update_replaces_effective_prompt() -> None:
         updated,
     )
     assert kept["aura_system_prompt"] == "explicit"
+
+
+def test_plan_partial_stage_output_hands_a_sentence_to_talker() -> None:
+    def aura2tts() -> None:
+        return None
+
+    class _Pool:
+        stage_client = SimpleNamespace(custom_process_input_func=aura2tts)
+
+    orchestrator = SimpleNamespace(
+        stage_pools={2: _Pool()},
+        _stage_receives_async_chunks=lambda stage_id: False,
+    )
+    req_state = SimpleNamespace(
+        session_owned=True,
+        final_stage_id=3,
+        request_id="req-1",
+        prompt={"additional_information": {}},
+        streaming=SimpleNamespace(bridge_states={}),
+    )
+    sentence = "这是一段用来直接测试句子级语音交接而且长度已经超过三十个字的内容。"
+    output = SimpleNamespace(
+        finished=False,
+        request_id="req-1",
+        outputs=[SimpleNamespace(cumulative_text=sentence)],
+    )
+
+    plan = AuraDuplexPlugin(_encode_audio).plan_partial_stage_output(orchestrator, 1, 0, output, req_state)
+
+    assert plan is not None
+    assert plan.close_only is False
+    assert plan.is_final_update is False
+    assert plan.output.text == sentence.strip()
+    assert req_state.prompt["additional_information"]["aura_tts_partial"] is True
+    assert AuraDuplexPlugin(_encode_audio).plan_partial_stage_output(orchestrator, 0, 0, output, req_state) is None

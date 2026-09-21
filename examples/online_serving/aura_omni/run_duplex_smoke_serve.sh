@@ -8,7 +8,6 @@ cd "$REPO_ROOT"
 PORT="${PORT:-8099}"
 MODEL="${MODEL:-/workspace/models/AURA}"
 DEPLOY_CONFIG="${DEPLOY_CONFIG:-$REPO_ROOT/examples/online_serving/aura_omni/aura_omni_duplex_smoke.yaml}"
-PYTHON="${PYTHON:-$REPO_ROOT/.venv/bin/python}"
 
 # AURA v1 / Qwen3-VL ChatML ids (do not use AURA v2 248070/248046 here).
 export VLLM_AURA_SILENT_TOKEN_ID="${VLLM_AURA_SILENT_TOKEN_ID:-151669}"

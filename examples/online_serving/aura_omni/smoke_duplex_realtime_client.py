@@ -102,8 +102,6 @@ async def run(url: str, model: str, wav: Path, timeout_s: float) -> int:
                 break
             # Keep draining until response.done so TTS is not truncated.
             await asyncio.sleep(0.2)
-        # expose for result
-        collector._smoke_got_done = got_done  # type: ignore[attr-defined]
 
         try:
             await client.close(timeout_s=30.0)
@@ -117,9 +115,9 @@ async def run(url: str, model: str, wav: Path, timeout_s: float) -> int:
     event_types = [e.get("type") for e in collector.events]
     errors = [json.dumps(e, ensure_ascii=False)[:500] for e in collector.errors()]
     result = {
-        "ok": progress and bool(getattr(collector, "_smoke_got_done", False) or collector.count("response.done")),
+        "ok": progress and (got_done or collector.count("response.done") > 0),
         "got_response_progress": progress,
-        "got_response_done": bool(getattr(collector, "_smoke_got_done", False) or collector.count("response.done")),
+        "got_response_done": got_done or collector.count("response.done") > 0,
         "errors": errors,
         "event_types": event_types,
         "n_events": len(event_types),
