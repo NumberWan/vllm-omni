@@ -1087,9 +1087,7 @@ async def run_omniinteract_case(
                 else:
                     stream = stream_inputs(client, pcm, frames, playback)
                 try:
-                    chunks, frame_count, mean_lag, max_lag = await asyncio.wait_for(
-                        stream, timeout=upload_timeout_s
-                    )
+                    chunks, frame_count, mean_lag, max_lag = await asyncio.wait_for(stream, timeout=upload_timeout_s)
                 except asyncio.TimeoutError as exc:
                     raise TimeoutError(f"Realtime upload timed out after {upload_timeout_s:g}s") from exc
                 commit_from = len(client.events.events)

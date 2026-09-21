@@ -11,7 +11,6 @@ annotation WAV is one append at ``question_time`` followed by ``commit``.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import subprocess
@@ -19,6 +18,8 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+import pybase64 as base64
 
 logger = logging.getLogger(__name__)
 
