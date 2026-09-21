@@ -221,9 +221,7 @@ def test_project_intermediate_output_targets_stage1_only() -> None:
 
 def test_release_concurrent_turn_requests_on_stage1_final() -> None:
     plugin = AuraDuplexPlugin(_encode_audio)
-    assert plugin.release_concurrent_turn_requests(
-        stage_id=1, segment_finished=True, output=object(), context=object()
-    )
+    assert plugin.release_concurrent_turn_requests(stage_id=1, segment_finished=True, output=object(), context=object())
     assert not plugin.release_concurrent_turn_requests(
         stage_id=1, segment_finished=False, output=object(), context=object()
     )
@@ -475,3 +473,105 @@ def test_plan_partial_stage_output_hands_a_sentence_to_talker() -> None:
     assert plan.output.text == sentence.strip()
     assert req_state.prompt["additional_information"]["aura_tts_partial"] is True
     assert AuraDuplexPlugin(_encode_audio).plan_partial_stage_output(orchestrator, 0, 0, output, req_state) is None
+
+
+def _sentence_plan_fixture() -> tuple[SimpleNamespace, SimpleNamespace]:
+    def aura2tts() -> None:
+        return None
+
+    class _Pool:
+        stage_client = SimpleNamespace(custom_process_input_func=aura2tts)
+
+    orchestrator = SimpleNamespace(
+        stage_pools={2: _Pool()},
+        _stage_receives_async_chunks=lambda stage_id: False,
+    )
+    req_state = SimpleNamespace(
+        session_owned=True,
+        final_stage_id=3,
+        request_id="req-1",
+        prompt={"additional_information": {}},
+        streaming=SimpleNamespace(bridge_states={}),
+    )
+    return orchestrator, req_state
+
+
+def _stage1_output(text: str, *, finished: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        finished=finished,
+        request_id="req-1",
+        outputs=[SimpleNamespace(cumulative_text=text)],
+    )
+
+
+def test_finished_remainder_stays_resumable_until_close_sentinel() -> None:
+    """A second sentence at Stage1 finish must not be the Talker end sentinel.
+
+    The first sentence is already a resumable Talker request. Marking the
+    remainder ``is_final_update`` makes ``StreamingUpdate.from_request``
+    return None, which aborts that in-flight sentence before Code2Wav has a
+    full codec group.
+    """
+    orchestrator, req_state = _sentence_plan_fixture()
+    plugin = AuraDuplexPlugin(_encode_audio)
+    first = "我看到你身后是一个很明亮的办公室环境，天花板上能看到白色的管道和通风口，"
+    full = first + "远处还有办公桌和绿植。"
+    opened = plugin.plan_partial_stage_output(orchestrator, 1, 0, _stage1_output(first, finished=False), req_state)
+    assert opened is not None
+    assert opened.is_final_update is False
+    assert opened.queue_close_after is False
+    assert req_state.prompt["additional_information"]["aura_tts_close_only"] is False
+
+    tail = plugin.plan_partial_stage_output(orchestrator, 1, 0, _stage1_output(full, finished=True), req_state)
+    assert tail is not None
+    assert tail.close_only is False
+    assert tail.queue_close_after is True
+    assert tail.is_final_update is False
+    assert tail.output.text == "远处还有办公桌和绿植。"
+    assert req_state.prompt["additional_information"]["aura_tts_close_only"] is False
+
+    followup = plugin.partial_stage_followup(tail, req_state)
+    assert followup is not None
+    assert followup.is_final_update is True
+    assert followup.close_only is True
+    assert followup.output.text == ""
+    assert req_state.prompt["additional_information"]["aura_tts_close_only"] is True
+
+
+def test_single_finished_sentence_is_one_non_resumable_submit() -> None:
+    orchestrator, req_state = _sentence_plan_fixture()
+    plugin = AuraDuplexPlugin(_encode_audio)
+    sentence = "你好，我看到一个戴眼镜、穿黑T恤的男生正对着镜头说话呢。"
+    plan = plugin.plan_partial_stage_output(orchestrator, 1, 0, _stage1_output(sentence, finished=True), req_state)
+    assert plan is not None
+    assert plan.queue_close_after is False
+    assert plan.is_final_update is True
+    assert plan.close_only is False
+    assert plugin.partial_stage_followup(plan, req_state) is None
+
+
+def test_aura_draining_stages_are_declared_by_the_plugin() -> None:
+    plugin = AuraDuplexPlugin(_encode_audio)
+    assert plugin.draining_stage_ids(stage_count=4) == frozenset({2, 3})
+    assert plugin.draining_stage_ids(stage_count=2) == frozenset()
+
+
+def test_spoken_stage0_text_is_the_user_transcript() -> None:
+    plugin = AuraDuplexPlugin(_encode_audio)
+    output = SimpleNamespace(
+        finished=True,
+        outputs=[
+            SimpleNamespace(text="language Chinese<asr_text>你好", cumulative_text="language Chinese<asr_text>你好")
+        ],
+    )
+    prompt = {"additional_information": {"is_speech": True}}
+    assert plugin.user_transcript(stage_id=0, output=output, prompt=prompt, finished=True) == "你好"
+
+
+def test_vision_follow_stage0_text_is_not_shown_as_user_speech() -> None:
+    plugin = AuraDuplexPlugin(_encode_audio)
+    output = SimpleNamespace(finished=True, text="嗯")
+    prompt = {"additional_information": {"is_speech": False}}
+    assert plugin.user_transcript(stage_id=0, output=output, prompt=prompt, finished=True) is None
+    assert plugin.user_transcript(stage_id=1, output=output, prompt=prompt, finished=True) is None
+    assert plugin.user_transcript(stage_id=0, output=output, prompt=prompt, finished=False) is None

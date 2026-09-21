@@ -600,3 +600,53 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
         assert not orchestrator.request_states[submitted.request_id].streaming.enabled
     finally:
         await _close(orchestrator, rpc_q)
+
+
+@pytest.mark.asyncio
+async def test_sentence_partial_does_not_legacy_forward_the_full_stage_output() -> None:
+    from vllm_omni.engine.duplex.plugin import PartialStageForward
+
+    orchestrator, *_ = _build(stages=4)
+    forwarded: list[object] = []
+
+    async def record_forward(req_id, stage_id, output, req_state, **kwargs):
+        del req_id, stage_id, req_state, kwargs
+        forwarded.append(output)
+
+    async def no_intercept(*args, **kwargs):
+        del args, kwargs
+        return False
+
+    orchestrator._forward_to_next_stage = record_forward  # type: ignore[method-assign]
+    orchestrator._intercept_stage_output = no_intercept  # type: ignore[method-assign]
+    orchestrator.async_chunk = True
+    orchestrator._stage_receives_async_chunks = lambda stage_id: False  # type: ignore[method-assign]
+
+    full = SimpleNamespace(request_id="r", finished=True, text="FULL")
+    chunk = SimpleNamespace(request_id="r", finished=True, text="CHUNK")
+    req_state = DuplexOrchestratorRequestState(
+        request_id="r",
+        final_stage_id=3,
+        session_owned=True,
+        sampling_params_list=[SimpleNamespace() for _ in range(4)],
+    )
+    orchestrator.plugin.plan_partial_stage_output = lambda *args, **kwargs: PartialStageForward(  # type: ignore[method-assign]
+        output=chunk, is_final_update=True
+    )
+    orchestrator.plugin.partial_stage_followup = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    await orchestrator._route_output(1, 0, full, req_state, None)
+
+    assert forwarded == [chunk]
+    assert req_state.skip_legacy_stage_forward is False
+
+    forwarded.clear()
+    orchestrator.plugin.plan_partial_stage_output = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    await orchestrator._route_output(1, 0, full, req_state, None)
+
+    assert forwarded == [full]
+
+
+def test_default_plugin_declares_no_draining_stages() -> None:
+    plugin = MiniCPMO45DuplexPlugin(_encode_audio)
+    assert plugin.draining_stage_ids(stage_count=4) == frozenset()

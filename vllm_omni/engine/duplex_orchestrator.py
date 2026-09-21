@@ -154,14 +154,22 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # Session gone: nothing may forward or reach a client.
             return True
         segment = req_state.streaming.segment(stage_id)
+        finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and segment.finished)
+        transcript = self.plugin.user_transcript(
+            stage_id=stage_id,
+            output=output,
+            prompt=getattr(req_state, "prompt", None),
+            finished=finished,
+        )
+        if isinstance(transcript, str) and transcript:
+            runner.emit({"type": "input.transcribed", "transcript": transcript})
         context = DuplexOutputContext(
             identity=DuplexRequestIdentity(
                 session_id=req_state.session_id,
                 fence=req_state.stage_fences.get(stage_id, req_state.fence),
             ),
             final_stage_id=req_state.final_stage_id,
-            segment_finished=bool(getattr(output, "finished", False))
-            or (req_state.streaming.enabled and segment.finished),
+            segment_finished=finished,
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
         )
@@ -410,6 +418,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> None:
         plan = self.plugin.plan_partial_stage_output(self, stage_id, replica_id, output, req_state)
         if plan is not None:
+            # A text-bearing final is not itself the end sentinel. Submit the
+            # sentence resumable first; the follow-up, if any, closes the stream.
             await self._forward_to_next_stage(
                 req_state.request_id,
                 stage_id,
@@ -417,9 +427,28 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 req_state,
                 src_replica_id=replica_id,
                 is_streaming_session=True,
-                is_final_update=plan.is_final_update,
+                is_final_update=plan.is_final_update and not plan.queue_close_after,
             )
-        await super()._route_output(stage_id, replica_id, output, req_state, stage_metrics)
+            followup = self.plugin.partial_stage_followup(plan, req_state)
+            if followup is not None:
+                await self._forward_to_next_stage(
+                    req_state.request_id,
+                    stage_id,
+                    followup.output,
+                    req_state,
+                    src_replica_id=replica_id,
+                    is_streaming_session=True,
+                    is_final_update=followup.is_final_update,
+                )
+            # Sentence TTS already handed this Stage1 result to Talker. The
+            # legacy path below would run aura2tts on the original full text
+            # again when the next stage is not connector-fed (AURA Talker is
+            # a sender: Stage1→2 is orchestrator-fed).
+            req_state.skip_legacy_stage_forward = True
+        try:
+            await super()._route_output(stage_id, replica_id, output, req_state, stage_metrics)
+        finally:
+            req_state.skip_legacy_stage_forward = False
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         await self._cleanup_request_ids(request_ids, abort=abort)

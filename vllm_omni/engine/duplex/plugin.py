@@ -177,11 +177,17 @@ class PartialStageForward:
 
     ``close_only`` is a final update with no new sentence. ``output`` is the
     model-built payload; the orchestrator does not interpret its text.
+
+    ``queue_close_after`` means this chunk still has text, but Stage1 has
+    finished and an earlier sentence is already in flight. The text must be
+    submitted resumable. A non-resumable submit is an end sentinel
+    (``StreamingUpdate.from_request`` returns None) and aborts that sentence.
     """
 
     output: object
     is_final_update: bool
     close_only: bool = False
+    queue_close_after: bool = False
 
 
 class DuplexModelPlugin(ABC):
@@ -268,6 +274,22 @@ class DuplexModelPlugin(ABC):
         del stage_id, output, context
         return False
 
+    def user_transcript(
+        self,
+        *,
+        stage_id: int,
+        output: object,
+        prompt: object,
+        finished: bool,
+    ) -> str | None:
+        """ASR text to show as the user's words, or None.
+
+        Default models do not surface Stage0. AURA uses this for a spoken
+        turn only; vision-follow commits stay off the transcript.
+        """
+        del stage_id, output, prompt, finished
+        return None
+
     def plan_partial_stage_output(
         self,
         orchestrator: object,
@@ -282,6 +304,15 @@ class DuplexModelPlugin(ABC):
         actual ``_forward_to_next_stage`` call.
         """
         del orchestrator, stage_id, replica_id, output, req_state
+        return None
+
+    def partial_stage_followup(self, plan: PartialStageForward, req_state: object) -> PartialStageForward | None:
+        """Optional second submit after ``plan`` has already been forwarded.
+
+        Default models have nothing to add. AURA uses this to queue the
+        end sentinel only after the last sentence text is already resumable.
+        """
+        del plan, req_state
         return None
 
     def commit_model_context(self, *, session_id: str | None, assistant_text: str) -> None:
@@ -308,6 +339,15 @@ class DuplexModelPlugin(ABC):
         """
         del stage_id, segment_finished, output, context
         return False
+
+    def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Output stages that may keep running after the next user turn starts.
+
+        Empty means a concurrent turn does not overlap a previous output
+        stage. Shared lifecycle reads this instead of assuming a stage layout.
+        """
+        del stage_count
+        return frozenset()
 
     # ---- session policy (was ServingRuntimeAdapter) ----
 

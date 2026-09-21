@@ -210,6 +210,9 @@ class OrchestratorRequestState:
     # its own ``finished`` flag: no synthetic terminal, no client emission of
     # stage-0 segment ends, no terminal re-forward, no cleanup on finish.
     session_owned: bool = False
+    # Duplex sentence TTS already submitted this output. Do not also run the
+    # legacy full-text handoff for the same stage result.
+    skip_legacy_stage_forward: bool = False
     running_counter_registered: bool = False
     request_artifact_dirs: set[str] = field(default_factory=set)
     native_kv_transfer_id: str | None = None
@@ -1697,6 +1700,7 @@ class OrchestratorBase:
         if (
             (finished or segment_finished)
             and stage_id < req_state.final_stage_id
+            and not req_state.skip_legacy_stage_forward
             and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
         ):

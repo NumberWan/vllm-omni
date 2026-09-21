@@ -706,9 +706,28 @@ async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> N
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="he"))
         h.session.bind_draining_request("duplex-drain-tts", "resp-old")
+        # Draining TTS sits on an older turn fence. cancel_fence only drops
+        # the fence being cancelled, so these bindings must be popped by id.
+        from vllm_omni.engine.duplex.contracts import DuplexFence
+        from vllm_omni.engine.duplex.session.engine_session import DuplexRequestResource
+
+        older = DuplexFence(h.session.session_id, epoch=h.session.epoch, turn_id=h.session.turn_id + 5)
+        h.session.request_resources[(2, "duplex-drain-tts")] = DuplexRequestResource(
+            stage_id=2, request_id="duplex-drain-tts", fence=older, submitted=True
+        )
+        h.session.request_resources[(3, "duplex-drain-tts")] = DuplexRequestResource(
+            stage_id=3, request_id="duplex-drain-tts", fence=older, submitted=True
+        )
+        h.session.request_resources[(1, "still-live")] = DuplexRequestResource(
+            stage_id=1, request_id="still-live", fence=older, submitted=True
+        )
         await h.run(commands.BargeIn())
         assert h.port.aborts == [[request_id, "duplex-drain-tts"]]
         assert not h.session.is_draining_request("duplex-drain-tts")
+        assert (2, "duplex-drain-tts") not in h.session.request_resources
+        assert (3, "duplex-drain-tts") not in h.session.request_resources
+        assert (0, request_id) not in h.session.request_resources
+        assert (1, "still-live") in h.session.request_resources
     finally:
         await close_harness(h)
 

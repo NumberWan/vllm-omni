@@ -100,6 +100,14 @@ class ModelChannel:
         self._schedule_silence_continuation = schedule_silence_continuation
         self._abort_request = abort_request
 
+    def _draining_stage_ids(self) -> frozenset[int]:
+        """Stages the plugin keeps across a concurrent turn. Empty if undeclared."""
+        declare = getattr(self._ctx.plugin, "draining_stage_ids", None)
+        if not callable(declare):
+            return frozenset()
+        stage_count = int(getattr(self._ctx.stage_port, "stage_count", 0) or 0)
+        return frozenset(int(stage_id) for stage_id in declare(stage_count=stage_count))
+
     @staticmethod
     def should_commit_response_to_history(session: DuplexEngineSession, response_id: str | None) -> bool:
         if response_id is not None and response_id != session.active_response_id:
@@ -235,12 +243,13 @@ class ModelChannel:
             session.request_resources.pop((stage_id, stale_ephemeral_id), None)
             if concurrent_turn:
                 # Input gate already released after assistant text/silent final,
-                # so Stage0/1 are idle. Drop their session bindings only — do
-                # not abort engine work. Stage2/3 keep draining under the prior
-                # response_id; open a fresh response for this turn.
+                # so non-draining stages are idle. Drop their session bindings
+                # only — do not abort engine work. Stages the plugin marks as
+                # draining keep running under the prior response_id.
                 prior_response_id = session.active_response_id
+                draining_stages = self._draining_stage_ids()
                 for sid, rid in stale_keys:
-                    if sid < 2:
+                    if sid not in draining_stages:
                         session.request_resources.pop((sid, rid), None)
                     elif prior_response_id is not None and not session.is_draining_request(rid):
                         # Already-draining ids keep their original response_id.
@@ -254,8 +263,8 @@ class ModelChannel:
                     session.bind_response_turn(fence.turn_id)
             elif stale_ids:
                 # Input gate not released yet (e.g. commit while Stage1 is still
-                # running): abort the whole prior ephemeral so Stage2 is not
-                # left orphaned.
+                # running): abort the whole prior ephemeral so a later output
+                # stage is not left orphaned.
                 try:
                     await self._ctx.stage_port.cleanup(stale_ids, abort=True)
                 except Exception:
@@ -1012,8 +1021,8 @@ class ModelChannel:
                 drained_response_id = session.pop_draining_request(data_plane_request_id)
                 data_plane.close_stream(data_plane_request_id)
                 data_plane.mark_terminal(data_plane_request_id)
-                session.request_resources.pop((2, data_plane_request_id), None)
-                session.request_resources.pop((3, data_plane_request_id), None)
+                for stage_id in self._draining_stage_ids():
+                    session.request_resources.pop((stage_id, data_plane_request_id), None)
                 await self._release_ephemeral_request(data_plane_request_id)
                 if drained_response_id is not None:
                     playback = session.playback_for_response(drained_response_id).as_dict()

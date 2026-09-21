@@ -161,6 +161,13 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             configured[2] = stage2
         return tuple(configured)
 
+    def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        # Talker is stage 2; Code2Wav is the last stage. Stage 0/1 are the
+        # input gate and are idle once a turn is released.
+        if stage_count <= 2:
+            return frozenset()
+        return frozenset(range(2, stage_count))
+
     def plan_append(
         self,
         *,
@@ -270,6 +277,35 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         del output, context
         return stage_id == 1
 
+    def user_transcript(
+        self,
+        *,
+        stage_id: int,
+        output: object,
+        prompt: object,
+        finished: bool,
+    ) -> str | None:
+        """Stage0 ASR text for a spoken turn, so the demo can show what was said.
+
+        Vision-follow sets ``is_speech`` false; that audio is a silent pad and
+        must not open a user bubble. The pipeline still forwards Stage0.
+        """
+        if stage_id != 0 or not finished:
+            return None
+        info = prompt.get("additional_information") if isinstance(prompt, dict) else None
+        if isinstance(info, dict) and info.get("is_speech") is False:
+            return None
+        from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+            _extract_text,
+            _normalize_asr_transcript,
+            is_effectively_silent,
+        )
+
+        text = _normalize_asr_transcript(_extract_text(output))
+        if not text or is_effectively_silent(text):
+            return None
+        return text
+
     def plan_partial_stage_output(
         self,
         orchestrator: Any,
@@ -283,6 +319,32 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         )
 
         return plan_partial_stage_output(orchestrator, stage_id, replica_id, output, req_state)
+
+    def partial_stage_followup(self, plan: Any, req_state: Any) -> Any:
+        """Close the Talker stream after a resumable final sentence.
+
+        The sentence text was already forwarded with ``queue_close_after``.
+        Flipping the prompt flag here makes the second submit a close-only
+        sentinel instead of another copy of that sentence.
+        """
+        if plan is None or not getattr(plan, "queue_close_after", False):
+            return None
+        prompt = getattr(req_state, "prompt", None)
+        info = prompt.get("additional_information") if isinstance(prompt, dict) else None
+        if isinstance(info, dict):
+            info["aura_tts_partial"] = True
+            info["aura_tts_close_only"] = True
+        from vllm_omni.engine.duplex.plugin import PartialStageForward
+        from vllm_omni.model_executor.models.aura_omni.duplex.sentence_tts import (
+            SentenceTtsOutput,
+        )
+
+        request_id = str(getattr(plan.output, "request_id", ""))
+        return PartialStageForward(
+            output=SentenceTtsOutput(request_id, ""),
+            is_final_update=True,
+            close_only=True,
+        )
 
     def commit_model_context(self, *, session_id: str | None, assistant_text: str) -> None:
         if not isinstance(session_id, str) or not session_id:

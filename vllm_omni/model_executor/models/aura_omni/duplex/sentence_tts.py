@@ -142,6 +142,8 @@ def plan_partial_stage_output(
 
     finished = bool(getattr(output, "finished", False))
     raw_text = stage1_tts_text(orchestrator, output, cache=bridge)
+    # Captured before the chunk helper increments ``emits``.
+    prior_emits = int(bridge.get("emits", 0))
     chunk = next_duplex_sentence_chunk(bridge, raw_text, finished=finished)
     close_only = False
     if chunk is None:
@@ -164,13 +166,24 @@ def plan_partial_stage_output(
         raw_info["aura_tts_close_only"] = close_only
 
     view = SentenceTtsOutput(str(getattr(output, "request_id", req_state.request_id)), chunk)
+    # A later sentence on an already-running Talker must stay resumable.
+    # is_final_update=True is a non-resumable end sentinel: it discards this
+    # text and sets streaming_input=False on the in-flight sentence, so
+    # Code2Wav sees a short codec and the user hears a blip.
+    queue_close_after = bool(chunk) and finished and not close_only and prior_emits > 0
     logger.info(
-        "[AURA] sentence TTS req=%s finished=%s close_only=%s text_len=%d",
+        "[AURA] sentence TTS req=%s finished=%s close_only=%s text_len=%d queue_close_after=%s",
         req_state.request_id,
         finished,
         close_only,
         len(chunk),
+        queue_close_after,
     )
     if finished:
         bridge["closed"] = True
-    return PartialStageForward(output=view, is_final_update=finished, close_only=close_only)
+    return PartialStageForward(
+        output=view,
+        is_final_update=finished and not queue_close_after,
+        close_only=close_only,
+        queue_close_after=queue_close_after,
+    )

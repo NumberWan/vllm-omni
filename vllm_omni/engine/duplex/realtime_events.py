@@ -895,6 +895,16 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
                 state, event, response_id, status=status, status_details=status_details
             ),
         ]
+    if event_type == "input.transcribed":
+        transcript = event.get("transcript")
+        if not isinstance(transcript, str) or not transcript.strip():
+            return []
+        return [
+            InputTranscriptionCompleted(
+                item_id=f"item_{uuid4().hex}",
+                transcript=transcript.strip(),
+            )
+        ]
     if event_type == "input.committed":
         event_item_id = event.get("realtime_item_id")
         item_id = (

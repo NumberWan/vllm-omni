@@ -262,6 +262,22 @@ def test_concurrent_turn_requests_released_resets_when_new_stage0_binds() -> Non
     assert run.concurrent_turn_requests_released is False
 
 
+def test_draining_stage_ids_come_from_the_plugin() -> None:
+    from types import SimpleNamespace
+
+    from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+
+    channel = ModelChannel.__new__(ModelChannel)
+    channel._ctx = SimpleNamespace(
+        plugin=SimpleNamespace(draining_stage_ids=lambda *, stage_count: {stage_count - 1}),
+        stage_port=SimpleNamespace(stage_count=5),
+    )
+    assert channel._draining_stage_ids() == frozenset({4})
+
+    channel._ctx.plugin = SimpleNamespace()
+    assert channel._draining_stage_ids() == frozenset()
+
+
 def test_draining_empty_eos_completes_owning_response_before_shortcut() -> None:
     """R2 finishing first must not swallow R1's empty Stage3 EOS."""
     import asyncio

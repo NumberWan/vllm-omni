@@ -498,6 +498,20 @@ def test_request_resource_keys_are_stage_id_and_request_id():
         dict.fromkeys(rid for _, rid in session.request_resources.items())
 
 
+def test_release_resources_for_request_ids_keeps_other_ids_on_the_same_fence():
+    session = _session("sid-drain-release")
+    fence = session.fence
+    session.bind_stage_request(2, "drain", fence=fence)
+    session.bind_stage_request(3, "drain", fence=fence)
+    session.bind_stage_request(0, "live", fence=fence)
+
+    released = session.release_resources_for_request_ids(["drain"])
+
+    assert released == ["drain"]
+    assert session.resource_request_ids() == ["live"]
+    assert session.release_resources_for_request_ids([]) == []
+
+
 # ---- public view ----
 
 

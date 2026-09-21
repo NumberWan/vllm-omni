@@ -457,6 +457,23 @@ test('AURA PTT profile sets duplex, is_speech append, commit on release, and she
   assert.equal(update.session.extra_body.auto_response, true);
 });
 
+test('AURA does not open a second bubble for the same sentence after response.done', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  const sentence = '你好，我看到一个戴眼镜、穿黑T恤的男生正对着镜头说话呢。';
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.delta', response_id: 'r1', delta: sentence,
+  });
+  await app.ui.handleEvent({ type: 'response.done', response_id: 'r1' });
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.done', response_id: 'r2', transcript: sentence,
+  });
+  const turns = [...app.elements.get('conversation').children].filter((row) => row.children.length);
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].children[1].textContent, sentence);
+  await app.ui.stopSession({ terminal: false });
+});
+
 test('AURA shell holds speech until PTT and vision-follows while speaking', async () => {
   const app = shell('aura-ptt');
   await app.ui.startSession();

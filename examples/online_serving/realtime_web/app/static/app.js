@@ -38,6 +38,11 @@
   document.getElementById('profileDescription').textContent = profile.description;
   document.getElementById('policyLabel').textContent = profile.policy;
   cameraButton.hidden = !profile.camera;
+  if (profile.cameraPreviewWidth && profile.cameraPreviewHeight) {
+    cameraPreview.style.width = `${profile.cameraPreviewWidth}px`;
+    cameraPreview.style.height = `${profile.cameraPreviewHeight}px`;
+    cameraPreview.classList.add('camera-preview-large');
+  }
   sendTurnButton.hidden = !profile.clientCommit;
   pttButton.hidden = !profile.pushToTalk;
   promptPreset.replaceChildren();
@@ -92,6 +97,8 @@
   const interruptedResponses = new Set();
   const pendingEvents = new Set();
   let assistantTextChannel = null;
+  const assistantRowByResponse = new Map();
+  let lastClosedAssistantText = '';
   let connectionReady = false;
   let turnCounter = 0;
   let stopping = null;
@@ -245,6 +252,7 @@
       current.value = finalText;
       current.text.textContent = finalText;
     }
+    if (role === 'assistant' && current.value) lastClosedAssistantText = current.value;
     current.row.classList.remove('turn-live');
     if (role === 'user') liveUserTurn = null;
     else liveAssistantTurn = null;
@@ -458,12 +466,43 @@
       if (profile.deduplicateTranscript && assistantTextChannel && action.channel !== assistantTextChannel) return;
       if (action.text) assistantTextChannel = action.channel || assistantTextChannel;
     }
-    if (action.kind === 'text') addTranscript(action.role, action.text);
-    else if (profile.deduplicateTranscript && action.role === 'assistant') {
+    const responseId = action.responseId || null;
+    const existing = responseId && action.role === 'assistant' ? assistantRowByResponse.get(responseId) : null;
+    if (existing) {
+      if (action.kind === 'text') {
+        if (!action.text) return;
+        existing.value += action.text;
+      } else if (action.text) {
+        existing.value = action.text;
+      }
+      existing.text.textContent = existing.value;
+      liveAssistantTurn = existing;
+      return;
+    }
+    if (
+      action.role === 'assistant'
+      && !liveAssistantTurn
+      && action.text
+      && action.text === lastClosedAssistantText
+    ) {
+      // response.done already closed this sentence. A later full transcript,
+      // including one stamped with a newer vision-follow response id, must
+      // not open a second bubble with the same words.
+      return;
+    }
+    if (action.kind === 'text') {
+      addTranscript(action.role, action.text);
+      if (action.role === 'assistant' && responseId && liveAssistantTurn) {
+        assistantRowByResponse.set(responseId, liveAssistantTurn);
+      }
+      return;
+    }
+    if (profile.deduplicateTranscript && action.role === 'assistant') {
       if (action.text) {
         const turn = ensureTurn('assistant');
         turn.value = action.text;
         turn.text.textContent = action.text;
+        if (responseId) assistantRowByResponse.set(responseId, turn);
       }
     } else finishTranscript(action.role, action.text);
   }
@@ -835,6 +874,8 @@
     playbackComplete = true;
     turnSubmitted = false;
     assistantTextChannel = null;
+    assistantRowByResponse.clear();
+    lastClosedAssistantText = '';
     sendTurnButton.disabled = true;
     pttHeld = false;
     pttButton.disabled = true;

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import copy
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -375,6 +375,28 @@ class DuplexEngineSession:
         }
         return stale
 
+    def release_resources_for_request_ids(self, request_ids: Iterable[str]) -> list[str]:
+        """Drop bindings for these request ids, whichever fence they sit on.
+
+        ``cancel_fence`` only releases the fence being cancelled. Overlapped
+        draining output stages belong to an older turn fence and would
+        otherwise stay until the session closes.
+        """
+        wanted = {request_id for request_id in request_ids if isinstance(request_id, str) and request_id}
+        if not wanted:
+            return []
+        released = list(
+            dict.fromkeys(
+                resource.request_id for resource in self.request_resources.values() if resource.request_id in wanted
+            )
+        )
+        self.request_resources = {
+            resource_key: resource
+            for resource_key, resource in self.request_resources.items()
+            if resource.request_id not in wanted
+        }
+        return released
+
     def cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
         stale = self.prepare_cancel_fence(cancelled_fence, next_fence)
         self.release_fence(cancelled_fence)
@@ -599,7 +621,7 @@ class DuplexEngineSession:
         return False
 
     def bind_draining_request(self, request_id: str, response_id: str) -> None:
-        """Map a still-playing Stage2/3 request onto the response that owns it."""
+        """Map a still-playing draining-stage request onto the response that owns it."""
         if request_id and response_id:
             self._response.draining_response_by_request[request_id] = response_id
 
