@@ -145,6 +145,7 @@ def test_project_marks_finished_silent_text_as_listen() -> None:
     )
     events = list(plane.project({"data_plane_outputs": [final]}))
     assert any(e.get("silent") and e.get("is_listen") for e in events)
+    assert any(e.get("abort_data_plane_request") is True for e in events)
 
 
 def test_project_finished_spoken_turn_carries_model_context() -> None:

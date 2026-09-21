@@ -746,7 +746,9 @@ class ModelChannel:
         self._attach_runtime_metadata(payload, model_result)
         self._out.emit(payload)
         if model_result.get("abort_data_plane_request") is True and isinstance(data_plane_request_id, str):
-            await self._abort_request(data_plane_request_id, notify=False)
+            # stage_port.abort_requests expects a list of ids; a bare str is
+            # iterated as characters and never matches the prewarmed binding.
+            await self._abort_request([data_plane_request_id], notify=False)
         if response_id is not None:
             if not auto_response and self.response_continuations_remaining(response_id):
                 self._ctx.services.spawn(

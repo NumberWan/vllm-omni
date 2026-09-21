@@ -624,3 +624,78 @@ def test_silent_listen_with_continuation_releases_ephemeral_request() -> None:
     assert [event.get("type") for event in out.events] == ["response.listen", "response.done"]
     assert out.events[0].get("response_id") == response_id
     assert out.events[1].get("response_id") == response_id
+
+
+def test_silent_listen_aborts_data_plane_request_with_full_id() -> None:
+    """abort_data_plane_request must pass [request_id], not a bare str."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+    from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+
+    session = DuplexEngineSession(
+        session_id="s-silent-abort",
+        config=DuplexSessionConfig(model="m", modalities=["text", "audio"]),
+        capabilities=DuplexCapabilities(supports_concurrent_turn_requests=True, supports_core_resumable_request=False),
+    )
+    request_id = "duplex-s.x.e.0.r.stage0-turn7"
+    session.bind_request(request_id)
+    aborts: list[list[str]] = []
+
+    class _Plane:
+        def is_terminal(self, request_id: str | None) -> bool:
+            return False
+
+        def mark_terminal(self, request_id: str) -> None:
+            del request_id
+
+    class _Port:
+        async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
+            del request_ids, abort
+
+    class _Out:
+        def auto_responds(self) -> bool:
+            return True
+
+        def emit(self, payload: dict[str, object]) -> None:
+            del payload
+
+    async def _noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def _abort(request_ids: list[str], *, notify: bool = False) -> None:
+        del notify
+        aborts.append(list(request_ids))
+
+    channel = ModelChannel(
+        SimpleNamespace(
+            session=session,
+            plugin=SimpleNamespace(data_plane=_Plane()),
+            stage_port=_Port(),
+            model_state=SimpleNamespace(
+                continuation_owner_id=None, continuation_units=0, clear_continuation=lambda: None
+            ),
+            services=SimpleNamespace(spawn=lambda coro, **_k: None),
+            run=SimpleNamespace(closing=False),
+        ),
+        _Out(),
+        close_from_runtime=_noop,
+        schedule_silence_continuation=_noop,
+        abort_request=_abort,
+    )
+    asyncio.run(
+        channel._send_one_model_output_event(
+            {
+                "data_plane_request_id": request_id,
+                "is_listen": True,
+                "end_of_turn": True,
+                "model_turn_id": 1,
+                "reason": "model_listen",
+                "abort_data_plane_request": True,
+            }
+        )
+    )
+    assert aborts == [[request_id]]
+    assert all(len(item) > 1 for batch in aborts for item in batch), "must not split request id into chars"

@@ -259,6 +259,9 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 end_of_turn=True,
                 silent=True,
                 model_context_text=SILENT_TEXT,
+                # Prewarm already reserved Stage2/3 on Stage0 submit. Silent
+                # short-circuit never feeds codec chunks; abort frees those seats.
+                abort_data_plane_request=True,
             )
             state.terminal = True
             return
@@ -355,6 +358,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 end_of_turn=True,
                 silent=True,
                 model_context_text=SILENT_TEXT,
+                abort_data_plane_request=True,
             )
             state.terminal = True
 

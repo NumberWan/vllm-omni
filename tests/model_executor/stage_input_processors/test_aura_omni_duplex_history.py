@@ -206,6 +206,7 @@ def test_duplex_interception_commits_silent_history_without_aura2tts() -> None:
     events = list(plane.project_output(output))
     assert events and events[0].get("silent") is True
     assert events[0].get("model_context_text") == SILENT_TEXT
+    assert events[0].get("abort_data_plane_request") is True
     assert history.pending_user == "look"
     from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
 
