@@ -10,6 +10,8 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
+    _estimate_tts_prompt_len_from_token_ids,
+    _estimate_tts_prompt_len_official,
     _normalize_asr_transcript,
     asr2aura,
     aura2tts,
@@ -167,7 +169,7 @@ def test_aura2tts_supports_custom_voice_mode():
     assert tts_input["additional_information"]["task_type"] == ["CustomVoice"]
     assert tts_input["additional_information"]["speaker"] == ["Vivian"]
     assert "ref_audio" not in tts_input["additional_information"]
-    assert len(tts_input["prompt_token_ids"]) == 14
+    assert len(tts_input["prompt_token_ids"]) > 0
 
 
 def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
@@ -198,6 +200,43 @@ def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
 def test_aura2tts_drops_silent_response():
     assert aura2tts([_source_output(SILENT_TEXT)]) == []
     assert aura2tts([_source_output(f"{SILENT_TEXT}<|im_end|>")]) == []
+
+
+def test_aura2tts_customvoice_uses_official_prompt_len_not_aura_token_count():
+    text = "当然可以，我正看着你呢。"
+    prompt = {
+        "additional_information": {
+            "tts_task_type": ["CustomVoice"],
+            "tts_speaker": ["Vivian"],
+            "tts_language": ["Chinese"],
+        }
+    }
+    aura_token_ids = list(range(80))
+    tts_info = {
+        "task_type": ["CustomVoice"],
+        "language": ["Chinese"],
+        "instruct": [""],
+        "text": [text],
+        "speaker": ["Vivian"],
+    }
+    official = _estimate_tts_prompt_len_official(tts_info, task_type="CustomVoice")
+    if official is None:
+        pytest.skip("Qwen3-TTS tokenizer unavailable for official prompt_len")
+    old_heuristic = _estimate_tts_prompt_len_from_token_ids(
+        aura_token_ids,
+        task_type="CustomVoice",
+        language="Chinese",
+        instruct="",
+    )
+    assert official != old_heuristic
+
+    [tts_input] = aura2tts(
+        [_source_output(text, token_ids=aura_token_ids)],
+        prompt=[prompt],
+    )
+    assert len(tts_input["prompt_token_ids"]) == official
+    assert tts_input["additional_information"]["instruct"] == [""]
+
 
 
 def test_aura2tts_strips_im_end_from_spoken_text():

@@ -474,7 +474,7 @@ test('AURA does not open a second bubble for the same sentence after response.do
   await app.ui.stopSession({ terminal: false });
 });
 
-test('AURA shell holds speech until PTT and vision-follows while speaking', async () => {
+test('AURA shell holds speech until PTT and vision-follows at 2 fps while idle', async () => {
   const app = shell('aura-ptt');
   await app.ui.startSession();
   assert.equal(app.elements.get('pttButton').hidden, false);
@@ -485,6 +485,14 @@ test('AURA shell holds speech until PTT and vision-follows while speaking', asyn
   app.ui.capture();
   app.ui.flushCapture();
   assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.append'), false);
+
+  app.ui.setPendingFrame('IDLE');
+  app.ui.flushCapture();
+  const idle = app.sockets[0].sent.find(e => e.type === 'input_audio_buffer.append');
+  assert.equal(idle.is_speech, false);
+  assert.equal(idle.video_frames[0], 'IDLE');
+  assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
+  assert.equal(app.ui.state().assistantActive, false);
 
   app.ui.setPttHeld(true);
   assert.equal(app.ui.microphoneUploadEnabled(), true);

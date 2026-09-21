@@ -7,8 +7,9 @@
     policy: 'Hold to talk • release to commit',
     description:
       'Hold to stream speech (is_speech=true) with camera frames. Release to commit. '
-      + 'While the assistant speaks, camera frames go as vision-follow (is_speech=false). '
-      + 'AURA has no client VAD.',
+    + 'Camera frames are committed at 2 fps whenever you are not holding the button '
+    + '(is_speech=false), including while idle and while the assistant speaks. '
+    + 'AURA has no client VAD.',
     waiting: 'Ready',
     camera: true,
     // Display only. Shared CSS puts .camera-preview-large on its own row.

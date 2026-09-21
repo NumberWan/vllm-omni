@@ -40,6 +40,16 @@
   cameraButton.hidden = !profile.camera;
   if (profile.cameraPreviewLarge) {
     cameraPreview.classList.add('camera-preview-large');
+    // Inline, so a cached stylesheet cannot leave the 96×72 HTML default.
+    cameraPreview.style.width = '100%';
+    cameraPreview.style.height = 'auto';
+    cameraPreview.style.maxHeight = '480px';
+    cameraPreview.style.flex = '0 0 100%';
+    const cameraActions = cameraPreview.closest('.call-actions');
+    if (cameraActions) {
+      cameraActions.style.flexWrap = 'wrap';
+      cameraActions.style.gridColumn = '1 / -1';
+    }
   }
   sendTurnButton.hidden = !profile.clientCommit;
   pttButton.hidden = !profile.pushToTalk;
@@ -336,9 +346,9 @@
   function flushCapture() {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
 
-    // AURA only: vision-follow while TTS plays (silent PCM + frame + commit).
+    // AURA vision clock: 2 fps whether idle or speaking. PTT still sends speech.
     if (profile.pushToTalk && profile.visionFollowWhileSpeaking
-        && !pttHeld && assistantActive && cameraPendingFrame) {
+        && !pttHeld && cameraPendingFrame) {
       const frame = cameraPendingFrame;
       cameraPendingFrame = null;
       const silent = new Int16Array(SILENT_PCM_SAMPLES);

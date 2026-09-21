@@ -88,6 +88,25 @@ def test_asr2aura_duplex_uses_session_history_prefix() -> None:
     drop_session_history("duplex-hist")
 
 
+def test_asr2aura_vision_follow_keeps_previous_assistant_in_prefix() -> None:
+    drop_session_history("duplex-watch")
+    history = get_or_create_session_history("duplex-watch")
+    history.begin_user_turn("盯着滑鼠")
+    history.commit_turn("好的，出现的时候我会说")
+    prompt = {
+        "additional_information": {
+            "aura_duplex": True,
+            "session_id": "duplex-watch",
+            "is_speech": False,
+            "deferred_multi_modal_data": {"image": ["frame"]},
+        },
+        "multi_modal_data": {},
+    }
+    [next_input] = asr2aura([_source_output("noise")], prompt=[prompt])
+    assert "好的，出现的时候我会说" in next_input["prompt"]
+    drop_session_history("duplex-watch")
+
+
 def test_aura2tts_drops_silent_response() -> None:
     prompt = {"additional_information": {"tts_task_type": "CustomVoice"}}
     assert aura2tts([_source_output(SILENT_TEXT)], prompt=[prompt]) == []
