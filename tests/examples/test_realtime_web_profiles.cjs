@@ -497,7 +497,7 @@ test('AURA shell holds speech until PTT and opens one vision turn per two frames
   app.ui.flushCapture();
   const idle = visionAppends(app).at(-1);
   assert.equal(idle.is_speech, false);
-  assert.deepEqual(idle.video_frames, ['IDLE1', 'IDLE2']);
+  assert.deepEqual(idle.video_frames, ['IDLE2'], 'two frames gate the turn; only the latest is sent');
   assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
   assert.equal(app.ui.state().assistantActive, false);
 
@@ -526,7 +526,7 @@ test('AURA shell holds speech until PTT and opens one vision turn per two frames
   });
   assert.equal(app.ui.state().assistantActive, true, 'text end must not wait for playback');
   app.ui.flushCapture();
-  assert.deepEqual(visionAppends(app).at(-1).video_frames, ['LOCKED1', 'LOCKED2']);
+  assert.deepEqual(visionAppends(app).at(-1).video_frames, ['LOCKED2']);
   assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
 
   await app.ui.handleEvent({ type: 'response.created', response: { id: 'aura-r2' } });
@@ -537,7 +537,7 @@ test('AURA shell holds speech until PTT and opens one vision turn per two frames
   assert.equal(visionAppends(app).length, 2);
   await app.ui.handleEvent({ type: 'response.listen', response_id: 'aura-r2' });
   app.ui.flushCapture();
-  assert.deepEqual(visionAppends(app).at(-1).video_frames, ['SILENT1', 'SILENT2']);
+  assert.deepEqual(visionAppends(app).at(-1).video_frames, ['SILENT2']);
   await app.ui.stopSession({ terminal: false });
 });
 

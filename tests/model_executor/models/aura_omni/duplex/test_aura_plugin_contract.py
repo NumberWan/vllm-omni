@@ -167,6 +167,25 @@ def test_plan_append_commit_builds_stage0_prompt() -> None:
     assert "prompt_token_ids" not in plan.prompt
 
 
+def test_video_frames_to_mm_keeps_only_latest_image() -> None:
+    """Two JPEG frames must not become two image items (one Stage1 image_pad)."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import _video_frames_to_mm
+
+    frames: list[str] = []
+    for color in ((255, 0, 0), (0, 255, 0)):
+        buf = BytesIO()
+        Image.new("RGB", (8, 8), color).save(buf, format="JPEG")
+        frames.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+    mm = _video_frames_to_mm(frames)
+    assert list(mm.keys()) == ["image"]
+    assert len(mm["image"]) == 1
+    assert np.asarray(mm["image"][0]).shape == (8, 8, 3)
+
+
 def test_plan_append_vision_empty_audio_never_leaves_empty_prompt() -> None:
     """Frames + empty/near-silent audio must still get a Stage0 ASR pad."""
     from io import BytesIO

@@ -6,13 +6,8 @@
     eyebrow: 'Push-to-talk duplex',
     policy: 'Hold to talk • release to commit',
     description:
-      'Hold to stream speech (is_speech=true) with camera frames. Release to commit. '
-    + 'Holding the button stops local playback of the previous response only. '
-    + 'The camera still captures at 2 fps. While the button is up, frames are '
-    + 'committed once per two frames (is_speech=false), and not while the previous '
-    + 'response text is still open. Silence (response.listen) or the end of the '
-    + 'assistant text releases the next vision turn; playback does not. '
-    + 'AURA has no client VAD.',
+      'Hold to talk, release to send. Camera stays on whether you speak or not. '
+    + 'Holding the button stops local playback.',
     waiting: 'Ready',
     camera: true,
     // Display only. Shared CSS puts .camera-preview-large on its own row.

@@ -92,7 +92,11 @@ def _video_frames_to_mm(frames: object) -> dict[str, object]:
             continue
     if not images:
         return {}
-    return {"image": images[-2:]}
+    # Duplex Stage1 prompt inserts one <|image_pad|>. Native packs N frames as
+    # a single video + <|video_pad|>; until that lands here, keep only the latest
+    # frame. Two images with one pad crash: Failed to apply prompt replacement
+    # for mm_items['image'][1].
+    return {"image": [images[-1]]}
 
 
 def _completion_token_ids(completion: object | None) -> list[int]:
