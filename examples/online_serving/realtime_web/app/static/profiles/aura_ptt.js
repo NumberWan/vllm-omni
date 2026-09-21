@@ -7,8 +7,11 @@
     policy: 'Hold to talk • release to commit',
     description:
       'Hold to stream speech (is_speech=true) with camera frames. Release to commit. '
-    + 'Camera frames are committed at 2 fps whenever you are not holding the button '
-    + '(is_speech=false), including while idle and while the assistant speaks. '
+    + 'Holding the button stops local playback of the previous response only. '
+    + 'The camera still captures at 2 fps. While the button is up, frames are '
+    + 'committed once per two frames (is_speech=false), and not while the previous '
+    + 'response text is still open. Silence (response.listen) or the end of the '
+    + 'assistant text releases the next vision turn; playback does not. '
     + 'AURA has no client VAD.',
     waiting: 'Ready',
     camera: true,

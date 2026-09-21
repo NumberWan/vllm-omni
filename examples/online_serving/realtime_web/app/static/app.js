@@ -81,6 +81,10 @@
   let cameraTimer = null;
   let cameraPendingFrame = null;
   let cameraLastFrame = null;
+  // AURA vision clock only. Other profiles leave this empty and never read it.
+  let visionFollowQueue = [];
+  let visionTurnLocked = false;
+  let suppressedPlaybackId = null;
   let pttHeld = false;
   const cameraCanvas = document.createElement('canvas');
   let playbackRate = OUTPUT_RATE;
@@ -154,7 +158,7 @@
       assistantTextChannel = null;
       if (profile.halfDuplex) pendingCapture = [];
       sendTurnButton.disabled = !profile.clientCommit;
-      setModel(profile.waiting);
+      if (!pttHeld) setModel(profile.waiting);
     }, ECHO_GUARD_MS);
   }
 
@@ -343,17 +347,52 @@
     return !profile.halfDuplex || !assistantActive;
   }
 
+  function queueVisionFrame(frame) {
+    visionFollowQueue.push(frame);
+    if (visionFollowQueue.length > 2) visionFollowQueue.shift();
+  }
+
+  function commitVisionFollow() {
+    const frames = visionFollowQueue.slice();
+    visionFollowQueue = [];
+    const silent = new Int16Array(SILENT_PCM_SAMPLES);
+    const event = profile.append(int16ToBase64(silent), null, { isSpeech: false });
+    event.video_frames = frames;
+    socket.send(JSON.stringify(event));
+    for (const message of profile.commitMessages()) socket.send(JSON.stringify(message));
+  }
+
+  function releaseVisionTurn(responseId) {
+    if (!profile.visionFollowWhileSpeaking || !visionTurnLocked) return;
+    if (responseId && currentResponseId && responseId !== currentResponseId) return;
+    visionTurnLocked = false;
+  }
+
+  function suppressLocalPlayback() {
+    // Hold-to-talk cuts the speaker only. The in-flight response stays on the server.
+    if (currentResponseId) suppressedPlaybackId = currentResponseId;
+    if (playbackNode) playbackNode.port.postMessage({ type: 'clear' });
+    playbackComplete = true;
+    responseHasAudio = false;
+    setPlayback('Idle');
+  }
+
+  function playbackSuppressed(responseId) {
+    return Boolean(suppressedPlaybackId) && responseId === suppressedPlaybackId;
+  }
+
   function flushCapture() {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
 
-    // AURA vision clock: 2 fps whether idle or speaking. PTT still sends speech.
-    if (profile.pushToTalk && profile.visionFollowWhileSpeaking
-        && !pttHeld && cameraPendingFrame) {
-      const frame = cameraPendingFrame;
-      cameraPendingFrame = null;
-      const silent = new Int16Array(SILENT_PCM_SAMPLES);
-      socket.send(JSON.stringify(profile.append(int16ToBase64(silent), frame, { isSpeech: false })));
-      for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+    // AURA: capture stays 2 fps, but a turn opens only every 2 frames, and
+    // not until the previous response's text is done (or it listened).
+    // Playback still running is not the lock. PTT speech is not batched here.
+    if (profile.pushToTalk && profile.visionFollowWhileSpeaking && !pttHeld) {
+      if (cameraPendingFrame) {
+        queueVisionFrame(cameraPendingFrame);
+        cameraPendingFrame = null;
+      }
+      if (!visionTurnLocked && visionFollowQueue.length >= 2) commitVisionFollow();
       return;
     }
 
@@ -388,6 +427,7 @@
     if (!profile.pushToTalk || !running || pttHeld === held) return;
     if (held) {
       pttHeld = true;
+      suppressLocalPlayback();
       pttButton.classList.toggle('is-active', true);
       pttButton.textContent = 'Release to send';
       setModel('Talking');
@@ -417,6 +457,7 @@
   }
 
   function feedPlayback(decoded, responseId) {
+    if (playbackSuppressed(responseId || currentResponseId)) return;
     if (!decoded || !decoded.pcm || decoded.pcm.length === 0 || !playbackNode) return;
     const pcm = resampleInt16(decoded.pcm, decoded.sourceRate, playbackRate);
     responseHasAudio = true;
@@ -458,13 +499,18 @@
   }
 
   async function handleAudioEvent(action) {
+    const responseId = action.responseId || currentResponseId || `turn-${turnCounter}`;
+    if (playbackSuppressed(responseId)) return;
     markBusy();
-    currentResponseId = action.responseId || currentResponseId || `turn-${turnCounter}`;
+    currentResponseId = responseId;
     setModel('Speaking');
     const generation = sessionGeneration;
-    const responseId = currentResponseId;
     const decoded = await decodeAudioDelta(action.event);
-    if (generation === sessionGeneration && !interruptedResponses.has(responseId)) feedPlayback(decoded, responseId);
+    if (
+      generation === sessionGeneration
+      && !interruptedResponses.has(responseId)
+      && !playbackSuppressed(responseId)
+    ) feedPlayback(decoded, responseId);
   }
 
   function handleTranscriptEvent(action) {
@@ -556,12 +602,14 @@
       }
       case 'listen':
         assistantActive = false;
+        releaseVisionTurn(responseId);
         setModel(profile.waiting);
         break;
       case 'begin':
         if (profile.halfDuplex) armTurnTimeout();
         if (echoTimer !== null) { clearTimeout(echoTimer); echoTimer = null; }
         beginAssistant(responseId);
+        if (profile.visionFollowWhileSpeaking) visionTurnLocked = true;
         break;
       case 'audio':
         await handleAudioEvent(action);
@@ -571,11 +619,13 @@
         break;
       case 'text': case 'text-final':
         handleTranscriptEvent(action);
+        if (action.kind === 'text-final' && action.role === 'assistant') releaseVisionTurn(responseId);
         break;
       case 'done':
         clearTimeout(turnTimeout);
         responseComplete = true;
         finishTranscript('assistant');
+        releaseVisionTurn(responseId);
         requestPlaybackDrain(responseId);
         finishResponseIfReady();
         break;
@@ -770,6 +820,9 @@
       muted = false;
       pttHeld = false;
       assistantActive = false;
+      visionFollowQueue = [];
+      visionTurnLocked = false;
+      suppressedPlaybackId = null;
       sendTimer = window.setInterval(flushCapture, profile.sendIntervalMs || SEND_INTERVAL_MS);
       startClock();
       callButton.textContent = 'End session';
@@ -891,6 +944,9 @@
     pttButton.textContent = 'Hold to talk';
     running = false;
     assistantActive = false;
+    visionFollowQueue = [];
+    visionTurnLocked = false;
+    suppressedPlaybackId = null;
     pendingCapture = [];
     if (sendTimer !== null) clearInterval(sendTimer);
     if (clockTimer !== null) clearInterval(clockTimer);

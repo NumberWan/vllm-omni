@@ -474,7 +474,11 @@ test('AURA does not open a second bubble for the same sentence after response.do
   await app.ui.stopSession({ terminal: false });
 });
 
-test('AURA shell holds speech until PTT and vision-follows at 2 fps while idle', async () => {
+function visionAppends(app) {
+  return app.sockets[0].sent.filter(e => e.type === 'input_audio_buffer.append' && e.is_speech === false);
+}
+
+test('AURA shell holds speech until PTT and opens one vision turn per two frames', async () => {
   const app = shell('aura-ptt');
   await app.ui.startSession();
   assert.equal(app.elements.get('pttButton').hidden, false);
@@ -486,11 +490,14 @@ test('AURA shell holds speech until PTT and vision-follows at 2 fps while idle',
   app.ui.flushCapture();
   assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.append'), false);
 
-  app.ui.setPendingFrame('IDLE');
+  app.ui.setPendingFrame('IDLE1');
   app.ui.flushCapture();
-  const idle = app.sockets[0].sent.find(e => e.type === 'input_audio_buffer.append');
+  assert.equal(visionAppends(app).length, 0, 'one frame must not open a turn');
+  app.ui.setPendingFrame('IDLE2');
+  app.ui.flushCapture();
+  const idle = visionAppends(app).at(-1);
   assert.equal(idle.is_speech, false);
-  assert.equal(idle.video_frames[0], 'IDLE');
+  assert.deepEqual(idle.video_frames, ['IDLE1', 'IDLE2']);
   assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
   assert.equal(app.ui.state().assistantActive, false);
 
@@ -499,21 +506,58 @@ test('AURA shell holds speech until PTT and vision-follows at 2 fps while idle',
   app.ui.setPendingFrame('FRAME1');
   app.ui.capture();
   app.ui.flushCapture();
-  const speech = app.sockets[0].sent.find(e => e.type === 'input_audio_buffer.append');
-  assert.equal(speech.is_speech, true);
+  const speech = app.sockets[0].sent.find(e => e.type === 'input_audio_buffer.append' && e.is_speech === true);
   assert.equal(speech.video_frames[0], 'FRAME1');
+  assert.equal(visionAppends(app).length, 1, 'speech must not wait for a second frame');
 
   app.ui.setPttHeld(false);
   assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
   assert.equal(app.ui.state().pttHeld, false);
 
   await app.ui.handleEvent({ type: 'response.created', response: { id: 'aura-r1' } });
-  app.ui.setPendingFrame('FRAME2');
+  app.ui.setPendingFrame('LOCKED1');
   app.ui.flushCapture();
-  const follow = app.sockets[0].sent.filter(e => e.type === 'input_audio_buffer.append').at(-1);
-  assert.equal(follow.is_speech, false);
-  assert.equal(follow.video_frames[0], 'FRAME2');
+  app.ui.setPendingFrame('LOCKED2');
+  app.ui.flushCapture();
+  assert.equal(visionAppends(app).length, 1, 'open text turn blocks the next vision commit');
+
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.done', response_id: 'aura-r1', transcript: '看到了。',
+  });
+  assert.equal(app.ui.state().assistantActive, true, 'text end must not wait for playback');
+  app.ui.flushCapture();
+  assert.deepEqual(visionAppends(app).at(-1).video_frames, ['LOCKED1', 'LOCKED2']);
   assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
+
+  await app.ui.handleEvent({ type: 'response.created', response: { id: 'aura-r2' } });
+  app.ui.setPendingFrame('SILENT1');
+  app.ui.flushCapture();
+  app.ui.setPendingFrame('SILENT2');
+  app.ui.flushCapture();
+  assert.equal(visionAppends(app).length, 2);
+  await app.ui.handleEvent({ type: 'response.listen', response_id: 'aura-r2' });
+  app.ui.flushCapture();
+  assert.deepEqual(visionAppends(app).at(-1).video_frames, ['SILENT1', 'SILENT2']);
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('AURA hold-to-talk stops local playback and does not cancel the response', async () => {
+  const app = shell('aura-ptt', 'stt', { realPlayback: true });
+  await app.ui.startSession();
+  receive(app, { type: 'response.created', response: { id: 'old' } });
+  receive(app, audioChunk('old'));
+  await app.ui.awaitQueue();
+  const player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
+  for (let index = 0; index < 75; index++) renderPlayback(player);
+  assert.ok(renderPlayback(player).some(sample => sample !== 0));
+  const sentBefore = app.sockets[0].sent.length;
+  app.ui.setPttHeld(true);
+  assertSilent(player);
+  const extra = app.sockets[0].sent.slice(sentBefore);
+  assert.ok(extra.every(event => event.type === 'playback.ack'), 'hold must not abort the server response');
+  receive(app, audioChunk('old'));
+  await app.ui.awaitQueue();
+  assertSilent(player);
   await app.ui.stopSession({ terminal: false });
 });
 
