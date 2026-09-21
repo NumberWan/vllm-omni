@@ -9,7 +9,7 @@ This implements [RFC #7222](https://github.com/vllm-project/vllm-omni/issues/722
 | `minicpm-native` | Model-controlled listen/speak, continuous audio input | Frames accompany audio | Yes |
 | `qwen3-turn --stt` (default) | User presses **Send turn** | No | No |
 | `qwen3-turn --vad` | Server detects trailing silence; speech interrupts replies | Sampled frames with each spoken turn | Yes |
-| `aura-ptt` | Hold **Hold to talk**; release commits. Hold also stops local playback | Sticky frames with speech; vision-follow commits every 2 frames while the button is up, after the previous text turn ends | Yes |
+| `aura-ptt` | Hold **Hold to talk**; release commits. Hold also stops local playback | Sticky frames with speech; vision-follow every 2 frames only while unlocked (locked from PTT release until text-final / listen) | Yes |
 
 Qwen3 VAD uses an engine-owned duplex plugin: microphone upload continues
 while replies stream, and speech can interrupt generation and playback. The
@@ -54,8 +54,10 @@ Open the UI, start a session, optionally enable **Camera**, then **hold**
 in the browser only; the in-flight response is not cancelled on the server.
 With the camera on, frames are still captured at 2 fps. While the button is
 up they are committed once per two frames (`is_speech=false` + silent PCM),
-and not until the previous response has finished its text or returned
-`response.listen`. Audio still playing does not hold the next vision turn.
+but only after the prior spoken turn unlocks (text-final or `response.listen`).
+Release itself locks vision immediately so a follow-up frame cannot abort the
+just-committed speech turn on Stage0/1 (`max_num_seqs=1`). Audio still playing
+does not hold the next vision turn once text is done.
 MiniCPM / Qwen profiles do not set `pushToTalk`, so the PTT control stays hidden.
 
 ## Qwen3: explicit-turn STT adapter

@@ -440,6 +440,13 @@
     if (socket && socket.readyState === WebSocket.OPEN) {
       for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
     }
+    // Lock vision before clearing pttHeld. Stage0/1 are max_num_seqs=1: a
+    // vision-follow commit in the gap before response.begin aborts the speech
+    // turn (server sees a new ephemeral and kills the prior ASR request).
+    if (profile.visionFollowWhileSpeaking) {
+      visionTurnLocked = true;
+      visionFollowQueue = [];
+    }
     pttHeld = false;
     pttButton.classList.toggle('is-active', false);
     pttButton.textContent = 'Hold to talk';
