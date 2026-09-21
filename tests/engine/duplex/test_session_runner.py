@@ -946,7 +946,7 @@ async def test_stage_failure_on_draining_request_fails_that_response_only() -> N
 
     h = await open_harness()
     try:
-        h.session.capabilities = replace(h.session.capabilities, supports_overlapped_commit=True)
+        h.session.capabilities = replace(h.session.capabilities, supports_concurrent_turn_requests=True)
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))

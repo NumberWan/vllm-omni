@@ -292,7 +292,7 @@ class DuplexModelPlugin(ABC):
         """
         del session_id, assistant_text
 
-    def release_overlapped_commit(
+    def release_concurrent_turn_requests(
         self,
         *,
         stage_id: int,

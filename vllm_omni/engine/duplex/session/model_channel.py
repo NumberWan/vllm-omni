@@ -224,14 +224,16 @@ class ModelChannel:
             # Keys are ``(stage_id, request_id)``; values are DuplexRequestResource.
             stale_keys = list(session.request_resources.keys())
             stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
-            overlapped = session.capabilities.supports_overlapped_commit and self._ctx.run.overlapped_commit_released
+            concurrent_turn = session.capabilities.supports_concurrent_turn_requests and (
+                self._ctx.run.concurrent_turn_requests_released
+            )
             # Prior TTS may still drain under the same response_id; acceptance
-            # is gated by supports_overlapped_commit, not a per-turn drain id.
+            # is gated by supports_concurrent_turn_requests, not a per-turn drain id.
             session.complete_model_turn(fence.turn_id)
             fence = DuplexFence(session.session_id, epoch=session.epoch, turn_id=session.turn_id)
             request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=False)
             session.request_resources.pop((stage_id, stale_ephemeral_id), None)
-            if overlapped:
+            if concurrent_turn:
                 # Input gate already released after assistant text/silent final,
                 # so Stage0/1 are idle. Drop their session bindings only — do
                 # not abort engine work. Stage2/3 keep draining under the prior
@@ -243,7 +245,7 @@ class ModelChannel:
                     elif prior_response_id is not None and not session.is_draining_request(rid):
                         # Already-draining ids keep their original response_id.
                         session.bind_draining_request(rid, prior_response_id)
-                self._ctx.run.overlapped_commit_released = False
+                self._ctx.run.concurrent_turn_requests_released = False
                 if prior_response_id is not None:
                     session.snapshot_active_response_for_drain()
                     new_response_id = session.begin_response(turn_id=fence.turn_id)
@@ -323,10 +325,10 @@ class ModelChannel:
                 raise
             session.touch_lease(DuplexLeaseActivity.APPEND)
             session.bind_request(request_id)
-            # Consuming a Stage0 bind closes the overlapped-input gate even when
+            # Consuming a Stage0 bind closes the concurrent-turn gate even when
             # this turn used a fresh ephemeral id (not the reuse branch above).
             if stage_id == 0:
-                self._ctx.run.overlapped_commit_released = False
+                self._ctx.run.concurrent_turn_requests_released = False
             return {
                 "ok": True,
                 "operation": "append",
@@ -448,9 +450,11 @@ class ModelChannel:
             context=context,
         )
 
-    def release_overlapped_commit(self, stage_id: int, output: RequestOutput, context: DuplexOutputContext) -> bool:
+    def release_concurrent_turn_requests(
+        self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
+    ) -> bool:
         """Ask the plugin whether the next commit may start while TTS drains."""
-        return self._ctx.plugin.release_overlapped_commit(
+        return self._ctx.plugin.release_concurrent_turn_requests(
             stage_id=stage_id,
             segment_finished=context.segment_finished,
             output=output,
@@ -536,7 +540,8 @@ class ModelChannel:
             active_request_id = session.active_request_id
             if active_request_id is not None and active_request_id != item.request_id:
                 if not (
-                    session.capabilities.supports_overlapped_commit and session.is_draining_request(item.request_id)
+                    session.capabilities.supports_concurrent_turn_requests
+                    and session.is_draining_request(item.request_id)
                 ):
                     return
         engine_output = self._build_stage_output(item)
@@ -1000,7 +1005,7 @@ class ModelChannel:
             # Prior TTS finished under its own draining response_id while a
             # newer turn already owns active_response_id — close that response.
             if (
-                session.capabilities.supports_overlapped_commit
+                session.capabilities.supports_concurrent_turn_requests
                 and isinstance(data_plane_request_id, str)
                 and session.is_draining_request(data_plane_request_id)
             ):

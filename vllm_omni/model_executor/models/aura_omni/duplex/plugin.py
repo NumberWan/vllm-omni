@@ -291,7 +291,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
 
         get_or_create_session_history(session_id).commit_turn(assistant_text or SILENT_TEXT)
 
-    def release_overlapped_commit(
+    def release_concurrent_turn_requests(
         self,
         *,
         stage_id: int,

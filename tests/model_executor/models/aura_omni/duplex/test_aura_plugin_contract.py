@@ -67,7 +67,7 @@ def test_load_aura_duplex_plugin_and_sampling_arity() -> None:
     caps = plugin.capabilities(max_sessions=1)
     assert caps.supports_turn_commit_only is True
     assert caps.supports_core_resumable_request is False
-    assert caps.supports_overlapped_commit is True
+    assert caps.supports_concurrent_turn_requests is True
     assert caps.required_input_modalities == frozenset({"video"})
     assert caps.optional_input_modalities == frozenset({"audio"})
     assert caps.allows_video_without_audio() is True
@@ -219,13 +219,21 @@ def test_project_intermediate_output_targets_stage1_only() -> None:
     assert plugin.project_intermediate_output(stage_id=3, output=object(), context=object()) is False
 
 
-def test_release_overlapped_commit_on_stage1_final() -> None:
+def test_release_concurrent_turn_requests_on_stage1_final() -> None:
     plugin = AuraDuplexPlugin(_encode_audio)
-    assert plugin.release_overlapped_commit(stage_id=1, segment_finished=True, output=object(), context=object())
-    assert not plugin.release_overlapped_commit(stage_id=1, segment_finished=False, output=object(), context=object())
+    assert plugin.release_concurrent_turn_requests(
+        stage_id=1, segment_finished=True, output=object(), context=object()
+    )
+    assert not plugin.release_concurrent_turn_requests(
+        stage_id=1, segment_finished=False, output=object(), context=object()
+    )
     finished = type("Out", (), {"finished": True})()
-    assert plugin.release_overlapped_commit(stage_id=1, segment_finished=False, output=finished, context=object())
-    assert not plugin.release_overlapped_commit(stage_id=2, segment_finished=True, output=object(), context=object())
+    assert plugin.release_concurrent_turn_requests(
+        stage_id=1, segment_finished=False, output=finished, context=object()
+    )
+    assert not plugin.release_concurrent_turn_requests(
+        stage_id=2, segment_finished=True, output=object(), context=object()
+    )
 
 
 def test_configure_sampling_keeps_silent_stop_visible() -> None:

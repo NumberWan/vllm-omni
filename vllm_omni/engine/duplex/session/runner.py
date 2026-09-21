@@ -253,10 +253,10 @@ class DuplexSessionRunner:
             # Optional mid-pipeline projection: client sees this stage; TTS still runs.
             if decision is None:
                 project = self.model.project_intermediate_output(stage_id, output, context)
-        if self.session.capabilities.supports_overlapped_commit and self.model.release_overlapped_commit(
+        if self.session.capabilities.supports_concurrent_turn_requests and self.model.release_concurrent_turn_requests(
             stage_id, output, context
         ):
-            self.run.overlapped_commit_released = True
+            self.run.concurrent_turn_requests_released = True
         consume = decision is not None or stage_id >= context.final_stage_id
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
         if not consume and not project and not project_intermediate:
@@ -288,7 +288,7 @@ class DuplexSessionRunner:
     def on_stage_failure(self, stage_id: int, exc: BaseException, *, request_id: str | None = None) -> None:
         """A stage rejected this session's request: fail the owning response.
 
-        Under overlapped input the failing request may belong to a draining
+        Under concurrent turn requests the failing request may belong to a draining
         older response; resolve via ``response_id_for_request`` before falling
         back to ``active_response_id``.
 
@@ -1427,8 +1427,8 @@ class DuplexSessionRunner:
         old_epoch = session.epoch
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
-        # Barge-in / cancel aborts prior TTS; clear overlapped-input release.
-        self.run.overlapped_commit_released = False
+        # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
+        self.run.concurrent_turn_requests_released = False
         committed_message = session.end_response(
             commit_text=self.model.should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
@@ -1917,7 +1917,7 @@ class DuplexSessionRunner:
                 if not helpers.next_commit_allowed(
                     self.session,
                     self.tasks,
-                    overlapped_commit_released=self.run.overlapped_commit_released,
+                    concurrent_turn_requests_released=self.run.concurrent_turn_requests_released,
                 ):
                     if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
                         self._discard_short_overlap_ack()
@@ -1939,7 +1939,7 @@ class DuplexSessionRunner:
         if helpers.next_commit_allowed(
             self.session,
             self.tasks,
-            overlapped_commit_released=self.run.overlapped_commit_released,
+            concurrent_turn_requests_released=self.run.concurrent_turn_requests_released,
         ) and await self._flush_and_submit_committed_turn(
             event,
             event_type=event_type,
@@ -1948,7 +1948,7 @@ class DuplexSessionRunner:
         ):
             return
         # Nothing flushed (or a response is still in progress without
-        # overlapped-input release): acknowledge without starting a new response.
+        # concurrent-turn release): acknowledge without starting a new response.
         had_uncommitted_audio = (
             model_state.input_since_commit
             or model_state.audio_buffer.has_pending()

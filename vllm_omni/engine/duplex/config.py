@@ -96,7 +96,7 @@ class DuplexCapabilities:
     supports_core_resumable_request: bool = False
     # Prior assistant TTS may keep draining while a new user commit is admitted.
     # Not barge-in (which aborts prior TTS).
-    supports_overlapped_commit: bool = False
+    supports_concurrent_turn_requests: bool = False
     #: Input modality contract. Defaults match audio-primary duplex (e.g. MiniCPM):
     #: audio required, video optional when attached to an audio unit.
     required_input_modalities: frozenset[str] = field(default_factory=lambda: frozenset({"audio"}))
@@ -149,7 +149,7 @@ class DuplexCapabilities:
             "supports_stage_resumption": self.supports_stage_resumption,
             "supports_scheduler_native_append": self.supports_scheduler_native_append,
             "supports_core_resumable_request": self.supports_core_resumable_request,
-            "supports_overlapped_commit": self.supports_overlapped_commit,
+            "supports_concurrent_turn_requests": self.supports_concurrent_turn_requests,
             "required_input_modalities": sorted(self.required_input_modalities),
             "optional_input_modalities": sorted(self.optional_input_modalities),
             "supports_stage_connector_handoff": self.supports_stage_connector_handoff,
