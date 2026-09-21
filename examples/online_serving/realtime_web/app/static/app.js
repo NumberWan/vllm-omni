@@ -38,9 +38,7 @@
   document.getElementById('profileDescription').textContent = profile.description;
   document.getElementById('policyLabel').textContent = profile.policy;
   cameraButton.hidden = !profile.camera;
-  if (profile.cameraPreviewWidth && profile.cameraPreviewHeight) {
-    cameraPreview.style.width = `${profile.cameraPreviewWidth}px`;
-    cameraPreview.style.height = `${profile.cameraPreviewHeight}px`;
+  if (profile.cameraPreviewLarge) {
     cameraPreview.classList.add('camera-preview-large');
   }
   sendTurnButton.hidden = !profile.clientCommit;

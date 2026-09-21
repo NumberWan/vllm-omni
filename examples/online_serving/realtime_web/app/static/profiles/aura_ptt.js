@@ -11,9 +11,9 @@
       + 'AURA has no client VAD.',
     waiting: 'Ready',
     camera: true,
-    // Display only. Other profiles keep the 96×72 preview in index.html.
-    cameraPreviewWidth: 320,
-    cameraPreviewHeight: 240,
+    // Display only. Shared CSS puts .camera-preview-large on its own row.
+    // Other profiles keep the 96×72 preview in index.html.
+    cameraPreviewLarge: true,
     playbackAck: true,
     clientCommit: false,
     pushToTalk: true,

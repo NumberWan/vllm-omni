@@ -249,9 +249,9 @@ def test_aura_camera_preview_size_is_not_shared() -> None:
     qwen = (STATIC_ROOT / "profiles" / "qwen3_turn.js").read_text(encoding="utf-8")
     html = (APP_ROOT / "index.html").read_text(encoding="utf-8")
 
-    assert "cameraPreviewWidth: 320" in aura
-    assert "cameraPreviewHeight: 240" in aura
-    assert "cameraPreviewWidth" not in minicpm
-    assert "cameraPreviewWidth" not in qwen
-    assert "profile.cameraPreviewWidth" in app
+    assert "cameraPreviewLarge: true" in aura
+    assert "cameraPreviewLarge" not in minicpm
+    assert "cameraPreviewLarge" not in qwen
+    assert "profile.cameraPreviewLarge" in app
+    assert "camera-preview-break" not in app
     assert "width:96px;height:72px" in html
