@@ -92,11 +92,22 @@ def _video_frames_to_mm(frames: object) -> dict[str, object]:
             continue
     if not images:
         return {}
-    # Duplex Stage1 prompt inserts one <|image_pad|>. Native packs N frames as
-    # a single video + <|video_pad|>; until that lands here, keep only the latest
-    # frame. Two images with one pad crash: Failed to apply prompt replacement
-    # for mm_items['image'][1].
-    return {"image": [images[-1]]}
+    # One <|video_pad|> for the whole clip. Two separate images with one
+    # <|image_pad|> crash Stage1 (mm_items['image'][1]). Qwen3-VL's temporal
+    # patch wants at least two frames; a single sticky frame is duplicated.
+    if len(images) == 1:
+        images = [images[0], images[0]]
+    video = np.stack(images, axis=0)
+    n_frames = int(video.shape[0])
+    metadata = {
+        "fps": 2.0,
+        "duration": n_frames / 2.0,
+        "total_num_frames": n_frames,
+        "frames_indices": list(range(n_frames)),
+        "video_backend": "opencv",
+        "do_sample_frames": False,
+    }
+    return {"video": [(video, metadata)]}
 
 
 def _completion_token_ids(completion: object | None) -> list[int]:

@@ -263,6 +263,13 @@ def _source_prompt_by_request_id(source_outputs: list[Any], prompt: Any) -> dict
     }
 
 
+def _one_video_item(video: Any) -> Any:
+    """The current clip, if ``multi_modal_data['video']`` is one ``(array, meta)``."""
+    if isinstance(video, list) and len(video) == 1 and isinstance(video[0], tuple):
+        return video[0]
+    return None
+
+
 def _vision_placeholder(multi_modal_data: dict[str, Any]) -> str:
     if "video" in multi_modal_data:
         return "<|vision_start|><|video_pad|><|vision_end|>"
@@ -526,6 +533,7 @@ def asr2aura(
         multi_modal_data = _vision_multimodal_data(multi_modal_data)
 
         history_prefix = ""
+        prompt_mm = multi_modal_data
         session_id = additional_info.get("session_id") or additional_info.get("aura_session_id")
         if additional_info.get("aura_duplex") and isinstance(session_id, str) and session_id:
             from vllm_omni.model_executor.models.aura_omni.duplex.history import (
@@ -533,8 +541,27 @@ def asr2aura(
             )
 
             history = get_or_create_session_history(session_id)
-            history.begin_user_turn(transcript)
+            current_video = _one_video_item(multi_modal_data.get("video"))
+            history.begin_user_turn(transcript, video=current_video)
             history_prefix = history.render_prefix()
+            prior_videos = history.retained_videos()
+            # Native get_vllm_inputs: every retained clip is a <|video_pad|> in
+            # order, then this turn. The placeholder on the current user message
+            # is only this clip, so pad count matches multi_modal_data["video"].
+            if prior_videos or current_video is not None:
+                merged = list(prior_videos)
+                if current_video is not None:
+                    merged.append(current_video)
+                multi_modal_data = dict(multi_modal_data)
+                multi_modal_data["video"] = merged
+            prompt_mm = dict(multi_modal_data)
+            if prior_videos:
+                if current_video is None:
+                    prompt_mm.pop("video", None)
+                else:
+                    prompt_mm["video"] = [current_video]
+            else:
+                prompt_mm = multi_modal_data
             if not transcript:
                 last_assistant = next(
                     (
@@ -555,7 +582,7 @@ def asr2aura(
             "prompt": _aura_prompt(
                 str(system_prompt),
                 transcript,
-                multi_modal_data,
+                prompt_mm,
                 history_prefix=history_prefix,
             ),
         }

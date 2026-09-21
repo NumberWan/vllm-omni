@@ -53,7 +53,8 @@
         sample_rate_hz: 16000,
         is_speech: isSpeech,
       };
-      if (frame) event.video_frames = [frame];
+      const frames = Array.isArray(frame) ? frame.filter(Boolean) : (frame ? [frame] : []);
+      if (frames.length) event.video_frames = frames;
       return event;
     },
     commitMessages: () => [{ type: 'input_audio_buffer.commit', create_response: true }],

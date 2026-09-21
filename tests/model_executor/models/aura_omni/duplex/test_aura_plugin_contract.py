@@ -167,8 +167,8 @@ def test_plan_append_commit_builds_stage0_prompt() -> None:
     assert "prompt_token_ids" not in plan.prompt
 
 
-def test_video_frames_to_mm_keeps_only_latest_image() -> None:
-    """Two JPEG frames must not become two image items (one Stage1 image_pad)."""
+def test_video_frames_to_mm_packs_one_video() -> None:
+    """Two JPEG frames are one video clip, not two image items."""
     from io import BytesIO
 
     from PIL import Image
@@ -181,9 +181,12 @@ def test_video_frames_to_mm_keeps_only_latest_image() -> None:
         Image.new("RGB", (8, 8), color).save(buf, format="JPEG")
         frames.append(base64.b64encode(buf.getvalue()).decode("ascii"))
     mm = _video_frames_to_mm(frames)
-    assert list(mm.keys()) == ["image"]
-    assert len(mm["image"]) == 1
-    assert np.asarray(mm["image"][0]).shape == (8, 8, 3)
+    assert list(mm.keys()) == ["video"]
+    assert len(mm["video"]) == 1
+    video, metadata = mm["video"][0]
+    assert np.asarray(video).shape == (2, 8, 8, 3)
+    assert metadata["total_num_frames"] == 2
+    assert metadata["do_sample_frames"] is False
 
 
 def test_plan_append_vision_empty_audio_never_leaves_empty_prompt() -> None:
@@ -375,25 +378,24 @@ def test_data_plane_close_session_drops_history() -> None:
     from vllm_omni.model_executor.models.aura_omni.duplex.history import get_or_create_session_history
 
     drop_session_history("close-hist")
-    get_or_create_session_history("close-hist", max_turns=2).begin_user_turn("hi")
+    get_or_create_session_history("close-hist").begin_user_turn("hi")
     AuraDataPlaneSession(encode_audio=_encode_audio).close_session("close-hist")
     from vllm_omni.model_executor.models.aura_omni.duplex.history import _STORE
 
     assert "close-hist" not in _STORE
 
 
-def test_session_history_commit_and_prune() -> None:
+def test_session_history_strips_oldest_silent_videos() -> None:
     drop_session_history("hist-ut")
-    history = get_or_create_session_history("hist-ut", max_turns=2)
-    history.begin_user_turn("hi")
-    history.commit_turn("hello")
-    history.begin_user_turn("again")
-    history.commit_turn("world")
-    history.begin_user_turn("third")
-    history.commit_turn(SILENT_TEXT)
-    assert len(history.messages) <= 4
-    prefix = history.render_prefix()
-    assert "<|im_start|>user" in prefix
+    history = get_or_create_session_history("hist-ut")
+    history.max_video_rounds = 2
+    history.video_rounds_to_remove = 1
+    for index in range(3):
+        history.begin_user_turn("", video=(f"clip-{index}",))
+        history.commit_turn(SILENT_TEXT)
+    kept = [message["video"] for message in history.messages if message.get("video") is not None]
+    assert kept == [("clip-1",), ("clip-2",)]
+    assert not any(message.get("video") == ("clip-0",) for message in history.messages)
     drop_session_history("hist-ut")
 
 

@@ -53,7 +53,9 @@ Open the UI, start a session, optionally enable **Camera**, then **hold**
 **Release** to `input_audio_buffer.commit`. Holding the button stops playback
 in the browser only; the in-flight response is not cancelled on the server.
 With the camera on, frames are still captured at 2 fps. While the button is
-up they are committed once per two frames (`is_speech=false` + silent PCM),
+up they are committed once per two frames (`is_speech=false` + silent PCM).
+Both frames of that commit are sent and packed as one video (`<|video_pad|>`).
+Turns still open from this client commit, not from a server-side auto trigger.
 but only after the prior spoken turn unlocks (text-final or `response.listen`).
 Release itself locks vision immediately so a follow-up frame cannot abort the
 just-committed speech turn on Stage0/1 (`max_num_seqs=1`). Audio still playing

@@ -69,6 +69,33 @@ def test_asr2aura_duplex_empty_transcript_is_not_a_vision_user_turn() -> None:
     drop_session_history("duplex-vision")
 
 
+def test_asr2aura_duplex_history_videos_match_prompt_pads() -> None:
+    """Retained clips then this clip: one <|video_pad|> each, same order as mm data."""
+    drop_session_history("duplex-pads")
+    history = get_or_create_session_history("duplex-pads")
+    history.begin_user_turn("看着手", video=("clip-a", {"fps": 2.0}))
+    history.commit_turn("好的")
+    prompt = {
+        "additional_information": {
+            "aura_duplex": True,
+            "session_id": "duplex-pads",
+            "is_speech": False,
+            "deferred_multi_modal_data": {"video": [("clip-b", {"fps": 2.0})]},
+        },
+        "multi_modal_data": {},
+    }
+    [next_input] = asr2aura([_source_output("")], prompt=[prompt])
+    text = next_input["prompt"]
+    assert text.count("<|video_pad|>") == 2
+    assert "clip-a" not in text and "clip-b" not in text
+    assert next_input["multi_modal_data"]["video"] == [
+        ("clip-a", {"fps": 2.0}),
+        ("clip-b", {"fps": 2.0}),
+    ]
+    assert text.index("<|video_pad|>") < text.rindex("<|im_start|>user")
+    drop_session_history("duplex-pads")
+
+
 def test_asr2aura_duplex_uses_session_history_prefix() -> None:
     drop_session_history("duplex-hist")
     history = get_or_create_session_history("duplex-hist")

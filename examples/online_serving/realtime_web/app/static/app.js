@@ -353,12 +353,12 @@
   }
 
   function commitVisionFollow() {
-    // Queue length gates the turn; only the latest frame is sent. Duplex Stage1
-    // has one image pad (Native packs N frames as one video).
-    const latest = visionFollowQueue[visionFollowQueue.length - 1];
+    // Two frames still gate the turn (client commit). Both frames are one clip;
+    // the server packs them as a single <|video_pad|>, same as Native.
+    const frames = visionFollowQueue.slice();
     visionFollowQueue = [];
     const silent = new Int16Array(SILENT_PCM_SAMPLES);
-    const event = profile.append(int16ToBase64(silent), latest, { isSpeech: false });
+    const event = profile.append(int16ToBase64(silent), frames, { isSpeech: false });
     socket.send(JSON.stringify(event));
     for (const message of profile.commitMessages()) socket.send(JSON.stringify(message));
   }
