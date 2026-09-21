@@ -1463,11 +1463,15 @@ class DuplexSessionRunner:
         # The epoch bump is the atomic part: from here on every model output
         # and append of the old epoch is dropped by the stale-epoch filter in
         # ``emit`` / the append tail, whatever the awaits below interleave with.
-        # Release bindings first. ``barge_in`` clears the drain map, and
-        # ``cancel_fence`` would only drop the fence just cancelled — draining
-        # output stages are on an older turn fence.
+        # ``cancel_fence`` only drops the fence being cancelled, and that is
+        # what tells the orchestrator to cleanup(abort=True). Releasing those
+        # ids here first leaves the stage request in ``request_states``.
+        # Draining output stages sit on an older turn fence, so drop only those.
         abort_ids = [request_id for request_id in (old_request_id, *draining_ids) if request_id]
-        session.release_resources_for_request_ids(abort_ids)
+        cancelled_ids = set(session.resource_request_ids(session.fence))
+        older_abort_ids = [request_id for request_id in abort_ids if request_id not in cancelled_ids]
+        if older_abort_ids:
+            session.release_resources_for_request_ids(older_abort_ids)
         new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
         if old_request_id is not None:
             # Release projector/parser cursors so cancelled epochs do not
