@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_omni.model_executor.models.aura_omni.duplex.history import (
     drop_session_history,
     get_or_create_session_history,
@@ -16,6 +18,8 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     asr2aura,
     aura2tts,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _source_output(text: str, request_id: str = "r0") -> SimpleNamespace:
@@ -139,7 +143,8 @@ def test_aura2tts_drops_silent_response() -> None:
     assert aura2tts([_source_output(SILENT_TEXT)], prompt=[prompt]) == []
 
 
-def test_aura2tts_duplex_commits_silent_into_history() -> None:
+def test_aura2tts_duplex_does_not_commit_history() -> None:
+    """Stage1 history has one owner: commit_model_context. aura2tts must not write a second row."""
     drop_session_history("duplex-silent")
     history = get_or_create_session_history("duplex-silent")
     history.begin_user_turn("look")
@@ -151,7 +156,15 @@ def test_aura2tts_duplex_commits_silent_into_history() -> None:
         }
     }
     assert aura2tts([_source_output(SILENT_TEXT)], prompt=[prompt]) == []
-    assert history.messages[-1]["content"] == SILENT_TEXT
+    assert all(message.get("role") != "assistant" for message in history.messages)
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
+
+    AuraDuplexPlugin(encode_audio=lambda *_a, **_k: None).commit_model_context(
+        session_id="duplex-silent",
+        assistant_text="只記一次",
+    )
+    assert [message["role"] for message in history.messages] == ["user", "assistant"]
+    assert history.messages[-1]["content"] == "只記一次"
     drop_session_history("duplex-silent")
 
 

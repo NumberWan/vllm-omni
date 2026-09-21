@@ -899,10 +899,27 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         transcript = event.get("transcript")
         if not isinstance(transcript, str) or not transcript.strip():
             return []
+        transcript = transcript.strip()
+        raw_item_id = event.get("realtime_item_id")
+        item_id = raw_item_id if isinstance(raw_item_id, str) and raw_item_id else f"item_{uuid4().hex}"
+        committed_item = state.conversation_items.get(item_id)
+        if isinstance(committed_item, dict):
+            content = committed_item.get("content")
+            if not isinstance(content, list):
+                content = []
+                committed_item["content"] = content
+            updated = False
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "input_audio":
+                    part["transcript"] = transcript
+                    updated = True
+                    break
+            if not updated:
+                content.append({"type": "input_audio", "transcript": transcript})
         return [
             InputTranscriptionCompleted(
-                item_id=f"item_{uuid4().hex}",
-                transcript=transcript.strip(),
+                item_id=item_id,
+                transcript=transcript,
             )
         ]
     if event_type == "input.committed":

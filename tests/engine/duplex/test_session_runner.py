@@ -721,9 +721,15 @@ async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> N
         h.session.request_resources[(1, "still-live")] = DuplexRequestResource(
             stage_id=1, request_id="still-live", fence=older, submitted=True
         )
-        await h.run(commands.BargeIn())
+        events = await h.run(commands.BargeIn())
         assert h.port.aborts == [[request_id, "duplex-drain-tts"]]
         assert not h.session.is_draining_request("duplex-drain-tts")
+        done_ids = [
+            event.response["id"]
+            for event in events
+            if getattr(event, "wire_type", "") == "response.done" and isinstance(getattr(event, "response", None), dict)
+        ]
+        assert "resp-old" in done_ids
         assert (2, "duplex-drain-tts") not in h.session.request_resources
         assert (3, "duplex-drain-tts") not in h.session.request_resources
         assert (0, request_id) not in h.session.request_resources

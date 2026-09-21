@@ -162,7 +162,13 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             finished=finished,
         )
         if isinstance(transcript, str) and transcript:
-            runner.emit({"type": "input.transcribed", "transcript": transcript})
+            payload: dict[str, object] = {"type": "input.transcribed", "transcript": transcript}
+            prompt = getattr(req_state, "prompt", None)
+            info = prompt.get("additional_information") if isinstance(prompt, dict) else None
+            item_id = info.get("realtime_item_id") if isinstance(info, dict) else None
+            if isinstance(item_id, str) and item_id:
+                payload["realtime_item_id"] = item_id
+            runner.emit(payload)
         context = DuplexOutputContext(
             identity=DuplexRequestIdentity(
                 session_id=req_state.session_id,

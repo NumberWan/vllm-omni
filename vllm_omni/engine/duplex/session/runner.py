@@ -1439,6 +1439,17 @@ class DuplexSessionRunner:
                 session.register_history_item(item_id, committed_message)
             elif committed_ms > 0 and not session.playback_ack_is_too_late(old_response_id, item_id):
                 session.truncate_history_item(item_id, audio_end_ms=committed_ms)
+        draining_cancels: list[tuple[str, int, dict[str, int]]] = []
+        seen_responses: set[str] = set()
+        if isinstance(old_response_id, str) and old_response_id:
+            seen_responses.add(old_response_id)
+        for request_id in draining_ids:
+            response_id = session.response_id_for_request(request_id)
+            if not isinstance(response_id, str) or not response_id or response_id in seen_responses:
+                continue
+            seen_responses.add(response_id)
+            playback = session.playback_for_response(response_id).as_dict()
+            draining_cancels.append((response_id, int(playback.get("committed_ms") or 0), playback))
         # The epoch bump is the atomic part: from here on every model output
         # and append of the old epoch is dropped by the stale-epoch filter in
         # ``emit`` / the append tail, whatever the awaits below interleave with.
@@ -1476,6 +1487,19 @@ class DuplexSessionRunner:
                     "playback": old_playback,
                 }
             )
+            for response_id, drain_committed_ms, drain_playback in draining_cancels:
+                self.emit(
+                    {
+                        "type": "audio.cancelled",
+                        "session_id": session.session_id,
+                        "response_id": response_id,
+                        "reason": reason,
+                        "cancelled_epoch": old_epoch,
+                        "epoch": new_epoch,
+                        "committed_ms": drain_committed_ms,
+                        "playback": drain_playback,
+                    }
+                )
         return True
 
     async def _abort_request_background(self, request_ids: list[str], *, notify: bool) -> None:
@@ -1571,6 +1595,9 @@ class DuplexSessionRunner:
         if overlap_policy.should_force_listen_for_short_commit(self.session, event, flushed):
             flushed = dict(flushed)
             flushed["force_listen"] = True
+        if isinstance(realtime_item_id, str) and realtime_item_id:
+            flushed = dict(flushed)
+            flushed["realtime_item_id"] = realtime_item_id
         model_state.input_since_commit = False
         committed = helpers.commit_audio_input(
             session,
@@ -1739,6 +1766,9 @@ class DuplexSessionRunner:
             )
         else:
             retained_payload = deferred_payload
+        if isinstance(realtime_item_id, str) and realtime_item_id:
+            retained_payload = dict(retained_payload)
+            retained_payload["realtime_item_id"] = realtime_item_id
         model_state.retain_committed_audio(
             retained_payload,
             operation_id=commit_reservation.operation_id,
@@ -1805,6 +1835,8 @@ class DuplexSessionRunner:
             )
         )
         if final_payload is not None:
+            if isinstance(realtime_item_id, str) and realtime_item_id:
+                final_payload = {**final_payload, "realtime_item_id": realtime_item_id}
             await self._start_append(
                 {**final_payload, "duplex_turn_id": data_plane_turn_id},
                 final=True,

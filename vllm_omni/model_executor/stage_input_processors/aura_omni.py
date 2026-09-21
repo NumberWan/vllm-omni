@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage processors for the AURA Omni pipeline."""
 
 from __future__ import annotations
@@ -457,20 +457,6 @@ def next_duplex_sentence_chunk(state: dict[str, Any], raw_text: str, *, finished
     return remainder
 
 
-def commit_duplex_stage1_history(additional_info: dict[str, Any], text: str) -> None:
-    """Commit one Stage1 turn into duplex SessionHistory, if this prompt owns one."""
-    if additional_info.get("aura_tts_partial"):
-        return
-    session_id = additional_info.get("session_id") or additional_info.get("aura_session_id")
-    if not (additional_info.get("aura_duplex") and isinstance(session_id, str) and session_id):
-        return
-    from vllm_omni.model_executor.models.aura_omni.duplex.history import (
-        get_or_create_session_history,
-    )
-
-    get_or_create_session_history(session_id).commit_turn(text or SILENT_TEXT)
-
-
 def is_silent_text_prefix(text: str | None) -> bool:
     """True while streamed text is still a prefix of ``<|silent|>``.
 
@@ -575,7 +561,7 @@ def asr2aura(
                     "[asr2aura] vision-follow history_prefix_len=%d has_assistant=%s last_assistant_len=%d",
                     len(history_prefix),
                     bool(last_assistant),
-                    len(last_assistant),
+                    len(last_assistant) if isinstance(last_assistant, str) else 0,
                 )
 
         next_input: dict[str, Any] = {
@@ -667,24 +653,14 @@ def _approx_qwen_token_count(text: str) -> int:
     i = 0
     while i < len(text):
         code = ord(text[i])
-        if (
-            0x4E00 <= code <= 0x9FFF
-            or 0x3400 <= code <= 0x4DBF
-            or 0x3000 <= code <= 0x303F
-            or 0xFF00 <= code <= 0xFFEF
-        ):
+        if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF or 0x3000 <= code <= 0x303F or 0xFF00 <= code <= 0xFFEF:
             n += 1
             i += 1
             continue
         j = i + 1
         while j < len(text):
             cj = ord(text[j])
-            if (
-                0x4E00 <= cj <= 0x9FFF
-                or 0x3400 <= cj <= 0x4DBF
-                or 0x3000 <= cj <= 0x303F
-                or 0xFF00 <= cj <= 0xFFEF
-            ):
+            if 0x4E00 <= cj <= 0x9FFF or 0x3400 <= cj <= 0x4DBF or 0x3000 <= cj <= 0x303F or 0xFF00 <= cj <= 0xFFEF:
                 break
             j += 1
         n += max(1, (j - i + 3) // 4)
@@ -784,7 +760,6 @@ def aura2tts(
         text = _strip_assistant_text(raw_text)
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
-        commit_duplex_stage1_history(additional_info, text or SILENT_TEXT)
         close_only = bool(additional_info.get("aura_tts_close_only"))
         if is_effectively_silent(text) and not close_only:
             continue
@@ -871,7 +846,7 @@ def aura2tts(
         )
         next_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=[0] if close_only else [0] * prompt_len,
+                prompt_token_ids=[0] if close_only else [0] * int(prompt_len or 1),
                 additional_information=tts_info,
                 # Prefer runner data-plane so Talker preprocess still sees
                 # text if legacy additional_information is wiped (e.g. a

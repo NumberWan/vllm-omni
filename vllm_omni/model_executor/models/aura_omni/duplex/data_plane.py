@@ -189,19 +189,27 @@ class AuraDataPlaneSession(DuplexDataPlane):
     def __init__(self, encode_audio: EncodeAudio) -> None:
         self._encode_audio = encode_audio
         self._requests: dict[str, _RequestState] = {}
+        self._closed: set[str] = set()
 
     def begin_request(self, request_id: str) -> None:
+        self._closed.discard(request_id)
         state = self._requests.setdefault(request_id, _RequestState())
         state.terminal = False
 
     def is_terminal(self, request_id: str | None) -> bool:
         if request_id is None:
             return False
+        if request_id in self._closed:
+            return True
         state = self._requests.get(request_id)
         return state is not None and state.terminal
 
     def mark_terminal(self, request_id: str) -> None:
-        self._requests.setdefault(request_id, _RequestState()).terminal = True
+        # The shared session already calls this when a turn finishes. Drop the
+        # projector row here so completed turns do not accumulate; the id stays
+        # closed so a late chunk cannot open a second turn.
+        self._requests.pop(request_id, None)
+        self._closed.add(request_id)
 
     def close_stream(self, request_id: str) -> None:
         state = self._requests.get(request_id)
@@ -214,6 +222,11 @@ class AuraDataPlaneSession(DuplexDataPlane):
         for request_id in list(self._requests):
             if duplex_resource_request_belongs_to_session(request_id, session_id):
                 self._requests.pop(request_id, None)
+        self._closed = {
+            request_id
+            for request_id in self._closed
+            if not duplex_resource_request_belongs_to_session(request_id, session_id)
+        }
         from vllm_omni.model_executor.models.aura_omni.duplex.history import drop_session_history
 
         drop_session_history(session_id)
@@ -231,6 +244,8 @@ class AuraDataPlaneSession(DuplexDataPlane):
         response_format, speed = _requested_audio_format(context)
         request_id = getattr(result, "request_id", None)
         if not isinstance(request_id, str) or not request_id:
+            return
+        if request_id in self._closed:
             return
         model_turn_id = duplex_turn_id_from_request_id(request_id)
         outer_finished = bool(getattr(result, "finished", False))

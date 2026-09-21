@@ -254,6 +254,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             "tts_language": runtime_config.get("tts_language", "Chinese"),
             "tts_speaker": runtime_config.get("tts_speaker", "Vivian"),
         }
+        item_id = payload.get("realtime_item_id")
+        if isinstance(item_id, str) and item_id:
+            additional_information["realtime_item_id"] = item_id
         for key in _TTS_EXTRA_KEYS:
             if key in additional_information:
                 continue

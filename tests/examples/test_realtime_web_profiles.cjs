@@ -83,6 +83,7 @@ function shell(profileName, adapter = 'stt', options = {}) {
   class Element {
     constructor() { this.style = {}; this.listeners = {}; this.children = []; this.value = ''; this.textContent = ''; this.classList = { add() {}, remove() {}, toggle() {} }; }
     addEventListener(name, callback) { this.listeners[name] = callback; }
+    closest() { return null; }
     append(...children) { this.children.push(...children); }
     appendChild(child) { this.children.push(child); }
     replaceChildren() { this.children = []; }

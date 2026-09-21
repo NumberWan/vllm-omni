@@ -129,6 +129,60 @@ def load_annotation_utterances(video_path: Path) -> list[dict[str, Any]]:
     return items
 
 
+def _collector_events(client: Any) -> list[object] | None:
+    events = getattr(getattr(client, "events", None), "events", None)
+    return events if isinstance(events, list) else None
+
+
+def _response_id(event: dict[str, object]) -> str | None:
+    raw = event.get("response_id")
+    if isinstance(raw, str) and raw:
+        return raw
+    response = event.get("response")
+    if isinstance(response, dict):
+        nested = response.get("id")
+        if isinstance(nested, str) and nested:
+            return nested
+    return None
+
+
+def _open_response_count(client: Any) -> int | None:
+    """Responses still occupying the input gate, or None when the client has no event log."""
+    events = _collector_events(client)
+    if events is None:
+        return None
+    open_ids: set[str] = set()
+    anon = 0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        response_id = _response_id(event)
+        if kind == "response.created":
+            if response_id:
+                open_ids.add(response_id)
+            else:
+                anon += 1
+        elif kind in {"response.done", "response.listen"}:
+            if response_id:
+                open_ids.discard(response_id)
+            elif anon:
+                anon -= 1
+            elif open_ids:
+                open_ids.pop()
+    return len(open_ids) + anon
+
+
+def _terminal_count(client: Any) -> int:
+    events = _collector_events(client) or []
+    return sum(
+        1 for event in events if isinstance(event, dict) and event.get("type") in {"response.done", "response.listen"}
+    )
+
+
+_VISION_COMMIT_FRAMES = 2
+
+
 async def stream_annotation_clock(
     client: Any,
     frames: Sequence[str | None],
@@ -137,13 +191,52 @@ async def stream_annotation_clock(
     video_path: Path,
     fps: float = ANNOTATION_VIDEO_FPS,
 ) -> tuple[int, int, float, float]:
-    """Send one frame per tick. Commit only when an annotation WAV is due."""
+    """Send one frame per tick. Speech commits at question_time; vision every two frames.
+
+    Vision-only appends are not sent until they can be committed. The server
+    buffer keeps only the latest frames and will not infer until ``commit``.
+    A commit waits while a response is still open so it does not abort Stage0/1.
+    Clients without an event log (unit stubs) are not gated.
+    """
     utterances = await asyncio.to_thread(load_annotation_utterances, video_path)
     frame_interval_s = 1.0 / fps
     started_at = time.monotonic()
     sent_frames = chunks = 0
     lags: list[float] = []
     held_frame: str | None = None
+    vision_pending: list[str] = []
+    local_commits = 0
+    terminals_at_start = 0
+    if _collector_events(client) is not None:
+        terminals_at_start = _terminal_count(client)
+
+    def _gate_blocked() -> bool:
+        if _collector_events(client) is None:
+            return False
+        open_responses = _open_response_count(client)
+        if open_responses:
+            return True
+        return local_commits > _terminal_count(client) - terminals_at_start
+
+    async def _commit_vision(frames_to_send: list[str]) -> None:
+        nonlocal chunks, sent_frames, local_commits
+        if not frames_to_send or _gate_blocked():
+            return
+        await client.send(
+            {
+                "type": "input_audio_buffer.append",
+                "is_speech": False,
+                "sample_rate_hz": _PCM16_SAMPLE_RATE,
+                "video_frames": list(frames_to_send),
+            }
+        )
+        chunks += 1
+        sent_frames += len(frames_to_send)
+        await playback.acknowledge(client)
+        await client.commit()
+        local_commits += 1
+        frames_to_send.clear()
+
     for index, frame in enumerate(frames):
         if frame:
             held_frame = frame
@@ -153,6 +246,7 @@ async def stream_annotation_clock(
         due = [item for item in utterances if not item["sent"] and float(item["at_sec"]) <= source_time]
         due_at = time.monotonic()
         if due:
+            vision_pending.clear()
             for item in due:
                 audio = item["pcm"]
                 assert isinstance(audio, bytes)
@@ -172,20 +266,17 @@ async def stream_annotation_clock(
                 await playback.acknowledge(client)
                 item["sent"] = True
                 await client.commit()
+                local_commits += 1
         else:
-            await client.send(
-                {
-                    "type": "input_audio_buffer.append",
-                    "is_speech": False,
-                    "sample_rate_hz": _PCM16_SAMPLE_RATE,
-                    "video_frames": [held_frame],
-                }
-            )
-            chunks += 1
-            sent_frames += 1
-            await playback.acknowledge(client)
+            vision_pending.append(held_frame)
+            if len(vision_pending) > _VISION_COMMIT_FRAMES:
+                vision_pending = vision_pending[-_VISION_COMMIT_FRAMES:]
+            if len(vision_pending) >= _VISION_COMMIT_FRAMES:
+                await _commit_vision(vision_pending)
         lags.append(max(0.0, time.monotonic() - due_at))
         await asyncio.sleep(max(0.0, started_at + (index + 1) * frame_interval_s - time.monotonic()))
+    if vision_pending:
+        await _commit_vision(vision_pending)
     unsent = [item for item in utterances if not item["sent"]]
     if unsent:
         logger.warning(
