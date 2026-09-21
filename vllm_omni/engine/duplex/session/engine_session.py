@@ -1106,13 +1106,19 @@ class DuplexEngineSession:
         self._playback.by_response.pop(response_id, None)
 
     def release_finished_drain_response(self, response_id: str | None) -> None:
-        """Drop books for a response whose TTS just finished.
+        """Drop unused books for a response whose TTS just finished.
 
         Overlap leaves the next turn active, so this must not call
-        ``end_response``. The live response keeps its snapshot, playback
-        cursor, and history placeholder.
+        ``end_response``. Audio that was already sent stays ACK-admissible:
+        the client may ``playback.ack`` after the drain ``response.done``.
+        A response that sent no audio has nothing to acknowledge, so its
+        snapshot, playback cursor, and unused history placeholder are dropped.
+        The live response is left untouched.
         """
         if response_id is None or response_id == self.active_response_id:
+            return
+        playback = self._playback.by_response.get(response_id)
+        if playback is not None and max(playback.sent_ms, playback.generated_ms) > 0:
             return
         self._conversation.assistant_response_snapshots.pop(response_id, None)
         self.release_response_playback(response_id)

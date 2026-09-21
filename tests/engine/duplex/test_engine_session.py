@@ -667,3 +667,37 @@ def test_draining_response_stays_ack_admissible_after_next_begin_response() -> N
     session.mark_audio_sent(900, text_chars=5, response_id=first)
     assert session.playback_for_response(first).sent_ms == 900
     assert session.playback.sent_ms == 0
+
+
+def test_finished_drain_keeps_sent_audio_ackable() -> None:
+    from vllm_omni.engine.duplex.events import ErrorEvent
+    from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
+
+    session = _session()
+    first = session.begin_response(turn_id=1)
+    session.append_assistant_text("hello")
+    session.mark_audio_sent(400, text_chars=5)
+    session.snapshot_active_response_for_drain()
+    second = session.begin_response(turn_id=2)
+    session.release_finished_drain_response(first)
+    assert first in session._conversation.assistant_response_snapshots
+    assert f"item_{first}" in session._conversation.history_item_placeholders
+    events = apply_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": first,
+            "item_id": f"item_{first}",
+            "played_ms": 400,
+            "committed_ms": 400,
+        },
+    )
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert session.active_response_id == second
+
+    silent = session.begin_response(turn_id=3)
+    session.snapshot_active_response_for_drain()
+    session.begin_response(turn_id=4)
+    session.release_finished_drain_response(silent)
+    assert silent not in session._conversation.assistant_response_snapshots
+    assert f"item_{silent}" not in session._conversation.history_item_placeholders
