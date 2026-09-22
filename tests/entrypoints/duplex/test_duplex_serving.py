@@ -120,23 +120,38 @@ class FakeHandle:
 
 class FakeOmni:
     def __init__(
-        self, *, resumable: bool = True, replay_max_bytes: int = 64 * 1024, idle_timeout_s: float = 300
+        self,
+        *,
+        resumable: bool = True,
+        replay_max_bytes: int = 64 * 1024,
+        idle_timeout_s: float = 300,
+        max_sessions: int | None = None,
     ) -> None:
         self.duplex_session_config = DuplexSessionRuntimeConfig(
             resume_replay_ttl_s=60.0, resume_replay_max_bytes_per_session=replay_max_bytes
         )
         self.capabilities = DuplexCapabilities(supports_session_resume=resumable)
         self.idle_timeout_s = idle_timeout_s
+        self.max_sessions = max_sessions
         self.opened: list[dict[str, Any]] = []
         self.handles: dict[str, FakeHandle] = {}
         self.resumed: list[tuple[str, int]] = []
         self.detached: list[str] = []
         self.open_error: DuplexSessionError | None = None
 
+    def _live_session_count(self) -> int:
+        return sum(1 for handle in self.handles.values() if not handle.closed)
+
     async def open_session(self, config: Any) -> FakeHandle:
         self.opened.append(dict(config))
         if self.open_error is not None:
             raise self.open_error
+        if self.max_sessions is not None and self._live_session_count() >= self.max_sessions:
+            raise DuplexSessionError(
+                "no room",
+                code="resource_exhausted",
+                retryable=True,
+            )
         session_id = f"duplex-{len(self.handles) + 1:032x}"
         handle = FakeHandle(session_id, self.capabilities, idle_timeout_s=self.idle_timeout_s)
         self.handles[session_id] = handle
@@ -341,6 +356,38 @@ async def test_transport_send_failure_detaches_the_session_instead_of_closing_it
     handle.deliver(SessionClosed(session_id=handle.session_id, reason="client_close"))
     await asyncio.sleep(0.05)
     assert handle.session_id not in handler._pumps
+
+
+@pytest.mark.asyncio
+async def test_session_created_send_failure_closes_session_so_capacity_can_be_reused() -> None:
+    """If ``session.created`` never reaches the client, nobody can resume (#7636 #9).
+
+    Detach-for-resume would keep the admission slot occupied until idle expiry.
+    Closing frees it so a later open can succeed under ``max_sessions=1``.
+    """
+    omni = FakeOmni(max_sessions=1)
+    handler = _handler(omni)
+    ws = FakeWebSocket({"duplex": "1", "autostart": "0"})
+    # Fail every wire send before ``session.created`` is pumped out.
+    ws.break_sends()
+    task = asyncio.create_task(handler.handle_realtime_session(ws))
+    ws.feed(_session_update())
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert len(omni.handles) == 1
+    handle = next(iter(omni.handles.values()))
+    assert handle.closed
+    assert handle.close_reasons == ["session_created_undelivered"]
+    assert omni.detached == []
+    assert "session.created" not in ws.types()
+
+    # Capacity is free again: a new connection can open under max_sessions=1.
+    ws2, handle2, task2 = await _open(handler, omni)
+    assert handle2.session_id != handle.session_id
+    assert not handle2.closed
+    assert omni._live_session_count() == 1
+    ws2.disconnect()
+    await asyncio.wait_for(task2, timeout=2.0)
 
 
 @pytest.mark.asyncio
