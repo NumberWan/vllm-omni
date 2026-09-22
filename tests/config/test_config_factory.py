@@ -694,7 +694,49 @@ class TestCosmos3PolicyPipeline:
         assert stage.engine_args.model_config.policy_server_config.action_space == "joint_position"
 
 
-class TestStagePipelineConfig:
+class TestCosmos3OmniT2IPipeline:
+    """T2I deploy yaml selects an opt-in topology so --deploy-config applies (#6874)."""
+
+    def test_registered_without_auto_capturing_cosmos3_omni(self):
+        assert "cosmos3_omni_t2i" in OMNI_PIPELINES
+        # Same shared HF metadata as policy: must not register cosmos3_omni for
+        # auto-detect, or T2I/video/policy would collide.
+        assert "cosmos3_omni" not in OMNI_PIPELINES
+        pipeline = OMNI_PIPELINES["cosmos3_omni_t2i"]
+        assert pipeline.hf_architectures == ()
+        assert pipeline.diffusers_class_name is None
+        assert pipeline.stages[0].final_output_type == "image"
+
+    def test_super_t2i_deploy_yaml_applies_guardrails_false(self):
+        deploy = load_deploy_config(get_deploy_config_path("cosmos3_super_t2i.yaml"))
+        assert deploy.pipeline == "cosmos3_omni_t2i"
+
+        stages = merge_pipeline_deploy(OMNI_PIPELINES["cosmos3_omni_t2i"], deploy)
+        assert len(stages) == 1
+        stage = stages[0].to_omegaconf()
+
+        assert stage.stage_type == "diffusion"
+        assert stage.final_output_type == "image"
+        assert stage.engine_args.model_class_name == "Cosmos3OmniDiffusersPipeline"
+        assert stage.engine_args.model_config.guardrails is False
+
+    def test_get_pipeline_config_honours_deploy_yaml_pipeline_key(self):
+        deploy_path = get_deploy_config_path("cosmos3_super_t2i.yaml")
+        # No HF download: explicit pipeline: key is highest priority.
+        pipeline = StageConfigFactory.get_pipeline_config(
+            model="nvidia/Cosmos3-Super-Text2Image",
+            trust_remote_code=True,
+            deploy_config_path=deploy_path,
+        )
+        assert pipeline is not None
+        assert pipeline.model_type == "cosmos3_omni_t2i"
+
+    def test_without_deploy_yaml_stays_on_unregistered_fallback(self):
+        # Without an explicit deploy yaml, cosmos3_omni is still not registered,
+        # so resolution returns None and the engine keeps the CLI single-stage
+        # fallback (the pre-#6874 behaviour for generation itself).
+        assert "cosmos3_omni" not in OMNI_PIPELINES
+
     def test_frozen(self):
         s = StagePipelineConfig(stage_id=0, model_stage="a")
         with pytest.raises(AttributeError):
