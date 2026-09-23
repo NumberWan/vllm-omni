@@ -111,8 +111,6 @@ class FakeHandle:
                 return
 
     async def close(self, *, reason: str = "client_close", timeout: float | None = None) -> None:
-        # Serving-layer stub: does not go through DuplexOmni.close_session_async /
-        # wait_closed. Production admission is released after manager cleanup.
         self.close_reasons.append(reason)
         if self.closed:
             return
@@ -122,40 +120,23 @@ class FakeHandle:
 
 class FakeOmni:
     def __init__(
-        self,
-        *,
-        resumable: bool = True,
-        replay_max_bytes: int = 64 * 1024,
-        idle_timeout_s: float = 300,
-        max_sessions: int | None = None,
+        self, *, resumable: bool = True, replay_max_bytes: int = 64 * 1024, idle_timeout_s: float = 300
     ) -> None:
         self.duplex_session_config = DuplexSessionRuntimeConfig(
             resume_replay_ttl_s=60.0, resume_replay_max_bytes_per_session=replay_max_bytes
         )
         self.capabilities = DuplexCapabilities(supports_session_resume=resumable)
         self.idle_timeout_s = idle_timeout_s
-        #: Fake-only cap on unclosed FakeHandle objects. Not
-        #: DuplexSessionManager admission (``runners | _closing | _admitting``).
-        self.max_sessions = max_sessions
         self.opened: list[dict[str, Any]] = []
         self.handles: dict[str, FakeHandle] = {}
         self.resumed: list[tuple[str, int]] = []
         self.detached: list[str] = []
         self.open_error: DuplexSessionError | None = None
 
-    def _live_session_count(self) -> int:
-        return sum(1 for handle in self.handles.values() if not handle.closed)
-
     async def open_session(self, config: Any) -> FakeHandle:
         self.opened.append(dict(config))
         if self.open_error is not None:
             raise self.open_error
-        if self.max_sessions is not None and self._live_session_count() >= self.max_sessions:
-            raise DuplexSessionError(
-                "no room",
-                code="resource_exhausted",
-                retryable=True,
-            )
         session_id = f"duplex-{len(self.handles) + 1:032x}"
         handle = FakeHandle(session_id, self.capabilities, idle_timeout_s=self.idle_timeout_s)
         self.handles[session_id] = handle
@@ -363,14 +344,13 @@ async def test_transport_send_failure_detaches_the_session_instead_of_closing_it
 
 
 @pytest.mark.asyncio
-async def test_session_created_send_failure_closes_session_so_capacity_can_be_reused() -> None:
+async def test_session_created_send_failure_closes_instead_of_detaching() -> None:
     """If ``session.created`` never reaches the client, serving must close (#7636 #9).
 
-    This file's FakeOmni only stubs the serving branch (close vs detach). It
-    does not model manager admission. Production frees the slot when
-    ``handle.close()`` waits for ``session.closed`` after cleanup.
+    Covers the serving branch only (close vs detach). Production admission is
+    released when ``handle.close()`` waits for ``session.closed`` after cleanup.
     """
-    omni = FakeOmni(max_sessions=1)
+    omni = FakeOmni()
     handler = _handler(omni)
     ws = FakeWebSocket({"duplex": "1", "autostart": "0"})
     # Fail every wire send before ``session.created`` is pumped out.
@@ -385,14 +365,6 @@ async def test_session_created_send_failure_closes_session_so_capacity_can_be_re
     assert handle.close_reasons == ["session_created_undelivered"]
     assert omni.detached == []
     assert "session.created" not in ws.types()
-
-    # Fake-handle cap: a closed stub is not counted, so a second open is allowed.
-    ws2, handle2, task2 = await _open(handler, omni)
-    assert handle2.session_id != handle.session_id
-    assert not handle2.closed
-    assert omni._live_session_count() == 1
-    ws2.disconnect()
-    await asyncio.wait_for(task2, timeout=2.0)
 
 
 @pytest.mark.asyncio

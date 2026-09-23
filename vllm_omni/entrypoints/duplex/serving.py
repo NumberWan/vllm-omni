@@ -417,10 +417,9 @@ class OmniDuplexSessionHandler:
     async def _close_undeliverable_session(self, session_id: str) -> None:
         """Tear down a session whose ``session.created`` never reached the client.
 
-        Production admission is ``len(runners | _closing | _admitting)``.
-        ``DuplexSessionHandle.close`` waits until ``session.closed`` after
-        manager cleanup, so the slot is free when this returns. If close
-        raises, the handle is already marked closed and we must not detach.
+        Production admission frees after ``handle.close`` waits for
+        ``session.closed`` (manager cleanup). If close raises, the handle is
+        already marked closed and we must not detach.
         """
         handle = self._omni.get_session(session_id)
         if handle is None or handle.closed:
