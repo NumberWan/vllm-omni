@@ -241,6 +241,82 @@ def test_transformer_component_quant_reaches_real_linear(monkeypatch: pytest.Mon
     )
 
 
+def test_transformer_pathway_default_keeps_nested_layer_override() -> None:
+    """Pathway leaf plus a more-specific key must still longest-prefix match."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+        Cosmos3GatedMLP,
+        _resolve_cosmos3_quant_configs,
+    )
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+    class _TaggedLinearMethod(UnquantizedLinearMethod):
+        def __init__(self, tag: str) -> None:
+            super().__init__()
+            self.tag = tag
+
+    class _TaggedQuantConfig(QuantizationConfig):
+        def __init__(self, tag: str) -> None:
+            super().__init__()
+            self.tag = tag
+
+        def get_name(self) -> str:
+            return self.tag
+
+        def get_quant_method(self, layer, prefix):  # noqa: ANN001
+            del layer, prefix
+            return _TaggedLinearMethod(self.tag)
+
+        @classmethod
+        def get_supported_act_dtypes(cls):
+            return [torch.float32]
+
+        def get_min_capability(self) -> int:
+            return 0
+
+        @classmethod
+        def from_config(cls, config):  # noqa: ANN001
+            raise NotImplementedError
+
+        def get_config_filenames(self) -> list[str]:
+            return []
+
+    pathway = _TaggedQuantConfig("pathway")
+    mlp_override = _TaggedQuantConfig("mlp")
+    language_qc, gen_qc = _resolve_cosmos3_quant_configs(
+        ComponentQuantizationConfig(
+            {
+                "language_model": pathway,
+                "gen_layers": pathway,
+                "language_model.layers.0.mlp": mlp_override,
+            }
+        )
+    )
+
+    assert isinstance(language_qc, ComponentQuantizationConfig)
+    assert language_qc.resolve("language_model.layers.0.mlp.gate_proj") is mlp_override
+    assert language_qc.resolve("language_model.layers.0.self_attn.to_q") is pathway
+    assert language_qc.resolve("language_model.layers.1.mlp.gate_proj") is pathway
+    assert gen_qc is pathway
+
+    mlp0 = Cosmos3GatedMLP(
+        hidden_size=8,
+        intermediate_size=16,
+        quant_config=language_qc,
+        prefix="language_model.layers.0.mlp",
+    )
+    mlp1 = Cosmos3GatedMLP(
+        hidden_size=8,
+        intermediate_size=16,
+        quant_config=language_qc,
+        prefix="language_model.layers.1.mlp",
+    )
+    assert mlp0.gate_proj.quant_method.tag == "mlp"
+    assert mlp1.gate_proj.quant_method.tag == "pathway"
+
+
 def test_mrope_position_ids_cover_text_video_sound_and_action() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
         compute_mrope_position_ids_action,
