@@ -59,8 +59,10 @@ Guardrails are on by default (gated `nvidia/Cosmos-1.0-Guardrail` — `pip insta
 cosmos-guardrail`, accept the license, set `HF_TOKEN`); add `--no-guardrails` to
 disable, or pass
 [`vllm_omni/deploy/cosmos3_super_t2i.yaml`](../../vllm_omni/deploy/cosmos3_super_t2i.yaml)
-via `--deploy-config` (opt-in `pipeline: cosmos3_omni_t2i`; without that key
-`--deploy-config` cannot apply for Cosmos3 T2I).
+via `--deploy-config` on either multi-GPU command above (opt-in
+`pipeline: cosmos3_omni_t2i`; the YAML does not pin `devices`, so CFG / HSDP /
+Ulysses keep owning placement. Without that `pipeline:` key `--deploy-config`
+cannot apply for Cosmos3).
 `--enable-layerwise-offload` reduces VRAM on smaller GPUs;
 `--vae-fast-path channels_last` speeds up the Wan VAE video decode by switching the
 decoder convolutions to channels-last kernels (output no longer bit-identical to

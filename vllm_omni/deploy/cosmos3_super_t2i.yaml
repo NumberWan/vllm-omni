@@ -10,6 +10,10 @@
 #   vllm serve nvidia/Cosmos3-Super-Text2Image --omni \
 #     --deploy-config /absolute/path/to/vllm_omni/deploy/cosmos3_super_t2i.yaml
 #
+# Do not pin ``devices`` here: the recipe's 2-GPU / 8-GPU CLI (CFG / HSDP /
+# Ulysses) must own placement. An explicit ``devices: "0"`` would fail the
+# stage device-count check against those parallelism settings.
+#
 # Without --deploy-config, behaviour is unchanged (CLI single-stage fallback).
 # --no-guardrails remains the CLI-only equivalent of model_config.guardrails
 # below. Per-checkpoint knobs can still be layered with --stage-overrides.
@@ -22,7 +26,6 @@ distributed_executor_backend: mp
 
 stages:
   - stage_id: 0
-    devices: "0"
     model_class_name: Cosmos3OmniDiffusersPipeline
     model_config:
       # Gated nvidia/Cosmos-1.0-Guardrail is often unavailable; default this
