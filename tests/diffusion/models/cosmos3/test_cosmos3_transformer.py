@@ -86,8 +86,6 @@ def _tiny_cosmos3_edge_config(**overrides):
         ("transformer_language_override", "language", "transformer"),
         ("transformer_gen_disabled", "transformer", None),
         ("independent_subcomponents", "language", "gen"),
-        ("nested_language_layers", "language", "transformer"),
-        ("nested_gen_layers", "transformer", "gen"),
     ],
 )
 def test_transformer_resolves_global_and_subcomponent_quant_configs(
@@ -140,14 +138,6 @@ def test_transformer_resolves_global_and_subcomponent_quant_configs(
         )
     elif config_kind == "transformer_gen_disabled":
         top_level_config = ComponentQuantizationConfig({"transformer": configs["transformer"], "gen_layers": None})
-    elif config_kind == "nested_language_layers":
-        top_level_config = ComponentQuantizationConfig(
-            {"transformer": configs["transformer"], "language_model.layers": configs["language"]}
-        )
-    elif config_kind == "nested_gen_layers":
-        top_level_config = ComponentQuantizationConfig(
-            {"transformer": configs["transformer"], "gen_layers.0": configs["gen"]}
-        )
     else:
         top_level_config = ComponentQuantizationConfig(
             {"language_model": configs["language"], "gen_layers": configs["gen"]}

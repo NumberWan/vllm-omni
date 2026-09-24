@@ -64,29 +64,19 @@ def _resolve_cosmos3_quant_configs(
     A pipeline-level ``transformer`` entry is the default for both internal
     pathways (same leaf-unwrapping pattern as Flux2 / MiniMax / Boogu). The
     historical ``language_model`` and ``gen_layers`` scopes remain supported as
-    more-specific overrides, including explicit ``None`` entries that leave one
-    pathway unquantized.
-
-    Nested keys under those pathway roots (for example ``language_model.layers``)
-    are resolved via longest-prefix match against the prefixes children announce,
-    so they are not silently dropped by exact-key lookup.
+    exact-key overlays, including explicit ``None`` entries that leave one
+    pathway unquantized. Nested keys under those roots are not supported here;
+    callers that need per-layer routing should pass a flat leaf config or use
+    the exact pathway names.
     """
     if not isinstance(quant_config, ComponentQuantizationConfig):
         return quant_config, quant_config
 
     transformer_config = resolve_component_quant_config(quant_config, "transformer")
     components = quant_config.component_configs
-
-    def _pathway(pathway: str, sample_prefix: str) -> QuantizationConfig | None:
-        if pathway in components:
-            return components[pathway]
-        if any(key.startswith(f"{pathway}.") for key in components):
-            return quant_config.resolve(sample_prefix)
-        return transformer_config
-
     return (
-        _pathway("language_model", "language_model.layers.0"),
-        _pathway("gen_layers", "gen_layers.0"),
+        components["language_model"] if "language_model" in components else transformer_config,
+        components["gen_layers"] if "gen_layers" in components else transformer_config,
     )
 
 
