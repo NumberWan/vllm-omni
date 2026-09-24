@@ -465,10 +465,46 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                     return nested
         return video
 
+    def _is_video_file_path(value: Any) -> bool:
+        # Serving may leave uploaded references as temp paths (e.g.
+        # /tmp/vllm_omni_video_reference_*.mp4) instead of decoded frames.
+        if not isinstance(value, str | os.PathLike):
+            return False
+        suffix = os.path.splitext(os.fspath(value))[1].lower()
+        return suffix in {".mkv", ".mov", ".mp4", ".webm", ".avi", ".m4v"}
+
+    def _decode_video_file_to_frames(path: str | os.PathLike) -> list[PIL.Image.Image]:
+        media_path = os.fspath(path)
+        if not os.path.exists(media_path):
+            raise FileNotFoundError(f"Cosmos3 video input path does not exist: {media_path}")
+        try:
+            import imageio.v3 as iio
+        except ImportError as exc:
+            raise ImportError(
+                "Cosmos3 video path decoding requires imageio. Install imageio[ffmpeg] or provide decoded video frames."
+            ) from exc
+
+        frames: list[PIL.Image.Image] = []
+        for frame in iio.imiter(media_path):
+            frames.append(PIL.Image.fromarray(np.asarray(frame)).convert("RGB"))
+        if not frames:
+            raise ValueError(f"Cosmos3 video input path produced no frames: {media_path}")
+        return frames
+
+    def _expand_video_payload_item(item: Any) -> list[Any]:
+        if _is_video_file_path(item):
+            return _decode_video_file_to_frames(item)
+        return [item]
+
     def _video_payload_to_frames(video: Any) -> list[Any]:
         video = _unwrap_video_payload(video)
+        if _is_video_file_path(video):
+            return _decode_video_file_to_frames(video)
         if isinstance(video, list):
-            return video
+            frames: list[Any] = []
+            for item in video:
+                frames.extend(_expand_video_payload_item(item))
+            return frames
         if isinstance(video, torch.Tensor):
             tensor = video.detach().cpu()
             if tensor.ndim == 5:

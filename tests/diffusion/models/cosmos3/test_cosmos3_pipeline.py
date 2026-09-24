@@ -1121,7 +1121,7 @@ def test_pipeline_init_passes_tokenizer_attrs_into_transformer(
 def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
 
-    preprocess = get_cosmos3_pre_process_func(SimpleNamespace())
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
     i2v = SimpleNamespace(
         prompt={"prompt": "A slow camera push.", "multi_modal_data": {"image": Image.new("RGB", (320, 160))}},
         sampling_params=make_sampling_params(height=None, width=None, extra_args={}),
@@ -1151,6 +1151,32 @@ def test_preprocess_i2v_image_and_action_video_inputs() -> None:
         ),
     )
     additional = preprocess(v2v).prompt["additional_information"]
+    assert tuple(additional["preprocessed_video"].shape) == (1, 3, 5, 16, 32)
+    assert additional["condition_frame_indexes_vision"] == [0, 1]
+
+
+def test_preprocess_v2v_decodes_uploaded_video_path(tmp_path) -> None:
+    """Serving may pass multipart uploads as /tmp/...mp4 path lists (#8073)."""
+    imageio = pytest.importorskip("imageio.v3")
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    frames = [np.full((16, 32, 3), i * 40, dtype=np.uint8) for i in range(6)]
+    video_path = tmp_path / "vllm_omni_video_reference_test.mp4"
+    imageio.imwrite(video_path, frames, fps=4, codec="libx264")
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    request = SimpleNamespace(
+        prompt={"prompt": "Continue.", "multi_modal_data": {"video": [str(video_path)]}},
+        sampling_params=make_sampling_params(
+            height=16,
+            width=32,
+            extra_args={"condition_frame_indexes_vision": [0, 1], "condition_video_keep": "first"},
+        ),
+    )
+
+    additional = preprocess(request).prompt["additional_information"]
+    # condition_frame_indexes_vision=[0,1] => 5 pixel frames after VAE indexing.
     assert tuple(additional["preprocessed_video"].shape) == (1, 3, 5, 16, 32)
     assert additional["condition_frame_indexes_vision"] == [0, 1]
 
@@ -1224,7 +1250,7 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     )
     assert tuple(loaded.shape) == (3, 2, 8, 8)
 
-    preprocess = get_cosmos3_pre_process_func(SimpleNamespace())
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
 
     class FramesWithFps(list):
         fps = 12.5
