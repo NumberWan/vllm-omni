@@ -1181,6 +1181,37 @@ def test_preprocess_v2v_decodes_uploaded_video_path(tmp_path) -> None:
     assert additional["condition_frame_indexes_vision"] == [0, 1]
 
 
+def test_decode_path_video_frames_honors_max_frames_and_keep(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("imageio.v3")
+    import imageio.v3 as iio
+
+    from vllm_omni.diffusion.models.cosmos3.transfer import decode_path_video_frames
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"placeholder")
+    seen = {"n": 0}
+
+    def fake_imiter(_path):
+        for idx in range(20):
+            seen["n"] += 1
+            yield np.full((4, 4, 3), idx, dtype=np.uint8)
+
+    monkeypatch.setattr(iio, "imiter", fake_imiter)
+
+    first = decode_path_video_frames(source, max_frames=5, keep="first")
+    assert len(first) == 5
+    assert seen["n"] == 5
+    assert first[0][0, 0, 0] == 0
+    assert first[-1][0, 0, 0] == 4
+
+    seen["n"] = 0
+    last = decode_path_video_frames(source, max_frames=5, keep="last")
+    assert len(last) == 5
+    assert seen["n"] == 20
+    assert last[0][0, 0, 0] == 15
+    assert last[-1][0, 0, 0] == 19
+
+
 def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transfer
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (

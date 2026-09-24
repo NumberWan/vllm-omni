@@ -98,7 +98,9 @@ from .action import (
     vision_condition_indexes,
 )
 from .transfer import (
+    VIDEO_EXTENSIONS,
     Cosmos3TransferConfig,
+    decode_path_video_frames,
     has_transfer_hints,
     load_or_compute_control_frames,
     media_hw,
@@ -471,39 +473,40 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
         if not isinstance(value, str | os.PathLike):
             return False
         suffix = os.path.splitext(os.fspath(value))[1].lower()
-        return suffix in {".mkv", ".mov", ".mp4", ".webm", ".avi", ".m4v"}
+        return suffix in VIDEO_EXTENSIONS
 
-    def _decode_video_file_to_frames(path: str | os.PathLike) -> list[PIL.Image.Image]:
-        media_path = os.fspath(path)
-        if not os.path.exists(media_path):
-            raise FileNotFoundError(f"Cosmos3 video input path does not exist: {media_path}")
-        try:
-            import imageio.v3 as iio
-        except ImportError as exc:
-            raise ImportError(
-                "Cosmos3 video path decoding requires imageio. Install imageio[ffmpeg] or provide decoded video frames."
-            ) from exc
+    def _decode_video_file_to_frames(
+        path: str | os.PathLike,
+        *,
+        max_frames: int | None,
+        keep: str,
+    ) -> list[PIL.Image.Image]:
+        rgb_frames = decode_path_video_frames(path, max_frames=max_frames, keep=keep)
+        return [PIL.Image.fromarray(frame).convert("RGB") for frame in rgb_frames]
 
-        frames: list[PIL.Image.Image] = []
-        for frame in iio.imiter(media_path):
-            frames.append(PIL.Image.fromarray(np.asarray(frame)).convert("RGB"))
-        if not frames:
-            raise ValueError(f"Cosmos3 video input path produced no frames: {media_path}")
-        return frames
-
-    def _expand_video_payload_item(item: Any) -> list[Any]:
+    def _expand_video_payload_item(
+        item: Any,
+        *,
+        max_frames: int | None,
+        keep: str,
+    ) -> list[Any]:
         if _is_video_file_path(item):
-            return _decode_video_file_to_frames(item)
+            return _decode_video_file_to_frames(item, max_frames=max_frames, keep=keep)
         return [item]
 
-    def _video_payload_to_frames(video: Any) -> list[Any]:
+    def _video_payload_to_frames(
+        video: Any,
+        *,
+        max_frames: int | None,
+        keep: str,
+    ) -> list[Any]:
         video = _unwrap_video_payload(video)
         if _is_video_file_path(video):
-            return _decode_video_file_to_frames(video)
+            return _decode_video_file_to_frames(video, max_frames=max_frames, keep=keep)
         if isinstance(video, list):
             frames: list[Any] = []
             for item in video:
-                frames.extend(_expand_video_payload_item(item))
+                frames.extend(_expand_video_payload_item(item, max_frames=max_frames, keep=keep))
             return frames
         if isinstance(video, torch.Tensor):
             tensor = video.detach().cpu()
@@ -567,11 +570,22 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
         if "additional_information" not in prompt:
             prompt["additional_information"] = {}
 
+        extra = _extra_args(request)
+        transfer_requested = action_mode is None and has_transfer_hints(extra)
+
         raw_video_frames: list[Any] | None = None
         transfer_input_fps: float | None = None
         if raw_video is not None:
             transfer_input_fps = _video_payload_fps(raw_video)
-            raw_video_frames = _video_payload_to_frames(raw_video)
+            decode_spec = Cosmos3OmniDiffusersPipeline.reference_video_decode_spec(
+                num_frames=getattr(request.sampling_params, "num_frames", None),
+                extra_args=extra,
+            )
+            raw_video_frames = _video_payload_to_frames(
+                raw_video,
+                max_frames=decode_spec.max_frames,
+                keep=decode_spec.keep,
+            )
             if not raw_video_frames:
                 raise TypeError("Cosmos3 video input must be a non-empty list of PIL images or image paths.")
 
@@ -580,8 +594,6 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
             image = _pil_to_rgb(raw_video_frames[0])
         else:
             image = _pil_to_rgb(raw_image)
-        extra = _extra_args(request)
-        transfer_requested = action_mode is None and has_transfer_hints(extra)
 
         # Resolve missing H/W.
         if transfer_requested:

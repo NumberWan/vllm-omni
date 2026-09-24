@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 transfer inference helpers.
 
 The reference Cosmos Framework transfer path accepts one or more control hints
@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import importlib
 import math
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import PIL.Image
@@ -88,6 +89,7 @@ BILATERAL_SIGMA_COLOR = 150
 BILATERAL_SIGMA_SPACE = 100
 BILATERAL_ITERATIONS = 1
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 
 
 @dataclass
@@ -530,6 +532,48 @@ def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int)
     return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
 
 
+def decode_path_video_frames(
+    path: str | Path,
+    *,
+    max_frames: int | None = None,
+    keep: Literal["first", "last"] = "first",
+) -> list[np.ndarray]:
+    """Decode a video file to RGB uint8 frames (H, W, C).
+
+    ``keep='first'`` stops after ``max_frames``. ``keep='last'`` still scans the
+    file and retains only the tail window.
+    """
+    media_path = Path(path)
+    if not media_path.exists():
+        raise FileNotFoundError(f"Cosmos3 video path does not exist: {media_path}")
+    if keep not in {"first", "last"}:
+        raise ValueError("Cosmos3 video keep must be either 'first' or 'last'.")
+    if max_frames is not None and int(max_frames) <= 0:
+        raise ValueError("Cosmos3 video max_frames must be positive.")
+    try:
+        import imageio.v3 as iio
+    except ImportError as exc:
+        raise ImportError(
+            "Cosmos3 video path decoding requires imageio. Install imageio[ffmpeg] or provide decoded frames."
+        ) from exc
+
+    limit = None if max_frames is None else int(max_frames)
+    if keep == "last" and limit is not None:
+        window: deque[np.ndarray] = deque(maxlen=limit)
+        for frame in iio.imiter(media_path):
+            window.append(_pil_to_uint8_rgb(frame))
+        frames = list(window)
+    else:
+        frames = []
+        for frame in iio.imiter(media_path):
+            frames.append(_pil_to_uint8_rgb(frame))
+            if limit is not None and len(frames) >= limit:
+                break
+    if not frames:
+        raise ValueError(f"Cosmos3 video path produced no frames: {media_path}")
+    return frames
+
+
 def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch.Tensor:
     media_path = Path(path)
     if not media_path.exists():
@@ -538,23 +582,9 @@ def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch
         array = _pil_to_uint8_rgb(media_path)
         return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(1).contiguous()
 
-    try:
-        import imageio.v3 as iio
-    except ImportError as exc:
-        raise ImportError(
-            "Cosmos3 transfer video control_path loading requires imageio. "
-            "Install imageio[ffmpeg] or provide decoded control frames."
-        ) from exc
-
-    frames: list[torch.Tensor] = []
-    limit = max_frames if max_frames is not None else None
-    for frame in iio.imiter(media_path):
-        frames.append(torch.from_numpy(_pil_to_uint8_rgb(frame)).permute(2, 0, 1))
-        if limit is not None and len(frames) >= int(limit):
-            break
-    if not frames:
-        raise ValueError(f"Cosmos3 transfer control_path produced no frames: {media_path}")
-    return torch.stack(frames, dim=1).contiguous()
+    rgb_frames = decode_path_video_frames(media_path, max_frames=max_frames, keep="first")
+    stacked = [torch.from_numpy(frame).permute(2, 0, 1) for frame in rgb_frames]
+    return torch.stack(stacked, dim=1).contiguous()
 
 
 def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int | None = None) -> torch.Tensor:
