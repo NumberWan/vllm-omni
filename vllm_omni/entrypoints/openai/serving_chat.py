@@ -3558,10 +3558,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                         for img in images
                     ]
+                    actual_size = f"{images[0].width}x{images[0].height}"
+                    # Echo the request size only when it already matches the
+                    # decoded pixels. Use actual WxH for size=auto/None or when
+                    # the pipeline diverged (e.g. Qwen-Image-2.1 aspect-derived
+                    # outputs). Edit models that honor an explicit WxH keep the
+                    # same wire string because size == actual_size.
+                    if size in (None, "auto") or size != actual_size:
+                        chunk_size = actual_size
+                    else:
+                        chunk_size = size
                     chunk = ImageEditImageChunk(
                         data=image_data,
                         output_format=output_format,
-                        size=size,
+                        size=chunk_size,
                         created=created,
                         model=model,
                         metrics=metrics,
