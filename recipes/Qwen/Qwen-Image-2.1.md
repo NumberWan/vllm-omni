@@ -366,16 +366,20 @@ image.save("qwen_image_21_diffusers.png")
 
 | Metric | vLLM-Omni | diffusers (#14804) | Status |
 | --- | --- | --- | --- |
-| Output image (1024×1024, 50 steps, seed 42, BF16, H200) | generated (eager + CUDA-graph) | generated | measured |
-| PSNR / LPIPS vs reference | eager vs Diffusers **47.17 dB**; CUDA-graph vs Diffusers **38.02 dB**; CUDA-graph vs eager **38.10 dB** | — | measured (H200) |
-| Latency (time/image, same GPU, H200) | CUDA-graph **6.04 s** (120.8 ms/step); eager **7.31 s** (146.2 ms/step) | **7.74 s** (154.9 ms/step) | measured |
+| Output image (1024×1024, 50 steps, seed 42, BF16, H200) | generated (eager + default CUDA-graph) | generated | measured |
+| PSNR / LPIPS vs reference | eager vs Diffusers **47.17 dB**; **default compile+graph** vs Diffusers **38.02 dB**; **default compile+graph** vs eager **38.10 dB** | — | measured (H200) |
+| Latency (time/image, same GPU, H200) | **default compile+graph** **6.04 s** (120.8 ms/step); eager **7.31 s** (146.2 ms/step) | **7.74 s** (154.9 ms/step) | measured |
 
 The prefix KV cache changes the compute path (cached prefix vs. full recompute
 at every step), so exact numerical parity is not expected; match the cache
 setting on both sides or compare with PSNR/LPIPS rather than exact pixels.
-Eager stays numerically close to Diffusers (~47 dB); CUDA-graph decode has
-expected ~38 dB texture-level drift with the latency win (~1.21× vs eager on
-H200).
+Eager stays numerically close to Diffusers (~47 dB). The **default** serving
+path stacks regional `torch.compile` with CUDA-graph decode; on H200 that
+combo lands at **~38.1 dB** vs eager (~1.21× latency). That is the drift users
+see out of the box. It is **not** the same datapoint as the GB200 breakdown in
+"CUDA Graph decode" above (GB200: graph-only bit-identical to eager;
+compile+graph **44.5–45.6 dB** vs eager) — different GPU / inductor fusion,
+and the H200 row was not a graph-only run.
 
 Parity / feature measurements (same prompt/seed/steps/CFG, BF16, eager decode
 unless noted; 4× NVIDIA H200):
@@ -387,11 +391,11 @@ unless noted; 4× NVIDIA H200):
   `--vae-use-tiling` **43.55 dB** (peak mem ~37.7 GB → ~32.7 GB); 2048×2048
   nontile vs tiled **44.14 dB** (peak mem ~57.9 GB → ~33.3 GB; gen ~36.8 s vs
   ~37.1 s).
-- [x] CUDA graph decode vs eager — measured on H200 (1024×1024, 50 steps,
-  seed 42, BF16): CUDA-graph 6.04 s/image vs eager 7.31 s/image (~1.21×),
-  ~38.1 dB PSNR vs eager. Earlier GB200 numbers in this recipe's CUDA Graph
-  section (compile+graph 3.04 s vs eager 4.3 s, ~1.4×) remain as a second
-  datapoint. See "CUDA Graph decode" above.
+- [x] Default CUDA-graph decode (compile+graph) vs eager — measured on H200
+  (1024×1024, 50 steps, seed 42, BF16): **6.04 s**/image vs eager **7.31 s**
+  (~1.21×), **~38.1 dB** PSNR vs eager. GB200 compile+graph numbers in
+  "CUDA Graph decode" (3.04 s vs eager 4.3 s, ~44.5–45.6 dB) remain a second
+  datapoint; H200 graph-only vs eager was not re-measured here.
 
 ## Known Limitations
 

@@ -223,13 +223,13 @@ def test_assemble_kv_cache_mixed_phases_raises():
 
 
 def test_assemble_kv_cache_decode_rejects_mismatched_prefill_prompt_seq_len():
-    """Requests baked under different padded VLM lengths must not decode together."""
+    """Homogeneous merge invariant: denoise_step must sub-batch before assembling."""
     short = _state(_decode_cache(1, 1.0))
     short.extra["prefill_prompt_seq_len"] = 4
     long = _state(_decode_cache(1, 2.0))
     long.extra["prefill_prompt_seq_len"] = 8
 
-    with pytest.raises(ValueError, match="different padded prompt"):
+    with pytest.raises(ValueError, match="sub-batch by prefill_prompt_seq_len"):
         QwenImage21Pipeline._assemble_kv_cache([short, long])
 
     # Same baked length remains batchable.
@@ -239,6 +239,30 @@ def test_assemble_kv_cache_decode_rejects_mismatched_prefill_prompt_seq_len():
     same_b.extra["prefill_prompt_seq_len"] = 4
     _, take_ownership = QwenImage21Pipeline._assemble_kv_cache([same_a, same_b])
     assert take_ownership is False
+
+
+def test_split_decode_groups_by_prefill_prompt_seq_len():
+    """Routine serving: separate prefills → joint decode must split, not fail."""
+    short = _state(_decode_cache(1, 1.0))
+    short.request_id = "short"
+    short.extra["prefill_prompt_seq_len"] = 4
+    long = _state(_decode_cache(1, 2.0))
+    long.request_id = "long"
+    long.extra["prefill_prompt_seq_len"] = 8
+    short2 = _state(_decode_cache(1, 3.0))
+    short2.request_id = "short2"
+    short2.extra["prefill_prompt_seq_len"] = 4
+
+    states = [short, long, short2]
+    assert QwenImage21Pipeline._needs_decode_seq_len_split(states) is True
+    groups = QwenImage21Pipeline._split_decode_groups(states)
+    assert [[s.request_id for s in g] for g in groups] == [["short", "short2"], ["long"]]
+
+    same = [_state(_decode_cache(1, 1.0)), _state(_decode_cache(1, 2.0))]
+    for s in same:
+        s.extra["prefill_prompt_seq_len"] = 4
+    assert QwenImage21Pipeline._needs_decode_seq_len_split(same) is False
+    assert QwenImage21Pipeline._split_decode_groups(same) == [same]
 
 
 def test_scatter_kv_cache_splits_rows_back_per_request():

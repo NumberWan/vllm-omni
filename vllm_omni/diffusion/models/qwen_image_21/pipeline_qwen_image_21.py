@@ -1228,13 +1228,13 @@ class QwenImage21Pipeline(
             # Decode only reads the cache, so a batched view is enough and the
             # per-request caches stay untouched. Merge every stored part — FP8
             # cache entries carry per-request scale tensors alongside "key"/"value".
-            # Requests baked under different padded VLM lengths cannot share a
-            # decode batch (cat along the token axis would misalign).
+            # Callers must pass a homogeneous baked-prefix-length group: denoise_step
+            # sub-batches by prefill_prompt_seq_len before assembling.
             prefix_lens = {state.extra.get("prefill_prompt_seq_len") for state in states}
             if len(prefix_lens) > 1:
                 raise ValueError(
-                    "Cannot batch decode requests that were prefills at different padded prompt "
-                    "lengths. Schedule them separately."
+                    "Cannot merge decode KV for requests baked at different padded prompt "
+                    "lengths. denoise_step must sub-batch by prefill_prompt_seq_len first."
                 )
             num_blocks = len(caches[0])
             merged = []
@@ -1253,6 +1253,42 @@ class QwenImage21Pipeline(
             "Cannot batch requests at mixed KV-cache phases (a request starting its first denoise step "
             "joined a batch of in-flight requests). Schedule them separately."
         )
+
+    @staticmethod
+    def _decode_group_key(state: "StepRequestState") -> tuple[Any, ...]:
+        """Group decode requests by the padded VLM length baked into their KV."""
+        return (
+            state.extra.get("prefill_prompt_seq_len"),
+            state.extra.get("prefill_negative_prompt_seq_len"),
+        )
+
+    @staticmethod
+    def _split_decode_groups(
+        states: list["StepRequestState"],
+    ) -> list[list["StepRequestState"]]:
+        """Split a decode batch into homogeneous baked-prefix-length groups.
+
+        Preserves first-seen group order and relative order within each group.
+        Callers stitch per-group noise preds back into the input request order.
+        """
+        groups: dict[tuple[Any, ...], list["StepRequestState"]] = {}
+        order: list[tuple[Any, ...]] = []
+        for state in states:
+            key = QwenImage21Pipeline._decode_group_key(state)
+            if key not in groups:
+                order.append(key)
+                groups[key] = []
+            groups[key].append(state)
+        return [groups[key] for key in order]
+
+    @staticmethod
+    def _needs_decode_seq_len_split(states: list["StepRequestState"]) -> bool:
+        if len(states) <= 1:
+            return False
+        phases = {QwenImage21Pipeline._kv_cache_phase(state.extra.get("kv_cache")) for state in states}
+        if phases != {"decode"}:
+            return False
+        return len({QwenImage21Pipeline._decode_group_key(state) for state in states}) > 1
 
     @staticmethod
     def _scatter_kv_cache(
@@ -1308,8 +1344,47 @@ class QwenImage21Pipeline(
         input_batch: "InputBatch",
         **kwargs: Any,
     ) -> torch.Tensor | None:
-        """One denoise step: read from *input_batch*, delegate to CFGParallelMixin."""
+        """One denoise step: read from *input_batch*, delegate to CFGParallelMixin.
+
+        Decode batches that mix different baked ``prefill_prompt_seq_len`` values
+        (common when the mixed-phase gate forces separate prefills) are
+        sub-batched by that length so both requests keep running.
+        """
         del kwargs
+        if self.interrupt:
+            return None
+
+        t = input_batch.timesteps
+        self._current_timestep = t
+        self.transformer.do_true_cfg = input_batch.do_true_cfg
+
+        states = list(input_batch.states)
+        if not states:
+            raise ValueError("QwenImage21Pipeline.denoise_step requires per-request states on the InputBatch.")
+
+        if self._needs_decode_seq_len_split(states):
+            # Local import: InputBatch is only TYPE_CHECKING at module scope.
+            from vllm_omni.diffusion.worker.input_batch import InputBatch as _InputBatch
+
+            preds_by_id: dict[str, torch.Tensor] = {}
+            for group in self._split_decode_groups(states):
+                group_pred = self._denoise_step_homogeneous(_InputBatch.make_batch(group))
+                if group_pred is None:
+                    return None
+                offset = 0
+                for state in group:
+                    rows = state.latents.shape[0]
+                    preds_by_id[state.request_id] = group_pred[offset : offset + rows]
+                    offset += rows
+            return torch.cat([preds_by_id[state.request_id] for state in states], dim=0)
+
+        return self._denoise_step_homogeneous(input_batch)
+
+    def _denoise_step_homogeneous(
+        self,
+        input_batch: "InputBatch",
+    ) -> torch.Tensor | None:
+        """Run one denoise forward for a KV-compatible state group."""
         if self.interrupt:
             return None
 
