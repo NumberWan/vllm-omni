@@ -204,3 +204,37 @@ def test_adaptive_oom_restores_tile_configuration(monkeypatch, persistent):
         vae.tile_sample_stride_height,
         vae.tile_sample_stride_width,
     ) == (512, 512, 384, 384)
+
+
+def test_adaptive_oom_clears_feat_map_when_retries_exhausted(monkeypatch):
+    """Final min-tile OOM must not leave decoder activations on the device."""
+    vae = _make_vae()
+    vae.enable_tiling(
+        tile_sample_min_height=512,
+        tile_sample_min_width=512,
+        tile_sample_stride_height=384,
+        tile_sample_stride_width=384,
+    )
+    vae.clear_cache()
+    z = torch.zeros(1, 4, 1, 4, 4)
+    leaked = torch.ones(2, 2, device="cpu")  # stand-in for a cached activation
+
+    def decode_tile(z, return_dict):
+        # Mimic a partial tiled decode that already wrote into _feat_map before OOM.
+        vae._feat_map[0] = leaked
+        raise torch.OutOfMemoryError("injected tile OOM")
+
+    monkeypatch.setattr(vae, "tiled_decode", decode_tile)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+    with pytest.raises(torch.OutOfMemoryError):
+        vae._tiled_decode_adaptive(z, return_dict=False)
+
+    assert all(slot is None for slot in vae._feat_map)
+    assert all(slot is None for slot in vae._enc_feat_map)
+    assert (
+        vae.tile_sample_min_height,
+        vae.tile_sample_min_width,
+        vae.tile_sample_stride_height,
+        vae.tile_sample_stride_width,
+    ) == (512, 512, 384, 384)

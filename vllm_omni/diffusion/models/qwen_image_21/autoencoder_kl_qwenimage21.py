@@ -1514,6 +1514,11 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                     self.clear_cache()
                     torch.accelerator.empty_cache()
         finally:
+            # Always drop decoder activations: exhausting the min-tile OOM path
+            # raises before tiled_decode's trailing clear_cache, and _decode
+            # returns through this adaptive branch so it never hits its own
+            # cleanup finally either.
+            self.clear_cache()
             (
                 self.tile_sample_min_height,
                 self.tile_sample_min_width,
