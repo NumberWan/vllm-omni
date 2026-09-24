@@ -572,14 +572,23 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
 
         extra = _extra_args(request)
         transfer_requested = action_mode is None and has_transfer_hints(extra)
+        condition_frame_indexes_vision = normalize_condition_frame_indexes_vision(
+            extra.get("condition_frame_indexes_vision", prompt.get("condition_frame_indexes_vision"))
+        )
+        condition_video_keep = normalize_condition_video_keep(
+            extra.get("condition_video_keep", prompt.get("condition_video_keep"))
+        )
 
         raw_video_frames: list[Any] | None = None
         transfer_input_fps: float | None = None
         if raw_video is not None:
             transfer_input_fps = _video_payload_fps(raw_video)
+            decode_extra = dict(extra)
+            decode_extra["condition_frame_indexes_vision"] = list(condition_frame_indexes_vision)
+            decode_extra["condition_video_keep"] = condition_video_keep
             decode_spec = Cosmos3OmniDiffusersPipeline.reference_video_decode_spec(
                 num_frames=getattr(request.sampling_params, "num_frames", None),
-                extra_args=extra,
+                extra_args=decode_extra,
             )
             raw_video_frames = _video_payload_to_frames(
                 raw_video,
@@ -658,22 +667,13 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                     dtype=torch.float32,
                 )
             else:
-                condition_frame_indexes_vision = normalize_condition_frame_indexes_vision(
-                    extra.get(
-                        "condition_frame_indexes_vision",
-                        prompt.get("condition_frame_indexes_vision"),
-                    )
-                )
-                keep = normalize_condition_video_keep(
-                    extra.get("condition_video_keep", prompt.get("condition_video_keep"))
-                )
                 max_frames = condition_pixel_frame_count(condition_frame_indexes_vision)
                 prompt["additional_information"]["preprocessed_video"] = _preprocess_condition_video(
                     raw_video_frames,
                     int(target_h),
                     int(target_w),
                     max_frames,
-                    keep,
+                    condition_video_keep,
                 )
                 prompt["additional_information"]["condition_frame_indexes_vision"] = list(
                     condition_frame_indexes_vision
