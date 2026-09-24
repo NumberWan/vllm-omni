@@ -62,6 +62,10 @@ disable, or pass
 via `--deploy-config` (opt-in `pipeline: cosmos3_omni_t2i`; without that key
 `--deploy-config` cannot apply for Cosmos3 T2I).
 `--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+`--vae-fast-path channels_last` speeds up the Wan VAE video decode by switching the
+decoder convolutions to channels-last kernels (output no longer bit-identical to
+diffusers; the default `lossless` fast path is bit-exact, see
+[Wan VAE Decoder Fast Path](../../docs/user_guide/diffusion/vae_fast_path.md));
 `--quantization fp8` (online, no calibration) cuts peak VRAM for 720p video
 generation from ~83 GB to ~55 GB per GPU (2-GPU) with BF16-level quality (T2V
 composition can shift at the same seed).
