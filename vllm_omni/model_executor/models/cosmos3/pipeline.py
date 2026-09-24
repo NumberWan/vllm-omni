@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cosmos3 opt-in topologies for policy (OpenPI) and T2I deploy YAML.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Cosmos3 opt-in topologies for policy (OpenPI) and omni deploy YAML.
 
 Both topologies declare neither ``hf_architectures`` nor
 ``diffusers_class_name``. Every Cosmos3 checkpoint (T2I, video, policy)
@@ -14,12 +14,14 @@ Policy (``cosmos3_policy``)::
     vllm serve nvidia/Cosmos3-Nano-Policy-DROID --omni \\
       --deploy-config .../vllm_omni/deploy/cosmos3_policy_droid.yaml
 
-T2I (``cosmos3_omni_t2i``) — makes ``--deploy-config`` apply stage /
-``model_config`` (e.g. ``guardrails: false``) instead of being silently
-dropped (#6874)::
+Omni deploy overlay (``cosmos3_omni_deploy``) — makes ``--deploy-config``
+apply stage / ``model_config`` (e.g. ``guardrails: false``) instead of being
+silently dropped (#6874). Same overlay works for Super / Nano (T2I and video).
+``final_output_type`` matches the CLI Cosmos3OmniDiffusersPipeline default
+(``video``)::
 
-    vllm serve nvidia/Cosmos3-Super-Text2Image --omni \\
-      --deploy-config .../vllm_omni/deploy/cosmos3_super_t2i.yaml
+    vllm serve nvidia/Cosmos3-Super --omni \\
+      --deploy-config .../vllm_omni/deploy/cosmos3_omni.yaml
 
 Without ``--deploy-config``, T2I/video keep the default single-stage
 diffusion CLI fallback. ``--no-guardrails`` remains the CLI-only path.
@@ -47,8 +49,8 @@ COSMOS3_POLICY_PIPELINE = PipelineConfig(
     ),
 )
 
-COSMOS3_OMNI_T2I_PIPELINE = PipelineConfig(
-    model_type="cosmos3_omni_t2i",
+COSMOS3_OMNI_DEPLOY_PIPELINE = PipelineConfig(
+    model_type="cosmos3_omni_deploy",
     model_arch="Cosmos3OmniDiffusersPipeline",
     stages=(
         StagePipelineConfig(
@@ -57,7 +59,7 @@ COSMOS3_OMNI_T2I_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.DIFFUSION,
             input_sources=(),
             final_output=True,
-            final_output_type="image",
+            final_output_type="video",
             model_arch="Cosmos3OmniDiffusersPipeline",
         ),
     ),

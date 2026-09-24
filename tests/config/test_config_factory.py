@@ -694,42 +694,41 @@ class TestCosmos3PolicyPipeline:
         assert stage.engine_args.model_config.policy_server_config.action_space == "joint_position"
 
 
-class TestCosmos3OmniT2IPipeline:
-    """T2I deploy yaml selects an opt-in topology so --deploy-config applies (#6874)."""
+class TestCosmos3OmniDeployPipeline:
+    """Omni deploy yaml selects an opt-in topology so --deploy-config applies (#6874)."""
 
     def test_registered_without_auto_capturing_cosmos3_omni(self):
-        assert "cosmos3_omni_t2i" in OMNI_PIPELINES
+        assert "cosmos3_omni_deploy" in OMNI_PIPELINES
         # Same shared HF metadata as policy: must not register cosmos3_omni for
         # auto-detect, or T2I/video/policy would collide.
         assert "cosmos3_omni" not in OMNI_PIPELINES
-        pipeline = OMNI_PIPELINES["cosmos3_omni_t2i"]
+        pipeline = OMNI_PIPELINES["cosmos3_omni_deploy"]
         assert pipeline.hf_architectures == ()
         assert pipeline.diffusers_class_name is None
-        assert pipeline.stages[0].final_output_type == "image"
+        # Align with CLI Cosmos3OmniDiffusersPipeline default (video), not T2I-only.
+        assert pipeline.stages[0].final_output_type == "video"
 
-    def test_super_t2i_deploy_yaml_applies_guardrails_false(self):
-        deploy = load_deploy_config(get_deploy_config_path("cosmos3_super_t2i.yaml"))
-        assert deploy.pipeline == "cosmos3_omni_t2i"
-        # Must not pin devices: recipe 2/8-GPU CFG/HSDP would then fail device-count.
+    def test_deploy_yaml_applies_guardrails_false(self):
+        deploy = load_deploy_config(get_deploy_config_path("cosmos3_omni.yaml"))
+        assert deploy.pipeline == "cosmos3_omni_deploy"
         assert deploy.stages[0].devices is None
 
-        stages = merge_pipeline_deploy(OMNI_PIPELINES["cosmos3_omni_t2i"], deploy)
+        stages = merge_pipeline_deploy(OMNI_PIPELINES["cosmos3_omni_deploy"], deploy)
         assert len(stages) == 1
         stage = stages[0].to_omegaconf()
 
         assert stage.stage_type == "diffusion"
-        assert stage.final_output_type == "image"
+        assert stage.final_output_type == "video"
         assert stage.engine_args.model_class_name == "Cosmos3OmniDiffusersPipeline"
         assert stage.engine_args.model_config.guardrails is False
         assert "devices" not in stage.runtime
 
-    def test_super_t2i_yaml_accepts_documented_multi_gpu_cli(self):
-        """YAML + recipe 2-GPU CFG/HSDP must not fight on devices placement."""
+    def test_deploy_yaml_accepts_documented_multi_gpu_cli(self):
         from vllm_omni.engine.stage_init_utils import _check_stage_device_layout
 
-        deploy = load_deploy_config(get_deploy_config_path("cosmos3_super_t2i.yaml"))
+        deploy = load_deploy_config(get_deploy_config_path("cosmos3_omni.yaml"))
         stages, _ = StageConfigFactory._create_legacy_from_registry(
-            OMNI_PIPELINES["cosmos3_omni_t2i"],
+            OMNI_PIPELINES["cosmos3_omni_deploy"],
             {
                 "cfg_parallel_size": 2,
                 "use_hsdp": True,
@@ -744,11 +743,10 @@ class TestCosmos3OmniT2IPipeline:
         assert omega.engine_args.parallel_config.use_hsdp is True
         assert omega.engine_args.parallel_config.hsdp_shard_size == 2
         assert "devices" not in omega.runtime
-        # Unpinned devices: layout check is a no-op (CLI owns visible GPUs).
         _check_stage_device_layout(omega, dict(omega.engine_args))
 
     def test_get_pipeline_config_honours_deploy_yaml_pipeline_key(self):
-        deploy_path = get_deploy_config_path("cosmos3_super_t2i.yaml")
+        deploy_path = get_deploy_config_path("cosmos3_omni.yaml")
         # No HF download: explicit pipeline: key is highest priority.
         pipeline = StageConfigFactory.get_pipeline_config(
             model="nvidia/Cosmos3-Super-Text2Image",
@@ -756,11 +754,11 @@ class TestCosmos3OmniT2IPipeline:
             deploy_config_path=deploy_path,
         )
         assert pipeline is not None
-        assert pipeline.model_type == "cosmos3_omni_t2i"
+        assert pipeline.model_type == "cosmos3_omni_deploy"
 
     def test_without_deploy_yaml_stays_on_unregistered_fallback(self):
         # Shared HF metadata must not auto-select a pipeline; only the deploy
-        # yaml ``pipeline:`` key selects cosmos3_omni_t2i and merges guardrails.
+        # yaml ``pipeline:`` key selects cosmos3_omni_deploy and merges guardrails.
         assert "cosmos3_omni" not in OMNI_PIPELINES
 
         class FakeCosmos3Config(PretrainedConfig):
@@ -769,7 +767,7 @@ class TestCosmos3OmniT2IPipeline:
         fake_config = FakeCosmos3Config()
         fake_config.architectures = ["Cosmos3OmniDiffusersPipeline"]
         model = "nvidia/Cosmos3-Super-Text2Image"
-        deploy_path = get_deploy_config_path("cosmos3_super_t2i.yaml")
+        deploy_path = get_deploy_config_path("cosmos3_omni.yaml")
 
         StageConfigFactory.get_hf_config.cache_clear()
         StageConfigFactory.try_infer_model_type.cache_clear()
@@ -789,11 +787,13 @@ class TestCosmos3OmniT2IPipeline:
                 deploy_config_path=deploy_path,
             )
         assert pipeline is not None
-        assert pipeline.model_type == "cosmos3_omni_t2i"
+        assert pipeline.model_type == "cosmos3_omni_deploy"
 
         stages = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))
         assert stages[0].to_omegaconf().engine_args.model_config.guardrails is False
 
+
+class TestStagePipelineConfig:
     def test_frozen(self):
         s = StagePipelineConfig(stage_id=0, model_stage="a")
         with pytest.raises(AttributeError):

@@ -50,7 +50,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
 )
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
 from vllm_omni.model_executor.models.cosmos3.pipeline import (
-    COSMOS3_OMNI_T2I_PIPELINE,
+    COSMOS3_OMNI_DEPLOY_PIPELINE,
     COSMOS3_POLICY_PIPELINE,
 )
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
@@ -157,12 +157,12 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
     "pi05": PI05_PIPELINE,
-    # Cosmos3 policy / T2I topologies share HF metadata with video Cosmos3
-    # checkpoints (which stay on the single-stage diffusion fallback), so these
-    # entries are only reachable through a deploy yaml's ``pipeline:`` key
-    # (see deploy/cosmos3_policy_droid.yaml and deploy/cosmos3_super_t2i.yaml).
+    # Cosmos3 policy / omni-deploy topologies share HF metadata with video
+    # Cosmos3 checkpoints (which stay on the single-stage diffusion fallback),
+    # so these entries are only reachable through a deploy yaml's ``pipeline:``
+    # key (see deploy/cosmos3_policy_droid.yaml and deploy/cosmos3_omni.yaml).
     "cosmos3_policy": COSMOS3_POLICY_PIPELINE,
-    "cosmos3_omni_t2i": COSMOS3_OMNI_T2I_PIPELINE,
+    "cosmos3_omni_deploy": COSMOS3_OMNI_DEPLOY_PIPELINE,
     "gepard": GEPARD_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,
