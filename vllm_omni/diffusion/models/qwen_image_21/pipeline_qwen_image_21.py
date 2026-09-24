@@ -1271,7 +1271,7 @@ class QwenImage21Pipeline(
         Preserves first-seen group order and relative order within each group.
         Callers stitch per-group noise preds back into the input request order.
         """
-        groups: dict[tuple[Any, ...], list["StepRequestState"]] = {}
+        groups: dict[tuple[Any, ...], list[StepRequestState]] = {}
         order: list[tuple[Any, ...]] = []
         for state in states:
             key = QwenImage21Pipeline._decode_group_key(state)

@@ -271,7 +271,7 @@ def test_ltx_reference_image_size_policy(tmp_path, model_version: str, expected:
 
 
 def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = {}
+    captured: dict[str, Any] = {}
 
     def fake_policy(*, model, revision=None):
         captured.update(model=model, revision=revision)
@@ -806,7 +806,7 @@ def _patch_hunyuan_autotokenizer(monkeypatch: pytest.MonkeyPatch, tokenizer: obj
             return tokenizer
 
     fake_transformers = type(sys)("transformers")
-    fake_transformers.AutoTokenizer = _FakeAutoTokenizer
+    setattr(fake_transformers, "AutoTokenizer", _FakeAutoTokenizer)
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
     return calls
 

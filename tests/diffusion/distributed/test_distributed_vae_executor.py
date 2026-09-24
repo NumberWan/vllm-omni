@@ -28,7 +28,7 @@ class E2EOperator:
         h_size = z.shape[0]
         w_size = z.shape[1]
 
-        tasks = []
+        tasks: list[TileTask] = []
         for i in range(rows_num):
             for j in range(cols_num):
                 tasks.append(

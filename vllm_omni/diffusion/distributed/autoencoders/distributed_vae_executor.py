@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -35,9 +36,9 @@ class TileTask:
 
 @dataclass
 class DistributedOperator:
-    split: callable
-    exec: callable
-    merge: callable
+    split: Callable[[torch.Tensor], tuple[list[TileTask], GridSpec]]
+    exec: Callable[[TileTask], torch.Tensor]
+    merge: Callable[[dict[tuple[int, ...], torch.Tensor], GridSpec], torch.Tensor]
 
 
 class DistributedVaeExecutor:
@@ -132,17 +133,16 @@ class DistributedVaeExecutor:
                 tid = int(meta_src[idx, 0])
                 if tid < 0:
                     continue
-                slices = [slice(None)] * tiles_src[idx].ndim
+                slices_list = [slice(None)] * tiles_src[idx].ndim
                 for i, dim in enumerate(grid_spec.split_dims):
-                    slices[dim] = slice(0, int(meta_src[idx, i + 1]))
-                slices = tuple(slices)
-                coord_tensor_map[tid_coord_map[tid]] = tiles_src[idx][slices]
+                    slices_list[dim] = slice(0, int(meta_src[idx, i + 1]))
+                coord_tensor_map[tid_coord_map[tid]] = tiles_src[idx][tuple(slices_list)]
 
         return coord_tensor_map
 
     def _balance_tasks(self, task_list, num_rank):
         workloads = [0] * num_rank
-        assigned = [[] for _ in range(num_rank)]
+        assigned: list[list[TileTask]] = [[] for _ in range(num_rank)]
 
         for task in sorted(task_list, key=lambda t: t.workload, reverse=True):
             r = workloads.index(min(workloads))

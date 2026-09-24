@@ -467,10 +467,10 @@ def build_text_to_image_prompt(
     if builder is None:
         return prompt
     return builder(
-        prompt=str(prompt["prompt"]),
-        negative_prompt=prompt.get("negative_prompt"),
-        height=height,
-        width=width,
+        str(prompt["prompt"]),
+        prompt.get("negative_prompt"),
+        height,
+        width,
     )
 
 
@@ -507,10 +507,10 @@ def build_image_to_video_prompt(
     if not isinstance(media_inputs, Mapping):
         raise TypeError("Canonical I2V prompt multi_modal_data must be a mapping.")
     return builder(
-        prompt=str(prompt["prompt"]),
-        negative_prompt=prompt.get("negative_prompt"),
-        media_inputs=media_inputs,
-        height=height,
-        width=width,
-        num_frames=num_frames,
+        str(prompt["prompt"]),
+        prompt.get("negative_prompt"),
+        media_inputs,
+        height,
+        width,
+        num_frames,
     )
