@@ -133,11 +133,11 @@ disables both graph capture and automatic `torch.compile`. The two
 optimizations stack: the DiT blocks are regionally `torch.compile`'d and
 graph capture records the compiled (fused) kernels, while inductor's own
 cudagraphs stay disabled so the two graph layers never nest. Measured on a
-single GB200 (1024×1024, 50 steps, seed 42, BF16, `true_cfg_scale=1.0`,
-warmup 1 + median of 3): compile+graph 3.04 s, compile-only 3.2 s,
-graph-only 4.0 s, eager 4.3 s end-to-end per image; combo output vs eager is
-44.5–45.6 dB PSNR (the same magnitude as pure `torch.compile` fusion
-divergence), and graph-only vs eager is bit-identical.
+single H200 (1024×1024, 50 steps, seed 42, BF16, `true_cfg_scale=1.0`,
+warmup 1 + median of 3): compile+graph **5.93 s**, compile-only **6.88 s**,
+graph-only **9.52 s**, eager **8.28 s** end-to-end per image; combo and
+compile-only vs eager are **38.10 dB** PSNR (compile fusion drift), and
+graph-only vs eager is bit-identical.
 
 The autoregressive engine's `compilation_config.cudagraph_mode` does not
 control this diffusion path; use `enable_cuda_graph_decode` (or
@@ -228,21 +228,19 @@ timesteps across the trajectory, relative L2 of the noise prediction vs BF16)
 ranks the groups: `img_mlp` is the most sensitive (3.8% max error on its own,
 driven by `img_mlp.proj` 2.8% and `img_mlp.out` 2.5%), then `attn.to_out`
 (2.7%), then `attn.to_qkv` (1.6%); errors are largest at the late (low-sigma)
-steps. End-to-end on 4 fixed prompts at 1024x1024, 50 steps, seed 42
-(GB200, single GPU):
+steps. End-to-end on H200, single GPU, same prompt as Quality Comparison
+(`"A ceramic teapot on a wooden table"`, 1024×1024, 50 steps, seed 42,
+eager):
 
-| Config | Quantized block linears | Avg PSNR vs BF16 | Min PSNR | Steady-state time/image | Peak memory |
-| --- | --- | --- | --- | --- | --- |
-| BF16 | 0 / 160 | — | — | 7.2 s | 40.0 GB |
-| FP8 all layers | 160 / 160 | 26.1 dB | 19.1 dB | 8.4 s | 33.4 GB |
-| FP8, `ignored_layers=["img_mlp"]` | 64 / 160 | 29.7 dB | 21.6 dB | 8.8 s | 38.3 GB |
+| Config | Quantized block linears | PSNR vs BF16 | Steady-state time/image | Peak memory |
+| --- | --- | --- | --- | --- |
+| BF16 | 0 / 160 | — | **7.34 s** | **36.9 GB** |
+| FP8 all layers | 160 / 160 | **33.0 dB** | **6.06 s** | **30.4 GB** |
+| FP8, `ignored_layers=["img_mlp"]` | 64 / 160 | **34.3 dB** | **6.98 s** | **34.9 GB** |
 
-All-layer FP8 is usable but its composition can drift on some prompts
-(fine detail and layout shift, worst case ~19 dB); keeping `img_mlp` in BF16
-preserves composition noticeably better and is the recommended setting. On
-Blackwell (GB200) FP8 here is a memory optimization, not a speedup: dynamic
-per-token activation quantization costs more than the FP8 GEMM saves at these
-shapes, so BF16 remains the fastest option.
+Keeping `img_mlp` in BF16 is still the higher-fidelity DiT setting vs
+all-layer FP8. On H200, all-layer FP8 is both leaner and faster than BF16
+at this shape.
 
 ## Quantization
 
@@ -263,13 +261,12 @@ omni = Omni(
 )
 ```
 
-Either component can be quantized on its own. Measured on GB200 at 1024×1024
-(seed 42, 50 steps): text-encoder FP8 lowers peak GPU memory from ~41.0 GiB to
-~34.4 GiB (−6.6 GiB); adding DiT FP8 reaches ~28.1 GiB. Output quality stays
-close to BF16 (T2I PSNR vs BF16 ≈ 28–32 dB with text-encoder FP8; the
-image-conditioned edit path ≈ 36 dB). FP8 saves memory but does not speed up
-generation on this hardware. The edit path routes condition images through the
-BF16 vision tower, so it is unaffected by text-encoder FP8. See
+Either component can be quantized on its own. Measured on H200 at 1024×1024
+(seed 42, 50 steps, same teapot prompt, eager): text-encoder FP8 lowers peak
+GPU memory from **36.9 GB** (BF16) to **30.4 GB** (−6.5 GB); T2I PSNR vs BF16
+**32.1 dB**. DiT FP8-all is **30.4 GB** / **6.06 s**. Combined DiT+text-encoder
+FP8 was not re-measured on H200. The edit path routes condition images through
+the BF16 vision tower, so it is unaffected by text-encoder FP8. See
 [`docs/user_guide/quantization/fp8.md`](../../docs/user_guide/quantization/fp8.md)
 for the scope rules.
 
@@ -375,11 +372,10 @@ at every step), so exact numerical parity is not expected; match the cache
 setting on both sides or compare with PSNR/LPIPS rather than exact pixels.
 Eager stays numerically close to Diffusers (~47 dB). The **default** serving
 path stacks regional `torch.compile` with CUDA-graph decode; on H200 that
-combo lands at **~38.1 dB** vs eager (~1.21× latency). That is the drift users
-see out of the box. It is **not** the same datapoint as the GB200 breakdown in
-"CUDA Graph decode" above (GB200: graph-only bit-identical to eager;
-compile+graph **44.5–45.6 dB** vs eager) — different GPU / inductor fusion,
-and the H200 row was not a graph-only run.
+combo lands at **~38.1 dB** vs eager (~1.21× on the Quality Comparison timed
+run). Graph-only vs eager is bit-identical; the ~38 dB drift is the compile
+fusion, not CUDA-graph replay. See "CUDA Graph decode" for the four-mode
+H200 breakdown (warmup 1 + median of 3).
 
 Parity / feature measurements (same prompt/seed/steps/CFG, BF16, eager decode
 unless noted; 4× NVIDIA H200):
@@ -391,11 +387,12 @@ unless noted; 4× NVIDIA H200):
   `--vae-use-tiling` **43.55 dB** (peak mem ~37.7 GB → ~32.7 GB); 2048×2048
   nontile vs tiled **44.14 dB** (peak mem ~57.9 GB → ~33.3 GB; gen ~36.8 s vs
   ~37.1 s).
-- [x] Default CUDA-graph decode (compile+graph) vs eager — measured on H200
-  (1024×1024, 50 steps, seed 42, BF16): **6.04 s**/image vs eager **7.31 s**
-  (~1.21×), **~38.1 dB** PSNR vs eager. GB200 compile+graph numbers in
-  "CUDA Graph decode" (3.04 s vs eager 4.3 s, ~44.5–45.6 dB) remain a second
-  datapoint; H200 graph-only vs eager was not re-measured here.
+- [x] CUDA-graph four-mode vs eager — measured on H200 (1024×1024, 50 steps,
+  seed 42, BF16, warmup 1 + median of 3): compile+graph **5.93 s**,
+  compile-only **6.88 s**, graph-only **9.52 s**, eager **8.28 s**. Combo /
+  compile-only vs eager **38.10 dB**; graph-only vs eager bit-identical.
+  Quality Comparison table uses a separate single-run A/B vs Diffusers
+  (compile+graph **6.04 s**, eager **7.31 s**).
 
 ## Known Limitations
 
