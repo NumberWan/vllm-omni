@@ -25,7 +25,7 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
-from .video_decode import decode_path_video_frames
+from vllm_omni.diffusion.video_decode import decode_path_video_frames
 
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
 _TRANSFER_HINT_COMMON_FIELDS = frozenset({"control_path", "control", "control_weight"})

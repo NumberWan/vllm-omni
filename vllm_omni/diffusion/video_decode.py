@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Decode Cosmos3 video file paths to RGB frames.
+"""Decode video file paths to RGB frames.
 
-Shared by V2V preprocess and transfer ``control_path`` loading. Conditioning
-options and decode-budget calculation stay in the pipeline preprocess layer.
+Path suffix checks and bounded first/last-N imageio decoding. Model-specific
+conditioning and decode-budget stay in each pipeline's preprocess layer.
+
+Currently used by Cosmos3 V2V preprocess and transfer ``control_path``.
+Unifying with ``OmniVideoBackend`` / ``_decode_video_bytes`` is a follow-up.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ def _frame_to_uint8_rgb(value: Any) -> np.ndarray:
                 array = np.clip(array, -1.0, 1.0) * 0.5 + 0.5
             array = (np.clip(array, 0.0, 1.0) * 255.0).round().astype(np.uint8)
         return array[..., :3].astype(np.uint8)
-    raise TypeError(f"Cosmos3 video decode expected an RGB frame, got {type(value)!r}.")
+    raise TypeError(f"Video decode expected an RGB frame, got {type(value)!r}.")
 
 
 def decode_path_video_frames(
@@ -59,16 +62,16 @@ def decode_path_video_frames(
     """
     media_path = Path(path)
     if not media_path.exists():
-        raise FileNotFoundError(f"Cosmos3 video path does not exist: {media_path}")
+        raise FileNotFoundError(f"Video path does not exist: {media_path}")
     if keep not in {"first", "last"}:
-        raise ValueError("Cosmos3 video keep must be either 'first' or 'last'.")
+        raise ValueError("Video keep must be either 'first' or 'last'.")
     if max_frames is not None and int(max_frames) <= 0:
-        raise ValueError("Cosmos3 video max_frames must be positive.")
+        raise ValueError("Video max_frames must be positive.")
     try:
         import imageio.v3 as iio
     except ImportError as exc:
         raise ImportError(
-            "Cosmos3 video path decoding requires imageio. Install imageio[ffmpeg] or provide decoded frames."
+            "Video path decoding requires imageio. Install imageio[ffmpeg] or provide decoded frames."
         ) from exc
 
     limit = None if max_frames is None else int(max_frames)
@@ -84,5 +87,5 @@ def decode_path_video_frames(
             if limit is not None and len(frames) >= limit:
                 break
     if not frames:
-        raise ValueError(f"Cosmos3 video path produced no frames: {media_path}")
+        raise ValueError(f"Video path produced no frames: {media_path}")
     return frames
