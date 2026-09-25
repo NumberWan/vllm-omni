@@ -1185,7 +1185,7 @@ def test_decode_path_video_frames_honors_max_frames_and_keep(tmp_path, monkeypat
     pytest.importorskip("imageio.v3")
     import imageio.v3 as iio
 
-    from vllm_omni.diffusion.video_decode import decode_path_video_frames
+    from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
 
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"placeholder")
@@ -1220,7 +1220,7 @@ def test_preprocess_v2v_video_path_honors_prompt_level_keep_and_indexes(
 
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as cosmos_pipeline
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
-    from vllm_omni.diffusion.video_decode import decode_path_video_frames
+    from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
 
     source = tmp_path / "vllm_omni_video_reference_prompt.mp4"
     source.write_bytes(b"placeholder")
