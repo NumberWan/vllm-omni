@@ -73,6 +73,8 @@ def _local_files_only(model: str) -> bool:
     return Path(model).exists()
 
 
+# FLASH_ATTN_3_HUB is Hopper-only (sm 9.x). These cases stay H100; dual-marking
+# B200 (#7028) made Release CI collect them on Blackwell and fail at resolve (#8087).
 _OMNI_FA3_HUB_BACKEND = "FLASH_ATTN_3_HUB"
 _OMNI_FA3_HUB_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_FA3_HUB_BACKEND}
 
@@ -233,7 +235,7 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
@@ -253,7 +255,7 @@ def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_2512_matches_diffusers_pixelwise(accuracy_artifact_root: Path) -> None:
     model = _model_2512_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_2512_ID)

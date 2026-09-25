@@ -263,12 +263,20 @@ steps:
         commands:
           - pytest -s -v tests/examples/*/test_text_to_image.py -m "full_model and example and H100 and B200 and (cards_1 or cards_2)" --run-level "full_model"
 
+      # FA3-hub Qwen-Image gold is Hopper-only. Keep this step off the B200
+      # mirror (`-m` must not include B200, or MIRROR_HW=b200 still runs it).
+      - label: ":full_moon: Diffusion X2I(&A&T) · Accuracy Test · Qwen-Image"
+        source_file_dependencies: diffusion_qwen_image_accuracy
+        timeout_in_minutes: 180
+        commands:
+          - export VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120
+          - pytest -s -v tests/e2e/accuracy/test_qwen_image.py -m "H100 and cards_1" --run-level full_model
+
       - label: ":full_moon: Diffusion X2I(&A&T) · Accuracy Test"
         source_file_dependencies: diffusion_qwen_image_accuracy
         timeout_in_minutes: 180
         commands:
           - export VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120
-          - pytest -s -v tests/e2e/accuracy/test_qwen_image.py -m "H100 and B200 and cards_1" --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2i_matches_diffusers' -m "full_model and H100 and B200 and cards_1" --run-level full_model
 
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
