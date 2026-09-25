@@ -238,3 +238,29 @@ def test_adaptive_oom_clears_feat_map_when_retries_exhausted(monkeypatch):
         vae.tile_sample_stride_height,
         vae.tile_sample_stride_width,
     ) == (512, 512, 384, 384)
+
+
+def test_tiled_encode_oom_clears_enc_feat_map(monkeypatch):
+    """Tiled _encode must clear encoder activations if tiled_encode OOMs."""
+    vae = _make_vae()
+    vae.enable_tiling(
+        tile_sample_min_height=32,
+        tile_sample_min_width=32,
+        tile_sample_stride_height=24,
+        tile_sample_stride_width=24,
+    )
+    vae.clear_cache()
+    leaked = torch.ones(2, 2, device="cpu")
+    x = torch.zeros(1, 4, 1, 64, 64)
+
+    def encode_tile(x_in):
+        vae._enc_feat_map[0] = leaked
+        raise torch.OutOfMemoryError("injected tiled encode OOM")
+
+    monkeypatch.setattr(vae, "tiled_encode", encode_tile)
+
+    with pytest.raises(torch.OutOfMemoryError):
+        vae._encode(x)
+
+    assert all(slot is None for slot in vae._enc_feat_map)
+    assert all(slot is None for slot in vae._feat_map)

@@ -1281,10 +1281,10 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         if self.config.patch_size is not None:
             x = _patchify(x, patch_size=self.config.patch_size)
 
-        if self.use_tiling and (width > self.tile_sample_min_width or height > self.tile_sample_min_height):
-            return self.tiled_encode(x)
-
         try:
+            if self.use_tiling and (width > self.tile_sample_min_width or height > self.tile_sample_min_height):
+                return self.tiled_encode(x)
+
             iter_ = 1 + (num_frame - 1) // 4
             for i in range(iter_):
                 self._enc_conv_idx = [0]
@@ -1298,11 +1298,10 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                     )
                     out = torch.cat([out, out_], 2)
 
-            enc = self.quant_conv(out)
+            return self.quant_conv(out)
         finally:
-            # Drop cached activations even if the loop OOMs mid-cat.
+            # Drop cached activations even if tiled_encode or the loop OOMs.
             self.clear_cache()
-        return enc
 
     @apply_forward_hook
     def encode(
