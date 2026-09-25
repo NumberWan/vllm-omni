@@ -3479,36 +3479,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         peak_memory_mb = getattr(result, "peak_memory_mb", None)
         response_metrics = getattr(result, "metrics", None) if return_stage_metrics else None
         cot_output = None
-
-        req_out = result
-        if req_out:
-            prompt_obj = getattr(req_out, "prompt", None)
-            if isinstance(prompt_obj, dict):
-                extra = prompt_obj.get("extra", {})
-                if isinstance(extra, dict):
-                    ar_text = extra.get("ar_generated_text")
-                    if isinstance(ar_text, str) and ar_text.strip():
-                        cot_output = ar_text
-
-        req_out = result
-        if req_out:
-            prompt_obj = getattr(req_out, "prompt", None)
-            if isinstance(prompt_obj, dict):
-                extra = prompt_obj.get("extra", {})
-                if isinstance(extra, dict):
-                    ar_text = extra.get("ar_generated_text")
-                    if isinstance(ar_text, str) and ar_text.strip():
-                        cot_output = ar_text
-
-        req_out = result
-        if req_out:
-            prompt_obj = getattr(req_out, "prompt", None)
-            if isinstance(prompt_obj, dict):
-                extra = prompt_obj.get("extra", {})
-                if isinstance(extra, dict):
-                    ar_text = extra.get("ar_generated_text")
-                    if isinstance(ar_text, str) and ar_text.strip():
-                        cot_output = ar_text
+        prompt_obj = getattr(result, "prompt", None)
+        if isinstance(prompt_obj, dict):
+            extra = prompt_obj.get("extra", {})
+            if isinstance(extra, dict):
+                ar_text = extra.get("ar_generated_text")
+                if isinstance(ar_text, str) and ar_text.strip():
+                    cot_output = ar_text
 
         return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output, response_metrics
 
