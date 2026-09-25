@@ -98,9 +98,7 @@ from .action import (
     vision_condition_indexes,
 )
 from .transfer import (
-    VIDEO_EXTENSIONS,
     Cosmos3TransferConfig,
-    decode_path_video_frames,
     has_transfer_hints,
     load_or_compute_control_frames,
     media_hw,
@@ -152,6 +150,7 @@ from .utils import (
     postprocess_robolab_action,
     resize_rgb_uint8,
 )
+from .video_decode import decode_path_video_frames, is_video_file_path
 
 logger = init_logger(__name__)
 
@@ -467,14 +466,6 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                     return nested
         return video
 
-    def _is_video_file_path(value: Any) -> bool:
-        # Serving may leave uploaded references as temp paths (e.g.
-        # /tmp/vllm_omni_video_reference_*.mp4) instead of decoded frames.
-        if not isinstance(value, str | os.PathLike):
-            return False
-        suffix = os.path.splitext(os.fspath(value))[1].lower()
-        return suffix in VIDEO_EXTENSIONS
-
     def _decode_video_file_to_frames(
         path: str | os.PathLike,
         *,
@@ -490,7 +481,7 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
         max_frames: int | None,
         keep: str,
     ) -> list[Any]:
-        if _is_video_file_path(item):
+        if is_video_file_path(item):
             return _decode_video_file_to_frames(item, max_frames=max_frames, keep=keep)
         return [item]
 
@@ -501,7 +492,7 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
         keep: str,
     ) -> list[Any]:
         video = _unwrap_video_payload(video)
-        if _is_video_file_path(video):
+        if is_video_file_path(video):
             return _decode_video_file_to_frames(video, max_frames=max_frames, keep=keep)
         if isinstance(video, list):
             frames: list[Any] = []

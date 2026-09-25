@@ -15,16 +15,17 @@ from __future__ import annotations
 
 import importlib
 import math
-from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 import PIL.Image
 import torch
 import torch.nn.functional as F
+
+from .video_decode import decode_path_video_frames
 
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
 _TRANSFER_HINT_COMMON_FIELDS = frozenset({"control_path", "control", "control_weight"})
@@ -89,7 +90,6 @@ BILATERAL_SIGMA_COLOR = 150
 BILATERAL_SIGMA_SPACE = 100
 BILATERAL_ITERATIONS = 1
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
-VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 
 
 @dataclass
@@ -530,48 +530,6 @@ def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int)
     left = (resize_w - width) // 2
     cropped = resized[:, :, top : top + height, left : left + width]
     return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
-
-
-def decode_path_video_frames(
-    path: str | Path,
-    *,
-    max_frames: int | None = None,
-    keep: Literal["first", "last"] = "first",
-) -> list[np.ndarray]:
-    """Decode a video file to RGB uint8 frames (H, W, C).
-
-    ``keep='first'`` stops after ``max_frames``. ``keep='last'`` still scans the
-    file and retains only the tail window.
-    """
-    media_path = Path(path)
-    if not media_path.exists():
-        raise FileNotFoundError(f"Cosmos3 video path does not exist: {media_path}")
-    if keep not in {"first", "last"}:
-        raise ValueError("Cosmos3 video keep must be either 'first' or 'last'.")
-    if max_frames is not None and int(max_frames) <= 0:
-        raise ValueError("Cosmos3 video max_frames must be positive.")
-    try:
-        import imageio.v3 as iio
-    except ImportError as exc:
-        raise ImportError(
-            "Cosmos3 video path decoding requires imageio. Install imageio[ffmpeg] or provide decoded frames."
-        ) from exc
-
-    limit = None if max_frames is None else int(max_frames)
-    if keep == "last" and limit is not None:
-        window: deque[np.ndarray] = deque(maxlen=limit)
-        for frame in iio.imiter(media_path):
-            window.append(_pil_to_uint8_rgb(frame))
-        frames = list(window)
-    else:
-        frames = []
-        for frame in iio.imiter(media_path):
-            frames.append(_pil_to_uint8_rgb(frame))
-            if limit is not None and len(frames) >= limit:
-                break
-    if not frames:
-        raise ValueError(f"Cosmos3 video path produced no frames: {media_path}")
-    return frames
 
 
 def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch.Tensor:
