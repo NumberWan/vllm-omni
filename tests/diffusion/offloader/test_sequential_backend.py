@@ -309,12 +309,16 @@ def test_persistent_dit_staging_reuses_fixed_device_storage(accelerator_device) 
     first_ptr = dit.linear.weight.data_ptr()
     assert dit.linear.weight.device == accelerator_device
     torch.testing.assert_close(dit.linear.weight.data, original_weight)
+    retained_storage = dit_hook._stager._device_storages[0]
+    retained_ptr = retained_storage.data_ptr()
 
-    # Offload via a *different* module's hook (the cross-module swap path),
-    # then reload: the same fixed device storage must be reused so that
-    # CUDA-graph-captured weight pointers stay valid.
+    # Offload via a *different* module's hook (the cross-module swap path).
+    # The module parameters move back to the CPU master, but the fixed device
+    # storage stays allocated so CUDA-graph-captured weight pointers stay valid.
     encoder_hook._to_cpu(dit)
     assert dit.linear.weight.device.type == "cpu"
+    assert dit_hook._stager._device_storages
+    assert dit_hook._stager._device_storages[0].data_ptr() == retained_ptr
     dit_hook._to_gpu(dit)
     assert dit.linear.weight.data_ptr() == first_ptr
     torch.testing.assert_close(dit.linear.weight.data, original_weight)
@@ -346,6 +350,7 @@ def test_default_sequential_offload_releases_device_storage(accelerator_device) 
     assert dit.linear.weight.device == accelerator_device
     dit_hook._to_cpu(dit)
     assert dit.linear.weight.device.type == "cpu"
+    assert all(parameter.device.type == "cpu" for parameter in dit.parameters())
 
     remove_sequential_offload([dit, encoder])
 

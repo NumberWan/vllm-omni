@@ -143,9 +143,16 @@ The autoregressive engine's `compilation_config.cudagraph_mode` does not
 control this diffusion path; use `enable_cuda_graph_decode` (or
 `enforce_eager` for everything) to force eager decode execution.
 
-TP/SP/ring parallelism, HSDP, offload/cache hooks, quantized KV caches,
+TP/SP/ring parallelism, HSDP, cache hooks, quantized KV caches,
 dynamic LoRA, padded text masks, and a second in-flight request whose cache
 aliases an already-owned graph key fall back to eager decode.
+Model-level CPU offload does not disable decode graphs while
+`enable_cuda_graph_decode` stays on (the default). DiT weights stay on fixed
+device storage so captured pointers remain valid, and that storage is not
+released while the text encoder runs. Pass `--no-enable-cuda-graph-decode`
+(or `enable_cuda_graph_decode: false`) for the eager offload path, which
+moves DiT weights off the device and frees that VRAM. Peak memory for the
+default graph-plus-offload combination was not re-measured in this PR.
 Graphs keep separate entries for different image layouts and copy
 request-owned prefix K/V into static buffers before replay; each graph key
 has a single live owner at a time, so concurrent same-shape requests never
@@ -290,19 +297,18 @@ dtype — behavior unchanged). This is independent of
 `diffusion_kv_cache_dtype`, which quantizes attention Q/K/V *compute* per
 forward pass on supported backends.
 
-Measured on T2I 1024x1024 (seed 42, 50 steps, true CFG 4.0, PSNR vs. the
-bf16 baseline): **`"fp8"` 34.9 dB**, **`"fp8_v"` 40.9 dB** — same composition
-and semantics, with texture-level drift in fine detail for `"fp8"`, and
-visually indistinguishable output for `"fp8_v"`. The error is dominated by
+Measured on one NVIDIA L20X, T2I 1024x1024 (seed 42, 50 steps, true CFG 4.0,
+eager, PSNR vs. the bf16 baseline on the same GPU): **`"fp8"` 34.2 dB**,
+**`"fp8_v"` 44.0 dB**. The error is dominated by
 K quantization: post-RoPE keys are the precision-sensitive half of the
-cache, so `"fp8_v"` buys back ~6 dB at 75% (instead of 50%) of the original
+cache, so `"fp8_v"` buys back about 9.8 dB at 75% (instead of 50%) of the original
 cache size. The residual error is inherent e4m3 precision accumulated
 coherently over the denoising trajectory; finer scale granularity
 (per-tensor/per-head/per-token were compared) or Hadamard-rotated V did not
-improve it. The saving scales with prefix length — at the limit
-(8192 text tokens + 4 condition images, ~24.6k prefix tokens) the prefix
-cache is ~12.9 GB per CFG branch in bf16, ~6.6 GB in `"fp8"` and ~9.7 GB in
-`"fp8_v"`, which is where this option matters. Treat it as an opt-in for
+improve it. The saving scales with prefix length. These sizes are calculated at the
+limit (8192 text tokens + 4 condition images, ~24.6k prefix tokens), not
+measured on the 1024 T2I run above: ~12.9 GB per CFG branch in bf16, ~6.6 GB
+in `"fp8"` and ~9.7 GB in `"fp8_v"`. That is where this option matters. Treat it as an opt-in for
 memory-bound long-prompt / multi-image workloads, not a free lunch;
 `"fp8_v"` is the better default trade-off when quality matters.
 

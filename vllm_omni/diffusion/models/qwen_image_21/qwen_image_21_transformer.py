@@ -71,9 +71,9 @@ def _normalize_prefix_kv_cache_dtype(value: Any) -> str | None:
     if value in _PREFIX_KV_FP8_ALIASES:
         return "fp8_e4m3"
     if value in _PREFIX_KV_FP8_V_ALIASES:
-        # V-only FP8 storage: K stays in the native dtype. Measured nearly lossless on this
-        # model (PSNR 40.9 dB vs bf16 vs 34.9 dB for K+V fp8) — post-RoPE K is the
-        # precision-sensitive half of the cache.
+        # V-only FP8 storage: K stays in the native dtype. On L20X T2I 1024
+        # (CFG 4, 50 steps) PSNR vs bf16 is 44.0 dB for V-only vs 34.2 dB for
+        # K+V fp8 — post-RoPE K is the precision-sensitive half of the cache.
         return _PREFIX_KV_FP8_V
     raise ValueError(
         f"Unknown prefix_kv_cache_dtype {value!r}; expected None, 'auto' or one of "
