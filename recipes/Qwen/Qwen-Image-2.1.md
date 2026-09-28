@@ -297,7 +297,7 @@ dtype — behavior unchanged). This is independent of
 `diffusion_kv_cache_dtype`, which quantizes attention Q/K/V *compute* per
 forward pass on supported backends.
 
-Measured on one NVIDIA L20X, T2I 1024x1024 (seed 42, 50 steps, true CFG 4.0,
+Measured on one NVIDIA H200, T2I 1024x1024 (seed 42, 50 steps, true CFG 4.0,
 eager, PSNR vs. the bf16 baseline on the same GPU): **`"fp8"` 34.2 dB**,
 **`"fp8_v"` 44.0 dB**. The error is dominated by
 K quantization: post-RoPE keys are the precision-sensitive half of the
