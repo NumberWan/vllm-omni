@@ -404,7 +404,12 @@ unless noted; 4× NVIDIA H200):
 
 - Cache acceleration backends (`cache_dit`, `tea_cache`) are not supported;
   `QwenImage21Pipeline` is registered in `_NO_CACHE_ACCELERATION`.
-- Sequence parallelism supports Ulysses only; ring attention is not supported.
+- Ulysses sequence parallelism is wired; ring attention is not a supported path.
+  A short H200 smoke (1024×1024, 8 steps, seed 42, true CFG 1.0, eager) finished:
+  Ulysses SP=2 vs SP=1 is **46.5 dB**. That size's target length is divisible by 4,
+  so SP padding was not exercised, and this is not the 50-step parity next to the
+  TP tables. The features matrix therefore stays ❓. Ring SP=2 also ran, at
+  **29.9 dB** vs SP=1, which is why it stays unsupported.
 - Only true CFG is exposed; there is no `guidance_scale` knob.
 - VAE tiling (`--vae-use-tiling`, also implied by `--vae-patch-parallel-size > 1`)
   decodes in 512px tiles with 384px stride (32 latent pixels per tile at 16x
