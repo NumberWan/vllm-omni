@@ -296,6 +296,16 @@ class QwenImage21Pipeline(
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
+    def release_captured_graphs(self) -> None:
+        """Drop decode graphs before sleep level 2 discards their capture storage.
+
+        The runner looks this up on the pipeline, not on the transformer.
+        """
+        transformer = getattr(self, "transformer", None)
+        release = getattr(transformer, "release_captured_graphs", None)
+        if callable(release):
+            release()
+
     def __init__(
         self,
         *,

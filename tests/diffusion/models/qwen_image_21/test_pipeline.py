@@ -386,6 +386,16 @@ def test_postprocess_envelope_requires_image_payload(postprocess):
         postprocess({"payload": {"seed": 42}, "metadata": {}})
 
 
+def test_release_captured_graphs_delegates_to_transformer() -> None:
+    pipeline = QwenImage21Pipeline.__new__(QwenImage21Pipeline)
+    released: list[bool] = []
+    pipeline.transformer = SimpleNamespace(release_captured_graphs=lambda: released.append(True))
+
+    pipeline.release_captured_graphs()
+
+    assert released == [True]
+
+
 def test_postprocess_envelope_normalizes_non_dict_metadata(postprocess):
     result = postprocess({"payload": {"image": torch.rand(1, 4, 16, 16)}, "metadata": "bogus"})
 
