@@ -314,6 +314,11 @@ class SessionControl:
                 return
             if candidate_runtime_config is not None:
                 session.replace_runtime_config(candidate_runtime_config)
+                if (
+                    candidate_runtime_config.get("tool_followup_ready") is True
+                    and session.capabilities.supports_text_only_turn
+                ):
+                    session.notify_new_user_item()
             self._out.emit(
                 {
                     "type": "conversation.item.created",
