@@ -55,7 +55,6 @@ from vllm_omni.entrypoints.duplex.websocket import (
     receive_text_with_timeout,
 )
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni, DuplexSessionHandle
-from vllm_omni.protocol.duplex import RealtimeInputDefaults
 
 logger = init_logger(__name__)
 
@@ -112,13 +111,12 @@ class OmniDuplexSessionHandler:
             replay_max_bytes_per_session=runtime_config.resume_replay_max_bytes_per_session,
         )
         self._resync_required_sessions: set[str] = set()
-        #: Wire defaults (input/output audio format and rate) per session. They
-        #: are negotiated on the session but live on the per-connection
-        #: envelope, so a reconnect has to be handed them back.
-        self._input_defaults: dict[str, RealtimeInputDefaults] = {}
         #: Live connection envelopes keyed by session id. ``session.updated``
         #: arrives on the session-scoped pump; the envelope that must apply the
         #: new wire defaults lives on the read loop, so the pump looks it up here.
+        #: Defaults stay on that envelope. A reconnect copies them off the
+        #: previous entry before replacing it. The pump drops the entry when
+        #: the session ends.
         self._live_envelopes: dict[str, RealtimeEnvelope] = {}
         self._pumps: dict[str, asyncio.Task[None]] = {}
 
@@ -156,8 +154,6 @@ class OmniDuplexSessionHandler:
                     return
             if pending_command is not None:
                 await self._submit_wire_event(attachment, envelope, pending_command, send_json)
-            self._live_envelopes[attachment.handle.session_id] = envelope
-            self._input_defaults[attachment.handle.session_id] = envelope.defaults
             await self._read_loop(websocket, envelope, attachment, send_json)
             await self._drain_terminal_pump(attachment)
         except WebSocketDisconnect:
@@ -231,6 +227,9 @@ class OmniDuplexSessionHandler:
                 attachment_generation=created.attachment_generation,
                 resume_token=created.resume_token.plaintext,
             )
+        # Bind before the pump starts so a session.updated emitted during open
+        # applies onto this connection's envelope.
+        self._live_envelopes[handle.session_id] = envelope
         self._start_pump(handle, credentials)
         return attachment
 
@@ -363,11 +362,12 @@ class OmniDuplexSessionHandler:
             return None
         # A reconnect brings a fresh envelope carrying pcm16/16 kHz wire
         # defaults. The negotiated input format is a wire default, not part of
-        # the public session object, so it has to be carried over explicitly:
-        # otherwise the first append that omits format/rate is decoded as pcm16.
-        remembered = self._input_defaults.get(session_id)
-        if remembered is not None:
-            envelope.defaults = remembered
+        # the public session object, so copy it from the envelope this session
+        # is still holding before replacing the map entry. Otherwise the first
+        # append that omits format/rate is decoded as pcm16.
+        previous = self._live_envelopes.get(session_id)
+        if previous is not None:
+            envelope.defaults = previous.defaults
         self._live_envelopes[session_id] = envelope
         self._start_pump(handle, None)
         return _Attachment(handle=handle, generation=resumed.attachment_generation)
@@ -499,7 +499,6 @@ class OmniDuplexSessionHandler:
         finally:
             self._pumps.pop(session_id, None)
             self._resync_required_sessions.discard(session_id)
-            self._input_defaults.pop(session_id, None)
             self._live_envelopes.pop(session_id, None)
             attachment = None
             with suppress(Exception):
@@ -663,20 +662,14 @@ class OmniDuplexSessionHandler:
         except DuplexCommandError as exc:
             await send_json(envelope.command_error_payload(exc))
             return
-        # Remember accepted wire defaults for reconnect. Mid-session
-        # session.update must not land here until session.updated (see pump).
-        self._input_defaults[attachment.handle.session_id] = envelope.defaults
         await self._submit_command(attachment, envelope, command, send_json)
 
     def _apply_accepted_session_defaults(self, session_id: str, session_payload: Mapping[str, object]) -> None:
         """Apply wire defaults only after the engine accepted a session.update."""
         envelope = self._live_envelopes.get(session_id)
-        if envelope is not None:
-            envelope.apply_accepted_session(session_payload)
-            self._input_defaults[session_id] = envelope.defaults
+        if envelope is None:
             return
-        remembered = self._input_defaults.get(session_id) or RealtimeInputDefaults()
-        self._input_defaults[session_id] = remembered.with_session_payload(session_payload)
+        envelope.apply_accepted_session(session_payload)
 
     async def _submit_command(
         self,
