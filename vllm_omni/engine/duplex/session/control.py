@@ -30,6 +30,7 @@ from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+from vllm_omni.engine.duplex.session.tools import DuplexToolLedgerError
 from vllm_omni.engine.duplex.turn_detection import (
     PendingTurnDetectionUpdate,
     ServerTurnDetector,
@@ -295,6 +296,12 @@ class SessionControl:
         item_type = item.get("type") if isinstance(item, dict) else None
         if item_type == "function_call_output" and isinstance(item, dict):
             if not await self._wait_for_append_tail():
+                return
+            call_id = item.get("call_id")
+            try:
+                session.tool_ledger.accept_result(call_id if isinstance(call_id, str) else "", epoch=session.epoch)
+            except DuplexToolLedgerError as exc:
+                self._out.emit_error(exc.code, str(exc))
                 return
             try:
                 candidate_runtime_config = self._ctx.plugin.runtime_config_for_function_output(
