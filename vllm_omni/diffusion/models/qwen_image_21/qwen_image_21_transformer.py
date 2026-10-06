@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -919,9 +920,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             QwenImage21DecodeGraphManager(
                 self,
                 max_entries=cuda_graph_max_decode_graphs,
-                model_level_offload=(
-                    od_config.enable_cpu_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
-                ),
+                model_level_offload=resolve_offload_strategy(od_config)
+                in {OffloadStrategy.MODEL_LEVEL, OffloadStrategy.DISTRIBUTED_LAYER_WISE},
             )
             if self.enable_cuda_graph_decode
             else None
