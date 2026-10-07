@@ -161,6 +161,15 @@ class DuplexOutputBuffer:
         with self._lock:
             return self._is_valid(event)
 
+    def queued_events(self) -> tuple[DuplexEvent, ...]:
+        """Events still waiting behind the one the consumer is delivering.
+
+        Does not dequeue. The held event is omitted: the consumer already has it.
+        This is not ``pending_events``, which is the queued count.
+        """
+        with self._lock:
+            return tuple(pending.event for pending in self._pending)
+
     @contextmanager
     def guard(self, event: DuplexEvent) -> Iterator[bool]:
         """Hold validity stable during synchronous sequencing; never await here."""

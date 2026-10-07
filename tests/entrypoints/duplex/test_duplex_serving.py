@@ -19,7 +19,7 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
-from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, SessionClosed, SessionCreated
+from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, SessionClosed, SessionCreated, SessionUpdated
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, parse_resume_request
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
@@ -102,6 +102,9 @@ class FakeHandle:
 
     def output_guard(self, event: DuplexEvent):
         return self._outbox.guard(event)
+
+    def queued_events(self) -> tuple[DuplexEvent, ...]:
+        return self._outbox.queued_events()
 
     async def submit(self, command: commands.DuplexCommand) -> None:
         if self.closed:
@@ -622,6 +625,73 @@ def test_session_update_does_not_mutate_defaults_until_accepted() -> None:
 
     envelope.apply_accepted_session({"input_audio_format": "pcm_f32le"})
     assert envelope.defaults.input_audio_format == "pcm_f32le"
+
+
+def _append(audio: bytes) -> dict[str, object]:
+    return {"type": "input_audio_buffer.append", "audio": base64.b64encode(audio).decode("ascii")}
+
+
+def _decoded_audio_nbytes(command: commands.DuplexCommand) -> int:
+    audio = command.audio
+    if isinstance(audio, str):
+        return len(base64.b64decode(audio))
+    return len(audio)
+
+
+@pytest.mark.asyncio
+async def test_queued_session_updated_applies_before_next_append_while_send_is_delayed() -> None:
+    """#7996 review: a blocked outbound send must not leave the next append on the old format.
+
+    The engine has already queued ``session.updated``. The pump is still
+    delivering an earlier event, so it has not applied the new defaults yet.
+    A rejected update (no queued ``session.updated``) must keep pcm16.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    release = asyncio.Event()
+    sending = asyncio.Event()
+    original_send = ws.send_json
+
+    async def blocked_send(payload: dict[str, Any]) -> None:
+        sending.set()
+        await release.wait()
+        await original_send(payload)
+
+    ws.send_json = blocked_send  # type: ignore[method-assign]
+    try:
+        handle.deliver(AudioDelta(session_id=handle.session_id, response_id="r1", delta="aGk="))
+        await asyncio.wait_for(sending.wait(), timeout=2.0)
+
+        ws.feed(_session_update(input_audio_format="pcm_f32le"))
+        ws.feed(_append(b"\x00" * 8))
+        rejected = await _next_append(handle)
+        # pcm16 turns 8 bytes into 4 int16 samples, then 16 bytes of float32.
+        assert _decoded_audio_nbytes(rejected) == 16
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
+        assert "session.updated" not in ws.types()
+        ws.feed(_append(b"\x00" * 8))
+        accepted = await _next_append(handle, after=1)
+        # The queued session.updated is applied before this translate, so the
+        # 8 float32 bytes are kept instead of being read as pcm16.
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+    finally:
+        release.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+async def _next_append(handle: FakeHandle, *, after: int = 0) -> commands.AppendAudio:
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while asyncio.get_running_loop().time() < deadline:
+        appends = [command for command in handle.commands if isinstance(command, commands.AppendAudio)]
+        if len(appends) > after:
+            return appends[after]
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out waiting for append; commands={handle.commands!r}")
 
 
 def test_parse_resume_request_requires_the_three_fields_only() -> None:

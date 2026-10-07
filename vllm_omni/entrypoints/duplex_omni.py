@@ -243,6 +243,10 @@ class DuplexSessionHandle:
         """Recheck held audio while committing its delivery; never await inside this guard."""
         return self._outbox.guard(event)
 
+    def queued_events(self) -> tuple[DuplexEvent, ...]:
+        """Events accepted by the engine but not yet dequeued for delivery."""
+        return self._outbox.queued_events()
+
     async def __aenter__(self) -> DuplexSessionHandle:
         return self
 

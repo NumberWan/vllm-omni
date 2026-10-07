@@ -487,6 +487,9 @@ class OmniDuplexSessionHandler:
                         resume_token=credentials.resume_token,
                     )
                 if isinstance(event, SessionUpdated):
+                    # Queued updates are also applied before the next translate.
+                    # This path still covers a client that waits for the event
+                    # itself and sends nothing in between.
                     self._apply_accepted_session_defaults(session_id, event.session)
                 await self._send_event(session_id, event, handle=handle)
                 if isinstance(event, SessionClosed):
@@ -657,12 +660,23 @@ class OmniDuplexSessionHandler:
         payload: dict[str, object],
         send_json: SendJson,
     ) -> None:
+        # An accepted session.update is already on the outbox once the engine
+        # emits it. Apply that before translate so the next append does not
+        # keep the previous format while the pump is still sending an earlier
+        # event. A rejected update never queues session.updated.
+        self._apply_queued_session_updates(attachment.handle)
         try:
             command = envelope.translate(payload)
         except DuplexCommandError as exc:
             await send_json(envelope.command_error_payload(exc))
             return
         await self._submit_command(attachment, envelope, command, send_json)
+
+    def _apply_queued_session_updates(self, handle: DuplexSessionHandle) -> None:
+        """Apply ``session.updated`` events the pump has not dequeued yet."""
+        for event in handle.queued_events():
+            if isinstance(event, SessionUpdated):
+                self._apply_accepted_session_defaults(handle.session_id, event.session)
 
     def _apply_accepted_session_defaults(self, session_id: str, session_payload: Mapping[str, object]) -> None:
         """Apply wire defaults only after the engine accepted a session.update."""
