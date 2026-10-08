@@ -712,9 +712,7 @@ async def test_append_waits_for_engine_session_update_before_translate() -> None
         await asyncio.sleep(0.05)
         assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
 
-        handle.deliver(
-            ErrorEvent(code="model_update_unsupported", message="rejected", related_event_id="upd-reject")
-        )
+        handle.deliver(ErrorEvent(code="model_update_unsupported", message="rejected", related_event_id="upd-reject"))
         rejected = await _next_append(handle)
         # pcm16 turns 8 bytes into 4 int16 samples, then 16 bytes of float32.
         assert _decoded_audio_nbytes(rejected) == 16
