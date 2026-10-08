@@ -247,6 +247,18 @@ class DuplexSessionHandle:
         """Events accepted by the engine but not yet dequeued for delivery."""
         return self._outbox.queued_events()
 
+    def observation_seq(self) -> int:
+        """How many ``session.updated`` / ``error`` events this session has enqueued."""
+        return self._outbox.observation_seq()
+
+    def observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
+        """Control events enqueued after ``seq``, including ones the pump already dequeued."""
+        return self._outbox.observations_after(seq)
+
+    async def wait_for_observation(self, seen: int) -> bool:
+        """Wait for a control event newer than ``seen``. False if the outbox is closed."""
+        return await self._outbox.wait_for_observation(seen)
+
     async def __aenter__(self) -> DuplexSessionHandle:
         return self
 

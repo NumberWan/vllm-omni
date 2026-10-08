@@ -158,8 +158,9 @@ class RealtimeEnvelope:
 
         Mid-session ``session.update`` must not mutate ``defaults`` here: the
         engine may reject the update (``ErrorEvent``) after translate returns.
-        Defaults are applied from an accepted ``session.updated`` already
-        queued for delivery, and again when the pump dequeues it
+        A following append waits until that update is accepted or rejected.
+        Defaults are applied from the accepted ``session.updated`` once it is
+        enqueued, including while the pump is still sending an earlier event
         (:meth:`apply_accepted_session`).
         """
         return translate_realtime_command(payload, defaults=self.defaults)

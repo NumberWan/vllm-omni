@@ -27,9 +27,10 @@ from functools import partial
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.commands import DuplexCommand, DuplexCommandError
+from vllm_omni.engine.duplex.commands import DuplexCommand, DuplexCommandError, UpdateSession
 from vllm_omni.engine.duplex.events import (
     DuplexEvent,
+    ErrorEvent,
     SessionClosed,
     SessionCreated,
     SessionReplaced,
@@ -92,6 +93,34 @@ class _ResumeCredentials:
     resume_token: str
 
 
+@dataclass(frozen=True)
+class _PendingSessionUpdate:
+    """A ``session.update`` submitted to the engine and not yet accepted or rejected."""
+
+    event_id: str | None
+    #: ``observation_seq`` sampled before ``submit``, so the outcome is visible.
+    after_seq: int
+
+
+def _error_answers_session_update(event: ErrorEvent, event_id: str | None) -> bool:
+    related = event.related_event_id
+    if event_id:
+        return related == event_id
+    return related is None
+
+
+def _session_update_outcome(
+    events: tuple[DuplexEvent, ...], event_id: str | None
+) -> SessionUpdated | ErrorEvent | None:
+    """First acceptance, or the error that answers this update. Other errors are skipped."""
+    for event in events:
+        if isinstance(event, SessionUpdated):
+            return event
+        if isinstance(event, ErrorEvent) and _error_answers_session_update(event, event_id):
+            return event
+    return None
+
+
 class OmniDuplexSessionHandler:
     """WebSocket transport for engine-resident duplex sessions."""
 
@@ -119,6 +148,9 @@ class OmniDuplexSessionHandler:
         #: the session ends.
         self._live_envelopes: dict[str, RealtimeEnvelope] = {}
         self._pumps: dict[str, asyncio.Task[None]] = {}
+        #: One submitted ``session.update`` whose ``session.updated`` or rejection
+        #: is not yet visible. The next format-dependent append waits on it.
+        self._pending_session_updates: dict[str, _PendingSessionUpdate] = {}
 
     # ------------------------------------------------------------------ #
     # Entry point                                                         #
@@ -503,6 +535,7 @@ class OmniDuplexSessionHandler:
             self._pumps.pop(session_id, None)
             self._resync_required_sessions.discard(session_id)
             self._live_envelopes.pop(session_id, None)
+            self._pending_session_updates.pop(session_id, None)
             attachment = None
             with suppress(Exception):
                 attachment = await self._attachment_registry.close(session_id)
@@ -660,6 +693,15 @@ class OmniDuplexSessionHandler:
         payload: dict[str, object],
         send_json: SendJson,
     ) -> None:
+        # An append that omits its format has to see the outcome of a
+        # session.update already submitted on this connection. Acceptance may
+        # still be inside the engine, so it is not enough that a
+        # session.updated is sitting in the outbox. A later update waits too,
+        # so only one update is in flight.
+        if payload.get("type") in {"input_audio_buffer.append", "session.update"}:
+            await self._wait_for_pending_session_update(attachment.handle)
+            if attachment.handle.closed:
+                return
         # An accepted session.update is already on the outbox once the engine
         # emits it. Apply that before translate so the next append does not
         # keep the previous format while the pump is still sending an earlier
@@ -671,6 +713,30 @@ class OmniDuplexSessionHandler:
             await send_json(envelope.command_error_payload(exc))
             return
         await self._submit_command(attachment, envelope, command, send_json)
+
+    async def _wait_for_pending_session_update(self, handle: DuplexSessionHandle) -> None:
+        """Block until the in-flight ``session.update`` is accepted or rejected.
+
+        The outcome is the ``session.updated`` or matching ``error`` the engine
+        enqueued. This does not wait for the pump to send that event.
+        """
+        session_id = handle.session_id
+        while True:
+            pending = self._pending_session_updates.get(session_id)
+            if pending is None or handle.closed:
+                return
+            seen = handle.observation_seq()
+            outcome = _session_update_outcome(handle.observations_after(pending.after_seq), pending.event_id)
+            if isinstance(outcome, SessionUpdated):
+                self._apply_accepted_session_defaults(session_id, outcome.session)
+                self._pending_session_updates.pop(session_id, None)
+                return
+            if isinstance(outcome, ErrorEvent):
+                self._pending_session_updates.pop(session_id, None)
+                return
+            if not await handle.wait_for_observation(seen):
+                self._pending_session_updates.pop(session_id, None)
+                return
 
     def _apply_queued_session_updates(self, handle: DuplexSessionHandle) -> None:
         """Apply ``session.updated`` events the pump has not dequeued yet."""
@@ -692,10 +758,17 @@ class OmniDuplexSessionHandler:
         command: DuplexCommand,
         send_json: SendJson,
     ) -> None:
+        after_seq = attachment.handle.observation_seq() if isinstance(command, UpdateSession) else None
         try:
             await attachment.handle.submit(command)
         except DuplexSessionError as exc:
             await send_json(envelope.error_payload(exc.code, str(exc), event_id=command.event_id))
+            return
+        if after_seq is not None:
+            self._pending_session_updates[attachment.handle.session_id] = _PendingSessionUpdate(
+                event_id=command.event_id,
+                after_seq=after_seq,
+            )
 
     # ------------------------------------------------------------------ #
     # Disconnect                                                          #
