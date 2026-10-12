@@ -73,59 +73,37 @@ def _local_files_only(model: str) -> bool:
     return Path(model).exists()
 
 
-def _ci_attention_backends(major: int | None = None) -> tuple[str, str]:
-    """Return ``(omni_backend, diffusers_backend)`` that can launch on this GPU.
-
-    No FlashAttention kernel covers A100, H100, H200, and B200 together.
-    ``FLASH_ATTN_3_HUB`` is Hopper-only (compute capability 9.x). FA2 hub
-    covers Ampere/Ada/Hopper (8.x/9.x) and rejects Blackwell. This matches
-    ``test_diffusers_backend_similarity`` and the Diffusers adapter: do not
-    pin FA2/FA3 on Blackwell, use SDPA (Diffusers ``native``) instead.
-    ``set_attention_backend`` only checks import, so a non-Hopper GPU must
-    not probe ``_flash_3_hub``.
-    """
-    if major is None and torch.cuda.is_available():
-        major, _ = torch.cuda.get_device_capability()
-    if major == 9:
-        return "FLASH_ATTN_3_HUB", "_flash_3_hub"
-    if major == 8:
-        return "FLASH_ATTN_HUB", "flash_hub"
-    return "TORCH_SDPA", "native"
+# Same Omni / Diffusers pair on every CUDA SKU in release CI (H100, H200, B200).
+# FLASH_ATTN_3_HUB is Hopper-only and fails on B200/A100 (#8087). TORCH_SDPA
+# matches Diffusers ``native`` and has a binding on both sides.
+_OMNI_CI_ATTN_BACKEND = "TORCH_SDPA"
+_DIFFUSERS_CI_ATTN_BACKEND = "native"
+_OMNI_CI_ATTN_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_CI_ATTN_BACKEND}
 
 
-def _assert_omni_backend_resolves(omni_backend: str) -> None:
+def _assert_omni_backend_resolves() -> None:
     from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
     from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
 
-    path = CudaOmniPlatform.get_diffusion_attn_backend_cls(omni_backend, head_size=128)
-    expected = DiffusionAttentionBackendEnum[omni_backend].get_path()
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls(_OMNI_CI_ATTN_BACKEND, head_size=128)
+    expected = DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
     assert path == expected, path
-    print(f"Resolved Omni attention backend: {omni_backend} -> {path}")
+    print(f"Resolved Omni attention backend: {_OMNI_CI_ATTN_BACKEND} -> {path}")
 
 
-def _omni_server_args(omni_backend: str, *, fa_deterministic: bool = False) -> tuple[list[str], dict[str, str]]:
-    args = [
+def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
+    _assert_omni_backend_resolves()
+    server_args = [
         "--num-gpus",
         "1",
         "--stage-init-timeout",
         "300",
         "--init-timeout",
         "900",
+        "--diffusion-attention-backend",
+        _OMNI_CI_ATTN_BACKEND,
     ]
-    if fa_deterministic:
-        args.append("--fa-deterministic")
-    args.extend(["--diffusion-attention-backend", omni_backend])
-    return args, {"DIFFUSION_ATTENTION_BACKEND": omni_backend}
-
-
-def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
-    omni_backend, _ = _ci_attention_backends()
-    _assert_omni_backend_resolves(omni_backend)
-    server_args, env = _omni_server_args(
-        omni_backend,
-        fa_deterministic=omni_backend == "FLASH_ATTN_3_HUB",
-    )
-    with OmniServer(model, server_args, use_omni=True, env_dict=env) as omni_server:
+    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_CI_ATTN_ENV) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
@@ -161,8 +139,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
         ).to("cuda")
-        _, diffusers_backend = _ci_attention_backends()
-        pipe.transformer.set_attention_backend(diffusers_backend)
+        pipe.transformer.set_attention_backend(_DIFFUSERS_CI_ATTN_BACKEND)
         generator = torch.Generator(device="cuda").manual_seed(SEED)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT,
@@ -187,10 +164,18 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
 
 
 def _run_vllm_omni_qwen_image_2512(*, model: str, output_path: Path) -> Image.Image:
-    omni_backend, _ = _ci_attention_backends()
-    _assert_omni_backend_resolves(omni_backend)
-    server_args, env = _omni_server_args(omni_backend)
-    with OmniServer(model, server_args, use_omni=True, env_dict=env) as omni_server:
+    _assert_omni_backend_resolves()
+    server_args = [
+        "--num-gpus",
+        "1",
+        "--stage-init-timeout",
+        "300",
+        "--init-timeout",
+        "900",
+        "--diffusion-attention-backend",
+        _OMNI_CI_ATTN_BACKEND,
+    ]
+    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_CI_ATTN_ENV) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
@@ -226,8 +211,7 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
         ).to("cuda")
-        _, diffusers_backend = _ci_attention_backends()
-        pipe.transformer.set_attention_backend(diffusers_backend)
+        pipe.transformer.set_attention_backend(_DIFFUSERS_CI_ATTN_BACKEND)
         generator = torch.Generator(device="cuda").manual_seed(SEED_2512)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT_2512,
