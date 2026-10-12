@@ -36,6 +36,17 @@ from vllm_omni.engine.duplex.events import (
 _MAX_TERMINAL_BYTES = 4096
 
 
+def _is_retained_update_outcome(event: DuplexEvent, event_id: str | None) -> bool:
+    """Whether ``event`` settles the ``session.update`` retained for ``event_id``.
+
+    One update is in flight, so the next ``session.updated`` is its acceptance.
+    A rejection is the error whose ``related_event_id`` is that update's id.
+    """
+    if isinstance(event, SessionUpdated):
+        return True
+    return isinstance(event, ErrorEvent) and bool(event_id) and event.related_event_id == event_id
+
+
 class DuplexOutputOverflowError(RuntimeError):
     """One session exceeded its pending output budget; valid output was not dropped."""
 
@@ -83,6 +94,13 @@ class DuplexOutputBuffer:
         self._observation_seq = 0
         self._observations: deque[tuple[int, DuplexEvent]] = deque(maxlen=64)
         self._observe_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
+        # The ring above drops the oldest control event after 64 arrivals. An
+        # outstanding session.update keeps its own copy until the reader that
+        # submitted it consumes the acceptance or the matching rejection.
+        self._retention_after: int | None = None
+        self._retention_event_id: str | None = None
+        self._retention_sealed = False
+        self._retained: list[tuple[int, DuplexEvent]] = []
 
     @property
     def pending_bytes(self) -> int:
@@ -137,6 +155,14 @@ class DuplexOutputBuffer:
             if isinstance(event, SessionUpdated | ErrorEvent):
                 self._observation_seq += 1
                 self._observations.append((self._observation_seq, event))
+                if (
+                    self._retention_after is not None
+                    and not self._retention_sealed
+                    and self._observation_seq > self._retention_after
+                ):
+                    self._retained.append((self._observation_seq, event))
+                    if _is_retained_update_outcome(event, self._retention_event_id):
+                        self._retention_sealed = True
                 observe_waiters = self._observe_waiters
                 self._observe_waiters = []
             waiter = self._waiter
@@ -199,6 +225,32 @@ class DuplexOutputBuffer:
         """Control events enqueued after ``seq``. Not removed when ``get`` dequeues them."""
         with self._lock:
             return tuple(event for observed_seq, event in self._observations if observed_seq > seq)
+
+    def arm_observation_retention(self, after_seq: int, event_id: str) -> None:
+        """Keep this update's outcome after the 64-event ring drops it.
+
+        ``after_seq`` is ``observation_seq()`` sampled before the update is
+        submitted. Retention stops once ``session.updated`` or the error with
+        ``event_id`` is stored, so later unrelated errors do not accumulate.
+        """
+        with self._lock:
+            self._retention_after = after_seq
+            self._retention_event_id = event_id
+            self._retention_sealed = False
+            self._retained.clear()
+
+    def disarm_observation_retention(self) -> None:
+        """Drop the retained outcome. The ring is unchanged."""
+        with self._lock:
+            self._retention_after = None
+            self._retention_event_id = None
+            self._retention_sealed = False
+            self._retained.clear()
+
+    def retained_observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
+        """Control events kept for the outstanding update, including ones the ring dropped."""
+        with self._lock:
+            return tuple(event for observed_seq, event in self._retained if observed_seq > seq)
 
     async def wait_for_observation(self, seen: int) -> bool:
         """Wait until a newer control event is enqueued.

@@ -122,6 +122,15 @@ class FakeHandle:
     async def wait_for_observation(self, seen: int) -> bool:
         return await self._outbox.wait_for_observation(seen)
 
+    def arm_observation_retention(self, after_seq: int, event_id: str) -> None:
+        self._outbox.arm_observation_retention(after_seq, event_id)
+
+    def disarm_observation_retention(self) -> None:
+        self._outbox.disarm_observation_retention()
+
+    def retained_observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
+        return self._outbox.retained_observations_after(seq)
+
     async def submit(self, command: commands.DuplexCommand) -> None:
         if self.closed:
             raise DuplexSessionError("closed", code="session_closed", session_id=self.session_id)
@@ -727,6 +736,119 @@ async def test_append_waits_for_engine_session_update_before_translate() -> None
 
         handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
         accepted = await _next_append(handle, after=1)
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_unrelated_error_does_not_release_an_update_that_omitted_event_id() -> None:
+    """An earlier error with no related id must not settle a session.update that also omitted one.
+
+    The server stamps an id before submit. Only the error that echoes that id,
+    or ``session.updated``, releases the following append.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    try:
+        ws.feed(_session_update(input_audio_format="pcm_f32le"))
+        ws.feed(_append(b"\x00" * 8))
+        update = await _next_command(handle, commands.UpdateSession)
+        assert isinstance(update.event_id, str) and update.event_id
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(ErrorEvent(code="append_failed", message="earlier append", related_event_id=None))
+        handle.deliver(ErrorEvent(code="other", message="unrelated", related_event_id="not-this-update"))
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(
+            ErrorEvent(code="model_update_unsupported", message="rejected", related_event_id=update.event_id)
+        )
+        rejected = await _next_append(handle)
+        assert _decoded_audio_nbytes(rejected) == 16
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_takeover_during_session_update_does_not_submit_the_replaced_append() -> None:
+    """A reader that resumes the session while this one waits must not submit the old append.
+
+    The accepted defaults land on the new connection's envelope. The replaced
+    socket already has the audio bytes, but it no longer owns the attachment.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    token = ws.sent[0]["resume_token"]
+    opened_generation = ws.sent[0]["attachment_generation"]
+    ws2: FakeWebSocket | None = None
+    task2: asyncio.Task | None = None
+    try:
+        update = _session_update(input_audio_format="pcm_f32le")
+        update["event_id"] = "upd-takeover"
+        ws.feed(update)
+        ws.feed(_append(b"\x00" * 8))
+        await _next_command(handle, commands.UpdateSession)
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        ws2, task2 = await _resume(handler, handle.session_id, token)
+        await ws2.wait_for("session.resumed")
+        assert not await handler._attachment_registry.is_current_attachment(handle.session_id, opened_generation)
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        ws2.feed(_append(b"\x00" * 8))
+        accepted = await _next_append(handle)
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+        assert len([command for command in handle.commands if isinstance(command, commands.AppendAudio)]) == 1
+    finally:
+        task.cancel()
+        if task2 is not None:
+            task2.cancel()
+        for pending in (task, task2):
+            if pending is not None:
+                with suppress(asyncio.CancelledError, Exception):
+                    await pending
+
+
+@pytest.mark.asyncio
+async def test_session_update_outcome_survives_observation_ring_eviction() -> None:
+    """A ``session.updated`` followed by a full observation ring is still the update's outcome.
+
+    The ring keeps 64 control events. The acceptance has to outlive that, or
+    the next append waits for an outcome the pump may already have delivered.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    try:
+        update = _session_update(input_audio_format="pcm_f32le")
+        update["event_id"] = "upd-evict"
+        ws.feed(update)
+        await _next_command(handle, commands.UpdateSession)
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
+        ring = handle._outbox._observations.maxlen
+        assert ring is not None
+        for index in range(ring):
+            handle.deliver(ErrorEvent(code="unrelated", message=str(index), related_event_id="other"))
+        assert not any(isinstance(event, SessionUpdated) for event in handle.observations_after(0))
+
+        ws.feed(_append(b"\x00" * 8))
+        accepted = await _next_append(handle)
         assert accepted.format == "pcm_f32le"
         assert _decoded_audio_nbytes(accepted) == 8
     finally:

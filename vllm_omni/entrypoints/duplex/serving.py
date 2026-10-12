@@ -37,6 +37,7 @@ from vllm_omni.engine.duplex.events import (
     SessionResumed,
     SessionResyncRequired,
     SessionUpdated,
+    new_event_id,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, ResumeRequest, parse_resume_request
@@ -103,10 +104,10 @@ class _PendingSessionUpdate:
 
 
 def _error_answers_session_update(event: ErrorEvent, event_id: str | None) -> bool:
-    related = event.related_event_id
-    if event_id:
-        return related == event_id
-    return related is None
+    # An update with no id must not match every error that also has none.
+    # ``_submit_command`` stamps an id when the client omits one, and the
+    # engine echoes that id on the rejection.
+    return bool(event_id) and event.related_event_id == event_id
 
 
 def _session_update_outcome(
@@ -702,6 +703,13 @@ class OmniDuplexSessionHandler:
             await self._wait_for_pending_session_update(attachment.handle)
             if attachment.handle.closed:
                 return
+            # The wait can outlive this socket. A resume that took over in
+            # that window owns the live envelope, so this reader must not
+            # translate or submit the audio it is still holding.
+            if not await self._attachment_registry.is_current_attachment(
+                attachment.handle.session_id, attachment.generation
+            ):
+                return
         # An accepted session.update is already on the outbox once the engine
         # emits it. Apply that before translate so the next append does not
         # keep the previous format while the pump is still sending an earlier
@@ -726,17 +734,23 @@ class OmniDuplexSessionHandler:
             if pending is None or handle.closed:
                 return
             seen = handle.observation_seq()
-            outcome = _session_update_outcome(handle.observations_after(pending.after_seq), pending.event_id)
+            # Retained, not the 64-event ring: a burst of later errors can
+            # evict the acceptance from the ring before this waiter runs.
+            outcome = _session_update_outcome(handle.retained_observations_after(pending.after_seq), pending.event_id)
             if isinstance(outcome, SessionUpdated):
                 self._apply_accepted_session_defaults(session_id, outcome.session)
-                self._pending_session_updates.pop(session_id, None)
+                self._clear_pending_session_update(handle)
                 return
             if isinstance(outcome, ErrorEvent):
-                self._pending_session_updates.pop(session_id, None)
+                self._clear_pending_session_update(handle)
                 return
             if not await handle.wait_for_observation(seen):
-                self._pending_session_updates.pop(session_id, None)
+                self._clear_pending_session_update(handle)
                 return
+
+    def _clear_pending_session_update(self, handle: DuplexSessionHandle) -> None:
+        self._pending_session_updates.pop(handle.session_id, None)
+        handle.disarm_observation_retention()
 
     def _apply_queued_session_updates(self, handle: DuplexSessionHandle) -> None:
         """Apply ``session.updated`` events the pump has not dequeued yet."""
@@ -758,10 +772,20 @@ class OmniDuplexSessionHandler:
         command: DuplexCommand,
         send_json: SendJson,
     ) -> None:
-        after_seq = attachment.handle.observation_seq() if isinstance(command, UpdateSession) else None
+        after_seq: int | None = None
+        if isinstance(command, UpdateSession):
+            # The engine only echoes ``event_id``. Without one, a rejection is
+            # indistinguishable from an earlier error that also has none.
+            event_id = command.event_id or new_event_id()
+            if command.event_id != event_id:
+                command = replace(command, event_id=event_id)
+            after_seq = attachment.handle.observation_seq()
+            attachment.handle.arm_observation_retention(after_seq, event_id)
         try:
             await attachment.handle.submit(command)
         except DuplexSessionError as exc:
+            if after_seq is not None:
+                attachment.handle.disarm_observation_retention()
             await send_json(envelope.error_payload(exc.code, str(exc), event_id=command.event_id))
             return
         if after_seq is not None:
