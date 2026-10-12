@@ -1597,11 +1597,12 @@ class DuplexSessionRunner:
             if commit_reservation is not None
             else model_state.audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
         )
-        if model_state.committed_audio_payload is not None:
+        prior_committed = model_state.mergeable_committed_audio()
+        if prior_committed is not None:
             if flushed is not None:
-                flushed = overlap_policy.merge_audio_payloads(model_state.committed_audio_payload, flushed)
+                flushed = overlap_policy.merge_audio_payloads(prior_committed, flushed)
             else:
-                flushed = model_state.committed_audio_payload
+                flushed = prior_committed
         if commit_reservation is not None:
             commit_reservation.commit()
         if flushed is None:
@@ -1782,9 +1783,10 @@ class DuplexSessionRunner:
             commit_reservation.commit()
             return False
         retained_payload: dict[str, object]
-        if model_state.committed_audio_payload is not None:
+        prior_committed = model_state.mergeable_committed_audio()
+        if prior_committed is not None:
             retained_payload = overlap_policy.merge_audio_payloads(
-                model_state.committed_audio_payload,
+                prior_committed,
                 deferred_payload,
             )
         else:
@@ -1827,11 +1829,12 @@ class DuplexSessionRunner:
             chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
         )
         final_payload = commit_reservation.payload
-        if model_state.committed_audio_payload is not None:
+        prior_committed = model_state.mergeable_committed_audio()
+        if prior_committed is not None:
             if final_payload is not None:
-                final_payload = overlap_policy.merge_audio_payloads(model_state.committed_audio_payload, final_payload)
+                final_payload = overlap_policy.merge_audio_payloads(prior_committed, final_payload)
             else:
-                final_payload = model_state.committed_audio_payload
+                final_payload = prior_committed
         commit_reservation.commit()
         if final_payload is not None:
             model_state.retain_committed_audio(

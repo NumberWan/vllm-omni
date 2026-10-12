@@ -586,6 +586,35 @@ test('AURA shell holds speech until PTT and opens one vision turn per two frames
   await app.ui.stopSession({ terminal: false });
 });
 
+test('AURA shows one user bubble and the assistant reply', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  const said = '哎，你看到我吗？';
+  const reply = '看到了，我正盯着你呢。';
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: said, item_id: 'u1',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: said, item_id: 'u1b',
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.delta', delta: reply, response_id: 'a1',
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.done', transcript: reply, response_id: 'a1',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.done',
+    item: { id: 'item_a1', role: 'assistant', content: [{ type: 'output_audio', transcript: reply }] },
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio.delta', text: reply, audio: '', response_id: 'a1',
+  });
+  const turns = [...app.elements.get('conversation').children];
+  assert.deepEqual(turns.map(row => row.children[1].textContent), [said, reply]);
+  await app.ui.stopSession({ terminal: false });
+});
+
 test('AURA hold-to-talk stops local playback and does not cancel the response', async () => {
   const app = shell('aura-ptt', 'manual', { realPlayback: true });
   await app.ui.startSession();

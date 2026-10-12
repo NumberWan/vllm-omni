@@ -111,6 +111,9 @@
   let assistantTextChannel = null;
   const assistantRowByResponse = new Map();
   let lastClosedAssistantText = '';
+  let lastClosedUserText = '';
+  let lastClosedUserAt = 0;
+  let lastClosedRole = null;
   let connectionReady = false;
   let turnCounter = 0;
   let stopping = null;
@@ -251,9 +254,24 @@
   function addTranscript(role, delta) {
     if (!delta) return;
     const turn = ensureTurn(role);
-    turn.value += delta;
+    if (turn.value === delta) return;
+    // A later event may resend the whole sentence after a prefix. Replace
+    // instead of appending a second copy onto the same bubble.
+    if (delta.startsWith(turn.value)) turn.value = delta;
+    else turn.value += delta;
     turn.text.textContent = turn.value;
     conversation.scrollTop = conversation.scrollHeight;
+  }
+
+  function rememberClosedTranscript(role, value) {
+    const text = String(value || '').trim();
+    if (!text) return;
+    if (role === 'assistant') lastClosedAssistantText = text;
+    if (role === 'user') {
+      lastClosedUserText = text;
+      lastClosedUserAt = Date.now();
+    }
+    lastClosedRole = role;
   }
 
   function finishTranscript(role, finalText = '') {
@@ -264,7 +282,7 @@
       current.value = finalText;
       current.text.textContent = finalText;
     }
-    if (role === 'assistant' && current.value) lastClosedAssistantText = current.value;
+    rememberClosedTranscript(role, current.value);
     current.row.classList.remove('turn-live');
     if (role === 'user') liveUserTurn = null;
     else liveAssistantTurn = null;
@@ -522,18 +540,33 @@
   }
 
   function handleTranscriptEvent(action) {
+    const text = typeof action.text === 'string' ? action.text.trim() : '';
+    if (
+      action.role === 'user'
+      && text
+      && !liveUserTurn
+      && lastClosedRole === 'user'
+      && text === lastClosedUserText
+      && Date.now() - lastClosedUserAt < 3000
+    ) {
+      // The same utterance is completed twice (commit + ASR). Keep one bubble.
+      return;
+    }
     if (action.role === 'assistant') {
       // Qwen may emit both text and audio-transcript representations.
       // Display one channel per response instead of duplicating the answer.
-      if (profile.deduplicateTranscript && assistantTextChannel && action.channel !== assistantTextChannel) return;
-      if (action.text) assistantTextChannel = action.channel || assistantTextChannel;
+      // A channel chosen before any visible text must not hide the real reply.
+      const visible = liveAssistantTurn && liveAssistantTurn.value;
+      if (profile.deduplicateTranscript && assistantTextChannel && action.channel !== assistantTextChannel && visible) return;
+      if (text) assistantTextChannel = action.channel || assistantTextChannel;
     }
     const responseId = action.responseId || null;
     const existing = responseId && action.role === 'assistant' ? assistantRowByResponse.get(responseId) : null;
     if (existing) {
       if (action.kind === 'text') {
         if (!action.text) return;
-        existing.value += action.text;
+        if (existing.value === action.text || action.text.startsWith(existing.value)) existing.value = action.text;
+        else existing.value += action.text;
       } else if (action.text) {
         existing.value = action.text;
       }
@@ -620,7 +653,16 @@
         if (profile.visionFollowWhileSpeaking) visionTurnLocked = true;
         break;
       case 'audio':
-        await handleAudioEvent(action);
+        if (action.event && action.event.text) {
+          handleTranscriptEvent({
+            kind: 'text',
+            role: 'assistant',
+            channel: 'audio',
+            text: action.event.text,
+            responseId,
+          });
+        }
+        if (action.event && (action.event.delta || action.event.audio)) await handleAudioEvent(action);
         break;
       case 'drain':
         requestPlaybackDrain(responseId);
@@ -945,6 +987,9 @@
     assistantTextChannel = null;
     assistantRowByResponse.clear();
     lastClosedAssistantText = '';
+    lastClosedUserText = '';
+    lastClosedUserAt = 0;
+    lastClosedRole = null;
     sendTurnButton.disabled = true;
     pttHeld = false;
     pttButton.disabled = true;
