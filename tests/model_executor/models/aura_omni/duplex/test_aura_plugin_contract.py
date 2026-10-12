@@ -597,12 +597,11 @@ def test_single_finished_sentence_is_one_non_resumable_submit() -> None:
     assert plugin.partial_stage_followup(plan, req_state) is None
 
 
-def test_empty_remainder_after_mid_gen_emit_defers_talker_end_sentinel() -> None:
-    """16:35/16:36 drop: full sentence emitted mid-gen, then finish with no remainder.
+def test_empty_remainder_after_mid_gen_emit_is_one_end_sentinel() -> None:
+    """16:35/17:30: full sentence emitted mid-gen, then finish with no remainder.
 
-    Immediate ``close_only`` + ``is_final_update`` end-sentinels Talker before
-    Code2Wav has codec groups (no stage 2/3). Defer the sentinel like the
-    remainder path: ``queue_close_after`` then followup close.
+    The sentence is already on Talker. The finish is one close sentinel.
+    Queueing another close_only submits twice and never reaches stage 2/3.
     """
     orchestrator, req_state = _sentence_plan_fixture()
     plugin = AuraDuplexPlugin(_encode_audio)
@@ -615,12 +614,9 @@ def test_empty_remainder_after_mid_gen_emit_defers_talker_end_sentinel() -> None
     finished = plugin.plan_partial_stage_output(orchestrator, 1, 0, _stage1_output(sentence, finished=True), req_state)
     assert finished is not None
     assert finished.close_only is True
-    assert finished.queue_close_after is True
-    assert finished.is_final_update is False
-    followup = plugin.partial_stage_followup(finished, req_state)
-    assert followup is not None
-    assert followup.close_only is True
-    assert followup.is_final_update is True
+    assert finished.queue_close_after is False
+    assert finished.is_final_update is True
+    assert plugin.partial_stage_followup(finished, req_state) is None
 
 
 def test_aura_draining_stages_are_declared_by_the_plugin() -> None:

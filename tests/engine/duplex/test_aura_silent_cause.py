@@ -381,11 +381,7 @@ def _stage1_chunk(request_id: str, text: str, *, finished: bool):
 
 @pytest.mark.asyncio
 async def test_empty_remainder_close_only_forwards_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    """17:30: mid-gen full sentence then empty finish must close Talker once.
-
-    Current path forwards the empty close_only plan and the followup sentinel,
-    producing two close_only aura2tts submits and no stage 2/3.
-    """
+    """17:30: mid-gen full sentence then empty finish must close Talker once."""
     from tests.engine.test_duplex_orchestrator import _build
 
     monkeypatch.delenv("VLLM_AURA_SENTENCE_TTS", raising=False)
