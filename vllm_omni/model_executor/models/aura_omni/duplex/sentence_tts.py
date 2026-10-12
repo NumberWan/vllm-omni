@@ -170,7 +170,9 @@ def plan_partial_stage_output(
     # is_final_update=True is a non-resumable end sentinel: it discards this
     # text and sets streaming_input=False on the in-flight sentence, so
     # Code2Wav sees a short codec and the user hears a blip.
-    queue_close_after = bool(chunk) and finished and not close_only and prior_emits > 0
+    # prior_emits > 0 includes an empty remainder: closing immediately aborts
+    # Talker before codec groups. A one-shot sentence stays a single submit.
+    queue_close_after = finished and prior_emits > 0
     logger.info(
         "[AURA] sentence TTS req=%s finished=%s close_only=%s text_len=%d queue_close_after=%s",
         req_state.request_id,

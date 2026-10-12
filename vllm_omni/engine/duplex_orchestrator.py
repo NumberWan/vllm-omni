@@ -428,6 +428,19 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             replica_id=replica_id,
         )
 
+    def _release_turn_before_talker_handoff(self, req_state: OrchestratorRequestState) -> None:
+        """Treat a started Talker handoff as draining before Stage2 is bound."""
+        # Stage2/3 segment stops carry a finish_reason. With streaming off, that
+        # finish_reason becomes RequestOutput.finished and the data plane ends
+        # the duplex turn on the first codec chunk (10:13: second sentence's
+        # stage-2 output then arrives as an unknown req).
+        req_state.streaming.enabled = True
+        runner = self.session_manager.runner_for_request_id(req_state.request_id)
+        if runner is None or not runner.session.capabilities.supports_concurrent_turn_requests:
+            return
+        runner.run.concurrent_turn_requests_released = True
+        runner.run.talker_handoff_request_ids.add(req_state.request_id)
+
     async def _route_output(
         self,
         stage_id: int,
@@ -438,17 +451,29 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> None:
         plan = self.plugin.plan_partial_stage_output(self, stage_id, replica_id, output, req_state)
         if plan is not None:
+            # Sentence TTS awaits Talker here, before Stage2 is bound and before
+            # intercept sets the release flag. A commit in that window must open
+            # the next Stage0 only, not abort this id.
+            self._release_turn_before_talker_handoff(req_state)
             # A text-bearing final is not itself the end sentinel. Submit the
             # sentence resumable first; the follow-up, if any, closes the stream.
-            await self._forward_to_next_stage(
-                req_state.request_id,
-                stage_id,
-                plan.output,
-                req_state,
-                src_replica_id=replica_id,
-                is_streaming_session=True,
-                is_final_update=plan.is_final_update and not plan.queue_close_after,
+            # Empty-remainder finish is already close_only+queue_close_after: the
+            # plan forward would be a first close_only and the followup a second
+            # (17:30: two aura2tts close_only, no stage 2/3). Skip the plan and
+            # keep only the followup end sentinel.
+            skip_plan_forward = bool(getattr(plan, "close_only", False)) and bool(
+                getattr(plan, "queue_close_after", False)
             )
+            if not skip_plan_forward:
+                await self._forward_to_next_stage(
+                    req_state.request_id,
+                    stage_id,
+                    plan.output,
+                    req_state,
+                    src_replica_id=replica_id,
+                    is_streaming_session=True,
+                    is_final_update=plan.is_final_update and not plan.queue_close_after,
+                )
             followup = self.plugin.partial_stage_followup(plan, req_state)
             if followup is not None:
                 await self._forward_to_next_stage(
