@@ -73,34 +73,59 @@ def _local_files_only(model: str) -> bool:
     return Path(model).exists()
 
 
-_OMNI_FA3_HUB_BACKEND = "FLASH_ATTN_3_HUB"
-_OMNI_FA3_HUB_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_FA3_HUB_BACKEND}
+def _ci_attention_backends(major: int | None = None) -> tuple[str, str]:
+    """Return ``(omni_backend, diffusers_backend)`` that can launch on this GPU.
+
+    No FlashAttention kernel covers A100, H100, H200, and B200 together.
+    ``FLASH_ATTN_3_HUB`` is Hopper-only (compute capability 9.x). FA2 hub
+    covers Ampere/Ada/Hopper (8.x/9.x) and rejects Blackwell. This matches
+    ``test_diffusers_backend_similarity`` and the Diffusers adapter: do not
+    pin FA2/FA3 on Blackwell, use SDPA (Diffusers ``native``) instead.
+    ``set_attention_backend`` only checks import, so a non-Hopper GPU must
+    not probe ``_flash_3_hub``.
+    """
+    if major is None and torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+    if major == 9:
+        return "FLASH_ATTN_3_HUB", "_flash_3_hub"
+    if major == 8:
+        return "FLASH_ATTN_HUB", "flash_hub"
+    return "TORCH_SDPA", "native"
 
 
-def _assert_omni_fa3_hub_resolves() -> None:
+def _assert_omni_backend_resolves(omni_backend: str) -> None:
     from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
     from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
 
-    path = CudaOmniPlatform.get_diffusion_attn_backend_cls(_OMNI_FA3_HUB_BACKEND, head_size=128)
-    expected = DiffusionAttentionBackendEnum.FLASH_ATTN_3_HUB.get_path()
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls(omni_backend, head_size=128)
+    expected = DiffusionAttentionBackendEnum[omni_backend].get_path()
     assert path == expected, path
-    print(f"Resolved Omni attention backend: {_OMNI_FA3_HUB_BACKEND} -> {path}")
+    print(f"Resolved Omni attention backend: {omni_backend} -> {path}")
 
 
-def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
-    _assert_omni_fa3_hub_resolves()
-    server_args = [
+def _omni_server_args(omni_backend: str, *, fa_deterministic: bool = False) -> tuple[list[str], dict[str, str]]:
+    args = [
         "--num-gpus",
         "1",
         "--stage-init-timeout",
         "300",
         "--init-timeout",
         "900",
-        "--fa-deterministic",
-        "--diffusion-attention-backend",
-        _OMNI_FA3_HUB_BACKEND,
     ]
-    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_FA3_HUB_ENV) as omni_server:
+    if fa_deterministic:
+        args.append("--fa-deterministic")
+    args.extend(["--diffusion-attention-backend", omni_backend])
+    return args, {"DIFFUSION_ATTENTION_BACKEND": omni_backend}
+
+
+def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
+    omni_backend, _ = _ci_attention_backends()
+    _assert_omni_backend_resolves(omni_backend)
+    server_args, env = _omni_server_args(
+        omni_backend,
+        fa_deterministic=omni_backend == "FLASH_ATTN_3_HUB",
+    )
+    with OmniServer(model, server_args, use_omni=True, env_dict=env) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
@@ -136,7 +161,8 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
         ).to("cuda")
-        pipe.transformer.set_attention_backend("_flash_3_hub")
+        _, diffusers_backend = _ci_attention_backends()
+        pipe.transformer.set_attention_backend(diffusers_backend)
         generator = torch.Generator(device="cuda").manual_seed(SEED)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT,
@@ -161,18 +187,10 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
 
 
 def _run_vllm_omni_qwen_image_2512(*, model: str, output_path: Path) -> Image.Image:
-    _assert_omni_fa3_hub_resolves()
-    server_args = [
-        "--num-gpus",
-        "1",
-        "--stage-init-timeout",
-        "300",
-        "--init-timeout",
-        "900",
-        "--diffusion-attention-backend",
-        _OMNI_FA3_HUB_BACKEND,
-    ]
-    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_FA3_HUB_ENV) as omni_server:
+    omni_backend, _ = _ci_attention_backends()
+    _assert_omni_backend_resolves(omni_backend)
+    server_args, env = _omni_server_args(omni_backend)
+    with OmniServer(model, server_args, use_omni=True, env_dict=env) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
@@ -208,7 +226,8 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
         ).to("cuda")
-        pipe.transformer.set_attention_backend("_flash_3_hub")
+        _, diffusers_backend = _ci_attention_backends()
+        pipe.transformer.set_attention_backend(diffusers_backend)
         generator = torch.Generator(device="cuda").manual_seed(SEED_2512)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT_2512,
@@ -233,7 +252,7 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "H200", "B200"]}, num_cards=1)
 def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
@@ -253,7 +272,7 @@ def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "H200", "B200"]}, num_cards=1)
 def test_qwen_image_2512_matches_diffusers_pixelwise(accuracy_artifact_root: Path) -> None:
     model = _model_2512_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_2512_ID)
