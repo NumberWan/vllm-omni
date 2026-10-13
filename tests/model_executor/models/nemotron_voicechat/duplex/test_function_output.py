@@ -21,6 +21,24 @@ class _Tokenizer:
         return [ord(char) for char in text]
 
 
+def test_parse_function_call_reads_the_data_plane_event():
+    plugin = NemotronVoiceChatDuplexPlugin(lambda *_args: None)
+    call = plugin.parse_function_call(
+        {
+            "function_call": True,
+            "call_id": "call_ab12",
+            "name": "get_weather",
+            "arguments": '{"city":"Taipei"}',
+        }
+    )
+    assert call == {
+        "call_id": "call_ab12",
+        "name": "get_weather",
+        "arguments": '{"city":"Taipei"}',
+    }
+    assert plugin.parse_function_call({"text": "hello"}) is None
+
+
 def test_function_call_output_queues_a_later_frame_batch():
     plugin = NemotronVoiceChatDuplexPlugin(lambda *_args: None)
     plugin._tokenizers["test-tokenizer"] = (None, _Tokenizer())

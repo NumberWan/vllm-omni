@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen duplex function calls.
 
-The session ledger owns call identity. This module only recognizes one completed
-Hermes-style ``<tool_call>`` in Thinker text, and holds that markup out of the
-spoken transcript until the call is complete. Parsing goes through vLLM's
-Hermes tool parser; this file does not define a second grammar.
+Recognize one completed Hermes-style ``<tool_call>`` in Thinker text, and hold
+that markup out of the spoken transcript until the call is complete. The server
+assigns ``call_id``. Parsing goes through vLLM's Hermes tool parser; this file
+does not define a second grammar.
 """
 
 from __future__ import annotations
