@@ -135,6 +135,9 @@ def test_tools_reach_the_chat_template_and_results_join_the_next_prompt():
         sampling_params=None,
     )
     messages = seen["messages"]
+    kwargs = seen["kwargs"]
+    assert isinstance(messages, list)
+    assert isinstance(kwargs, dict)
     assert messages[-2]["role"] == "assistant"
     assert messages[-2]["tool_calls"][0]["function"]["name"] == "get_current_time"
     assert messages[-1] == {
@@ -142,7 +145,7 @@ def test_tools_reach_the_chat_template_and_results_join_the_next_prompt():
         "tool_call_id": "call_1",
         "content": "2026-10-05T00:00:00+00:00",
     }
-    assert seen["kwargs"]["tools"] == [
+    assert kwargs["tools"] == [
         {"type": "function", "function": {"name": "get_current_time", "description": "Now"}}
     ]
 
@@ -167,7 +170,9 @@ def test_prompt_without_tools_does_not_pass_a_tools_argument():
         final=True,
         sampling_params=None,
     )
-    assert "tools" not in seen["kwargs"]
+    kwargs = seen["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert "tools" not in kwargs
     assert plan.prompt["prompt"] == repr([{"role": "user", "content": [{"type": "text", "text": "hello"}]}])
 
 
