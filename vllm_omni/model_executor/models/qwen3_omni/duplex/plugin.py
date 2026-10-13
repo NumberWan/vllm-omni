@@ -288,9 +288,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     ) -> dict[str, object]:
         """Queue an accepted tool result for the next Qwen prompt.
 
-        The session still calls ``maybe_continue_response``. Qwen is turn-commit,
-        so that closes the in-flight response; ``tool_followup_ready`` lets the
-        client open the follow-up with ``response.create``.
+        Qwen is turn-commit, so this turn's request is already finished. The
+        messages are read when the next duplex turn builds its prompt.
         """
         del config
         call_id = item.get("call_id")
@@ -328,7 +327,6 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
         updated = dict(current)
         updated["qwen_tool_messages"] = messages
-        updated["tool_followup_ready"] = True
         return updated
 
     def configure_sampling_params(self, *, runtime_config, defaults):

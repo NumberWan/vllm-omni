@@ -52,7 +52,6 @@ from vllm_omni.engine.duplex.session.context import DuplexSessionContext, StageO
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
-from vllm_omni.engine.duplex.session.tools import DuplexToolLedgerError
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
@@ -83,7 +82,7 @@ def _recognized_function_call(plugin: object, model_result: Mapping[str, object]
 
     A plugin dict that is not a call is ``_INVALID_FUNCTION_CALL``. A missing
     legacy ``call_id``/``name`` returns None so the caller can still project
-    the raw event without opening a ledger row.
+    the raw event.
     """
     parsed = plugin.parse_function_call(model_result)  # type: ignore[attr-defined]
     if parsed is not None:
@@ -893,16 +892,6 @@ class ModelChannel:
             )
             return close_reason, True
         if isinstance(function_call, dict):
-            try:
-                session.tool_ledger.open_call(
-                    call_id=function_call["call_id"],
-                    name=function_call["name"],
-                    arguments=function_call["arguments"],
-                    epoch=session.epoch,
-                )
-            except DuplexToolLedgerError as exc:
-                self._out.emit_error(exc.code, str(exc))
-                return close_reason, True
             self._out.emit(
                 {
                     "type": "function_call.done",
@@ -915,7 +904,6 @@ class ModelChannel:
             )
             return close_reason, True
         if model_result.get("function_call") is True:
-            # Malformed legacy flag: still project, without opening a ledger row.
             self._out.emit(
                 {
                     "type": "function_call.done",

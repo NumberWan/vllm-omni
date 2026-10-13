@@ -4,8 +4,8 @@
 
 The server does not execute tools. This process listens for a completed
 function call, runs ``get_current_time`` locally, and sends
-``function_call_output``. Qwen is turn-commit, so the follow-up answer is a
-new ``response.create`` after the tool result is accepted.
+``function_call_output``. The next duplex turn's prompt includes that tool
+message.
 """
 
 from __future__ import annotations

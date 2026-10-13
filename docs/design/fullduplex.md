@@ -436,9 +436,9 @@ policy that used to be two separately configured objects:
 | Half | Members |
 | --- | --- |
 | engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment) |
-| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `parse_function_call` (recognize one call; the session ledger owns its lifecycle), `runtime_config_for_function_output`, `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
+| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `parse_function_call` (recognize one call), `runtime_config_for_function_output` (feed an accepted result back into that model), `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
 
-Function-call identity, duplicates, cancel, and stale epochs live on the session. See [Duplex session tool contract](duplex_session_tools.md).
+A duplex tool call uses one client sequence. The client supplies tools, receives one function call, runs the function, and sends `function_call_output`. The server does not execute the function. Each model plugin implements the two hooks. `resumable_request=false` (Qwen3-Omni) keeps `role: tool` for the next duplex turn's prompt. `resumable_request=true` (Nemotron VoiceChat) places the result on a later frame of the request that is still open. Where a `call_id` book lives is left open.
 
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage

@@ -122,7 +122,7 @@ def test_tools_reach_the_chat_template_and_results_join_the_next_prompt():
         runtime,
         {"type": "function_call_output", "call_id": "call_1", "output": "2026-10-05T00:00:00+00:00"},
     )
-    assert updated["tool_followup_ready"] is True
+    assert "tool_followup_ready" not in updated
     plugin.plan_append(
         request_id="follow-up",
         fence=None,
