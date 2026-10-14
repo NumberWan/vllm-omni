@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexConfigError, realtime_item_to_history_message
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.realtime_events import prepared_function_call_output
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
@@ -297,14 +298,24 @@ class SessionControl:
             if not await self._wait_for_append_tail():
                 return
             try:
+                prepared_item = prepared_function_call_output(item, self._out.require_projector().conversation_items)
                 candidate_runtime_config = self._ctx.plugin.runtime_config_for_function_output(
                     session.config,
                     dict(session.runtime_config),
-                    item,
+                    prepared_item,
                 )
             except DuplexRuntimeConfigError as exc:
                 self._out.emit_error(exc.code, str(exc))
                 return
+            if isinstance(candidate_runtime_config, dict):
+                pending_tools = candidate_runtime_config.get("qwen_tool_messages")
+                if (
+                    isinstance(pending_tools, list)
+                    and pending_tools
+                    and not isinstance(candidate_runtime_config.get("qwen_tool_history_len"), int)
+                ):
+                    candidate_runtime_config = dict(candidate_runtime_config)
+                    candidate_runtime_config["qwen_tool_history_len"] = len(session.history)
             if candidate_runtime_config is not None:
                 session.replace_runtime_config(candidate_runtime_config)
             self._out.emit(

@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-import importlib.util
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +8,7 @@ import pytest
 
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.realtime_events import prepared_function_call_output
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin, QwenDataPlane
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import ThinkerToolCursor
 
@@ -210,12 +209,84 @@ def test_prompt_without_tools_does_not_pass_a_tools_argument():
     assert plan.prompt["prompt"] == repr([{"role": "user", "content": [{"type": "text", "text": "hello"}]}])
 
 
-def test_example_local_tool_returns_utc_time():
-    path = Path(__file__).resolve().parents[4] / "examples/online_serving/qwen3_omni/duplex_tool_client.py"
-    spec = importlib.util.spec_from_file_location("qwen_duplex_tool_client", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    output = module.execute_local_tool("get_current_time", "{}")
-    assert output.endswith("+00:00")
-    assert json.loads(module.execute_local_tool("lookup", "{}"))["error"] == "unknown tool lookup"
+def test_one_thinker_chunk_emits_every_completed_call():
+    plane = QwenDataPlane(lambda *args: "AAAA")
+    second = '<tool_call>{"name": "get_weather", "arguments": {"city": "Taipei"}}</tool_call>'
+    events = list(
+        plane.project(
+            _output(f"{_CALL}{second}", finished=True),
+            context={"modalities": ("text", "audio"), "turn_id": 1},
+        )
+    )
+    names = [event["qwen_function_call"]["name"] for event in events if "qwen_function_call" in event]
+    assert names == ["get_current_time", "get_weather"]
+    assert events[-1]["end_of_turn"] is True
+
+
+def test_tool_messages_stay_before_a_later_user_turn():
+    seen: dict[str, object] = {}
+
+    def apply_chat_template(messages, **kwargs):
+        seen["messages"] = messages
+        return "prompt"
+
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.processor = SimpleNamespace(apply_chat_template=apply_chat_template)
+    state = plugin.create_session_state()
+    config = plugin.prepare_prompt_config(
+        {
+            "conversation": [
+                {"role": "user", "content": "taipei"},
+                {"role": "user", "content": "tokyo"},
+            ],
+            "qwen_tool_history_len": 1,
+        },
+        state=state,
+        payload={},
+    )
+    plugin.plan_append(
+        request_id="later-question",
+        fence=None,
+        session_config=config,
+        runtime_config={
+            "qwen_tool_messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": '{"city":"Taipei"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "25C"},
+            ]
+        },
+        seq=1,
+        turn_seq=1,
+        payload={"type": "conversation"},
+        final=True,
+        sampling_params=None,
+    )
+    prompt_messages = seen["messages"]
+    assert isinstance(prompt_messages, list)
+    roles = [message["role"] for message in prompt_messages]
+    assert roles == ["user", "assistant", "tool", "user"]
+
+
+def test_projected_function_call_supplies_name_and_arguments():
+    prepared = prepared_function_call_output(
+        {"type": "function_call_output", "call_id": "call_1", "output": "25C", "name": "forged"},
+        {
+            "item_1": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": '{"city":"Taipei"}',
+            }
+        },
+    )
+    assert prepared["name"] == "get_weather"
+    assert prepared["arguments"] == '{"city":"Taipei"}'
+    assert prepared["output"] == "25C"

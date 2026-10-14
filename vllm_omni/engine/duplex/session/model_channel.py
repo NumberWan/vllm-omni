@@ -335,11 +335,15 @@ class ModelChannel:
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
+            prompt_config = {**request_context.session_config, "conversation": list(session.history)}
+            tool_history_len = request_context.runtime_config.get("qwen_tool_history_len")
+            if isinstance(tool_history_len, int):
+                prompt_config["qwen_tool_history_len"] = tool_history_len
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
                 session_config=self._ctx.plugin.prepare_prompt_config(
-                    {**request_context.session_config, "conversation": list(session.history)},
+                    prompt_config,
                     state=self._ctx.model_state,
                     payload=prompt_payload,
                 ),
