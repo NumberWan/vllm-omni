@@ -44,10 +44,12 @@ from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
     discard_pending_commit_item,
     project_internal_event,
+    realtime_session_payload,
     resolve_clear_output_audio,
     resolve_truncate_item,
     retrieve_item_events,
 )
+from vllm_omni.protocol.realtime.session import RealtimeInputDefaults
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -549,6 +551,29 @@ def test_explicit_input_committed_id_removes_matching_pending_commit():
     )
     assert state.pending_commit_item_ids == []
     assert second[0].item_id == "item_b"
+
+
+def test_projected_session_updated_keeps_the_nested_input_sample_rate():
+    """A flat ``pcm16`` must not hide ``audio.input.format.rate`` on the projected session.
+
+    ``session.updated`` keeps the client's nested format object and also fills
+    ``input_audio_format``. ``audio/pcm`` becomes ``pcm16``, which has no rate,
+    so the 24000 Hz declaration has to survive into the append defaults.
+    """
+    state = RealtimeProjectionState(session_id="duplex-rate", model="test-model")
+    nested_audio = {"input": {"format": {"type": "audio/pcm", "rate": 24000}}}
+    state.apply_session_defaults({"audio": nested_audio})
+    # ``as_public_dict`` retains that audio block; projection then adds the flat format.
+    session = realtime_session_payload(
+        state,
+        {"id": "duplex-rate", "model": "test-model", "audio": nested_audio, "response_format": "wav"},
+    )
+    assert session["input_audio_format"] == "pcm16"
+    assert session["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+
+    defaults = RealtimeInputDefaults().with_session_payload(session)
+    assert defaults.input_audio_format == "pcm16"
+    assert defaults.input_sample_rate_hz == 24000
 
 
 def test_discard_pending_commit_item_clears_aborted_head():
