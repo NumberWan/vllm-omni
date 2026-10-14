@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin, QwenDataPlane
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import ThinkerToolCursor
 
@@ -120,7 +121,13 @@ def test_tools_reach_the_chat_template_and_results_join_the_next_prompt():
     updated = plugin.runtime_config_for_function_output(
         DuplexSessionConfig(model="qwen"),
         runtime,
-        {"type": "function_call_output", "call_id": "call_1", "output": "2026-10-05T00:00:00+00:00"},
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "name": "get_current_time",
+            "arguments": "{}",
+            "output": "2026-10-05T00:00:00+00:00",
+        },
     )
     assert "tool_followup_ready" not in updated
     plugin.plan_append(
@@ -146,6 +153,35 @@ def test_tools_reach_the_chat_template_and_results_join_the_next_prompt():
         "content": "2026-10-05T00:00:00+00:00",
     }
     assert kwargs["tools"] == [{"type": "function", "function": {"name": "get_current_time", "description": "Now"}}]
+
+
+def test_qwen_preparation_uses_the_supplied_call_and_can_be_repeated():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    parsed = plugin.parse_function_call(
+        {"qwen_function_call": {"call_id": "call_1", "name": "get_weather", "arguments": '{"city":"Taipei"}'}}
+    )
+    assert parsed == {"call_id": "call_1", "name": "get_weather", "arguments": '{"city":"Taipei"}'}
+    item = {
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "name": "get_weather",
+        "arguments": '{"city":"Taipei"}',
+        "output": "25C",
+    }
+    first = plugin.runtime_config_for_function_output(DuplexSessionConfig(model="qwen"), {}, item)
+    second = plugin.runtime_config_for_function_output(DuplexSessionConfig(model="qwen"), {}, item)
+    assert first == second
+    assert first["qwen_tool_messages"][0]["tool_calls"][0]["function"] == {
+        "name": "get_weather",
+        "arguments": '{"city":"Taipei"}',
+    }
+    with pytest.raises(DuplexRuntimeConfigError) as refused:
+        plugin.runtime_config_for_function_output(
+            DuplexSessionConfig(model="qwen"),
+            {},
+            {"type": "function_call_output", "call_id": "call_1", "name": "forged", "output": "25C"},
+        )
+    assert refused.value.code == "invalid_function_call_output"
 
 
 def test_prompt_without_tools_does_not_pass_a_tools_argument():

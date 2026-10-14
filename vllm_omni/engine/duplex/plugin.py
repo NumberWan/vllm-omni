@@ -522,7 +522,10 @@ class DuplexModelPlugin(ABC):
         return None
 
     # Optional hook: build the runtime config patch for a function-call output
-    # item. Plugins without tools keep the default (no change).
+    # item. ``name`` and ``arguments`` on that item are the call context for
+    # this preparation. A plugin that needs them reads those fields and refuses
+    # when they are absent. Parsing and this method do not consume a
+    # plugin-local call cache. Plugins without tools keep the default (no change).
     def runtime_config_for_function_output(
         self,
         config: DuplexSessionConfig,

@@ -190,7 +190,6 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self.data_plane = QwenDataPlane(encode_audio)
         self.processor = None
         self._processor_lock = asyncio.Lock()
-        self._function_calls: dict[str, dict[str, str]] = {}
 
     def capabilities(self, *, max_sessions):
         return DuplexCapabilities(
@@ -276,9 +275,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             return None
         if not isinstance(arguments, str):
             arguments = str(arguments)
-        call = {"call_id": call_id, "name": name, "arguments": arguments}
-        self._function_calls[call_id] = call
-        return call
+        return {"call_id": call_id, "name": name, "arguments": arguments}
 
     def runtime_config_for_function_output(
         self,
@@ -290,10 +287,15 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
 
         Qwen is turn-commit, so this turn's request is already finished. The
         messages are read when the next duplex turn builds its prompt.
+        ``name`` and ``arguments`` come from the preparation item. This method
+        does not read a plugin-local call cache, so a refused preparation can
+        be repeated with the same item.
         """
         del config
         call_id = item.get("call_id")
         output = item.get("output")
+        name = item.get("name")
+        arguments = item.get("arguments")
         if not isinstance(call_id, str) or not call_id:
             raise DuplexRuntimeConfigError(
                 "function_call_output requires call_id",
@@ -304,13 +306,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 "function_call_output requires a string output",
                 code="invalid_function_call_output",
             )
-        known = self._function_calls.pop(call_id, None)
-        name = known["name"] if known is not None else item.get("name")
-        arguments = known["arguments"] if known is not None else item.get("arguments", "")
-        if not isinstance(name, str) or not name:
-            name = "function"
-        if not isinstance(arguments, str):
-            arguments = json.dumps(arguments, ensure_ascii=False)
+        if not isinstance(name, str) or not name or not isinstance(arguments, str):
+            raise DuplexRuntimeConfigError(
+                "function_call_output requires the session call name and arguments",
+                code="invalid_function_call_output",
+            )
         messages = list(current.get("qwen_tool_messages") or [])
         messages.append(
             {

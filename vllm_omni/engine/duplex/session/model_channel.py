@@ -857,6 +857,24 @@ class ModelChannel:
         await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
 
+    async def _expose_function_call(self, function_call: Mapping[str, object]) -> None:
+        """Publish one recognized call as ``function_call.done``.
+
+        Parsed calls enter here before the client can see them. #8758 registers
+        the session call origin in this method before the same publish.
+        """
+        session = self._ctx.session
+        self._out.emit(
+            {
+                "type": "function_call.done",
+                "session_id": session.session_id,
+                "epoch": session.epoch,
+                "call_id": function_call["call_id"],
+                "name": function_call["name"],
+                "arguments": function_call["arguments"],
+            }
+        )
+
     async def _send_one_model_output_event(
         self,
         model_result: dict[str, object],
@@ -892,16 +910,7 @@ class ModelChannel:
             )
             return close_reason, True
         if isinstance(function_call, dict):
-            self._out.emit(
-                {
-                    "type": "function_call.done",
-                    "session_id": session.session_id,
-                    "epoch": session.epoch,
-                    "call_id": function_call["call_id"],
-                    "name": function_call["name"],
-                    "arguments": function_call["arguments"],
-                }
-            )
+            await self._expose_function_call(function_call)
             return close_reason, True
         if model_result.get("function_call") is True:
             self._out.emit(
