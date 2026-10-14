@@ -112,6 +112,7 @@
   const assistantRowByResponse = new Map();
   let lastClosedAssistantText = '';
   let lastClosedUserText = '';
+  let lastClosedUserItemId = '';
   let lastClosedUserAt = 0;
   let lastClosedRole = null;
   let connectionReady = false;
@@ -254,27 +255,28 @@
   function addTranscript(role, delta) {
     if (!delta) return;
     const turn = ensureTurn(role);
-    if (turn.value === delta) return;
     // A later event may resend the whole sentence after a prefix. Replace
-    // instead of appending a second copy onto the same bubble.
-    if (delta.startsWith(turn.value)) turn.value = delta;
+    // only when the new text strictly extends what is already shown.
+    // An identical incremental delta ("哈" then "哈") must append.
+    if (turn.value && delta.startsWith(turn.value) && delta.length > turn.value.length) turn.value = delta;
     else turn.value += delta;
     turn.text.textContent = turn.value;
     conversation.scrollTop = conversation.scrollHeight;
   }
 
-  function rememberClosedTranscript(role, value) {
+  function rememberClosedTranscript(role, value, itemId = '') {
     const text = String(value || '').trim();
     if (!text) return;
     if (role === 'assistant') lastClosedAssistantText = text;
     if (role === 'user') {
       lastClosedUserText = text;
+      lastClosedUserItemId = itemId || '';
       lastClosedUserAt = Date.now();
     }
     lastClosedRole = role;
   }
 
-  function finishTranscript(role, finalText = '') {
+  function finishTranscript(role, finalText = '', itemId = '') {
     const turn = role === 'user' ? liveUserTurn : liveAssistantTurn;
     if (!turn && !finalText) return;
     const current = turn || ensureTurn(role);
@@ -282,7 +284,7 @@
       current.value = finalText;
       current.text.textContent = finalText;
     }
-    rememberClosedTranscript(role, current.value);
+    rememberClosedTranscript(role, current.value, itemId);
     current.row.classList.remove('turn-live');
     if (role === 'user') liveUserTurn = null;
     else liveAssistantTurn = null;
@@ -547,9 +549,12 @@
       && !liveUserTurn
       && lastClosedRole === 'user'
       && text === lastClosedUserText
+      && action.itemId
+      && action.itemId === lastClosedUserItemId
       && Date.now() - lastClosedUserAt < 3000
     ) {
-      // The same utterance is completed twice (commit + ASR). Keep one bubble.
+      // Commit and ASR complete the same item twice. A new item with the same
+      // words is a second utterance and keeps its own bubble.
       return;
     }
     if (action.role === 'assistant') {
@@ -565,7 +570,7 @@
     if (existing) {
       if (action.kind === 'text') {
         if (!action.text) return;
-        if (existing.value === action.text || action.text.startsWith(existing.value)) existing.value = action.text;
+        if (action.text.startsWith(existing.value) && action.text.length > existing.value.length) existing.value = action.text;
         else existing.value += action.text;
       } else if (action.text) {
         existing.value = action.text;
@@ -599,7 +604,7 @@
         turn.text.textContent = action.text;
         if (responseId) assistantRowByResponse.set(responseId, turn);
       }
-    } else finishTranscript(action.role, action.text);
+    } else finishTranscript(action.role, action.text, action.itemId);
   }
 
   async function handleEvent(event, action = profile.mapEvent(event)) {
@@ -988,6 +993,7 @@
     assistantRowByResponse.clear();
     lastClosedAssistantText = '';
     lastClosedUserText = '';
+    lastClosedUserItemId = '';
     lastClosedUserAt = 0;
     lastClosedRole = null;
     sendTurnButton.disabled = true;

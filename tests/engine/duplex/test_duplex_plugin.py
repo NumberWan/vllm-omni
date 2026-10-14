@@ -479,3 +479,26 @@ def test_mergeable_committed_audio_stops_after_consume_starts() -> None:
     state.clear_committed_audio()
     assert state.committed_audio_payload is None
     assert state.committed_audio_consume_started is False
+
+
+def test_slots_session_states_track_committed_audio_consume() -> None:
+    """AURA and Qwen override retain/clear on slots dataclasses.
+
+    mergeable_committed_audio() reads committed_audio_consume_started. Without
+    the field on those states, the first commit raises AttributeError.
+    """
+    from vllm_omni.model_executor.models.aura_omni.duplex.session import AuraServingSessionState
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
+
+    for state in (AuraServingSessionState(), QwenDuplexSessionState()):
+        first = {"audio": "YQ=="}
+        state.retain_committed_audio(first, operation_id="op1", reserved_bytes=4)
+        assert state.mergeable_committed_audio() is first
+        state.mark_committed_audio_consume_started()
+        assert state.mergeable_committed_audio() is None
+        state.retain_committed_audio({"audio": "Yg=="}, operation_id="op2", reserved_bytes=4)
+        assert state.committed_audio_consume_started is False
+        assert state.mergeable_committed_audio() == {"audio": "Yg=="}
+        state.clear_committed_audio()
+        assert state.committed_audio_payload is None
+        assert state.committed_audio_consume_started is False
