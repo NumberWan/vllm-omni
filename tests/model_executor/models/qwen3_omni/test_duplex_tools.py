@@ -10,7 +10,7 @@ import pytest
 
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin, QwenDataPlane
-from vllm_omni.model_executor.models.qwen3_omni.duplex.tools import ThinkerToolCursor
+from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import ThinkerToolCursor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

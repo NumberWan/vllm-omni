@@ -27,7 +27,7 @@ from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConf
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
-from vllm_omni.model_executor.models.qwen3_omni.duplex.tools import (
+from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
     chat_template_tools,
 )
