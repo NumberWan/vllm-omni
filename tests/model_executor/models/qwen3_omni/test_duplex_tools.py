@@ -145,9 +145,7 @@ def test_tools_reach_the_chat_template_and_results_join_the_next_prompt():
         "tool_call_id": "call_1",
         "content": "2026-10-05T00:00:00+00:00",
     }
-    assert kwargs["tools"] == [
-        {"type": "function", "function": {"name": "get_current_time", "description": "Now"}}
-    ]
+    assert kwargs["tools"] == [{"type": "function", "function": {"name": "get_current_time", "description": "Now"}}]
 
 
 def test_prompt_without_tools_does_not_pass_a_tools_argument():
