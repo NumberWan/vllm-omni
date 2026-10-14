@@ -115,6 +115,7 @@
   let lastClosedUserItemId = '';
   let lastClosedUserAt = 0;
   let lastClosedRole = null;
+  const transcriptDoneResponses = new Set();
   let connectionReady = false;
   let turnCounter = 0;
   let stopping = null;
@@ -255,11 +256,9 @@
   function addTranscript(role, delta) {
     if (!delta) return;
     const turn = ensureTurn(role);
-    // A later event may resend the whole sentence after a prefix. Replace
-    // only when the new text strictly extends what is already shown.
-    // An identical incremental delta ("哈" then "哈") must append.
-    if (turn.value && delta.startsWith(turn.value) && delta.length > turn.value.length) turn.value = delta;
-    else turn.value += delta;
+    // Deltas are incremental, including a longer one that starts with the
+    // previous delta ("哈" then "哈哈"). Cumulative text arrives as text-final.
+    turn.value += delta;
     turn.text.textContent = turn.value;
     conversation.scrollTop = conversation.scrollHeight;
   }
@@ -566,12 +565,14 @@
       if (text) assistantTextChannel = action.channel || assistantTextChannel;
     }
     const responseId = action.responseId || null;
+    if (action.kind === 'text-final' && action.role === 'assistant' && responseId) {
+      transcriptDoneResponses.add(responseId);
+    }
     const existing = responseId && action.role === 'assistant' ? assistantRowByResponse.get(responseId) : null;
     if (existing) {
       if (action.kind === 'text') {
         if (!action.text) return;
-        if (action.text.startsWith(existing.value) && action.text.length > existing.value.length) existing.value = action.text;
-        else existing.value += action.text;
+        existing.value += action.text;
       } else if (action.text) {
         existing.value = action.text;
       }
@@ -659,13 +660,21 @@
         break;
       case 'audio':
         if (action.event && action.event.text) {
-          handleTranscriptEvent({
-            kind: 'text',
-            role: 'assistant',
-            channel: 'audio',
-            text: action.event.text,
-            responseId,
-          });
+          const shown = responseId && assistantRowByResponse.get(responseId);
+          const completedEcho = shown
+            && transcriptDoneResponses.has(responseId)
+            && action.event.text === shown.value;
+          // Audio deltas can carry the transcript already closed by
+          // output_audio_transcript.done. That copy is not a new delta.
+          if (!completedEcho) {
+            handleTranscriptEvent({
+              kind: 'text',
+              role: 'assistant',
+              channel: 'audio',
+              text: action.event.text,
+              responseId,
+            });
+          }
         }
         if (action.event && (action.event.delta || action.event.audio)) await handleAudioEvent(action);
         break;
@@ -991,6 +1000,7 @@
     turnSubmitted = false;
     assistantTextChannel = null;
     assistantRowByResponse.clear();
+    transcriptDoneResponses.clear();
     lastClosedAssistantText = '';
     lastClosedUserText = '';
     lastClosedUserItemId = '';
