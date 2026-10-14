@@ -607,6 +607,15 @@ test('AURA shows one bubble per item and keeps repeated syllables', async () => 
     type: 'conversation.item.input_audio_transcription.delta', delta: '哈', item_id: 'u2',
   });
   await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: '哈哈', item_id: 'u2',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈', item_id: 'u4',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈哈', item_id: 'u4',
+  });
+  await app.ui.handleEvent({
     type: 'response.output_audio_transcript.delta', delta: reply, response_id: 'a1',
   });
   await app.ui.handleEvent({
@@ -620,7 +629,7 @@ test('AURA shows one bubble per item and keeps repeated syllables', async () => 
     type: 'response.output_audio.delta', text: reply, audio: '', response_id: 'a1',
   });
   const turns = [...app.elements.get('conversation').children];
-  assert.deepEqual(turns.map(row => row.children[1].textContent), [said, said, '哈哈', reply]);
+  assert.deepEqual(turns.map(row => row.children[1].textContent), [said, said, '哈哈', '哈哈哈', reply]);
   await app.ui.stopSession({ terminal: false });
 });
 

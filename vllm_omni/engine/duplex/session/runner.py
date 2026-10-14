@@ -1836,6 +1836,10 @@ class DuplexSessionRunner:
             else:
                 final_payload = prior_committed
         commit_reservation.commit()
+        if final_payload is not None and isinstance(realtime_item_id, str) and realtime_item_id:
+            # Stamp the item id before retain. A copy made afterwards would not
+            # be the retained object, so the append would skip consume and clear.
+            final_payload = {**final_payload, "realtime_item_id": realtime_item_id}
         if final_payload is not None:
             model_state.retain_committed_audio(
                 final_payload,
@@ -1861,8 +1865,6 @@ class DuplexSessionRunner:
             )
         )
         if final_payload is not None:
-            if isinstance(realtime_item_id, str) and realtime_item_id:
-                final_payload = {**final_payload, "realtime_item_id": realtime_item_id}
             await self._start_append(
                 {**final_payload, "duplex_turn_id": data_plane_turn_id},
                 final=True,
