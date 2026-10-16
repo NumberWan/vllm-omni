@@ -1558,29 +1558,107 @@ async def test_adopted_session_update_publishes_when_replace_fails(monkeypatch: 
         await close_harness(h)
 
 
-@pytest.mark.asyncio
-async def test_runtime_replace_failure_after_config_still_echoes_the_patch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A runtime-config failure after ``replace_config`` still echoes the accepted patch.
+def _stage_turn_detection(monkeypatch: pytest.MonkeyPatch):
+    """Stage a detector without building Silero. ``prepare`` still leaves the patch in place."""
 
-    The live config object is already the candidate, so an id-only fallback would
-    leave serving on the old rate.
+    class _StagedDetector:
+        def __init__(self) -> None:
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+
+    staged = _StagedDetector()
+
+    def fake_prepare(cls, payload, *, backend_provider=None):
+        del cls, payload, backend_provider
+        from vllm_omni.engine.duplex.turn_detection import PendingTurnDetectionUpdate
+
+        return PendingTurnDetectionUpdate(config=None, detector=staged)
+
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.control.PendingTurnDetectionUpdate.prepare",
+        classmethod(fake_prepare),
+    )
+    return staged
+
+
+def _patch_with_turn_detection() -> dict[str, object]:
+    patch = _accepted_format_patch()
+    patch["turn_detection"] = {"type": "server_vad", "threshold": 0.5}
+    return patch
+
+
+@pytest.mark.asyncio
+async def test_runtime_replace_failure_finishes_adoption_before_echo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A runtime-config failure after ``replace_config`` is finished before the echo.
+
+    The first replace raises. The except path applies the runtime config and
+    commits the staged detector, so the echoed ``turn_detection`` is live and
+    the engine is not left on the new config with the old runtime config.
+    """
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+
+    calls = {"n": 0}
+    original = DuplexEngineSession.replace_runtime_config
+
+    def flaky(self, runtime_config: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("runtime replace exploded")
+        original(self, runtime_config)
+
+    staged = _stage_turn_detection(monkeypatch)
+    h = await open_harness()
+    monkeypatch.setattr(DuplexEngineSession, "replace_runtime_config", flaky)
+    try:
+        events = await h.run(commands.UpdateSession(patch=_patch_with_turn_detection(), event_id="evt-runtime"))
+        assert calls["n"] == 2
+        assert types(events) == ["session.updated"]
+        assert h.session.config.temperature == 0.3
+        assert h.session.runtime_config["duplex_stage_sampling_params"]["0"]["temperature"] == 0.3
+        assert h.runner.control._detector is staged
+        assert staged.reset_calls == 0
+        assert events[0].session["turn_detection"]["type"] == "server_vad"
+        assert all(getattr(event, "code", None) != "internal_error" for event in events)
+        _assert_serving_applies_adopted_session(events[0].session)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_runtime_replace_that_cannot_finish_drops_the_uncommitted_vad(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the runtime config never lands, restore the previous config and reject the detector.
+
+    The echo must not advertise the patch's ``turn_detection``. Projection still
+    carries the format and rate the projector already adopted.
     """
 
     def explode(self, runtime_config: object) -> None:
         del self, runtime_config
         raise RuntimeError("runtime replace exploded")
 
+    staged = _stage_turn_detection(monkeypatch)
     h = await open_harness()
+    temperature = h.session.config.temperature
     monkeypatch.setattr(
         "vllm_omni.engine.duplex.session.engine_session.DuplexEngineSession.replace_runtime_config",
         explode,
     )
     try:
-        events = await h.run(commands.UpdateSession(patch=_accepted_format_patch(), event_id="evt-runtime"))
+        events = await h.run(commands.UpdateSession(patch=_patch_with_turn_detection(), event_id="evt-runtime-stuck"))
         assert types(events) == ["session.updated"]
-        assert h.session.config.temperature == 0.3
+        assert h.session.config.temperature == temperature
+        assert h.runner.control._detector is not staged
+        assert staged.reset_calls == 1
+        # Projection fills a missing turn_detection with None. That is not the
+        # new server_vad config prepare wrote into the patch.
+        assert events[0].session.get("turn_detection") is None
         assert all(getattr(event, "code", None) != "internal_error" for event in events)
-        _assert_serving_applies_adopted_session(events[0].session)
+        envelope = RealtimeEnvelope()
+        envelope.apply_accepted_session(events[0].session)
+        assert envelope.defaults.input_audio_format == "pcm16"
+        assert envelope.defaults.input_sample_rate_hz == 24000
     finally:
         await close_harness(h)
 
