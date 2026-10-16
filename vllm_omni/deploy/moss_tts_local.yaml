@@ -18,9 +18,13 @@ connectors:
       connector_get_max_wait: 300
       initial_codec_chunk_frames: 1  # 80 ms first packet at 48 kHz
       codec_chunk_frames: 15  # 1.2 s steady chunks
+      # Stage0 sends frame 1; Stage1 adds 160 ms, then 480 ms, then 1.2 s.
+      codec_chunk_ramp: [3, 6, 15]
       codec_left_context_frames: 0
       generation_min_batch_size: 16
       generation_max_wait_ms: 6
+      # Decode first chunks separately from longer continuation chunks.
+      generation_first_chunk_express: true
 stages:
   - stage_id: 0
     max_num_seqs: 64
@@ -72,17 +76,22 @@ platforms:
           mrv2_batch_prefill: true
           mrv2_direct_tokens: true
           local_compile_audio_sampler: true
+          mrv2_eager_mtp: true
         compilation_config:
           mode: 3
           cudagraph_mode: FULL
           max_cudagraph_capture_size: 512
           cudagraph_num_of_warmups: 1
+          inductor_compile_config:
+            triton.enable_pdl: true
+            coordinate_descent_tuning: true
+            max_autotune_pointwise: true
         kv_cache_memory_bytes: 34359738368  # 32 GiB
         enable_prefix_caching: true
         attention_config:
           backend: TRITON_ATTN
       - stage_id: 1
-        # Graphs cover both batch B and codec chunk length T={1, 15}.
+        # Codec frame graph buckets are derived from codec_chunk_ramp above.
         compilation_config:
           mode: 3
           backend: inductor
@@ -92,6 +101,9 @@ platforms:
           inductor_compile_config:
             combo_kernels: false
             benchmark_combo_kernel: false
+            triton.enable_pdl: true
+            coordinate_descent_tuning: true
+            max_autotune_pointwise: true
         max_num_seqs: 128
         hf_overrides:
           codec_attention_backend: triton_slot

@@ -589,7 +589,9 @@ def _realtime_response_done_event(
             "status": status,
             "status_details": status_details,
             "output": [_response_done_output_item(state, response_id, status=status)],
-            "metadata": dict(event),
+            # Audio was delivered by output_audio.delta. Copying the waveform
+            # into the terminal doubles queue usage and defeats its reserve.
+            "metadata": {key: value for key, value in event.items() if key != "audio"},
         },
     )
 
@@ -965,6 +967,8 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         item_id = _acknowledge_pending_commit_item_id(
             state, event_item_id if isinstance(event_item_id, str) and event_item_id else None
         )
+        if isinstance(event_item_id, str) and event_item_id in state.pending_commit_item_ids:
+            state.pending_commit_item_ids.remove(event_item_id)
         committed_item = state.conversation_items.get(item_id)
         commit_events: list[DuplexEvent] = []
         if committed_item is None:
