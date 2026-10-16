@@ -599,18 +599,37 @@ class DuplexModelPlugin(ABC):
         del prompt
         return None
 
+    def bind_inflight_response(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        response_id: str | None,
+    ) -> dict[str, object] | None:
+        """Remember which response owns a just-submitted tool follow-up.
+
+        The default has no inflight tool state. A plugin that does returns a
+        runtime patch naming ``response_id``; ``None`` leaves the runtime as it
+        is.
+        """
+        del runtime_config, response_id
+        return None
+
     def runtime_config_after_response(
         self,
         runtime_config: Mapping[str, object],
         *,
         committed: bool,
+        awaiting_playback: bool = False,
+        response_id: str | None = None,
     ) -> dict[str, object] | None:
         """Adjust runtime after a response ends.
 
         ``committed`` is false when the response was cancelled or failed before
-        its text was stored. The default keeps the runtime unchanged.
+        its text was stored. ``awaiting_playback`` means audio was produced and
+        a later playback ACK may still store that text. The default keeps the
+        runtime unchanged.
         """
-        del runtime_config, committed
+        del runtime_config, committed, awaiting_playback, response_id
         return None
 
     def runtime_config_after_model_output(
@@ -628,13 +647,31 @@ class DuplexModelPlugin(ABC):
         return None
 
 
-def settle_response_runtime(plugin: DuplexModelPlugin, session: object, *, committed: bool) -> None:
-    """Let the plugin keep or drop response-scoped runtime after ``end_response``."""
+def settle_response_runtime(
+    plugin: object,
+    session: object,
+    *,
+    committed: bool,
+    awaiting_playback: bool = False,
+    response_id: str | None = None,
+) -> None:
+    """Let the plugin keep or drop response-scoped runtime after ``end_response``.
+
+    ``runtime_config_after_response`` is optional. A plugin object that does
+    not implement it, or implements something that is not callable, is left
+    unchanged.
+    """
     runtime = getattr(session, "runtime_config", None)
     replace = getattr(session, "replace_runtime_config", None)
-    if not isinstance(runtime, Mapping) or not callable(replace):
+    hook = getattr(plugin, "runtime_config_after_response", None)
+    if not isinstance(runtime, Mapping) or not callable(replace) or not callable(hook):
         return
-    updated = plugin.runtime_config_after_response(runtime, committed=committed)
+    updated = hook(
+        runtime,
+        committed=committed,
+        awaiting_playback=awaiting_playback,
+        response_id=response_id,
+    )
     if updated is not None:
         replace(updated)
 

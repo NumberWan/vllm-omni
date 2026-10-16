@@ -92,11 +92,16 @@ class QwenDataPlane(DuplexDataPlane):
         self._tool_cursors.pop(request_id, None)
 
     def close_stream(self, request_id):
-        pass
+        self._tool_cursors.pop(request_id, None)
 
     def close_session(self, session_id, *, active_request_id=None):
         self.terminal = {
             rid for rid in self.terminal if not duplex_resource_request_belongs_to_session(rid, session_id)
+        }
+        self._tool_cursors = {
+            rid: cursor
+            for rid, cursor in self._tool_cursors.items()
+            if not duplex_resource_request_belongs_to_session(rid, session_id)
         }
 
     def project(self, result, *, context=None):
@@ -302,6 +307,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         inflight = current.get("qwen_tool_turns_inflight")
         if isinstance(inflight, list):
             updated["qwen_tool_turns_inflight"] = inflight
+        response_id = current.get("qwen_tool_response_id")
+        if isinstance(response_id, str) and response_id:
+            updated["qwen_tool_response_id"] = response_id
         anchors = current.get("qwen_call_anchors")
         if isinstance(anchors, Mapping):
             updated["qwen_call_anchors"] = dict(anchors)
@@ -342,24 +350,49 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             patch["qwen_call_anchors"] = prompt.pop("_qwen_call_anchors")
         return patch or None
 
+    def bind_inflight_response(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        response_id: str | None,
+    ) -> dict[str, object] | None:
+        if not isinstance(response_id, str) or not response_id:
+            return None
+        if not isinstance(runtime_config.get("qwen_tool_turns_inflight"), list):
+            return None
+        if runtime_config.get("qwen_tool_response_id") == response_id:
+            return None
+        updated = dict(runtime_config)
+        updated["qwen_tool_response_id"] = response_id
+        return updated
+
     def runtime_config_after_response(
         self,
         runtime_config: Mapping[str, object],
         *,
         committed: bool,
+        awaiting_playback: bool = False,
+        response_id: str | None = None,
     ) -> dict[str, object] | None:
-        """Drop a submitted tool pair only when that response stored text.
+        """Drop a submitted tool pair only when that response stored its text.
 
-        ``committed`` is false when nothing from the response was written into
-        history: cancel, failure, or ``realtime_response_conversation`` set to
-        ``none``. The pair is not in ``session.history``, so that is the only
-        copy the next turn can still see.
+        The pair stays inflight while playback can still store the answer.
+        ``committed`` is false for cancel, failure, or
+        ``realtime_response_conversation`` set to ``none``; those put the pair
+        back. A settlement for a different response leaves this pair alone.
+        The pair is not in ``session.history``.
         """
         inflight = runtime_config.get("qwen_tool_turns_inflight")
         if not isinstance(inflight, list):
             return None
+        owner = runtime_config.get("qwen_tool_response_id")
+        if isinstance(response_id, str) and isinstance(owner, str) and response_id != owner:
+            return None
+        if awaiting_playback and not committed:
+            return None
         updated = dict(runtime_config)
         updated.pop("qwen_tool_turns_inflight", None)
+        updated.pop("qwen_tool_response_id", None)
         if not committed and inflight:
             turns = [turn for turn in updated.get("qwen_tool_turns", []) if isinstance(turn, dict)]
             updated["qwen_tool_turns"] = [*inflight, *turns]

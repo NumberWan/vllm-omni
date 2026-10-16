@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.realtime_events import prepared_function_call_output
 from vllm_omni.engine.duplex.session.model_channel import (
@@ -282,6 +283,52 @@ def test_cancel_puts_a_submitted_tool_pair_back():
     )
     assert dropped["qwen_tool_turns"] == []
     assert "qwen_tool_turns_inflight" not in dropped
+
+
+def test_playback_keeps_the_pair_until_that_response_stores_text():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    pair = {"history_len": 1, "messages": [{"role": "tool", "content": "18C"}]}
+    runtime = {
+        "qwen_tool_turns": [],
+        "qwen_tool_turns_inflight": [pair],
+        "qwen_tool_response_id": "resp-a",
+    }
+    assert (
+        plugin.runtime_config_after_response(runtime, committed=False, awaiting_playback=True, response_id="resp-a")
+        is None
+    )
+    assert plugin.runtime_config_after_response(runtime, committed=False, response_id="resp-b") is None
+    dropped = plugin.runtime_config_after_response(runtime, committed=True, response_id="resp-a")
+    assert dropped["qwen_tool_turns"] == []
+    assert "qwen_tool_turns_inflight" not in dropped
+    assert "qwen_tool_response_id" not in dropped
+
+
+def test_stream_and_session_close_drop_thinker_cursors():
+    plane = QwenDataPlane(lambda *args: None)
+    mine = duplex_resource_request_id(DuplexFence(session_id="sess-a", epoch=1, turn_id=1), "stage0-turn1")
+    other = duplex_resource_request_id(DuplexFence(session_id="sess-b", epoch=1, turn_id=1), "stage0-turn1")
+
+    def project(request_id: str) -> None:
+        output = SimpleNamespace(
+            request_id=request_id,
+            stage_id=0,
+            finished=False,
+            outputs=[SimpleNamespace(text="hello", multimodal_output={})],
+            multimodal_output={"sr": 24000},
+        )
+        list(plane.project({"data_plane_outputs": [output]}, context={"modalities": ["text"]}))
+
+    project(mine)
+    assert mine in plane._tool_cursors
+    plane.close_stream(mine)
+    assert mine not in plane._tool_cursors
+    project(mine)
+    project(other)
+    kept = plane._tool_cursors[other]
+    plane.close_session("sess-a")
+    assert mine not in plane._tool_cursors
+    assert plane._tool_cursors[other] is kept
 
 
 def test_call_anchors_older_than_the_prompt_window_are_dropped():

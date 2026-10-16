@@ -1014,6 +1014,47 @@ async def test_response_create_after_function_call_output_opens_one_follow_up():
 
 
 @pytest.mark.asyncio
+async def test_late_playback_ack_stores_the_answer_and_drops_the_tool_pair():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        projector = h.runner.out.require_projector()
+        projector.conversation_items["item_call"] = {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="sunny", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, finished=True), stage_id=2)
+        assert h.session.runtime_config.get("qwen_tool_turns_inflight")
+        assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert [message["content"] for message in h.session.history if message.get("role") == "assistant"] == ["sunny"]
+        assert not h.session.runtime_config.get("qwen_tool_turns_inflight")
+        assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "sunny" in prompt
+        assert "get_weather" not in prompt
+        assert "18C" not in prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_listen_audio_commit_does_not_use_video_deferred_response():
     h = await open_qwen()
     try:

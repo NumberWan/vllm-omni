@@ -419,6 +419,9 @@ class _OmniConnectorRuntimeMixin:
                 self._send_side_request_payload.pop(k, None)
                 self._code_prompt_token_ids.pop(k, None)
                 getattr(self, "_qwen3_tts_emitted_frames", {}).pop(k, None)
+                tool_speech_cuts = getattr(self, "_qwen3_tool_speech_cut_ids", None)
+                if isinstance(tool_speech_cuts, set):
+                    tool_speech_cuts.discard(k)
                 self._cached_ic.pop(k, None)
                 self._ramp_chunk_count.pop(k, None)
                 self._adaptive_states.pop(k, None)
@@ -443,6 +446,11 @@ class _OmniConnectorRuntimeMixin:
         watermark.pop(req_id, None)
         if ext_id is not None:
             watermark.pop(ext_id, None)
+        tool_speech_cuts = getattr(self, "_qwen3_tool_speech_cut_ids", None)
+        if isinstance(tool_speech_cuts, set):
+            tool_speech_cuts.discard(req_id)
+            if ext_id is not None:
+                tool_speech_cuts.discard(ext_id)
         if ext_id is not None:
             self._send_side_request_payload.pop(ext_id, None)
             self._cached_ic.pop(ext_id, None)

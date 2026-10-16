@@ -1437,6 +1437,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 self._send_side_request_payload.pop(cleanup_req_id, None)
                 self._code_prompt_token_ids.pop(cleanup_req_id, None)
                 getattr(self, "_qwen3_tts_emitted_frames", {}).pop(cleanup_req_id, None)
+                tool_speech_cuts = getattr(self, "_qwen3_tool_speech_cut_ids", None)
+                if isinstance(tool_speech_cuts, set):
+                    tool_speech_cuts.discard(cleanup_req_id)
                 self._cached_ic.pop(cleanup_req_id, None)
                 self._ramp_chunk_count.pop(cleanup_req_id, None)
                 self._adaptive_states.pop(cleanup_req_id, None)

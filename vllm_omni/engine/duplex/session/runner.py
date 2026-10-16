@@ -354,7 +354,7 @@ class DuplexSessionRunner:
                 session.request_resources.pop((stage_id, request_id), None)
         elif response_id == session.active_response_id:
             session.end_response(commit_text=False)
-            settle_response_runtime(self.plugin, session, committed=False)
+            settle_response_runtime(self.plugin, session, committed=False, response_id=response_id)
         self.emit(
             {
                 "type": "response.done",
@@ -455,8 +455,9 @@ class DuplexSessionRunner:
             await asyncio.gather(active_response_task, return_exceptions=True)
         self.tasks.active_response_task = None
         if session.active_response_id is not None:
+            closing_response_id = session.active_response_id
             session.end_response(commit_text=False)
-            settle_response_runtime(self.plugin, session, committed=False)
+            settle_response_runtime(self.plugin, session, committed=False, response_id=closing_response_id)
         self._cleanup_duplex_session_state()
         session.close()
         await self._stop_worker()
@@ -573,6 +574,20 @@ class DuplexSessionRunner:
             return
         logger.warning("Unknown duplex runner internal item: %s", item.kind)
 
+    def _settle_playback_committed_answer(self, events) -> None:
+        """Drop a tool pair only when this ACK stored that response's answer."""
+        for event in events:
+            if not isinstance(event, PlaybackAcknowledged):
+                continue
+            details = event.details
+            if not isinstance(details, Mapping) or not details.get("history_committed"):
+                continue
+            item_id = details.get("item_id")
+            response_id = (
+                item_id.removeprefix("item_") if isinstance(item_id, str) and item_id.startswith("item_") else None
+            )
+            settle_response_runtime(self.plugin, self.session, committed=True, response_id=response_id)
+
     async def _run_internal_payload(self, payload: dict[str, object]) -> None:
         """Run one internal event dictionary through the matching handler."""
         event_type = payload.get("type")
@@ -581,7 +596,9 @@ class DuplexSessionRunner:
         elif event_type in {"input_audio_buffer.commit", "input.commit", "response.create"}:
             await self._on_commit(payload)
         elif event_type == "playback.ack":
-            self._emit_events(playback_ledger.apply_playback_ack(self.session, payload))
+            events = playback_ledger.apply_playback_ack(self.session, payload)
+            self._emit_events(events)
+            self._settle_playback_committed_answer(events)
         elif event_type in _CANCEL_EVENTS:
             await self._on_cancel(payload)
         elif event_type == "turn.signal":
@@ -660,6 +677,7 @@ class DuplexSessionRunner:
         elif isinstance(command, AckPlayback):
             events = playback_ledger.apply_playback_ack(self.session, command.payload())
             self._emit_events(events)
+            self._settle_playback_committed_answer(events)
             # A camera commit can arrive after response.done while its audio
             # is still playing. In that case the final ACK, not another model
             # terminal event, releases the next observation.
@@ -1526,7 +1544,9 @@ class DuplexSessionRunner:
             commit_text=self.model.should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
         )
-        settle_response_runtime(self.plugin, session, committed=committed_message is not None)
+        settle_response_runtime(
+            self.plugin, session, committed=committed_message is not None, response_id=old_response_id
+        )
         if old_response_id is not None:
             item_id = f"item_{old_response_id}"
             if committed_message is not None:

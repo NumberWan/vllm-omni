@@ -95,8 +95,9 @@ class SessionEmitter:
         self._ctx.manager.invalidate_output(session.session_id, response_id, through_epoch=session.epoch)
         if session.active_response_id is not None:
             # Close still needs the request binding to abort the real engine work.
+            failed_response_id = session.active_response_id
             session.end_response(commit_text=False, preserve_request=True)
-            settle_response_runtime(self._ctx.plugin, session, committed=False)
+            settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=failed_response_id)
         events: list[DuplexEvent] = [error_event("output_backpressure", message)]
         if response_id is None:
             return events

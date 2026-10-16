@@ -81,10 +81,9 @@ def _get_accept_hidden_layer_index(transfer_manager: Any) -> int:
 # Set once chunk 0 carried the first generated token taken from the prefill
 # sample: from then on each chunk carries the token its step sampled.
 _SAMPLED_TEXT_STREAM = "_qwen3_omni_sampled_text_stream"
-# Request ids whose Thinker output has reached <tool_call>. Later decode
-# embeds are tool-call tokens and must not be spoken. Codec packets are not
-# cut; this stops the token handoff.
-_TOOL_SPEECH_CUT_IDS = "_qwen3_tool_speech_cut_ids"
+# Lives in ``request_payload``, which sender and MRv2 cleanup already drop.
+# A later decode embed is a tool-call token and must not be spoken.
+_TOOL_SPEECH_CUT = "_qwen3_tool_speech_cut"
 
 
 def _is_final_token(request: Any) -> bool | None:
@@ -103,12 +102,32 @@ def _is_final_token(request: Any) -> bool | None:
     return token in stop_ids or (max_tokens is not None and count >= max_tokens)
 
 
-def _tool_speech_cuts(transfer_manager: Any) -> set[str]:
-    cuts = getattr(transfer_manager, _TOOL_SPEECH_CUT_IDS, None)
-    if not isinstance(cuts, set):
-        cuts = set()
-        setattr(transfer_manager, _TOOL_SPEECH_CUT_IDS, cuts)
-    return cuts
+def _tool_speech_is_cut(transfer_manager: Any, request_id: Any) -> bool:
+    if not isinstance(request_id, str):
+        return False
+    state = transfer_manager.request_payload.get(request_id)
+    return isinstance(state, dict) and state.get(_TOOL_SPEECH_CUT) is True
+
+
+def _mark_tool_speech_cut(transfer_manager: Any, request_id: Any) -> None:
+    if not isinstance(request_id, str):
+        return
+    state = transfer_manager.request_payload.get(request_id)
+    if isinstance(state, dict) and "embed" not in state:
+        state[_TOOL_SPEECH_CUT] = True
+        return
+    transfer_manager.request_payload[request_id] = {_TOOL_SPEECH_CUT: True}
+
+
+def _clear_tool_speech_cut(transfer_manager: Any, request_id: Any) -> None:
+    if not isinstance(request_id, str):
+        return
+    state = transfer_manager.request_payload.get(request_id)
+    if not isinstance(state, dict):
+        return
+    state.pop(_TOOL_SPEECH_CUT, None)
+    if not state:
+        transfer_manager.request_payload.pop(request_id, None)
 
 
 def _sampled_token_is_tool_call(request: Any) -> bool:
@@ -123,19 +142,6 @@ def _output_reaches_tool_call(request: Any) -> bool:
     if TOOL_CALL_START_TOKEN_ID in output_token_ids:
         return True
     return _sampled_token_is_tool_call(request)
-
-
-def _stop_tool_speech(transfer_manager: Any, request: Any) -> bool:
-    """Remember and report that Talker text for this request ends here."""
-    request_id = getattr(request, "external_req_id", None)
-    cuts = _tool_speech_cuts(transfer_manager)
-    if isinstance(request_id, str) and request_id in cuts:
-        return True
-    if not _output_reaches_tool_call(request):
-        return False
-    if isinstance(request_id, str):
-        cuts.add(request_id)
-    return True
 
 
 def _sampled_token_embed(thinker_embed: Mapping[str, Any], request: Any) -> torch.Tensor | None:
@@ -304,9 +310,16 @@ def _construct_thinker2talker_streaming_input_async_chunk(
         if thinker_emb.shape[0] > 1:
             # A new prompt segment is speech again. The model prefill still
             # drops a <tool_call> token inside that segment.
-            _tool_speech_cuts(transfer_manager).discard(request.external_req_id)
-        elif _stop_tool_speech(transfer_manager, request):
-            return None
+            _clear_tool_speech_cut(transfer_manager, request.external_req_id)
+        else:
+            # Captured mode: this row is the token processed on this step,
+            # which is the one sampled on the previous step. The step that
+            # samples <tool_call> still carries the last spoken token.
+            external_req_id = request.external_req_id
+            if _tool_speech_is_cut(transfer_manager, external_req_id):
+                return None
+            if _output_reaches_tool_call(request):
+                _mark_tool_speech_cut(transfer_manager, external_req_id)
         if thinker_emb.shape[0] > 1:
             # if thinker_emb.shape[0] > 1, new streaming input segment is added
             # and will transfer prefill embeddings and hidden states to talker.
@@ -529,6 +542,10 @@ def thinker2talker_async_chunk(
         assert payload.embed is not None and payload.embed.prefill is not None
         assert payload.hidden_states is not None and payload.hidden_states.output is not None
         save_payload = transfer_manager.request_payload.pop(request_id, None)
+        if isinstance(save_payload, dict) and "embed" not in save_payload:
+            # Handoff flags are not a withheld prefill. A new chunk 0 is a new
+            # request generation; cleanup also drops this entry.
+            save_payload = None
         if save_payload is not None:
             payload.embed.prefill = torch.cat(
                 (save_payload.get("embed", {}).get("prefill"), payload.embed.prefill), dim=0
@@ -547,13 +564,13 @@ def thinker2talker_async_chunk(
                 payload.embed.prefill = torch.cat((payload.embed.prefill, first_token_embed), dim=0)
                 transfer_manager.request_payload[request_id] = {_SAMPLED_TEXT_STREAM: True}
             elif _sampled_token_is_tool_call(request):
-                _tool_speech_cuts(transfer_manager).add(request_id)
+                _mark_tool_speech_cut(transfer_manager, request_id)
         # A <tool_call> first token must still release the prompt prefill.
         # Holding it would keep chunk_id at 0 and append later tool tokens.
         if (
             not is_finished
             and payload.embed.prefill.shape[0] <= len(prompt_token_ids)
-            and request_id not in _tool_speech_cuts(transfer_manager)
+            and not _tool_speech_is_cut(transfer_manager, request_id)
         ):
             transfer_manager.request_payload[request_id] = to_dict(payload)
             return None
@@ -562,12 +579,22 @@ def thinker2talker_async_chunk(
             return _construct_thinker2talker_streaming_input_async_chunk(
                 is_finished, request, thinker_emb, thinker_hid, transfer_manager
             )
-        # Decode embeds have no token ids. Stop once the Thinker sample is
-        # <tool_call> or anything the model emitted after it.
-        if _stop_tool_speech(transfer_manager, request):
-            return None
+        # Decode embeds have no token ids. A sampled stream's payload is the
+        # token just sampled, so <tool_call> is dropped on this step. A
+        # captured stream's payload is still the previous spoken token.
+        already_cut = _tool_speech_is_cut(transfer_manager, request_id)
+        reached_tool_call = _output_reaches_tool_call(request)
         stream = transfer_manager.request_payload.get(request_id)
-        if stream is not None and stream.get(_SAMPLED_TEXT_STREAM):
+        sampled_stream = isinstance(stream, dict) and stream.get(_SAMPLED_TEXT_STREAM)
+        if sampled_stream:
+            if already_cut or reached_tool_call:
+                _mark_tool_speech_cut(transfer_manager, request_id)
+                return None
+        elif already_cut:
+            return None
+        elif reached_tool_call:
+            _mark_tool_speech_cut(transfer_manager, request_id)
+        if sampled_stream:
             # This step's capture was already sent as the previous step's sample.
             sampled = _sampled_token_embed(thinker_embed, request)
             if sampled is None:

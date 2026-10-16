@@ -244,8 +244,9 @@ class AppendAttempt:
 
     def _fail_precreated_response(self, reason: str) -> None:
         session = self.ctx.session
+        failed_response_id = session.active_response_id
         session.end_response(commit_text=False)
-        settle_response_runtime(self.ctx.plugin, session, committed=False)
+        settle_response_runtime(self.ctx.plugin, session, committed=False, response_id=failed_response_id)
         self.out.emit(
             {
                 "type": "response.done",
