@@ -33,9 +33,16 @@ def test_complete_call_is_recognized_once():
     assert call is not None
     assert call["name"] == "get_current_time"
     assert json.loads(call["arguments"]) == {}
-    again_speech, again_call = cursor.absorb(_CALL)
+    # A longer snapshot of the same span is not a second call.
+    again_speech, again_call = cursor.absorb(cursor.text + " thanks")
     assert again_call is None
+    assert again_speech == " thanks"
     assert "<tool_call>" not in again_speech
+    # A later identical tag is a new span, so it is a second call.
+    second_speech, second_call = cursor.absorb(_CALL)
+    assert second_speech == ""
+    assert second_call is not None
+    assert second_call["name"] == "get_current_time"
     trailing_speech, trailing_call = cursor.absorb(" thanks")
     assert trailing_speech == " thanks"
     assert trailing_call is None
@@ -259,6 +266,19 @@ def test_one_thinker_chunk_emits_every_completed_call():
     names = [event["qwen_function_call"]["name"] for event in events if "qwen_function_call" in event]
     assert names == ["get_current_time", "get_weather"]
     assert events[-1]["end_of_turn"] is True
+
+
+def test_identical_calls_in_one_chunk_both_emit():
+    plane = QwenDataPlane(lambda *args: "AAAA")
+    events = list(
+        plane.project(
+            _output(f"{_CALL}{_CALL}", finished=True),
+            context={"modalities": ("text", "audio"), "turn_id": 1},
+        )
+    )
+    calls = [event["qwen_function_call"] for event in events if "qwen_function_call" in event]
+    assert [call["name"] for call in calls] == ["get_current_time", "get_current_time"]
+    assert calls[0]["call_id"] != calls[1]["call_id"]
 
 
 def _weather_turn(call_id: str, city: str, output: str, history_len: int) -> dict[str, object]:

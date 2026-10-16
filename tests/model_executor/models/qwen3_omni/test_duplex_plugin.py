@@ -1026,3 +1026,43 @@ async def test_listen_audio_commit_does_not_use_video_deferred_response():
         assert len(h.port.submissions) == 1
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_follow_up_stays_armed_and_keeps_the_call_time_anchor():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "Paris"})
+        h.session.note_function_call_anchor("call_paris")
+        h.session.append_history_message({"role": "user", "content": "Tokyo"})
+        projector = h.runner.out.require_projector()
+        projector.conversation_items["item_call"] = {
+            "type": "function_call",
+            "call_id": "call_paris",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_paris", "output": "18C"}
+                ),
+            )
+        )
+        turns = h.session.runtime_config["qwen_tool_turns"]
+        assert turns[0]["history_len"] == 1
+        assert h.session.pending_tool_followup() == 1
+        h.port.fail_submit = RuntimeError("stage down")
+        failed = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in failed)
+        assert h.port.submissions == []
+        assert h.session.pending_tool_followup() == 1
+        assert h.session.runtime_config["qwen_tool_turns"][0]["history_len"] == 1
+        h.port.fail_submit = None
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert prompt.index("Paris") < prompt.index("18C") < prompt.index("Tokyo")
+        assert h.session.pending_tool_followup() == 0
+    finally:
+        await h.manager.shutdown()

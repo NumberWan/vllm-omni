@@ -293,9 +293,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         """Accept a tool result for the next Qwen prompt.
 
         Each accepted result is one ``qwen_tool_turns`` entry anchored at the
-        history length when the result arrived. The next prompt splices that
-        pair after the messages that existed then. ``response.create`` with no
-        new audio opens the follow-up.
+        history length recorded when the call was published. The next prompt
+        splices that pair after the messages that existed then.
+        ``response.create`` with no new audio opens the follow-up.
         """
         del config
         call_id = item.get("call_id")

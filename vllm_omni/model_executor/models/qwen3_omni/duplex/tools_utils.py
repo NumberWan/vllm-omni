@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import cast
 from uuid import uuid4
 
@@ -79,7 +79,6 @@ class ThinkerToolCursor:
     text: str = ""
     spoken: int = 0
     tool_turn: bool = False
-    emitted_call_keys: set[tuple[str, str]] = field(default_factory=set)
 
     def holding_open_call(self) -> bool:
         rest = self.text[self.spoken :]
@@ -90,8 +89,9 @@ class ThinkerToolCursor:
 
         A longer chunk that starts with the text already seen is a cumulative
         snapshot. Any other chunk, including a repeated delta, is appended.
-        An open tag contributes no speech and no call. The same name and
-        arguments are emitted once; the first ``call_id`` is kept.
+        An open tag contributes no speech and no call. ``spoken`` already
+        passed a finished tag, so the same span is not parsed again. A later
+        tag with the same name and arguments is a new call.
         """
         self.text = _merge_text(self.text, incoming)
         speech: list[str] = []
@@ -119,10 +119,6 @@ class ThinkerToolCursor:
             if parsed is None:
                 speech.append(rest[: end + len(TOOL_CALL_END)])
                 continue
-            key = (parsed["name"], parsed["arguments"])
-            if key in self.emitted_call_keys:
-                continue
-            self.emitted_call_keys.add(key)
             self.tool_turn = True
             call = parsed
             break

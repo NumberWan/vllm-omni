@@ -299,7 +299,11 @@ class SessionControl:
                 return
             try:
                 prepared_item = prepared_function_call_output(item, self._out.require_projector().conversation_items)
-                prepared_item["_history_len"] = len(session.history)
+                call_id = prepared_item.get("call_id")
+                anchored = session.function_call_history_len(call_id) if isinstance(call_id, str) else None
+                # The anchor is the history length at function_call.done. A result
+                # that arrives after a later user turn must not move with it.
+                prepared_item["_history_len"] = anchored if isinstance(anchored, int) else len(session.history)
                 candidate_runtime_config = self._ctx.plugin.runtime_config_for_function_output(
                     session.config,
                     dict(session.runtime_config),

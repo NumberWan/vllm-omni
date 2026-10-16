@@ -895,12 +895,15 @@ class ModelChannel:
         the session call origin in this method before the same publish.
         """
         session = self._ctx.session
+        call_id = function_call["call_id"]
+        if isinstance(call_id, str) and call_id:
+            session.note_function_call_anchor(call_id)
         self._out.emit(
             {
                 "type": "function_call.done",
                 "session_id": session.session_id,
                 "epoch": session.epoch,
-                "call_id": function_call["call_id"],
+                "call_id": call_id,
                 "name": function_call["name"],
                 "arguments": function_call["arguments"],
             }
