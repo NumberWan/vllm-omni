@@ -47,9 +47,11 @@ from vllm_omni.engine.duplex.messages import (
     DuplexSessionEventMessage,
     OpenDuplexSessionMessage,
 )
+from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import RESPONSE_REQUEST_MEASUREMENT_ORIGIN
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
+from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 
@@ -1392,12 +1394,32 @@ async def test_uncaught_session_update_error_names_that_update(monkeypatch: pyte
         await close_harness(h)
 
 
+def _accepted_format_patch() -> dict[str, object]:
+    return {
+        "temperature": 0.3,
+        "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}},
+    }
+
+
+def _assert_serving_applies_adopted_session(session: object) -> None:
+    """The object serving applies must move the live wire defaults, not only the event type."""
+    assert isinstance(session, dict)
+    assert session["id"] == SESSION_ID
+    assert session["temperature"] == 0.3
+    envelope = RealtimeEnvelope()
+    assert envelope.defaults.input_sample_rate_hz == 16000
+    envelope.apply_accepted_session(session)
+    assert envelope.defaults.input_audio_format == "pcm16"
+    assert envelope.defaults.input_sample_rate_hz == 24000
+
+
 @pytest.mark.asyncio
 async def test_adopted_session_update_publishes_when_the_snapshot_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     """After the live config is replaced, a snapshot failure is still ``session.updated``.
 
     A stamped ``internal_error`` would tell serving the update was rejected
-    while the engine had already adopted it.
+    while the engine had already adopted it. The fallback session is the
+    accepted client payload, so serving's apply path picks up the new rate.
     """
 
     def explode(self):
@@ -1410,10 +1432,67 @@ async def test_adopted_session_update_publishes_when_the_snapshot_fails(monkeypa
         explode,
     )
     try:
-        events = await h.run(commands.UpdateSession(patch={"temperature": 0.3}, event_id="evt-pub"))
+        events = await h.run(commands.UpdateSession(patch=_accepted_format_patch(), event_id="evt-pub"))
         assert types(events) == ["session.updated"]
         assert h.session.config.temperature == 0.3
         assert all(getattr(event, "code", None) != "internal_error" for event in events)
+        _assert_serving_applies_adopted_session(events[0].session)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_update_publishes_when_replace_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed replace still publishes ``session.updated`` so serving takes the new rate.
+
+    The live config did not change, so the event must not echo the patch's
+    temperature. Projection fills the format and rate from the projector.
+    """
+
+    def explode(self, config: object) -> None:
+        del self, config
+        raise RuntimeError("replace exploded")
+
+    h = await open_harness()
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.engine_session.DuplexEngineSession.replace_config",
+        explode,
+    )
+    try:
+        temperature = h.session.config.temperature
+        events = await h.run(commands.UpdateSession(patch=_accepted_format_patch(), event_id="evt-replace"))
+        assert types(events) == ["session.updated"]
+        assert h.session.config.temperature == temperature
+        assert events[0].session.get("temperature") != 0.3
+        assert all(getattr(event, "code", None) != "internal_error" for event in events)
+        envelope = RealtimeEnvelope()
+        envelope.apply_accepted_session(events[0].session)
+        assert envelope.defaults.input_audio_format == "pcm16"
+        assert envelope.defaults.input_sample_rate_hz == 24000
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_after_replace_carries_the_accepted_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Once the live config is replaced, a failed publish still echoes the accepted patch."""
+    calls = {"n": 0}
+    original = SessionEmitter.emit
+
+    def flaky(self: SessionEmitter, payload: dict[str, object]) -> None:
+        if payload.get("type") == "session.updated" and calls["n"] == 0:
+            calls["n"] += 1
+            raise RuntimeError("emit exploded")
+        original(self, payload)
+
+    h = await open_harness()
+    monkeypatch.setattr(SessionEmitter, "emit", flaky)
+    try:
+        events = await h.run(commands.UpdateSession(patch=_accepted_format_patch(), event_id="evt-emit"))
+        assert calls["n"] == 1
+        assert types(events) == ["session.updated"]
+        assert h.session.config.temperature == 0.3
+        _assert_serving_applies_adopted_session(events[0].session)
     finally:
         await close_harness(h)
 
