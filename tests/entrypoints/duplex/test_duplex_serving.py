@@ -824,6 +824,53 @@ async def test_append_waits_for_engine_session_update_before_translate() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ["turn.signal", "signal_turn"])
+async def test_session_update_alias_waits_for_the_in_flight_update(alias: str) -> None:
+    """A ``turn.signal`` session update must not skip an in-flight ``session.update``.
+
+    U1 stays pending. U2 arrives as an alias. U1's acceptance must not release
+    an append that is waiting for U2, or eight float32 bytes are decoded as pcm16.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    try:
+        u1 = _session_update(input_audio_format="pcm16")
+        u1["event_id"] = "u1"
+        ws.feed(u1)
+        await _next_command(handle, commands.UpdateSession)
+        await asyncio.sleep(0.05)
+
+        ws.feed(
+            {
+                "type": alias,
+                "event": "session.update",
+                "event_id": "u2",
+                "payload": {"input_audio_format": "pcm_f32le"},
+            }
+        )
+        ws.feed(_append(b"\x00" * 8))
+        await asyncio.sleep(0.05)
+        assert len([command for command in handle.commands if isinstance(command, commands.UpdateSession)]) == 1
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm16"}))
+        u2 = await _next_command(handle, commands.UpdateSession, after=1)
+        assert u2.event_id == "u2"
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
+        accepted = await _next_append(handle)
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
 async def test_unrelated_error_does_not_release_an_update_that_omitted_event_id() -> None:
     """An earlier error with no related id must not settle a session.update that also omitted one.
 

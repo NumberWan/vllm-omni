@@ -122,6 +122,19 @@ def _session_update_outcome(
     return None
 
 
+def _wire_event_awaits_session_update(payload: Mapping[str, object]) -> bool:
+    """Whether this client event has to wait for an in-flight ``session.update``.
+
+    ``turn.signal`` and ``signal_turn`` with ``event`` ``session.update`` become
+    ``UpdateSession`` in translate. The wait runs first, so those aliases have
+    to be recognized here or a second update can replace the pending outcome.
+    """
+    event_type = payload.get("type")
+    if event_type in {"input_audio_buffer.append", "session.update"}:
+        return True
+    return event_type in {"turn.signal", "signal_turn"} and payload.get("event") == "session.update"
+
+
 class OmniDuplexSessionHandler:
     """WebSocket transport for engine-resident duplex sessions."""
 
@@ -742,8 +755,10 @@ class OmniDuplexSessionHandler:
         # session.update already submitted on this connection. Acceptance may
         # still be inside the engine, so it is not enough that a
         # session.updated is sitting in the outbox. A later update waits too,
-        # so only one update is in flight.
-        if payload.get("type") in {"input_audio_buffer.append", "session.update"}:
+        # so only one update is in flight. ``turn.signal`` / ``signal_turn``
+        # with ``event: session.update`` are the same command, but translate
+        # is what recognizes them, and that runs after this wait.
+        if _wire_event_awaits_session_update(payload):
             await self._wait_for_pending_session_update(attachment.handle)
             if attachment.handle.closed:
                 return
