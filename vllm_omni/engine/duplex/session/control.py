@@ -308,15 +308,13 @@ class SessionControl:
                 self._out.emit_error(exc.code, str(exc))
                 return
             if isinstance(candidate_runtime_config, dict):
-                pending_tools = candidate_runtime_config.get("qwen_tool_messages")
-                if (
-                    isinstance(pending_tools, list)
-                    and pending_tools
-                    and not isinstance(candidate_runtime_config.get("qwen_tool_history_len"), int)
-                ):
-                    candidate_runtime_config = dict(candidate_runtime_config)
-                    candidate_runtime_config["qwen_tool_history_len"] = len(session.history)
-            if candidate_runtime_config is not None:
+                pending_history = candidate_runtime_config.pop("pending_history_messages", None)
+                if isinstance(pending_history, list):
+                    for message in pending_history:
+                        if isinstance(message, dict):
+                            session.append_history_message(message)
+                session.replace_runtime_config(candidate_runtime_config)
+            elif candidate_runtime_config is not None:
                 session.replace_runtime_config(candidate_runtime_config)
             self._out.emit(
                 {
@@ -326,13 +324,16 @@ class SessionControl:
                     "created": True,
                 }
             )
-            self._ctx.services.spawn(
-                self._model.maybe_continue_response(
-                    expected_epoch=session.epoch,
-                    expected_model_turn_id=session.turn_id,
-                ),
-                name="duplex-continue",
-            )
+            # Half-duplex follow-up is opened by response.create with
+            # tool_followup_ready. Only full-duplex continues the open request.
+            if session.capabilities.supports_core_resumable_request:
+                self._ctx.services.spawn(
+                    self._model.maybe_continue_response(
+                        expected_epoch=session.epoch,
+                        expected_model_turn_id=session.turn_id,
+                    ),
+                    name="duplex-continue",
+                )
             return
         item_payload = item if isinstance(item, dict) else None
         raw_parts = item_payload.get("content", []) if item_payload is not None else []

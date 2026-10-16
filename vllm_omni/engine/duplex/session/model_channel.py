@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -73,7 +74,10 @@ def _coerce_function_call(raw: object) -> dict[str, str] | None:
     if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
         return None
     if not isinstance(arguments, str):
-        arguments = str(arguments)
+        try:
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        except (TypeError, ValueError):
+            arguments = str(arguments)
     return {"call_id": call_id, "name": name, "arguments": arguments}
 
 
@@ -82,9 +86,20 @@ def _recognized_function_call(plugin: object, model_result: Mapping[str, object]
 
     A plugin dict that is not a call is ``_INVALID_FUNCTION_CALL``. A missing
     legacy ``call_id``/``name`` returns None so the caller can still project
-    the raw event.
+    the raw event. Plugins without ``parse_function_call`` are treated as no call.
     """
-    parsed = plugin.parse_function_call(model_result)  # type: ignore[attr-defined]
+    parse = getattr(plugin, "parse_function_call", None)
+    if not callable(parse):
+        if model_result.get("function_call") is not True:
+            return None
+        return _coerce_function_call(
+            {
+                "call_id": model_result.get("call_id"),
+                "name": model_result.get("name"),
+                "arguments": model_result.get("arguments", ""),
+            }
+        )
+    parsed = parse(model_result)
     if parsed is not None:
         call = _coerce_function_call(parsed)
         return call if call is not None else _INVALID_FUNCTION_CALL
@@ -335,15 +350,11 @@ class ModelChannel:
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
-            prompt_config = {**request_context.session_config, "conversation": list(session.history)}
-            tool_history_len = request_context.runtime_config.get("qwen_tool_history_len")
-            if isinstance(tool_history_len, int):
-                prompt_config["qwen_tool_history_len"] = tool_history_len
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
                 session_config=self._ctx.plugin.prepare_prompt_config(
-                    prompt_config,
+                    {**request_context.session_config, "conversation": list(session.history)},
                     state=self._ctx.model_state,
                     payload=prompt_payload,
                 ),
@@ -626,22 +637,18 @@ class ModelChannel:
         finished = self._data_plane_outputs_finished(drain_result)
         # Intermediate-stage projection finishing means text is done, not the duplex turn.
         # Closing the stream here drops later Code2Wav chunks / next-turn bind.
-        if (
-            finished
-            and emitted_response
-            and not self._out.auto_responds()
-            and item.stage_id >= item.context.final_stage_id
-        ):
-            # A finished, emitted response releases the per-request projector
-            # cursor on its way out and offers the model another
-            # silence unit.
+        if finished and not self._out.auto_responds() and item.stage_id >= item.context.final_stage_id:
+            # Clear the stream when the owning request finishes, even if this
+            # final emitted no client event (for example after an early tool
+            # result already closed the response book).
             self._ctx.plugin.data_plane.close_stream(item.request_id)
             if self._ctx.run.stream_request_id == item.request_id:
                 self._ctx.run.stream_request_id = None
-            self._ctx.services.spawn(
-                self.maybe_continue_response(expected_epoch=expected_epoch),
-                name="duplex-continue",
-            )
+            if emitted_response:
+                self._ctx.services.spawn(
+                    self.maybe_continue_response(expected_epoch=expected_epoch),
+                    name="duplex-continue",
+                )
 
     async def _send_model_output_events(
         self,
@@ -917,16 +924,20 @@ class ModelChannel:
             await self._expose_function_call(function_call)
             return close_reason, True
         if model_result.get("function_call") is True:
-            self._out.emit(
+            legacy = _coerce_function_call(
                 {
-                    "type": "function_call.done",
-                    "session_id": session.session_id,
-                    "epoch": session.epoch,
                     "call_id": model_result.get("call_id"),
                     "name": model_result.get("name"),
                     "arguments": model_result.get("arguments", ""),
                 }
             )
+            if legacy is None:
+                self._out.emit_error(
+                    "invalid_function_call",
+                    "A recognized function call requires call_id and name",
+                )
+            else:
+                await self._expose_function_call(legacy)
             return close_reason, True
         if model_result.get("requires_stage_handoff") is True or model_result.get("requires_tts_stage") is True:
             # Reserve the protocol response only when Stage1 emits text/audio.
@@ -1395,6 +1406,14 @@ class ModelChannel:
         # A continue for a response that still has draining TTS must not emit
         # response.done here; that finish owns the done event.
         if not session.capabilities.supports_core_resumable_request:
+            # A fast tool result must not end the response while the original
+            # request stream is still draining; that clears active_request_id
+            # and leaves stream_request_id stuck.
+            if (
+                getattr(self._ctx.run, "stream_request_id", None) is not None
+                or getattr(session, "active_request_id", None) is not None
+            ):
+                return
             model_state.clear_continuation()
             if response_id is not None and not session.response_has_draining_request(response_id):
                 should_commit = self.should_commit_response_to_history(session, response_id)

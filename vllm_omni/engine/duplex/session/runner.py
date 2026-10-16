@@ -1709,6 +1709,13 @@ class DuplexSessionRunner:
             session.reset_unanswered_user_items()
             await self._start_append({"type": "conversation"}, final=True, precreate_response=True)
             return
+        if session.runtime_config.get("tool_followup_ready") is True and session.capabilities.supports_text_only_turn:
+            # One-shot follow-up after an accepted half-duplex tool result.
+            runtime = dict(session.runtime_config)
+            runtime.pop("tool_followup_ready", None)
+            session.replace_runtime_config(runtime)
+            await self._start_append({"type": "conversation"}, final=True, precreate_response=True)
+            return
         if session.unanswered_user_items():
             # Conversation items are context, not a turn. A model-native model
             # decides to speak from the audio it hears, and there is no audio

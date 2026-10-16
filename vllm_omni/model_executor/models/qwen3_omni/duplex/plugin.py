@@ -116,8 +116,12 @@ class QwenDataPlane(DuplexDataPlane):
             finished = bool(output.finished)
             if finished:
                 speakable += cursor.finish()
-            # Tool markup is not speech, and audio generated from it is not playback.
-            suppress_audio = bool(calls) or cursor.tool_turn or cursor.holding_open_call()
+            # Tool markup is not speech. Pure tool turns drop later-stage audio.
+            # A spoken preface before the first tag keeps later-stage audio so the
+            # talker can play that preface; talker output is not token-aligned.
+            suppress_audio = (stage_id == 0 and (bool(calls) or cursor.holding_open_call() or cursor.tool_turn)) or (
+                stage_id != 0 and cursor.tool_turn and not cursor.speech_before_tools
+            )
             if suppress_audio:
                 encoded = None
                 duration_ms = 0
@@ -262,12 +266,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         tools = config.extra_body.get("realtime_tools")
         if isinstance(tools, list):
             updated["qwen_tools"] = tools
-        pending = current.get("qwen_tool_messages")
-        if isinstance(pending, list) and pending:
-            updated["qwen_tool_messages"] = pending
-            anchor = current.get("qwen_tool_history_len")
-            if isinstance(anchor, int):
-                updated["qwen_tool_history_len"] = anchor
+        if current.get("tool_followup_ready") is True:
+            updated["tool_followup_ready"] = True
         return updated
 
     def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
@@ -280,7 +280,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
             return None
         if not isinstance(arguments, str):
-            arguments = str(arguments)
+            try:
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            except (TypeError, ValueError):
+                arguments = str(arguments)
         return {"call_id": call_id, "name": name, "arguments": arguments}
 
     def runtime_config_for_function_output(
@@ -289,13 +292,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         current: Mapping[str, object],
         item: Mapping[str, object],
     ) -> dict[str, object]:
-        """Queue an accepted tool result for the next Qwen prompt.
+        """Accept a tool result for the next Qwen prompt.
 
-        Qwen is turn-commit, so this turn's request is already finished. The
-        messages are read when the next duplex turn builds its prompt.
-        ``name`` and ``arguments`` come from the preparation item. This method
-        does not read a plugin-local call cache, so a refused preparation can
-        be repeated with the same item.
+        Qwen is turn-commit, so this turn's request is already finished.
+        ``name`` and ``arguments`` come from the preparation item. The session
+        writes the assistant/tool pair into conversation history; this method
+        only marks a one-shot ``response.create`` follow-up.
         """
         del config
         call_id = item.get("call_id")
@@ -317,8 +319,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 "function_call_output requires the session call name and arguments",
                 code="invalid_function_call_output",
             )
-        messages = list(current.get("qwen_tool_messages") or [])
-        messages.append(
+        updated = dict(current)
+        updated["tool_followup_ready"] = True
+        updated["pending_history_messages"] = [
             {
                 "role": "assistant",
                 "tool_calls": [
@@ -328,11 +331,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                         "function": {"name": name, "arguments": arguments},
                     }
                 ],
-            }
-        )
-        messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
-        updated = dict(current)
-        updated["qwen_tool_messages"] = messages
+            },
+            {"role": "tool", "tool_call_id": call_id, "content": output},
+        ]
         return updated
 
     def configure_sampling_params(self, *, runtime_config, defaults):
@@ -386,26 +387,21 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         turns = []
         for index, message in enumerate(history):
             role = message.get("role")
-            if not turns or role == "system" or (role == "user" and turns[-1][1][-1][1].get("role") != "user"):
+            if not turns or role == "system" or (role == "user" and turns[-1][1][-1].get("role") != "user"):
                 turns.append((index, []))
-            turns[-1][1].append((index, message))
+            turns[-1][1].append(message)
 
-        anchor = config.get("qwen_tool_history_len")
-        anchor = anchor if isinstance(anchor, int) else None
         messages = []
-        after_tools = []
         for index, turn in turns:
             # Keep the existing recent-message window, rounded outwards to a
             # complete turn. Never retain an answer whose input was cut off.
             if index + len(turn) <= len(history) - 16:
                 continue
-            if turn[0][1].get("role") == "assistant":
+            if turn[0].get("role") == "assistant" and "tool_calls" not in turn[0]:
                 continue
-            resolved: list[dict[str, object]] = []
-            resolved_after: list[dict[str, object]] = []
+            resolved = []
             included_audio = set()
-            for message_index, message in turn:
-                bucket = resolved_after if anchor is not None and message_index >= anchor else resolved
+            for message in turn:
                 content = message.get("content")
                 if message.get("role") == "user" and isinstance(content, list):
                     if any(part.get("type") == "audio_url" for part in content):
@@ -413,25 +409,21 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                         if audio is None:
                             break
                         if id(audio) not in included_audio:
-                            bucket.append({"role": "user", "audio_payload": audio})
+                            resolved.append({"role": "user", "audio_payload": audio})
                             included_audio.add(id(audio))
                         # Preserve text/images in mixed source items as well.
                         other_parts = [part for part in content if part.get("type") != "audio_url"]
                         if other_parts:
-                            bucket.append({"role": "user", "content": other_parts})
+                            resolved.append({"role": "user", "content": other_parts})
                         continue
-                bucket.append(message)
+                resolved.append(message)
             else:
                 messages.extend(resolved)
-                after_tools.extend(resolved_after)
         if has_audio and not current_is_in_history:
             # History is context, not a replacement for the current request.
             # Re-encoding only history here makes Qwen answer an old question.
-            # A tool result already stored against earlier history stays before
-            # this new audio.
-            target = after_tools if anchor is not None else messages
-            target.append({"role": "user", "audio_payload": payload})
-        return {**config, "qwen_messages": messages, "qwen_messages_after_tools": after_tools}
+            messages.append({"role": "user", "audio_payload": payload})
+        return {**config, "qwen_messages": messages}
 
     @staticmethod
     def format_history(messages):
@@ -511,68 +503,51 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     ):
         if not final or not isinstance(payload, dict):
             raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
+        has_audio = bool(payload.get("audio"))
+        if not has_audio and payload.get("type") != "conversation":
+            raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
         messages = []
         if runtime_config.get("instructions"):
             messages.append({"role": "system", "content": runtime_config["instructions"]})
         history = session_config.get("qwen_messages")
-        after_tools = session_config.get("qwen_messages_after_tools")
-        if not isinstance(after_tools, list):
-            after_tools = []
-        tool_messages = runtime_config.get("qwen_tool_messages")
-        has_tool_messages = isinstance(tool_messages, list) and bool(tool_messages)
-        if history is None and payload.get("audio") and not after_tools:
+        if history is None and has_audio:
             # Nothing prepared the conversation, so the committed payload is
             # the whole turn. An empty prepared list is not that: it means the
             # preparation ran and found nothing to say.
             history = [{"role": "user", "audio_payload": payload}]
-        if not history and not after_tools and not has_tool_messages:
-            raise DuplexRuntimeConfigError("Qwen generation requires committed audio or conversation history")
         if not history:
-            history = []
-        if payload.get("audio") and runtime_config.get("initial_user_text"):
-            extra = {"role": "user", "content": runtime_config["initial_user_text"]}
-            if after_tools:
-                after_tools = [*after_tools, extra]
-            else:
-                history = [*history, extra]
+            raise DuplexRuntimeConfigError("Qwen generation requires committed audio or conversation history")
+        if has_audio and runtime_config.get("initial_user_text"):
+            history = [*history, {"role": "user", "content": runtime_config["initial_user_text"]}]
         audios = []
         images = []
-
-        def render(source):
-            rendered = []
-            for message in source:
-                if "audio_payload" not in message:
-                    content = message.get("content")
-                    if isinstance(content, list):
-                        parts = []
-                        for part in content:
-                            if part.get("type") == "image_url":
-                                encoded = part["image_url"]["url"].split(",", 1)[1]
-                                with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True))) as image:
-                                    image.thumbnail((448, 448))
-                                    images.append(image.convert("RGB").copy())
-                                parts.append({"type": "image"})
-                            elif part.get("type") == "text":
-                                parts.append(part)
-                        rendered.append({"role": message["role"], "content": parts})
-                    else:
-                        rendered.append(message)
-                    continue
-                content, audio = self._audio_content(message["audio_payload"])
-                audios.append((audio, 16000))
-                rendered.append({"role": "user", "content": content})
-            return rendered
-
-        boundary = {"role": "boundary", "content": [{"type": "text", "text": ""}]}
-        rendered = render(history) + [boundary] + render(after_tools)
+        rendered = []
+        for message in history:
+            if message.get("role") == "tool" or message.get("tool_calls"):
+                rendered.append(message)
+                continue
+            if "audio_payload" not in message:
+                content = message.get("content")
+                if isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if part.get("type") == "image_url":
+                            encoded = part["image_url"]["url"].split(",", 1)[1]
+                            with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True))) as image:
+                                image.thumbnail((448, 448))
+                                images.append(image.convert("RGB").copy())
+                            parts.append({"type": "image"})
+                        elif part.get("type") == "text":
+                            parts.append(part)
+                    rendered.append({"role": message["role"], "content": parts})
+                else:
+                    rendered.append(message)
+                continue
+            content, audio = self._audio_content(message["audio_payload"])
+            audios.append((audio, 16000))
+            rendered.append({"role": "user", "content": content})
         rendered, images = self._trim_prompt_images(rendered, images)
-        split = next(index for index, message in enumerate(rendered) if message is boundary)
-        head = self.format_history(rendered[:split])
-        tail = self.format_history(rendered[split + 1 :])
-        if has_tool_messages:
-            head.extend(tool_messages)
-        messages.extend(head)
-        messages.extend(tail)
+        messages.extend(self.format_history(rendered))
         tools = chat_template_tools(runtime_config.get("qwen_tools"))
         if not tools:
             extra_body = session_config.get("extra_body") if isinstance(session_config, Mapping) else None

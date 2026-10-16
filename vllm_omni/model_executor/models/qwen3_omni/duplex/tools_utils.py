@@ -79,7 +79,8 @@ class ThinkerToolCursor:
     text: str = ""
     spoken: int = 0
     tool_turn: bool = False
-    emitted_call_ids: set[str] = field(default_factory=set)
+    speech_before_tools: bool = False
+    emitted_call_offsets: set[int] = field(default_factory=set)
 
     def holding_open_call(self) -> bool:
         rest = self.text[self.spoken :]
@@ -88,8 +89,9 @@ class ThinkerToolCursor:
     def absorb(self, incoming: str) -> tuple[str, dict[str, str] | None]:
         """Merge one Thinker delta and return ``(speakable, call)``.
 
-        A repeated cumulative snapshot does not open a second call. An open tag
-        with no closing tag contributes no speech and no call.
+        Qwen requests DELTA output, so each chunk is appended. An open tag with
+        no closing tag contributes no speech and no call. Dedup uses the tag
+        offset in the accumulated text, not the freshly assigned call_id.
         """
         self.text = _merge_text(self.text, incoming)
         speech: list[str] = []
@@ -111,17 +113,23 @@ class ThinkerToolCursor:
             end = rest.find(TOOL_CALL_END, len(TOOL_CALL_START))
             if end == -1:
                 break
+            call_offset = self.spoken
             inner = rest[len(TOOL_CALL_START) : end]
             parsed = parse_completed_tool_call(inner)
             self.spoken += end + len(TOOL_CALL_END)
-            if parsed is None or parsed["call_id"] in self.emitted_call_ids:
+            if parsed is None or call_offset in self.emitted_call_offsets:
                 speech.append(rest[: end + len(TOOL_CALL_END)])
                 continue
-            self.emitted_call_ids.add(parsed["call_id"])
+            self.emitted_call_offsets.add(call_offset)
+            if "".join(speech).strip() or self.speech_before_tools:
+                self.speech_before_tools = True
             self.tool_turn = True
             call = parsed
             break
-        return "".join(speech), call
+        piece = "".join(speech)
+        if piece.strip() and not self.tool_turn:
+            self.speech_before_tools = True
+        return piece, call
 
     def finish(self) -> str:
         """Flush held text that is not an open tool call. Drop an unclosed tag."""
@@ -135,8 +143,9 @@ class ThinkerToolCursor:
 
 
 def _merge_text(previous: str, incoming: str) -> str:
+    """Append one DELTA chunk. Qwen duplex sets ``RequestOutputKind.DELTA``."""
     if not incoming:
         return previous
-    if not previous or incoming.startswith(previous):
+    if not previous:
         return incoming
     return previous + incoming
