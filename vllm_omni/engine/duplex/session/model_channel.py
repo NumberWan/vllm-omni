@@ -350,11 +350,15 @@ class ModelChannel:
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
+            prompt_session = {**request_context.session_config, "conversation": list(session.history)}
+            tool_turns = request_context.runtime_config.get("qwen_tool_turns")
+            if isinstance(tool_turns, list):
+                prompt_session["qwen_tool_turns"] = tool_turns
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
                 session_config=self._ctx.plugin.prepare_prompt_config(
-                    {**request_context.session_config, "conversation": list(session.history)},
+                    prompt_session,
                     state=self._ctx.model_state,
                     payload=prompt_payload,
                 ),
@@ -371,9 +375,11 @@ class ModelChannel:
                 raise DuplexFenceMismatchError(session.fence, fence)
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
+            prompt = dict(append_plan.prompt)
+            remaining_tool_turns = prompt.pop("_qwen_tool_turns_remaining", None)
             submission = DuplexStageSubmission(
                 context=request_context,
-                prompt=append_plan.prompt,
+                prompt=prompt,
                 already_submitted=already_submitted,
                 resumable=resumable,
             )
@@ -383,6 +389,10 @@ class ModelChannel:
                     raise RuntimeError("duplex stage adapter returned a mismatched submission result")
                 if expected_epoch is not None and session.epoch != expected_epoch:
                     raise DuplexFenceMismatchError(session.fence, fence)
+                if remaining_tool_turns is not None:
+                    updated_runtime = dict(session.runtime_config)
+                    updated_runtime["qwen_tool_turns"] = remaining_tool_turns
+                    session.replace_runtime_config(updated_runtime)
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
             except BaseException:
@@ -637,10 +647,9 @@ class ModelChannel:
         finished = self._data_plane_outputs_finished(drain_result)
         # Intermediate-stage projection finishing means text is done, not the duplex turn.
         # Closing the stream here drops later Code2Wav chunks / next-turn bind.
+        # Clear the stream on the real final even when the projector emitted
+        # nothing (e.g. a fast tool result already cleared active_request_id).
         if finished and not self._out.auto_responds() and item.stage_id >= item.context.final_stage_id:
-            # Clear the stream when the owning request finishes, even if this
-            # final emitted no client event (for example after an early tool
-            # result already closed the response book).
             self._ctx.plugin.data_plane.close_stream(item.request_id)
             if self._ctx.run.stream_request_id == item.request_id:
                 self._ctx.run.stream_request_id = None
@@ -905,8 +914,11 @@ class ModelChannel:
         draining = session.is_draining_request(
             data_plane_request_id if isinstance(data_plane_request_id, str) else None
         )
-        active_request_matches = session.active_request_id == data_plane_request_id or (
-            auto_response and session.active_request_id is None
+        stream_request_id = getattr(self._ctx.run, "stream_request_id", None)
+        active_request_matches = (
+            session.active_request_id == data_plane_request_id
+            or stream_request_id == data_plane_request_id
+            or (auto_response and session.active_request_id is None)
         )
         if isinstance(data_plane_request_id, str) and not active_request_matches and not draining:
             return close_reason, emitted_response
@@ -1189,6 +1201,8 @@ class ModelChannel:
                 return close_reason, emitted_response
             if isinstance(data_plane_request_id, str) and not auto_response:
                 data_plane.close_stream(data_plane_request_id)
+                if self._ctx.run.stream_request_id == data_plane_request_id:
+                    self._ctx.run.stream_request_id = None
             if isinstance(data_plane_request_id, str):
                 if not auto_response and data_plane_request_id == session.active_request_id:
                     session.clear_request()
@@ -1407,12 +1421,17 @@ class ModelChannel:
         # response.done here; that finish owns the done event.
         if not session.capabilities.supports_core_resumable_request:
             # A fast tool result must not end the response while the original
-            # request stream is still draining; that clears active_request_id
-            # and leaves stream_request_id stuck.
+            # request is still running. Ending it clears active_request_id and
+            # the later final cannot own the stream.
+            request_id = getattr(session, "active_request_id", None)
+            data_plane = getattr(self._ctx.plugin, "data_plane", None)
             if (
-                getattr(self._ctx.run, "stream_request_id", None) is not None
-                or getattr(session, "active_request_id", None) is not None
+                isinstance(request_id, str)
+                and data_plane is not None
+                and callable(getattr(data_plane, "is_terminal", None))
+                and not data_plane.is_terminal(request_id)
             ):
+                model_state.clear_continuation()
                 return
             model_state.clear_continuation()
             if response_id is not None and not session.response_has_draining_request(response_id):

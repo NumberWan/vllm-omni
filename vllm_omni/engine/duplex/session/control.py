@@ -299,6 +299,7 @@ class SessionControl:
                 return
             try:
                 prepared_item = prepared_function_call_output(item, self._out.require_projector().conversation_items)
+                prepared_item["_history_len"] = len(session.history)
                 candidate_runtime_config = self._ctx.plugin.runtime_config_for_function_output(
                     session.config,
                     dict(session.runtime_config),
@@ -308,11 +309,9 @@ class SessionControl:
                 self._out.emit_error(exc.code, str(exc))
                 return
             if isinstance(candidate_runtime_config, dict):
-                pending_history = candidate_runtime_config.pop("pending_history_messages", None)
-                if isinstance(pending_history, list):
-                    for message in pending_history:
-                        if isinstance(message, dict):
-                            session.append_history_message(message)
+                turns = candidate_runtime_config.get("qwen_tool_turns")
+                if isinstance(turns, list) and turns and not session.capabilities.supports_core_resumable_request:
+                    session.notify_pending_tool_followup()
                 session.replace_runtime_config(candidate_runtime_config)
             elif candidate_runtime_config is not None:
                 session.replace_runtime_config(candidate_runtime_config)
@@ -325,7 +324,7 @@ class SessionControl:
                 }
             )
             # Half-duplex follow-up is opened by response.create with
-            # tool_followup_ready. Only full-duplex continues the open request.
+            # pending_tool_followup. Only full-duplex continues the open request.
             if session.capabilities.supports_core_resumable_request:
                 self._ctx.services.spawn(
                     self._model.maybe_continue_response(

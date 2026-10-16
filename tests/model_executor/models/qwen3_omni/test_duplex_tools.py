@@ -11,7 +11,7 @@ from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.realtime_events import prepared_function_call_output
 from vllm_omni.engine.duplex.session.model_channel import _coerce_function_call, _recognized_function_call
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin, QwenDataPlane
-from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import ThinkerToolCursor, _merge_text
+from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import ThinkerToolCursor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -26,16 +26,16 @@ def test_partial_tool_text_is_not_a_call_or_speech():
     assert cursor.holding_open_call()
 
 
-def test_complete_call_is_recognized_once_by_offset():
+def test_complete_call_is_recognized_once():
     cursor = ThinkerToolCursor()
     speech, call = cursor.absorb(f"The time is {_CALL}")
     assert speech == "The time is "
     assert call is not None
     assert call["name"] == "get_current_time"
     assert json.loads(call["arguments"]) == {}
-    again_speech, again_call = cursor.absorb("")
-    assert again_speech == ""
+    again_speech, again_call = cursor.absorb(_CALL)
     assert again_call is None
+    assert "<tool_call>" not in again_speech
     trailing_speech, trailing_call = cursor.absorb(" thanks")
     assert trailing_speech == " thanks"
     assert trailing_call is None
@@ -49,14 +49,16 @@ def test_unclosed_call_is_dropped_at_end_of_turn():
 
 
 def test_delta_chunks_are_appended_even_when_they_share_a_prefix():
-    assert _merge_text(" very", " very") == " very very"
-    assert _merge_text("ha", "ha") == "haha"
     cursor = ThinkerToolCursor()
     for chunk in [" very", " very", " good"]:
         speech, call = cursor.absorb(chunk)
         assert call is None
         assert speech == chunk
     assert cursor.text == " very very good"
+    grown = ThinkerToolCursor()
+    grown.absorb(" very")
+    grown.absorb(" very good")
+    assert grown.text == " very good"
 
 
 def _output(text: str, *, request_id: str = "req", stage_id: int = 0, finished: bool = False, audio: bool = False):
@@ -91,12 +93,12 @@ def test_data_plane_holds_markup_and_emits_one_call():
     assert audio and audio[0]["audio_data"] == "AAAA"
 
 
-def test_pure_tool_turn_suppresses_later_stage_audio():
+def test_stage2_keeps_audio_after_a_stage0_tool_call():
     plane = QwenDataPlane(lambda *args: "AAAA")
     context = {"modalities": ("text", "audio"), "response_format": "pcm16", "turn_id": 1}
     list(plane.project(_output(_CALL, audio=True), context=context))
     audio = list(plane.project(_output("", stage_id=2, audio=True), context=context))
-    assert all(event.get("audio_data", "") == "" for event in audio)
+    assert audio and audio[0]["audio_data"] == "AAAA"
 
 
 def test_plain_text_still_passes_through():
@@ -151,18 +153,18 @@ def test_tools_reach_the_chat_template_and_results_join_the_next_prompt():
             "name": "get_current_time",
             "arguments": "{}",
             "output": "2026-10-05T00:00:00+00:00",
+            "_history_len": 1,
         },
     )
-    assert updated["tool_followup_ready"] is True
-    history_messages = updated.pop("pending_history_messages")
+    turns = updated["qwen_tool_turns"]
+    assert isinstance(turns, list)
+    assert turns[0]["history_len"] == 1
     plugin.plan_append(
         request_id="follow-up",
         fence=None,
         session_config={
-            "qwen_messages": [
-                {"role": "user", "content": "what time is it"},
-                *history_messages,
-            ]
+            "qwen_messages": [{"role": "user", "content": "what time is it", "_src": 0}],
+            "qwen_tool_turns": turns,
         },
         runtime_config=updated,
         seq=1,
@@ -199,10 +201,14 @@ def test_qwen_preparation_uses_the_supplied_call_and_can_be_repeated():
         "output": "25C",
     }
     first = plugin.runtime_config_for_function_output(DuplexSessionConfig(model="qwen"), {}, item)
-    second = plugin.runtime_config_for_function_output(DuplexSessionConfig(model="qwen"), {}, item)
-    assert first == second
-    assert first["tool_followup_ready"] is True
-    assert first["pending_history_messages"][0]["tool_calls"][0]["function"] == {
+    second = plugin.runtime_config_for_function_output(
+        DuplexSessionConfig(model="qwen"),
+        first,
+        item | {"_history_len": 1},
+    )
+    assert len(first["qwen_tool_turns"]) == 1
+    assert len(second["qwen_tool_turns"]) == 2
+    assert first["qwen_tool_turns"][0]["messages"][0]["tool_calls"][0]["function"] == {
         "name": "get_weather",
         "arguments": '{"city":"Taipei"}',
     }
@@ -255,45 +261,44 @@ def test_one_thinker_chunk_emits_every_completed_call():
     assert events[-1]["end_of_turn"] is True
 
 
+def _weather_turn(call_id: str, city: str, output: str, history_len: int) -> dict[str, object]:
+    return {
+        "history_len": history_len,
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": json.dumps({"city": city})},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": call_id, "content": output},
+        ],
+    }
+
+
 def test_history_tool_pairs_keep_each_call_with_its_question():
     seen: dict[str, object] = {}
 
     def apply_chat_template(messages, **kwargs):
+        del kwargs
         seen["messages"] = messages
         return "prompt"
 
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
     plugin.processor = SimpleNamespace(apply_chat_template=apply_chat_template)
     state = plugin.create_session_state()
+    turns = [_weather_turn("call_1", "Taipei", "25C", 1), _weather_turn("call_2", "Tokyo", "29C", 2)]
     config = plugin.prepare_prompt_config(
         {
             "conversation": [
                 {"role": "user", "content": "taipei"},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "get_weather", "arguments": '{"city":"Taipei"}'},
-                        }
-                    ],
-                },
-                {"role": "tool", "tool_call_id": "call_1", "content": "25C"},
-                {"role": "assistant", "content": "Taipei is 25C"},
                 {"role": "user", "content": "tokyo"},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": "call_2",
-                            "type": "function",
-                            "function": {"name": "get_weather", "arguments": '{"city":"Tokyo"}'},
-                        }
-                    ],
-                },
-                {"role": "tool", "tool_call_id": "call_2", "content": "29C"},
-            ]
+            ],
+            "qwen_tool_turns": turns,
         },
         state=state,
         payload={},
@@ -302,7 +307,7 @@ def test_history_tool_pairs_keep_each_call_with_its_question():
         request_id="second-follow-up",
         fence=None,
         session_config=config,
-        runtime_config={"tool_followup_ready": True},
+        runtime_config={},
         seq=1,
         turn_seq=1,
         payload={"type": "conversation"},
@@ -312,9 +317,27 @@ def test_history_tool_pairs_keep_each_call_with_its_question():
     prompt_messages = seen["messages"]
     assert isinstance(prompt_messages, list)
     roles = [message["role"] for message in prompt_messages]
-    assert roles == ["user", "assistant", "tool", "assistant", "user", "assistant", "tool"]
+    assert roles == ["user", "assistant", "tool", "user", "assistant", "tool"]
     assert prompt_messages[2]["content"] == "25C"
-    assert prompt_messages[6]["content"] == "29C"
+    assert prompt_messages[5]["content"] == "29C"
+
+
+def test_new_user_audio_does_not_rebind_the_previous_question():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    state = plugin.create_session_state()
+    paris = {"role": "user", "content": [{"type": "audio_url"}]}
+    plugin.prepare_prompt_config({"conversation": [paris]}, state=state, payload={"audio": "paris"})
+    tokyo = {"role": "user", "content": [{"type": "audio_url"}]}
+    config = plugin.prepare_prompt_config(
+        {
+            "conversation": [paris, tokyo],
+            "qwen_tool_turns": [_weather_turn("call_p", "Paris", "18C", 1)],
+        },
+        state=state,
+        payload={"audio": "tokyo"},
+    )
+    payloads = [message["audio_payload"]["audio"] for message in config["qwen_messages"] if "audio_payload" in message]
+    assert payloads == ["paris", "tokyo"]
 
 
 def test_projected_function_call_supplies_name_and_arguments():
@@ -343,7 +366,12 @@ def test_missing_parse_function_call_is_not_a_call():
     assert call == {"call_id": "call_1", "name": "get_weather", "arguments": '{"city": "Taipei"}'}
 
 
-def test_coerce_function_call_json_dumps_mapping_arguments():
+def test_parse_function_call_json_dumps_dict_arguments():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    parsed = plugin.parse_function_call(
+        {"qwen_function_call": {"call_id": "call_1", "name": "get_weather", "arguments": {"city": "Taipei"}}}
+    )
+    assert parsed == {"call_id": "call_1", "name": "get_weather", "arguments": '{"city": "Taipei"}'}
     assert _coerce_function_call({"call_id": "c", "name": "n", "arguments": {"x": 1}}) == {
         "call_id": "c",
         "name": "n",

@@ -79,8 +79,7 @@ class ThinkerToolCursor:
     text: str = ""
     spoken: int = 0
     tool_turn: bool = False
-    speech_before_tools: bool = False
-    emitted_call_offsets: set[int] = field(default_factory=set)
+    emitted_call_keys: set[tuple[str, str]] = field(default_factory=set)
 
     def holding_open_call(self) -> bool:
         rest = self.text[self.spoken :]
@@ -89,9 +88,10 @@ class ThinkerToolCursor:
     def absorb(self, incoming: str) -> tuple[str, dict[str, str] | None]:
         """Merge one Thinker delta and return ``(speakable, call)``.
 
-        Qwen requests DELTA output, so each chunk is appended. An open tag with
-        no closing tag contributes no speech and no call. Dedup uses the tag
-        offset in the accumulated text, not the freshly assigned call_id.
+        A longer chunk that starts with the text already seen is a cumulative
+        snapshot. Any other chunk, including a repeated delta, is appended.
+        An open tag contributes no speech and no call. The same name and
+        arguments are emitted once; the first ``call_id`` is kept.
         """
         self.text = _merge_text(self.text, incoming)
         speech: list[str] = []
@@ -113,22 +113,20 @@ class ThinkerToolCursor:
             end = rest.find(TOOL_CALL_END, len(TOOL_CALL_START))
             if end == -1:
                 break
-            call_offset = self.spoken
             inner = rest[len(TOOL_CALL_START) : end]
             parsed = parse_completed_tool_call(inner)
             self.spoken += end + len(TOOL_CALL_END)
-            if parsed is None or call_offset in self.emitted_call_offsets:
+            if parsed is None:
                 speech.append(rest[: end + len(TOOL_CALL_END)])
                 continue
-            self.emitted_call_offsets.add(call_offset)
-            if "".join(speech).strip() or self.speech_before_tools:
-                self.speech_before_tools = True
+            key = (parsed["name"], parsed["arguments"])
+            if key in self.emitted_call_keys:
+                continue
+            self.emitted_call_keys.add(key)
             self.tool_turn = True
             call = parsed
             break
         piece = "".join(speech)
-        if piece.strip() and not self.tool_turn:
-            self.speech_before_tools = True
         return piece, call
 
     def finish(self) -> str:
@@ -143,9 +141,15 @@ class ThinkerToolCursor:
 
 
 def _merge_text(previous: str, incoming: str) -> str:
-    """Append one DELTA chunk. Qwen duplex sets ``RequestOutputKind.DELTA``."""
+    """Append a delta. A strictly longer prefix is a cumulative snapshot.
+
+    An identical chunk is a repeated delta, not a snapshot resend. Collapsing
+    it dropped ``[' very', ' very', ' good']`` down to ``' very good'``.
+    """
     if not incoming:
         return previous
     if not previous:
+        return incoming
+    if len(incoming) > len(previous) and incoming.startswith(previous):
         return incoming
     return previous + incoming

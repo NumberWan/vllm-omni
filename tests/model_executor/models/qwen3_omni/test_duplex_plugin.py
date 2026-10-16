@@ -23,6 +23,7 @@ from vllm_omni.engine.duplex.commands import (
     CancelResponse,
     ClearOutputAudio,
     Commit,
+    CreateItem,
     CreateResponse,
     UpdateSession,
 )
@@ -34,8 +35,13 @@ from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.model_executor.models.qwen3_omni.duplex.input import QwenPcmBuffer
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import MAX_PROMPT_IMAGES, Qwen3OmniDuplexPlugin
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.protocol.realtime.items import normalize_conversation_item
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _without_src(messages):
+    return [{key: value for key, value in message.items() if key != "_src"} for message in messages]
 
 
 def test_buffer_commit_and_rollback_preserve_all_samples():
@@ -359,7 +365,7 @@ def test_audio_byte_budget_evicts_whole_multimodal_turn():
     )
     current = {"audio": "B" * (4 * 1024 * 1024)}
     config = plugin.prepare_prompt_config({"conversation": source}, state=state, payload=current)
-    assert config["qwen_messages"] == [{"role": "user", "audio_payload": current}]
+    assert _without_src(config["qwen_messages"]) == [{"role": "user", "audio_payload": current}]
     assert len(state.audio_history) == 1
     assert source[1] is image
 
@@ -392,7 +398,7 @@ def test_dropped_audio_removes_its_image_and_assistant(assistant_text):
         history.append({"role": "user", "content": [{"type": "audio_url"}]})
         config = plugin.prepare_prompt_config({"conversation": history}, state=state, payload={"audio": str(i)})
         history.append({"role": "assistant", "content": assistant_text})
-    assert config["qwen_messages"] == [
+    assert _without_src(config["qwen_messages"]) == [
         {"role": "user", "audio_payload": {"audio": "2"}},
         {"role": "assistant", "content": assistant_text},
         {"role": "user", "audio_payload": {"audio": "3"}},
@@ -957,5 +963,43 @@ async def test_visual_capture_records_submitted_pixels_and_request(tmp_path, mon
             actual = submission.prompt["multi_modal_data"]["image"][0]
             assert saved.size == actual.size
             assert saved.tobytes() == actual.tobytes()
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_response_create_after_function_call_output_opens_one_follow_up():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        projector = h.runner.out.require_projector()
+        projector.conversation_items["item_call"] = {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+        created = await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        assert "conversation.item.created" in [event.type for event in created]
+        assert not any(getattr(event, "code", None) for event in created)
+        assert h.session.pending_tool_followup() == 1
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        assert h.port.submissions, [event.to_realtime() for event in h.events]
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "get_weather" in prompt
+        assert "18C" in prompt
+        assert h.session.pending_tool_followup() == 0
+        request_id = h.port.submissions[-1].context.request_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="18C", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=0, finished=True), stage_id=2)
+        refused = await h.run(CreateResponse())
+        assert any(getattr(event, "code", None) == "response_create_without_input" for event in refused)
     finally:
         await h.manager.shutdown()
