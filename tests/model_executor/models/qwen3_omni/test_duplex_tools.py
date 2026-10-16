@@ -340,6 +340,34 @@ def test_call_anchors_older_than_the_prompt_window_are_dropped():
     assert later is not None
     assert "call_old" not in later["qwen_call_anchors"]
     assert later["qwen_call_anchors"]["call_new"] == 20
+    assert "call_old" in later["qwen_expired_call_ids"]
+    with pytest.raises(DuplexRuntimeConfigError) as refused:
+        plugin.runtime_config_for_function_output(
+            DuplexSessionConfig(model="qwen"),
+            later,
+            {
+                "type": "function_call_output",
+                "call_id": "call_old",
+                "name": "get_weather",
+                "arguments": "{}",
+                "output": "18C",
+            },
+            history_len=20,
+        )
+    assert refused.value.code == "invalid_function_call_output"
+    unanchored = plugin.runtime_config_for_function_output(
+        DuplexSessionConfig(model="qwen"),
+        later,
+        {
+            "type": "function_call_output",
+            "call_id": "call_fresh",
+            "name": "get_weather",
+            "arguments": "{}",
+            "output": "19C",
+        },
+        history_len=20,
+    )
+    assert unanchored["qwen_tool_turns"][-1]["history_len"] == 20
     conversation = [{"role": "user", "content": f"q{i}"} for i in range(20)]
     plan = plugin.plan_append(
         request_id="prune-anchors",
@@ -561,3 +589,86 @@ def test_parse_function_call_json_dumps_dict_arguments():
         "name": "n",
         "arguments": '{"x": 1}',
     }
+
+
+def test_tool_choice_none_is_rejected():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    with pytest.raises(DuplexRuntimeConfigError) as refused:
+        plugin.runtime_config_for_update(
+            DuplexSessionConfig(
+                model="qwen",
+                extra_body={
+                    "realtime_tools": [{"type": "function", "name": "get_current_time"}],
+                    "realtime_tool_choice": "none",
+                },
+            ),
+            {},
+        )
+    assert refused.value.code == "unsupported_tool_choice"
+
+
+def test_inflight_pair_is_spliced_into_the_next_prompt():
+    seen: dict[str, object] = {}
+
+    def apply_chat_template(messages, **kwargs):
+        del kwargs
+        seen["messages"] = messages
+        return repr(messages)
+
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.processor = SimpleNamespace(apply_chat_template=apply_chat_template)
+    inflight = [
+        {
+            "history_len": 1,
+            "response_id": "resp-a",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "18C"},
+            ],
+        }
+    ]
+    plan = plugin.plan_append(
+        request_id="next-user",
+        fence=None,
+        session_config={
+            "qwen_messages": [
+                {"role": "user", "content": "paris", "_src": 0},
+                {"role": "user", "content": "and tomorrow", "_src": 2},
+            ],
+        },
+        runtime_config={"qwen_tool_turns_inflight": inflight, "qwen_tool_response_id": "resp-a"},
+        seq=2,
+        turn_seq=2,
+        payload={"type": "conversation"},
+        final=True,
+        sampling_params=None,
+    )
+    messages = seen["messages"]
+    assert isinstance(messages, list)
+    assert [message["role"] for message in messages] == ["user", "assistant", "tool", "user"]
+    assert messages[2]["content"] == "18C"
+    written = plan.prompt["_qwen_tool_turns_inflight"]
+    assert written[0]["response_id"] == "resp-a"
+    # A settlement for the owner drops it. A different response does not.
+    kept = plugin.runtime_config_after_response(
+        {"qwen_tool_turns_inflight": written, "qwen_tool_response_id": "resp-b"},
+        committed=True,
+        response_id="resp-b",
+    )
+    assert kept is None
+    dropped = plugin.runtime_config_after_response(
+        {"qwen_tool_turns_inflight": written, "qwen_tool_response_id": "resp-b"},
+        committed=True,
+        response_id="resp-a",
+    )
+    assert dropped is not None
+    assert "qwen_tool_turns_inflight" not in dropped

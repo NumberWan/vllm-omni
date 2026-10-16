@@ -565,6 +565,13 @@ def thinker2talker_async_chunk(
                 transfer_manager.request_payload[request_id] = {_SAMPLED_TEXT_STREAM: True}
             elif _sampled_token_is_tool_call(request):
                 _mark_tool_speech_cut(transfer_manager, request_id)
+        # Captured mode can merge the held prompt with one spoken token before
+        # the equality above runs. That sample may already be <tool_call>.
+        # Mark the boundary and release the captured preface; do not append
+        # the marker. After chunk 0 the data plane omits token history, so
+        # the flag is the only thing that stops the marker and the JSON.
+        if _sampled_token_is_tool_call(request):
+            _mark_tool_speech_cut(transfer_manager, request_id)
         # A <tool_call> first token must still release the prompt prefill.
         # Holding it would keep chunk_id at 0 and append later tool tokens.
         if (

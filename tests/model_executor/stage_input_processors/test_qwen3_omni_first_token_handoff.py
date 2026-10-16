@@ -189,6 +189,13 @@ def test_captured_tool_step_still_forwards_the_preceding_token():
 
 
 @pytest.mark.parametrize("publish", [True, False])
+def test_one_preface_token_is_kept_when_chunk_zero_samples_the_marker(publish):
+    rows, _chunks, manager = _run_turn([11, TOOL_CALL_START_TOKEN_ID, 99, EOS], publish=publish)
+    assert rows == [11]
+    assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
+
+
+@pytest.mark.parametrize("publish", [True, False])
 def test_tool_call_as_the_first_token_forwards_no_speech(publish):
     rows, _chunks, manager = _run_turn([TOOL_CALL_START_TOKEN_ID, 99, EOS], publish=publish)
     # Prompt prefill goes out so chunk_id can advance. No generated token does.

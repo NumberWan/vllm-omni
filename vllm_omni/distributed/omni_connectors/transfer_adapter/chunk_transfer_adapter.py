@@ -1178,9 +1178,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.ramp_chunk_count.pop(external_req_id, None)
         self._adaptive_states.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
-        tool_speech_cuts = getattr(self, "_qwen3_tool_speech_cut_ids", None)
-        if isinstance(tool_speech_cuts, set):
-            tool_speech_cuts.discard(external_req_id)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:

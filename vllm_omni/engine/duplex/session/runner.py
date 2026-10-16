@@ -850,8 +850,11 @@ class DuplexSessionRunner:
             cancelled = True
         if not cancelled and playback_was_active:
             old_epoch = session.epoch
+            playback_response_id = session.last_response_id
             committed_ms = session.playback.committed_ms
-            helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
+            helpers.commit_played_response_history(session, playback_response_id, committed_ms)
+            if committed_ms <= 0 and isinstance(playback_response_id, str):
+                settle_response_runtime(self.plugin, session, committed=False, response_id=playback_response_id)
             new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
             self.emit(
                 {
@@ -1460,8 +1463,14 @@ class DuplexSessionRunner:
             cancelled = True
         if not cancelled and playback_was_active:
             old_epoch = session.epoch
+            playback_response_id = session.last_response_id
             committed_ms = session.playback.committed_ms
-            helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
+            helpers.commit_played_response_history(session, playback_response_id, committed_ms)
+            # Generation already finished. A clear or cancel before any
+            # committed audio never reaches the playback ACK, so the tool
+            # pair would stay inflight and drop out of the next prompt.
+            if committed_ms <= 0 and isinstance(playback_response_id, str):
+                settle_response_runtime(self.plugin, session, committed=False, response_id=playback_response_id)
             new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
             self.emit(
                 {

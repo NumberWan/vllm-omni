@@ -1055,6 +1055,96 @@ async def test_late_playback_ack_stores_the_answer_and_drops_the_tool_pair():
 
 
 @pytest.mark.asyncio
+async def test_user_turn_before_playback_ack_still_sees_the_tool_pair():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        projector = h.runner.out.require_projector()
+        projector.conversation_items["item_call"] = {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="sunny", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, finished=True), stage_id=2)
+        first_inflight = h.session.runtime_config.get("qwen_tool_turns_inflight")
+        assert isinstance(first_inflight, list) and first_inflight
+        assert first_inflight[0].get("response_id") == response_id
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "18C" in prompt
+        assert "get_weather" in prompt
+        assert "sunny" not in prompt
+        # Barge-in restores the pair, then this turn owns it. It must not disappear.
+        assert h.session.runtime_config.get("qwen_tool_turns_inflight") or h.runner.plugin.has_pending_tool_followup(
+            h.session.runtime_config
+        )
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        # The item was reserved, so this ACK still stores the answer and drops
+        # the pair. The next prompt must not splice it again beside that text.
+        assert [message["content"] for message in h.session.history if message.get("role") == "assistant"] == ["sunny"]
+        assert not h.session.runtime_config.get("qwen_tool_turns_inflight")
+        await h.run(append_audio(value=-0.25))
+        await h.run(Commit(final=True, create_response=True))
+        later = h.port.submissions[-1].prompt["prompt"]
+        assert "sunny" in later
+        assert "18C" not in later
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_playback_clear_before_ack_puts_the_tool_pair_back():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        projector = h.runner.out.require_projector()
+        projector.conversation_items["item_call"] = {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="sunny", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, finished=True), stage_id=2)
+        assert h.session.runtime_config.get("qwen_tool_turns_inflight")
+        await h.run(ClearOutputAudio(response_id=response_id))
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        assert not h.session.runtime_config.get("qwen_tool_turns_inflight")
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "18C" in prompt
+        assert "get_weather" in prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_listen_audio_commit_does_not_use_video_deferred_response():
     h = await open_qwen()
     try:
