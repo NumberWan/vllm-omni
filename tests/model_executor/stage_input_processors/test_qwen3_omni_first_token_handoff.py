@@ -10,6 +10,10 @@ import pytest
 import torch
 
 import vllm_omni.model_executor.stage_input_processors.qwen3_omni as q3
+from vllm_omni.model_executor.models.qwen3_omni.tool_speech import (
+    TOOL_CALL_START_TOKEN_ID,
+    spoken_span_end,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -144,3 +148,26 @@ def test_missing_sample_on_sampled_stream(prefill_rows):
         assert manager.put_req_chunk["r"] == before
         chunk = manager.process(_output([12], sampled=_embed(13)), _request([11, 12, 13], history=False))
         assert torch.equal(chunk.embed.decode, _embed(13))
+
+
+def test_spoken_span_stops_at_the_tool_call_token():
+    prompt = [151644, 77091, 198]
+    preface = [11, 12]
+    tail = [TOOL_CALL_START_TOKEN_ID, 99, 100]
+    ids = prompt + preface + tail
+    assert spoken_span_end(ids, 0, len(ids)) == len(prompt) + len(preface)
+    assert spoken_span_end(preface, 0, len(preface)) == len(preface)
+
+
+def test_tool_call_token_is_not_forwarded_to_the_talker():
+    rows, _chunks, manager = _run_turn([11, 12, TOOL_CALL_START_TOKEN_ID, 99, EOS], publish=True)
+    # Preface stays. The marker and every token after it do not.
+    assert rows == [11, 12]
+    assert "r" in manager._qwen3_tool_speech_cut_ids
+
+
+def test_tool_call_as_the_first_token_forwards_no_speech():
+    rows, _chunks, manager = _run_turn([TOOL_CALL_START_TOKEN_ID, 99, EOS], publish=True)
+    # Prompt prefill goes out so chunk_id can advance. No generated token does.
+    assert rows == []
+    assert "r" in manager._qwen3_tool_speech_cut_ids

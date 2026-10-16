@@ -23,6 +23,7 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.qwen3_omni.tool_speech import TOOL_CALL_START_TOKEN_ID
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import compute_ramp_emit, parse_chunk_ramp
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
@@ -80,6 +81,10 @@ def _get_accept_hidden_layer_index(transfer_manager: Any) -> int:
 # Set once chunk 0 carried the first generated token taken from the prefill
 # sample: from then on each chunk carries the token its step sampled.
 _SAMPLED_TEXT_STREAM = "_qwen3_omni_sampled_text_stream"
+# Request ids whose Thinker output has reached <tool_call>. Later decode
+# embeds are tool-call tokens and must not be spoken. Codec packets are not
+# cut; this stops the token handoff.
+_TOOL_SPEECH_CUT_IDS = "_qwen3_tool_speech_cut_ids"
 
 
 def _is_final_token(request: Any) -> bool | None:
@@ -96,6 +101,41 @@ def _is_final_token(request: Any) -> bool | None:
     stop_ids = getattr(params, "all_stop_token_ids", None) or getattr(params, "stop_token_ids", None) or ()
     max_tokens = getattr(params, "max_tokens", None)
     return token in stop_ids or (max_tokens is not None and count >= max_tokens)
+
+
+def _tool_speech_cuts(transfer_manager: Any) -> set[str]:
+    cuts = getattr(transfer_manager, _TOOL_SPEECH_CUT_IDS, None)
+    if not isinstance(cuts, set):
+        cuts = set()
+        setattr(transfer_manager, _TOOL_SPEECH_CUT_IDS, cuts)
+    return cuts
+
+
+def _sampled_token_is_tool_call(request: Any) -> bool:
+    """True when the token this step sampled is ``<tool_call>``."""
+    last = getattr(request, "last_output_token_id", None)
+    return type(last) is int and last == TOOL_CALL_START_TOKEN_ID
+
+
+def _output_reaches_tool_call(request: Any) -> bool:
+    """True once this step's Thinker sample is ``<tool_call>`` or after it."""
+    output_token_ids = _ensure_list(getattr(request, "output_token_ids", None) or [])
+    if TOOL_CALL_START_TOKEN_ID in output_token_ids:
+        return True
+    return _sampled_token_is_tool_call(request)
+
+
+def _stop_tool_speech(transfer_manager: Any, request: Any) -> bool:
+    """Remember and report that Talker text for this request ends here."""
+    request_id = getattr(request, "external_req_id", None)
+    cuts = _tool_speech_cuts(transfer_manager)
+    if isinstance(request_id, str) and request_id in cuts:
+        return True
+    if not _output_reaches_tool_call(request):
+        return False
+    if isinstance(request_id, str):
+        cuts.add(request_id)
+    return True
 
 
 def _sampled_token_embed(thinker_embed: Mapping[str, Any], request: Any) -> torch.Tensor | None:
@@ -261,6 +301,12 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     hid_cpu = thinker_hid.detach().cpu()
 
     if output_token_ids:
+        if thinker_emb.shape[0] > 1:
+            # A new prompt segment is speech again. The model prefill still
+            # drops a <tool_call> token inside that segment.
+            _tool_speech_cuts(transfer_manager).discard(request.external_req_id)
+        elif _stop_tool_speech(transfer_manager, request):
+            return None
         if thinker_emb.shape[0] > 1:
             # if thinker_emb.shape[0] > 1, new streaming input segment is added
             # and will transfer prefill embeddings and hidden states to talker.
@@ -495,10 +541,20 @@ def thinker2talker_async_chunk(
             # which the next decode step would capture; take it from the
             # prefill step's sample instead when the producer published it.
             first_token_embed = _sampled_token_embed(thinker_embed, request)
-            if first_token_embed is not None:
+            # The sample is this step's token. Append a spoken preface token;
+            # a <tool_call> token is the end of speech, not the first word.
+            if first_token_embed is not None and not _sampled_token_is_tool_call(request):
                 payload.embed.prefill = torch.cat((payload.embed.prefill, first_token_embed), dim=0)
                 transfer_manager.request_payload[request_id] = {_SAMPLED_TEXT_STREAM: True}
-        if not is_finished and payload.embed.prefill.shape[0] <= len(prompt_token_ids):
+            elif _sampled_token_is_tool_call(request):
+                _tool_speech_cuts(transfer_manager).add(request_id)
+        # A <tool_call> first token must still release the prompt prefill.
+        # Holding it would keep chunk_id at 0 and append later tool tokens.
+        if (
+            not is_finished
+            and payload.embed.prefill.shape[0] <= len(prompt_token_ids)
+            and request_id not in _tool_speech_cuts(transfer_manager)
+        ):
             transfer_manager.request_payload[request_id] = to_dict(payload)
             return None
     else:
@@ -506,6 +562,10 @@ def thinker2talker_async_chunk(
             return _construct_thinker2talker_streaming_input_async_chunk(
                 is_finished, request, thinker_emb, thinker_hid, transfer_manager
             )
+        # Decode embeds have no token ids. Stop once the Thinker sample is
+        # <tool_call> or anything the model emitted after it.
+        if _stop_tool_speech(transfer_manager, request):
+            return None
         stream = transfer_manager.request_payload.get(request_id)
         if stream is not None and stream.get(_SAMPLED_TEXT_STREAM):
             # This step's capture was already sent as the previous step's sample.
