@@ -1672,6 +1672,11 @@ class DuplexSessionRunner:
             if commit_reservation is not None
             else model_state.audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
         )
+        if flushed is not None and isinstance(realtime_item_id, str) and realtime_item_id:
+            # Stamp before merge. The merger reads this id to keep each commit's
+            # owner; assigning it afterwards drops segments and replaces a
+            # retained speech owner with a later camera item.
+            flushed = {**flushed, "realtime_item_id": realtime_item_id}
         prior_committed = model_state.mergeable_committed_audio()
         if prior_committed is not None:
             if flushed is not None:
@@ -1694,10 +1699,6 @@ class DuplexSessionRunner:
         if overlap_policy.should_force_listen_for_short_commit(self.session, event, flushed):
             flushed = dict(flushed)
             flushed["force_listen"] = True
-        if isinstance(realtime_item_id, str) and realtime_item_id:
-            # Stamp before retain. A later copy would not be the retained object.
-            flushed = dict(flushed)
-            flushed["realtime_item_id"] = realtime_item_id
         model_state.input_since_commit = False
         committed = helpers.commit_audio_input(
             session,
@@ -1912,6 +1913,10 @@ class DuplexSessionRunner:
             chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
         )
         final_payload = commit_reservation.payload
+        if final_payload is not None and isinstance(realtime_item_id, str) and realtime_item_id:
+            # Stamp before merge, same as the deferred commit path. A copy made
+            # after merge would replace the retained owner.
+            final_payload = {**final_payload, "realtime_item_id": realtime_item_id}
         prior_committed = model_state.mergeable_committed_audio()
         if prior_committed is not None:
             if final_payload is not None:
@@ -1919,10 +1924,6 @@ class DuplexSessionRunner:
             else:
                 final_payload = prior_committed
         commit_reservation.commit()
-        if final_payload is not None and isinstance(realtime_item_id, str) and realtime_item_id:
-            # Stamp the item id before retain. A copy made afterwards would not
-            # be the retained object, so the append would skip consume and clear.
-            final_payload = {**final_payload, "realtime_item_id": realtime_item_id}
         if final_payload is not None:
             model_state.retain_committed_audio(
                 final_payload,
