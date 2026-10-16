@@ -464,9 +464,11 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         config: DuplexSessionConfig,
         current: Mapping[str, object],
         item: Mapping[str, object],
+        *,
+        history_len: int | None = None,
     ) -> dict[str, object]:
         """Queue a client tool result for frame-locked function-channel injection."""
-        del config
+        del config, history_len
         call_id = item.get("call_id")
         output = item.get("output")
         if not isinstance(call_id, str) or not call_id:

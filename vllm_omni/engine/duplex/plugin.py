@@ -552,8 +552,51 @@ class DuplexModelPlugin(ABC):
         config: DuplexSessionConfig,
         current: Mapping[str, object],
         item: Mapping[str, object],
+        *,
+        history_len: int | None = None,
     ) -> dict[str, object] | None:
-        del config, current, item
+        del config, current, item, history_len
+        return None
+
+    def note_published_function_call(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        call_id: str,
+        history_len: int,
+    ) -> dict[str, object] | None:
+        """Record where this call sat in session history when it was published.
+
+        The session calls this from ``function_call.done``, before a later user
+        turn can grow the history. A plugin that splices the result back into
+        that history stores the length in its own runtime. The default keeps
+        nothing.
+        """
+        del runtime_config, call_id, history_len
+        return None
+
+    def has_pending_tool_followup(self, runtime_config: Mapping[str, object]) -> bool:
+        """Whether a bare ``response.create`` should answer an accepted tool result.
+
+        The runner still decides that a text-only turn is legal. This only
+        reports that the plugin still has a result it has not yet prompted.
+        """
+        del runtime_config
+        return False
+
+    def extra_prompt_config(self, runtime_config: Mapping[str, object]) -> Mapping[str, object]:
+        """Runtime entries this model's prompt preparation reads. Default: none."""
+        del runtime_config
+        return {}
+
+    def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
+        """Pop plugin-private prompt keys and return the runtime patch to store.
+
+        The session applies the patch only after the stage accepts the append.
+        A failed submit leaves the runtime unchanged. The default prompt has
+        no private keys.
+        """
+        del prompt
         return None
 
     def runtime_config_after_model_output(

@@ -380,9 +380,7 @@ class ModelChannel:
                 "conversation": list(session.history),
                 "modalities": list(session.response_config.modalities),
             }
-            tool_turns = request_context.runtime_config.get("qwen_tool_turns")
-            if isinstance(tool_turns, list):
-                prompt_session["qwen_tool_turns"] = tool_turns
+            prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
             prompt_session["stage_sampling_params"] = request_context.sampling_params
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
@@ -406,7 +404,7 @@ class ModelChannel:
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
             prompt = dict(append_plan.prompt)
-            remaining_tool_turns = prompt.pop("_qwen_tool_turns_remaining", None)
+            runtime_patch = self._ctx.plugin.runtime_patch_for_submitted_prompt(prompt)
             submission = DuplexStageSubmission(
                 context=request_context,
                 prompt=prompt,
@@ -421,9 +419,9 @@ class ModelChannel:
                     raise RuntimeError("duplex stage adapter returned a mismatched submission result")
                 if expected_epoch is not None and session.epoch != expected_epoch:
                     raise DuplexFenceMismatchError(session.fence, fence)
-                if remaining_tool_turns is not None:
+                if runtime_patch:
                     updated_runtime = dict(session.runtime_config)
-                    updated_runtime["qwen_tool_turns"] = remaining_tool_turns
+                    updated_runtime.update(runtime_patch)
                     session.replace_runtime_config(updated_runtime)
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
@@ -981,7 +979,13 @@ class ModelChannel:
         session = self._ctx.session
         call_id = function_call["call_id"]
         if isinstance(call_id, str) and call_id:
-            session.note_function_call_anchor(call_id)
+            updated_runtime = self._ctx.plugin.note_published_function_call(
+                session.runtime_config,
+                call_id=call_id,
+                history_len=len(session.history),
+            )
+            if updated_runtime is not None:
+                session.replace_runtime_config(updated_runtime)
         self._out.emit(
             {
                 "type": "function_call.done",

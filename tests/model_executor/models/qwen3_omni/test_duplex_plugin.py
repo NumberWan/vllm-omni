@@ -989,14 +989,14 @@ async def test_response_create_after_function_call_output_opens_one_follow_up():
         )
         assert "conversation.item.created" in [event.type for event in created]
         assert not any(getattr(event, "code", None) for event in created)
-        assert h.session.pending_tool_followup() == 1
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
         started = await h.run(CreateResponse())
         assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
         assert h.port.submissions, [event.to_realtime() for event in h.events]
         prompt = h.port.submissions[-1].prompt["prompt"]
         assert "get_weather" in prompt
         assert "18C" in prompt
-        assert h.session.pending_tool_followup() == 0
+        assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
         request_id = h.port.submissions[-1].context.request_id
         await h.deliver_and_settle(tts_output(request_id, samples=0, text="18C", finished=True), stage_id=0)
         await h.deliver_and_settle(tts_output(request_id, samples=0, finished=True), stage_id=2)
@@ -1033,7 +1033,13 @@ async def test_failed_follow_up_stays_armed_and_keeps_the_call_time_anchor():
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "Paris"})
-        h.session.note_function_call_anchor("call_paris")
+        noted = h.runner.plugin.note_published_function_call(
+            h.session.runtime_config,
+            call_id="call_paris",
+            history_len=len(h.session.history),
+        )
+        assert noted is not None
+        h.session.replace_runtime_config(noted)
         h.session.append_history_message({"role": "user", "content": "Tokyo"})
         projector = h.runner.out.require_projector()
         projector.conversation_items["item_call"] = {
@@ -1051,18 +1057,18 @@ async def test_failed_follow_up_stays_armed_and_keeps_the_call_time_anchor():
         )
         turns = h.session.runtime_config["qwen_tool_turns"]
         assert turns[0]["history_len"] == 1
-        assert h.session.pending_tool_followup() == 1
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
         h.port.fail_submit = RuntimeError("stage down")
         failed = await h.run(CreateResponse())
         assert not any(getattr(event, "code", None) == "response_create_without_input" for event in failed)
         assert h.port.submissions == []
-        assert h.session.pending_tool_followup() == 1
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
         assert h.session.runtime_config["qwen_tool_turns"][0]["history_len"] == 1
         h.port.fail_submit = None
         started = await h.run(CreateResponse())
         assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
         prompt = h.port.submissions[-1].prompt["prompt"]
         assert prompt.index("Paris") < prompt.index("18C") < prompt.index("Tokyo")
-        assert h.session.pending_tool_followup() == 0
+        assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
     finally:
         await h.manager.shutdown()

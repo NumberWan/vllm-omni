@@ -1777,34 +1777,12 @@ class DuplexSessionRunner:
             session.reset_unanswered_user_items()
             await self._start_append({"type": "conversation"}, final=True, precreate_response=True)
             return
-        if session.pending_tool_followup() and session.capabilities.supports_text_only_turn:
-
-            def _accept_tool_followup(submit_time: float) -> None:
-                model_state.last_native_submit_monotonic = submit_time
-                model_state.silence_deadline_monotonic = None
-                turns = session.runtime_config.get("qwen_tool_turns")
-                if isinstance(turns, list) and turns:
-                    return
-                session.reset_pending_tool_followup()
-
-            def _rearm_tool_followup(done: asyncio.Task[bool]) -> None:
-                try:
-                    accepted = done.result()
-                except (asyncio.CancelledError, Exception):
-                    accepted = False
-                if accepted:
-                    return
-                turns = session.runtime_config.get("qwen_tool_turns")
-                if isinstance(turns, list) and turns and not session.pending_tool_followup():
-                    session.notify_pending_tool_followup()
-
-            task = await self._start_append(
-                {"type": "conversation"},
-                final=True,
-                precreate_response=True,
-                on_append_accepted=_accept_tool_followup,
-            )
-            task.add_done_callback(_rearm_tool_followup)
+        if session.capabilities.supports_text_only_turn and self.plugin.has_pending_tool_followup(
+            session.runtime_config
+        ):
+            # The plugin drops the waiting result only after this append is
+            # accepted, so a failed submit leaves the next response.create armed.
+            await self._start_append({"type": "conversation"}, final=True, precreate_response=True)
             return
         if session.unanswered_user_items():
             # Conversation items are context, not a turn. A model-native model

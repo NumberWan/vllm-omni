@@ -41,6 +41,26 @@ logger = init_logger(__name__)
 MAX_PROMPT_IMAGES = 8
 
 
+def _anchored_history_len(
+    current: Mapping[str, object],
+    item: Mapping[str, object],
+    history_len: int | None,
+) -> int:
+    """Prefer the length recorded at publish over the length when the result arrives."""
+    call_id = item.get("call_id")
+    anchors = current.get("qwen_call_anchors")
+    if isinstance(call_id, str) and isinstance(anchors, Mapping):
+        anchored = anchors.get(call_id)
+        if isinstance(anchored, int):
+            return anchored
+    stamped = item.get("_history_len")
+    if isinstance(stamped, int):
+        return stamped
+    if isinstance(history_len, int):
+        return history_len
+    return 0
+
+
 class QwenDataPlane(DuplexDataPlane):
     def __init__(self, encode_audio):
         self.encode_audio = encode_audio
@@ -266,7 +286,40 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         turns = current.get("qwen_tool_turns")
         if isinstance(turns, list):
             updated["qwen_tool_turns"] = turns
+        anchors = current.get("qwen_call_anchors")
+        if isinstance(anchors, Mapping):
+            updated["qwen_call_anchors"] = dict(anchors)
         return updated
+
+    def note_published_function_call(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        call_id: str,
+        history_len: int,
+    ) -> dict[str, object]:
+        """Remember the history length at ``function_call.done`` for this call."""
+        updated = dict(runtime_config)
+        anchors = updated.get("qwen_call_anchors")
+        copied = dict(anchors) if isinstance(anchors, Mapping) else {}
+        copied[call_id] = history_len
+        updated["qwen_call_anchors"] = copied
+        return updated
+
+    def has_pending_tool_followup(self, runtime_config: Mapping[str, object]) -> bool:
+        turns = runtime_config.get("qwen_tool_turns")
+        return isinstance(turns, list) and bool(turns)
+
+    def extra_prompt_config(self, runtime_config: Mapping[str, object]) -> Mapping[str, object]:
+        turns = runtime_config.get("qwen_tool_turns")
+        if isinstance(turns, list):
+            return {"qwen_tool_turns": turns}
+        return {}
+
+    def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
+        if "_qwen_tool_turns_remaining" not in prompt:
+            return None
+        return {"qwen_tool_turns": prompt.pop("_qwen_tool_turns_remaining")}
 
     def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
         raw = model_result.get("qwen_function_call")
@@ -289,13 +342,17 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         config: DuplexSessionConfig,
         current: Mapping[str, object],
         item: Mapping[str, object],
+        *,
+        history_len: int | None = None,
     ) -> dict[str, object]:
         """Accept a tool result for the next Qwen prompt.
 
-        Each accepted result is one ``qwen_tool_turns`` entry anchored at the
-        history length recorded when the call was published. The next prompt
-        splices that pair after the messages that existed then.
-        ``response.create`` with no new audio opens the follow-up.
+        Each accepted result is one ``qwen_tool_turns`` entry. Its
+        ``history_len`` is the length stored when the call was published.
+        ``history_len`` here is only the fallback for a result whose call was
+        not published through this plugin. The next prompt splices that pair
+        after the messages that existed then. A bare ``response.create`` opens
+        the follow-up while those turns are still waiting.
         """
         del config
         call_id = item.get("call_id")
@@ -317,9 +374,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 "function_call_output requires the session call name and arguments",
                 code="invalid_function_call_output",
             )
-        history_len = item.get("_history_len")
-        if not isinstance(history_len, int):
-            history_len = 0
+        history_len = _anchored_history_len(current, item, history_len)
         updated = dict(current)
         turns = [turn for turn in updated.get("qwen_tool_turns", []) if isinstance(turn, dict)]
         turns.append(

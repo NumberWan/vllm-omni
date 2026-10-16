@@ -299,25 +299,18 @@ class SessionControl:
                 return
             try:
                 prepared_item = prepared_function_call_output(item, self._out.require_projector().conversation_items)
-                call_id = prepared_item.get("call_id")
-                anchored = session.function_call_history_len(call_id) if isinstance(call_id, str) else None
-                # The anchor is the history length at function_call.done. A result
-                # that arrives after a later user turn must not move with it.
-                prepared_item["_history_len"] = anchored if isinstance(anchored, int) else len(session.history)
+                # history_len is the length now. A plugin that recorded the call
+                # at function_call.done uses that stored length instead.
                 candidate_runtime_config = self._ctx.plugin.runtime_config_for_function_output(
                     session.config,
                     dict(session.runtime_config),
                     prepared_item,
+                    history_len=len(session.history),
                 )
             except DuplexRuntimeConfigError as exc:
                 self._out.emit_error(exc.code, str(exc))
                 return
-            if isinstance(candidate_runtime_config, dict):
-                turns = candidate_runtime_config.get("qwen_tool_turns")
-                if isinstance(turns, list) and turns and not session.capabilities.supports_core_resumable_request:
-                    session.notify_pending_tool_followup()
-                session.replace_runtime_config(candidate_runtime_config)
-            elif candidate_runtime_config is not None:
+            if candidate_runtime_config is not None:
                 session.replace_runtime_config(candidate_runtime_config)
             self._out.emit(
                 {
@@ -327,8 +320,9 @@ class SessionControl:
                     "created": True,
                 }
             )
-            # Half-duplex follow-up is opened by response.create with
-            # pending_tool_followup. Only full-duplex continues the open request.
+            # A half-duplex follow-up waits for response.create. The plugin
+            # says whether a result is still waiting. Only a resumable session
+            # continues the request that is already open.
             if session.capabilities.supports_core_resumable_request:
                 self._ctx.services.spawn(
                     self._model.maybe_continue_response(

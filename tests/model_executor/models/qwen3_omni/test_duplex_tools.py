@@ -228,6 +228,36 @@ def test_qwen_preparation_uses_the_supplied_call_and_can_be_repeated():
     assert refused.value.code == "invalid_function_call_output"
 
 
+def test_published_anchor_beats_the_length_when_the_result_arrives():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    published = plugin.note_published_function_call({}, call_id="call_paris", history_len=1)
+    assert published is not None
+    kept = plugin.runtime_config_for_update(
+        DuplexSessionConfig(model="qwen"),
+        published,
+    )
+    updated = plugin.runtime_config_for_function_output(
+        DuplexSessionConfig(model="qwen"),
+        kept,
+        {
+            "type": "function_call_output",
+            "call_id": "call_paris",
+            "name": "get_weather",
+            "arguments": "{}",
+            "output": "18C",
+        },
+        history_len=2,
+    )
+    assert updated["qwen_tool_turns"][0]["history_len"] == 1
+    assert plugin.has_pending_tool_followup(updated)
+    assert plugin.extra_prompt_config(updated)["qwen_tool_turns"][0]["history_len"] == 1
+    prompt = {"prompt": "x", "_qwen_tool_turns_remaining": []}
+    patch = plugin.runtime_patch_for_submitted_prompt(prompt)
+    assert "_qwen_tool_turns_remaining" not in prompt
+    assert patch == {"qwen_tool_turns": []}
+    assert not plugin.has_pending_tool_followup({**updated, **patch})
+
+
 def test_prompt_without_tools_does_not_pass_a_tools_argument():
     seen: dict[str, object] = {}
 

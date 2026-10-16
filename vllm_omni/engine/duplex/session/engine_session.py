@@ -134,10 +134,6 @@ class ConversationHistory:
     #: answered yet. A turn can start from these alone, the way the Realtime
     #: protocol allows, without any audio having been committed.
     unanswered_user_items: int = 0
-    #: Accepted half-duplex tool results waiting for one ``response.create``.
-    pending_tool_followup: int = 0
-    #: History length when each call was published, keyed by ``call_id``.
-    function_call_history_len: dict[str, int] = field(default_factory=dict)
     item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     history_item_placeholders: dict[str, dict[str, object]] = field(default_factory=dict)
     item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
@@ -684,27 +680,6 @@ class DuplexEngineSession:
     def reset_unanswered_user_items(self) -> None:
         """A turn has started: the pending items are now its input."""
         self._conversation.unanswered_user_items = 0
-
-    def notify_pending_tool_followup(self) -> None:
-        """One accepted tool result may open the next half-duplex response."""
-        self._conversation.pending_tool_followup += 1
-
-    def pending_tool_followup(self) -> int:
-        """How many tool results are waiting for ``response.create``."""
-        return self._conversation.pending_tool_followup
-
-    def reset_pending_tool_followup(self) -> None:
-        """The follow-up turn has started."""
-        self._conversation.pending_tool_followup = 0
-
-    def note_function_call_anchor(self, call_id: str) -> None:
-        """Record history length at ``function_call.done``, before later user turns."""
-        self._conversation.function_call_history_len[call_id] = len(self.history)
-
-    def function_call_history_len(self, call_id: str) -> int | None:
-        """History length captured when ``call_id`` was published."""
-        value = self._conversation.function_call_history_len.get(call_id)
-        return value if isinstance(value, int) else None
 
     @property
     def pending_input_bytes(self) -> int:
