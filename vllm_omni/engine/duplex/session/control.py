@@ -239,6 +239,12 @@ class SessionControl:
             self._out.emit_error(exc.code, str(exc) or "session.update was rejected", event_id=realtime_event_id)
             reject_update()
             return
+        except Exception as exc:
+            # Still before the live session adopts the candidate. A stamped
+            # error means nothing was applied, including a staged detector.
+            self._out.emit_error("internal_error", str(exc), event_id=realtime_event_id)
+            reject_update()
+            return
         if candidate_config.instructions != session.config.instructions and model_state.context_locked:
             self._out.emit_error(
                 "instructions_update_unsupported",
@@ -276,17 +282,41 @@ class SessionControl:
             self._out.emit_error("runtime_signal_failed", str(exc), event_id=realtime_event_id)
             reject_update()
             return
-        session.replace_config(candidate_config)
-        session.replace_runtime_config(candidate_runtime_config)
         try:
-            session.touch_lease(DuplexLeaseActivity.SIGNAL)
+            # Projection defaults do not depend on the live config. A failure
+            # here is still a rejection: the session has not adopted anything.
+            projector = self._out.require_projector()
+            projector.apply_session_defaults(payload)
+        except Exception as exc:
+            self._out.emit_error("internal_error", str(exc), event_id=realtime_event_id)
+            reject_update()
+            return
+        # Past this point the update is adopted. Do not emit a stamped error:
+        # serving would keep the old input defaults while the engine moved on.
+        try:
+            session.replace_config(candidate_config)
+            session.replace_runtime_config(candidate_runtime_config)
+            try:
+                session.touch_lease(DuplexLeaseActivity.SIGNAL)
+            except Exception:
+                pass
+            if pending_turn_detection is not None:
+                self._config, self._detector = pending_turn_detection.commit(self._detector)
+            try:
+                public: dict[str, object] = session.as_public_dict()
+            except Exception:
+                logger.exception(
+                    "session.update %s was adopted but its public snapshot failed",
+                    realtime_event_id,
+                )
+                public = {"id": session.session_id}
+            self._out.emit({"type": "session.updated", "session": public})
         except Exception:
-            pass
-        if pending_turn_detection is not None:
-            self._config, self._detector = pending_turn_detection.commit(self._detector)
-        projector = self._out.require_projector()
-        projector.apply_session_defaults(payload)
-        self._out.emit({"type": "session.updated", "session": session.as_public_dict()})
+            logger.exception(
+                "session.update %s was adopted but publishing it failed",
+                realtime_event_id,
+            )
+            self._out.emit({"type": "session.updated", "session": {"id": session.session_id}})
 
     async def _on_conversation_item_create(self, event: dict[str, object]) -> None:
         session = self._ctx.session

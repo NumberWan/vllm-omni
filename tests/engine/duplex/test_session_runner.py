@@ -1346,23 +1346,74 @@ async def test_uncaught_session_update_error_names_that_update(monkeypatch: pyte
     """A failure outside the handled update branches still answers that command.
 
     The serving reader matches ``related_event_id``. Without it, the next
-    append waits forever.
+    append waits forever. The failure is before the session adopts the
+    candidate, so a staged turn detector is reset and the live config stays.
     """
 
     def explode(self, patch, *, session_id=None, audio_started=False):
         del self, patch, session_id, audio_started
         raise RuntimeError("update exploded")
 
+    class _StagedDetector:
+        def __init__(self) -> None:
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+
+    staged = _StagedDetector()
+
+    def fake_prepare(cls, payload, *, backend_provider=None):
+        del cls, payload, backend_provider
+        from vllm_omni.engine.duplex.turn_detection import PendingTurnDetectionUpdate
+
+        return PendingTurnDetectionUpdate(config=None, detector=staged)
+
     monkeypatch.setattr("vllm_omni.engine.duplex.config.DuplexSessionConfig.apply_realtime_update", explode)
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.control.PendingTurnDetectionUpdate.prepare",
+        classmethod(fake_prepare),
+    )
     h = await open_harness()
     try:
+        temperature = h.session.config.temperature
         events = await h.run(commands.UpdateSession(patch={"temperature": 0.2}, event_id="evt-boom"))
         assert types(events) == ["error"]
         assert events[0].code == "internal_error"
         assert events[0].related_event_id == "evt-boom"
+        assert h.session.config.temperature == temperature
+        assert staged.reset_calls == 1
         later = await h.run(commands.UpdateSession(patch={"temperature": 0.4}, event_id="evt-later"))
         assert later[0].code == "internal_error"
         assert later[0].related_event_id == "evt-later"
+        assert staged.reset_calls == 2
+        assert h.session.config.temperature == temperature
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_update_publishes_when_the_snapshot_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After the live config is replaced, a snapshot failure is still ``session.updated``.
+
+    A stamped ``internal_error`` would tell serving the update was rejected
+    while the engine had already adopted it.
+    """
+
+    def explode(self):
+        del self
+        raise RuntimeError("snapshot exploded")
+
+    h = await open_harness()
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.engine_session.DuplexEngineSession.as_public_dict",
+        explode,
+    )
+    try:
+        events = await h.run(commands.UpdateSession(patch={"temperature": 0.3}, event_id="evt-pub"))
+        assert types(events) == ["session.updated"]
+        assert h.session.config.temperature == 0.3
+        assert all(getattr(event, "code", None) != "internal_error" for event in events)
     finally:
         await close_harness(h)
 

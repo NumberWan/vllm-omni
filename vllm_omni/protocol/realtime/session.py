@@ -79,8 +79,9 @@ def apply_realtime_session_defaults(
     # A projected session.updated keeps the client's nested format object and
     # also fills the flat ``input_audio_format`` string (``audio/pcm`` →
     # ``pcm16``, which carries no rate). Borrow that rate only when the nested
-    # object is the same encoding, so a later flat ``pcm_f32le`` does not
-    # inherit a stale PCM rate.
+    # object is the same encoding. A mismatched nested rate is ignored. When
+    # this payload does not declare a rate, keep ``defaults.input_sample_rate_hz``
+    # (the last accepted rate on a live connection, or 16000 on a fresh object).
     if input_rate is None and isinstance(nested_input_format, dict):
         nested_format, nested_rate = parse_realtime_audio_format(nested_input_format)
         if nested_format == input_format and nested_rate is not None:
