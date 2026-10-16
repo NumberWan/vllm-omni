@@ -1324,7 +1324,7 @@ class ModelChannel:
                     data_plane.mark_terminal(data_plane_request_id)
             should_commit = self.should_commit_response_to_history(session, response_id)
             committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
-            settle_response_runtime(self._ctx.plugin, session, committed=True)
+            settle_response_runtime(self._ctx.plugin, session, committed=committed_message is not None)
             model_turn_id = coerce_int(model_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
@@ -1557,7 +1557,7 @@ class ModelChannel:
             if response_id is not None and not session.response_has_draining_request(response_id):
                 should_commit = self.should_commit_response_to_history(session, response_id)
                 committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
-                settle_response_runtime(self._ctx.plugin, session, committed=True)
+                settle_response_runtime(self._ctx.plugin, session, committed=committed_message is not None)
                 if should_commit and committed_message is not None:
                     session.register_history_item(f"item_{response_id}", committed_message)
                 self._out.emit(

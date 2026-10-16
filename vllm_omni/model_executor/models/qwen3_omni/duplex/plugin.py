@@ -348,11 +348,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         *,
         committed: bool,
     ) -> dict[str, object] | None:
-        """Drop a submitted tool pair once its response stands, or put it back.
+        """Drop a submitted tool pair only when that response stored text.
 
-        ``committed`` is false when the response was cancelled or failed before
-        any of its text was stored. The pair is not in ``session.history``, so
-        that is the only copy the next turn can still see.
+        ``committed`` is false when nothing from the response was written into
+        history: cancel, failure, or ``realtime_response_conversation`` set to
+        ``none``. The pair is not in ``session.history``, so that is the only
+        copy the next turn can still see.
         """
         inflight = runtime_config.get("qwen_tool_turns_inflight")
         if not isinstance(inflight, list):
