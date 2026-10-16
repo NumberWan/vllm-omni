@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import base64
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -1001,5 +1002,27 @@ async def test_response_create_after_function_call_output_opens_one_follow_up():
         await h.deliver_and_settle(tts_output(request_id, samples=0, finished=True), stage_id=2)
         refused = await h.run(CreateResponse())
         assert any(getattr(event, "code", None) == "response_create_without_input" for event in refused)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_listen_audio_commit_does_not_use_video_deferred_response():
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"turn_detection": None}))
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.run(replace(append_audio(), hints={"overlap_action": "listen"}))
+        await h.run(Commit(final=True, create_response=True))
+        assert not h.runner.model_state.deferred_response_create
+        assert h.runner.model_state.committed_audio_payload is None
+        assert h.runner.model_state.audio_buffer.has_pending()
+        await h.deliver_and_settle(tts_output(request_id, text="Hello", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert len(h.port.submissions) == 1
     finally:
         await h.manager.shutdown()

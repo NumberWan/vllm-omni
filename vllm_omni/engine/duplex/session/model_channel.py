@@ -350,7 +350,11 @@ class ModelChannel:
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
-            prompt_session = {**request_context.session_config, "conversation": list(session.history)}
+            prompt_session = {
+                **request_context.session_config,
+                "conversation": list(session.history),
+                "modalities": list(session.response_config.modalities),
+            }
             tool_turns = request_context.runtime_config.get("qwen_tool_turns")
             if isinstance(tool_turns, list):
                 prompt_session["qwen_tool_turns"] = tool_turns
@@ -395,6 +399,7 @@ class ModelChannel:
                     session.replace_runtime_config(updated_runtime)
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
+                self._ctx.plugin.commit_append_plan(request_id)
             except BaseException:
                 try:
                     await self._ctx.stage_port.cleanup([request_id])
@@ -432,6 +437,10 @@ class ModelChannel:
                     }
                 ],
             }
+        except BaseException:
+            if not resumable:
+                self._ctx.plugin.data_plane.close_stream(request_id)
+            raise
         finally:
             if operation_started and lease_operation_id in session.lease.active_operations:
                 try:
@@ -770,6 +779,8 @@ class ModelChannel:
                 if candidate not in release_ids and not session.is_draining_request(candidate):
                     release_ids.append(candidate)
         session.release_resources_for_request_ids(release_ids)
+        if self._ctx.run.stream_request_id in release_ids:
+            self._ctx.run.stream_request_id = None
         await self._ctx.stage_port.cleanup(release_ids)
 
     async def _on_model_listen(
@@ -924,6 +935,15 @@ class ModelChannel:
             return close_reason, emitted_response
         if isinstance(model_result.get("error_code"), str):
             self._fail_response_from_model_error(model_result)
+            if model_result.get("end_of_turn") is True and not session.capabilities.supports_core_resumable_request:
+                # A failed ephemeral turn owns the same stage resources as a
+                # successful one. Release them before accepting another turn.
+                self._complete_model_turn_without_output(
+                    model_result,
+                    model_turn_id=coerce_int(model_result.get("model_turn_id")),
+                    data_plane_request_id=data_plane_request_id,
+                )
+                await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
             return close_reason, True
         function_call = _recognized_function_call(self._ctx.plugin, model_result)
         if function_call is _INVALID_FUNCTION_CALL:
