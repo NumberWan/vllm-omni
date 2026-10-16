@@ -576,6 +576,18 @@ def test_projected_session_updated_keeps_the_nested_input_sample_rate():
     assert defaults.input_sample_rate_hz == 24000
 
 
+def test_flat_format_does_not_borrow_a_different_nested_rate():
+    """A flat encoding switch must not inherit the previous nested block's rate."""
+    defaults = RealtimeInputDefaults().with_session_payload(
+        {
+            "input_audio_format": "pcm_f32le",
+            "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}},
+        }
+    )
+    assert defaults.input_audio_format == "pcm_f32le"
+    assert defaults.input_sample_rate_hz == 16000
+
+
 def test_discard_pending_commit_item_clears_aborted_head():
     """#7636 Issue 12: commit_aborted must not leave a pending id behind."""
     state = RealtimeProjectionState(session_id="duplex-abort")

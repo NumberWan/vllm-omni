@@ -779,6 +779,31 @@ async def test_unrelated_error_does_not_release_an_update_that_omitted_event_id(
 
 
 @pytest.mark.asyncio
+async def test_internal_error_for_this_update_releases_the_following_append() -> None:
+    """An uncaught update failure is an ``internal_error`` stamped with that update's id.
+
+    The format change was not accepted, so the following append still uses pcm16.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    try:
+        ws.feed(_session_update(input_audio_format="pcm_f32le"))
+        ws.feed(_append(b"\x00" * 8))
+        update = await _next_command(handle, commands.UpdateSession)
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(ErrorEvent(code="internal_error", message="update exploded", related_event_id=update.event_id))
+        rejected = await _next_append(handle)
+        assert _decoded_audio_nbytes(rejected) == 16
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
 async def test_takeover_during_session_update_does_not_submit_the_replaced_append() -> None:
     """A reader that resumes the session while this one waits must not submit the old append.
 

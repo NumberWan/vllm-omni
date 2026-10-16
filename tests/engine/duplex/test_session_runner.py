@@ -1342,6 +1342,32 @@ async def test_session_update_rejects_instruction_changes_after_the_context_is_l
 
 
 @pytest.mark.asyncio
+async def test_uncaught_session_update_error_names_that_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failure outside the handled update branches still answers that command.
+
+    The serving reader matches ``related_event_id``. Without it, the next
+    append waits forever.
+    """
+
+    def explode(self, patch, *, session_id=None, audio_started=False):
+        del self, patch, session_id, audio_started
+        raise RuntimeError("update exploded")
+
+    monkeypatch.setattr("vllm_omni.engine.duplex.config.DuplexSessionConfig.apply_realtime_update", explode)
+    h = await open_harness()
+    try:
+        events = await h.run(commands.UpdateSession(patch={"temperature": 0.2}, event_id="evt-boom"))
+        assert types(events) == ["error"]
+        assert events[0].code == "internal_error"
+        assert events[0].related_event_id == "evt-boom"
+        later = await h.run(commands.UpdateSession(patch={"temperature": 0.4}, event_id="evt-later"))
+        assert later[0].code == "internal_error"
+        assert later[0].related_event_id == "evt-later"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_session_update_replaces_config_and_runtime_config_together() -> None:
     h = await open_harness()
     try:
@@ -1558,7 +1584,7 @@ async def test_duplex_stage_request_stamps_wall_clock_request_timestamp() -> Non
         await orchestrator.session_manager.shutdown()
 
 
-def _response_request_metrics_of(event: object) -> dict[str, object]:
+def _response_request_metrics_of(event: DuplexEvent) -> dict[str, object]:
     """Server request-start clocks as the client reads them off one wire event."""
     payload = event.to_realtime()
     metadata = payload.get("metadata")
