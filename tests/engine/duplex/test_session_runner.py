@@ -1559,6 +1559,33 @@ async def test_adopted_session_update_publishes_when_replace_fails(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_runtime_replace_failure_after_config_still_echoes_the_patch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A runtime-config failure after ``replace_config`` still echoes the accepted patch.
+
+    The live config object is already the candidate, so an id-only fallback would
+    leave serving on the old rate.
+    """
+
+    def explode(self, runtime_config: object) -> None:
+        del self, runtime_config
+        raise RuntimeError("runtime replace exploded")
+
+    h = await open_harness()
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.engine_session.DuplexEngineSession.replace_runtime_config",
+        explode,
+    )
+    try:
+        events = await h.run(commands.UpdateSession(patch=_accepted_format_patch(), event_id="evt-runtime"))
+        assert types(events) == ["session.updated"]
+        assert h.session.config.temperature == 0.3
+        assert all(getattr(event, "code", None) != "internal_error" for event in events)
+        _assert_serving_applies_adopted_session(events[0].session)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_publish_failure_after_replace_carries_the_accepted_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     """Once the live config is replaced, a failed publish still echoes the accepted patch."""
     calls = {"n": 0}

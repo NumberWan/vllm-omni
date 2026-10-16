@@ -292,21 +292,18 @@ class SessionControl:
             reject_update()
             return
 
-        # Past this point the update is adopted. Do not emit a stamped error:
-        # serving would keep the old input defaults while the engine moved on.
+        # Past this point the projector has the new wire defaults. Do not emit
+        # a stamped error: serving would keep the old format and rate.
         def adopted_session() -> dict[str, object]:
-            # Serving applies this object. Keep the patch the projector already
-            # adopted, including fields projection does not reconstruct.
-            # Copy so a later mutation cannot rewrite the event.
+            # The object serving applies. This is the patch apply_session_defaults
+            # already accepted. Copy so a later mutation cannot rewrite the event.
             public = dict(payload)
             public["id"] = session.session_id
             return public
 
-        config_adopted = False
         try:
             session.replace_config(candidate_config)
             session.replace_runtime_config(candidate_runtime_config)
-            config_adopted = True
             try:
                 session.touch_lease(DuplexLeaseActivity.SIGNAL)
             except Exception:
@@ -327,15 +324,15 @@ class SessionControl:
                 "session.update %s was adopted but publishing it failed",
                 realtime_event_id,
             )
-            # Projector defaults already moved, so this must stay session.updated.
-            # Before replace_config runs, the live config does not have the
-            # patch's temperature or instructions. An id-only session still
-            # projects the adopted format and rate. After it runs, publish the
-            # accepted patch because the snapshot never went out.
+            # replace_config assigns before it can raise. Echo the accepted
+            # patch once that assignment happened. If it did not, an id-only
+            # session still projects the format and rate the projector took.
             self._out.emit(
                 {
                     "type": "session.updated",
-                    "session": adopted_session() if config_adopted else {"id": session.session_id},
+                    "session": (
+                        adopted_session() if session.config is candidate_config else {"id": session.session_id}
+                    ),
                 }
             )
 
