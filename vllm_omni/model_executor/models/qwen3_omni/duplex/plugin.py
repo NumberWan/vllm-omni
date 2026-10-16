@@ -39,6 +39,9 @@ logger = init_logger(__name__)
 #: the engine and this one in the deploy config; the prompt is the only place
 #: that can keep them from drifting apart into a rejected submission.
 MAX_PROMPT_IMAGES = 8
+# Same window ``prepare_prompt_config`` keeps. Anchors older than this cannot
+# still point at a message the next prompt will retain.
+_TOOL_ANCHOR_WINDOW = 16
 
 
 def _anchored_history_len(
@@ -46,19 +49,29 @@ def _anchored_history_len(
     item: Mapping[str, object],
     history_len: int | None,
 ) -> int:
-    """Prefer the length recorded at publish over the length when the result arrives."""
+    """Prefer the length recorded at publish over the length when the result arrives.
+
+    A client ``function_call_output`` can carry ``_history_len``. That key is
+    not a splice position.
+    """
     call_id = item.get("call_id")
     anchors = current.get("qwen_call_anchors")
     if isinstance(call_id, str) and isinstance(anchors, Mapping):
         anchored = anchors.get(call_id)
         if isinstance(anchored, int):
             return anchored
-    stamped = item.get("_history_len")
-    if isinstance(stamped, int):
-        return stamped
     if isinstance(history_len, int):
         return history_len
     return 0
+
+
+def _prune_call_anchors(anchors: Mapping[str, object], *, history_len: int) -> dict[str, int]:
+    floor = history_len - _TOOL_ANCHOR_WINDOW
+    return {
+        key: value
+        for key, value in anchors.items()
+        if isinstance(key, str) and isinstance(value, int) and value > floor
+    }
 
 
 class QwenDataPlane(DuplexDataPlane):
@@ -286,6 +299,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         turns = current.get("qwen_tool_turns")
         if isinstance(turns, list):
             updated["qwen_tool_turns"] = turns
+        inflight = current.get("qwen_tool_turns_inflight")
+        if isinstance(inflight, list):
+            updated["qwen_tool_turns_inflight"] = inflight
         anchors = current.get("qwen_call_anchors")
         if isinstance(anchors, Mapping):
             updated["qwen_call_anchors"] = dict(anchors)
@@ -303,7 +319,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         anchors = updated.get("qwen_call_anchors")
         copied = dict(anchors) if isinstance(anchors, Mapping) else {}
         copied[call_id] = history_len
-        updated["qwen_call_anchors"] = copied
+        updated["qwen_call_anchors"] = _prune_call_anchors(copied, history_len=history_len)
         return updated
 
     def has_pending_tool_followup(self, runtime_config: Mapping[str, object]) -> bool:
@@ -317,14 +333,43 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         return {}
 
     def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
-        if "_qwen_tool_turns_remaining" not in prompt:
+        patch: dict[str, object] = {}
+        if "_qwen_tool_turns_remaining" in prompt:
+            patch["qwen_tool_turns"] = prompt.pop("_qwen_tool_turns_remaining")
+        if "_qwen_tool_turns_inflight" in prompt:
+            patch["qwen_tool_turns_inflight"] = prompt.pop("_qwen_tool_turns_inflight")
+        if "_qwen_call_anchors" in prompt:
+            patch["qwen_call_anchors"] = prompt.pop("_qwen_call_anchors")
+        return patch or None
+
+    def runtime_config_after_response(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        committed: bool,
+    ) -> dict[str, object] | None:
+        """Drop a submitted tool pair once its response stands, or put it back.
+
+        ``committed`` is false when the response was cancelled or failed before
+        any of its text was stored. The pair is not in ``session.history``, so
+        that is the only copy the next turn can still see.
+        """
+        inflight = runtime_config.get("qwen_tool_turns_inflight")
+        if not isinstance(inflight, list):
             return None
-        return {"qwen_tool_turns": prompt.pop("_qwen_tool_turns_remaining")}
+        updated = dict(runtime_config)
+        updated.pop("qwen_tool_turns_inflight", None)
+        if not committed and inflight:
+            turns = [turn for turn in updated.get("qwen_tool_turns", []) if isinstance(turn, dict)]
+            updated["qwen_tool_turns"] = [*inflight, *turns]
+        return updated
 
     def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
         raw = model_result.get("qwen_function_call")
         if not isinstance(raw, Mapping):
             return None
+        if raw.get("invalid") == "1":
+            return {"call_id": "invalid", "name": ""}
         call_id = raw.get("call_id")
         name = raw.get("name")
         arguments = raw.get("arguments", "")
@@ -374,6 +419,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 "function_call_output requires the session call name and arguments",
                 code="invalid_function_call_output",
             )
+        receipt_len = history_len if isinstance(history_len, int) else None
         history_len = _anchored_history_len(current, item, history_len)
         updated = dict(current)
         turns = [turn for turn in updated.get("qwen_tool_turns", []) if isinstance(turn, dict)]
@@ -396,6 +442,19 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             }
         )
         updated["qwen_tool_turns"] = turns
+        anchors = updated.get("qwen_call_anchors")
+        if isinstance(anchors, Mapping):
+            kept = {
+                key: value
+                for key, value in anchors.items()
+                if isinstance(key, str) and isinstance(value, int) and key != call_id
+            }
+            if receipt_len is not None:
+                kept = _prune_call_anchors(kept, history_len=receipt_len)
+            if kept:
+                updated["qwen_call_anchors"] = kept
+            else:
+                updated.pop("qwen_call_anchors", None)
         return updated
 
     def configure_sampling_params(self, *, runtime_config, defaults):
@@ -573,15 +632,15 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     def _splice_tool_turns(messages, turns):
         """Insert each tool pair after the history it was accepted against.
 
-        Returns ``(messages, remaining_turns)``. Turns whose ``history_len`` is
-        at or before the first kept message belonged to a user turn that already
-        left the window and are dropped. Turns that were spliced into this
-        prompt are also removed from ``remaining_turns`` so the next request
-        does not repeat them.
+        Returns ``(messages, remaining_turns, inflight_turns)``. Turns whose
+        ``history_len`` is at or before the first kept message belonged to a
+        user turn that already left the window and are dropped. Spliced turns
+        leave ``remaining_turns`` and are returned as ``inflight_turns`` until
+        the response that carries them is committed.
         """
         if not isinstance(turns, list) or not turns:
             cleaned = [{key: value for key, value in message.items() if key != "_src"} for message in messages]
-            return cleaned, None
+            return cleaned, None, None
         usable: list[tuple[int, list]] = []
         for turn in turns:
             if not isinstance(turn, dict):
@@ -596,6 +655,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if sources:
             earliest = min(sources)
             usable = [(history_len, pair) for history_len, pair in usable if history_len > earliest]
+        inflight = [{"history_len": history_len, "messages": pair} for history_len, pair in usable]
         pending = list(usable)
         spliced = []
         for message in messages:
@@ -608,7 +668,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         for _, pair in pending:
             spliced.extend(pair)
         # Every well-formed turn was either pruned or spliced into this prompt.
-        return spliced, []
+        return spliced, [], inflight
 
     async def prepare_append_plan(self, **kwargs):
         # History mutation has already happened on the session loop. The worker
@@ -635,7 +695,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             history = [{"role": "user", "audio_payload": payload}]
         if not history:
             raise DuplexRuntimeConfigError("Qwen generation requires committed audio or conversation history")
-        history, remaining_tool_turns = self._splice_tool_turns(list(history), session_config.get("qwen_tool_turns"))
+        history, remaining_tool_turns, inflight_tool_turns = self._splice_tool_turns(
+            list(history), session_config.get("qwen_tool_turns")
+        )
         if has_audio and runtime_config.get("initial_user_text"):
             history = [*history, {"role": "user", "content": runtime_config["initial_user_text"]}]
         audios = []
@@ -713,6 +775,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if remaining_tool_turns is not None:
             # Private write-back for the session after a successful submit.
             prompt_payload["_qwen_tool_turns_remaining"] = remaining_tool_turns
+        if inflight_tool_turns:
+            prompt_payload["_qwen_tool_turns_inflight"] = inflight_tool_turns
+        conversation = session_config.get("conversation")
+        anchors = runtime_config.get("qwen_call_anchors")
+        if isinstance(conversation, list) and isinstance(anchors, Mapping):
+            # Drop anchors whose user turn has already left the prompt window.
+            prompt_payload["_qwen_call_anchors"] = _prune_call_anchors(anchors, history_len=len(conversation))
         return DuplexAppendPlan(prompt=prompt_payload)
 
     def decide_output(self, **kwargs):

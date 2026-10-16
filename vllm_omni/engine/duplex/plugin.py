@@ -599,6 +599,20 @@ class DuplexModelPlugin(ABC):
         del prompt
         return None
 
+    def runtime_config_after_response(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        committed: bool,
+    ) -> dict[str, object] | None:
+        """Adjust runtime after a response ends.
+
+        ``committed`` is false when the response was cancelled or failed before
+        its text was stored. The default keeps the runtime unchanged.
+        """
+        del runtime_config, committed
+        return None
+
     def runtime_config_after_model_output(
         self,
         current: Mapping[str, object],
@@ -612,6 +626,17 @@ class DuplexModelPlugin(ABC):
         """
         del current, output_metadata
         return None
+
+
+def settle_response_runtime(plugin: DuplexModelPlugin, session: object, *, committed: bool) -> None:
+    """Let the plugin keep or drop response-scoped runtime after ``end_response``."""
+    runtime = getattr(session, "runtime_config", None)
+    replace = getattr(session, "replace_runtime_config", None)
+    if not isinstance(runtime, Mapping) or not callable(replace):
+        return
+    updated = plugin.runtime_config_after_response(runtime, committed=committed)
+    if updated is not None:
+        replace(updated)
 
 
 def load_duplex_plugin(path: str, encode_audio: EncodeAudio) -> DuplexModelPlugin:
@@ -682,5 +707,6 @@ __all__ = [
     "load_duplex_plugin",
     "payload_turn_id",
     "reject_changed_runtime_value",
+    "settle_response_runtime",
     "validate_duplex_plugin_sampling",
 ]

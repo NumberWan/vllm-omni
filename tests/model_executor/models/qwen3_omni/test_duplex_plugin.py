@@ -1072,3 +1072,44 @@ async def test_failed_follow_up_stays_armed_and_keeps_the_call_time_anchor():
         assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_the_follow_up_is_stored_keeps_the_tool_pair():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "Paris"})
+        noted = h.runner.plugin.note_published_function_call(
+            h.session.runtime_config,
+            call_id="call_paris",
+            history_len=len(h.session.history),
+        )
+        assert noted is not None
+        h.session.replace_runtime_config(noted)
+        projector = h.runner.out.require_projector()
+        projector.conversation_items["item_call"] = {
+            "type": "function_call",
+            "call_id": "call_paris",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_paris", "output": "18C"}
+                ),
+            )
+        )
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        assert h.session.runtime_config.get("qwen_tool_turns") == []
+        assert h.session.runtime_config["qwen_tool_turns_inflight"]
+        await h.run(CancelResponse())
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "18C" in prompt
+        assert "get_weather" in prompt
+    finally:
+        await h.manager.shutdown()

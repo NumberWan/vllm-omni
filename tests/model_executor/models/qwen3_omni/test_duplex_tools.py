@@ -9,7 +9,11 @@ import pytest
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.realtime_events import prepared_function_call_output
-from vllm_omni.engine.duplex.session.model_channel import _coerce_function_call, _recognized_function_call
+from vllm_omni.engine.duplex.session.model_channel import (
+    _INVALID_FUNCTION_CALL,
+    _coerce_function_call,
+    _recognized_function_call,
+)
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin, QwenDataPlane
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import ThinkerToolCursor
 
@@ -160,8 +164,8 @@ def test_tools_reach_the_chat_template_and_results_join_the_next_prompt():
             "name": "get_current_time",
             "arguments": "{}",
             "output": "2026-10-05T00:00:00+00:00",
-            "_history_len": 1,
         },
+        history_len=1,
     )
     turns = updated["qwen_tool_turns"]
     assert isinstance(turns, list)
@@ -211,7 +215,8 @@ def test_qwen_preparation_uses_the_supplied_call_and_can_be_repeated():
     second = plugin.runtime_config_for_function_output(
         DuplexSessionConfig(model="qwen"),
         first,
-        item | {"_history_len": 1},
+        item,
+        history_len=1,
     )
     assert len(first["qwen_tool_turns"]) == 1
     assert len(second["qwen_tool_turns"]) == 2
@@ -226,6 +231,88 @@ def test_qwen_preparation_uses_the_supplied_call_and_can_be_repeated():
             {"type": "function_call_output", "call_id": "call_1", "name": "forged", "output": "25C"},
         )
     assert refused.value.code == "invalid_function_call_output"
+
+
+def test_malformed_tool_call_is_not_speech():
+    cursor = ThinkerToolCursor()
+    speech, call = cursor.absorb("Sure <tool_call>not json</tool_call> thanks")
+    assert speech == "Sure "
+    assert call == {"call_id": "", "name": "", "invalid": "1"}
+    rest, later = cursor.absorb("")
+    assert rest == " thanks"
+    assert later is None
+    assert "<tool_call>" not in speech + rest
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    recognized = _recognized_function_call(plugin, {"qwen_function_call": call})
+    assert recognized is _INVALID_FUNCTION_CALL
+
+
+def test_client_history_len_does_not_steer_the_splice():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    published = plugin.note_published_function_call({}, call_id="call_paris", history_len=1)
+    updated = plugin.runtime_config_for_function_output(
+        DuplexSessionConfig(model="qwen"),
+        published,
+        {
+            "type": "function_call_output",
+            "call_id": "call_paris",
+            "name": "get_weather",
+            "arguments": "{}",
+            "output": "18C",
+            "_history_len": 99,
+        },
+        history_len=2,
+    )
+    assert updated["qwen_tool_turns"][0]["history_len"] == 1
+    assert "call_paris" not in updated.get("qwen_call_anchors", {})
+
+
+def test_cancel_puts_a_submitted_tool_pair_back():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    pair = {"history_len": 1, "messages": [{"role": "tool", "content": "18C"}]}
+    held = plugin.runtime_config_after_response(
+        {"qwen_tool_turns": [], "qwen_tool_turns_inflight": [pair]},
+        committed=False,
+    )
+    assert held["qwen_tool_turns"] == [pair]
+    assert "qwen_tool_turns_inflight" not in held
+    dropped = plugin.runtime_config_after_response(
+        {"qwen_tool_turns": [], "qwen_tool_turns_inflight": [pair]},
+        committed=True,
+    )
+    assert dropped["qwen_tool_turns"] == []
+    assert "qwen_tool_turns_inflight" not in dropped
+
+
+def test_call_anchors_older_than_the_prompt_window_are_dropped():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
+    published = plugin.note_published_function_call({}, call_id="call_old", history_len=1)
+    assert published is not None
+    later = plugin.note_published_function_call(published, call_id="call_new", history_len=20)
+    assert later is not None
+    assert "call_old" not in later["qwen_call_anchors"]
+    assert later["qwen_call_anchors"]["call_new"] == 20
+    conversation = [{"role": "user", "content": f"q{i}"} for i in range(20)]
+    plan = plugin.plan_append(
+        request_id="prune-anchors",
+        fence=None,
+        session_config={
+            "qwen_messages": [{"role": "user", "content": "q19", "_src": 19}],
+            "conversation": conversation,
+        },
+        runtime_config={"qwen_call_anchors": {"call_old": 1, "call_new": 20}},
+        seq=1,
+        turn_seq=1,
+        payload={"type": "conversation"},
+        final=True,
+        sampling_params=None,
+    )
+    assert plan.prompt["_qwen_call_anchors"] == {"call_new": 20}
+    patch = plugin.runtime_patch_for_submitted_prompt(plan.prompt)
+    assert patch is not None
+    assert patch["qwen_call_anchors"] == {"call_new": 20}
+    assert "_qwen_call_anchors" not in plan.prompt
 
 
 def test_published_anchor_beats_the_length_when_the_result_arrives():

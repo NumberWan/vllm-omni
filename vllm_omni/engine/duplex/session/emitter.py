@@ -28,6 +28,7 @@ from vllm_omni.engine.duplex.events import (
     ResponseDone,
     error_event,
 )
+from vllm_omni.engine.duplex.plugin import settle_response_runtime
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
     discard_pending_input_audio,
@@ -95,6 +96,7 @@ class SessionEmitter:
         if session.active_response_id is not None:
             # Close still needs the request binding to abort the real engine work.
             session.end_response(commit_text=False, preserve_request=True)
+            settle_response_runtime(self._ctx.plugin, session, committed=False)
         events: list[DuplexEvent] = [error_event("output_backpressure", message)]
         if response_id is None:
             return events

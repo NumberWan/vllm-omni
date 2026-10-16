@@ -116,11 +116,12 @@ class ThinkerToolCursor:
             inner = rest[len(TOOL_CALL_START) : end]
             parsed = parse_completed_tool_call(inner)
             self.spoken += end + len(TOOL_CALL_END)
-            if parsed is None:
-                speech.append(rest[: end + len(TOOL_CALL_END)])
-                continue
             self.tool_turn = True
-            call = parsed
+            if parsed is None:
+                # A closed tag that is not a call is not speech and not history.
+                call = {"call_id": "", "name": "", "invalid": "1"}
+            else:
+                call = parsed
             break
         piece = "".join(speech)
         return piece, call

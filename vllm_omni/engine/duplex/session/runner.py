@@ -73,6 +73,7 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexModelSessionState,
     PcmAppendReservation,
+    settle_response_runtime,
 )
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
@@ -353,6 +354,7 @@ class DuplexSessionRunner:
                 session.request_resources.pop((stage_id, request_id), None)
         elif response_id == session.active_response_id:
             session.end_response(commit_text=False)
+            settle_response_runtime(self.plugin, session, committed=False)
         self.emit(
             {
                 "type": "response.done",
@@ -454,6 +456,7 @@ class DuplexSessionRunner:
         self.tasks.active_response_task = None
         if session.active_response_id is not None:
             session.end_response(commit_text=False)
+            settle_response_runtime(self.plugin, session, committed=False)
         self._cleanup_duplex_session_state()
         session.close()
         await self._stop_worker()
@@ -1523,6 +1526,7 @@ class DuplexSessionRunner:
             commit_text=self.model.should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
         )
+        settle_response_runtime(self.plugin, session, committed=committed_message is not None)
         if old_response_id is not None:
             item_id = f"item_{old_response_id}"
             if committed_message is not None:
