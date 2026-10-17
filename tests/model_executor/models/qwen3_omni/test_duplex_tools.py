@@ -413,14 +413,110 @@ def test_reconcile_keeps_runtime_accepted_while_planning():
     reconciled = plugin.reconcile_submitted_runtime(
         {
             "qwen_tool_turns": [fresh],
-            "qwen_call_anchors": {"call_fresh": 4, "call_old": 1},
+            "qwen_call_anchors": {"call_fresh": 4, "call_kept": 3, "call_old": 1},
             "qwen_expired_call_ids": ["call_prev"],
         },
-        {"qwen_tool_turns": [], "qwen_call_anchors": {"call_kept": 3}, "qwen_expired_call_ids": ["call_old"]},
+        {
+            "qwen_tool_turns": [],
+            "qwen_call_anchors": {"call_kept": 3, "call_x": 3},
+            "qwen_expired_call_ids": ["call_old"],
+        },
     )
     assert reconciled["qwen_tool_turns"] == [fresh]
+    # call_x was consumed during the yield. call_old was expired by the snapshot.
     assert reconciled["qwen_call_anchors"] == {"call_kept": 3, "call_fresh": 4}
-    assert reconciled["qwen_expired_call_ids"] == ["call_old", "call_prev"]
+    assert reconciled["qwen_expired_call_ids"] == ["call_prev", "call_old"]
+
+
+def test_spliced_out_pair_stays_dropped_and_a_new_pair_survives():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: repr(messages))
+    old = _weather_turn("call_old", "Paris", "18C", 1)
+    new = _weather_turn("call_new", "Tokyo", "20C", 4)
+    plan = plugin.plan_append(
+        request_id="drop-old",
+        fence=None,
+        session_config={
+            "qwen_messages": [
+                {"role": "user", "content": "later", "_src": 2},
+                {"role": "user", "content": "newest", "_src": 3},
+            ],
+            "conversation": [{"role": "user", "content": f"q{index}"} for index in range(4)],
+            "qwen_tool_turns": [old],
+        },
+        runtime_config={},
+        seq=1,
+        turn_seq=1,
+        payload={"type": "conversation"},
+        final=True,
+        sampling_params=None,
+    )
+    assert "18C" not in plan.prompt["prompt"]
+    prompt = dict(plan.prompt)
+    patch = plugin.runtime_patch_for_submitted_prompt(prompt)
+    assert patch is not None
+    assert patch["_qwen_dropped_tool_call_ids"] == ["call_old"]
+    current = {"qwen_tool_turns": [old, new]}
+    updated = dict(current)
+    updated.update(patch)
+    reconciled = plugin.reconcile_submitted_runtime(current, updated)
+    assert reconciled is not None
+    assert "_qwen_dropped_tool_call_ids" not in reconciled
+    waiting = reconciled.get("qwen_tool_turns") or []
+    inflight = reconciled.get("qwen_tool_turns_inflight") or []
+    assert [_tool_call_id_from_turn(turn) for turn in [*waiting, *inflight]] == ["call_new"]
+    assert plugin.has_pending_tool_followup(reconciled)
+    only_old = plugin.reconcile_submitted_runtime({"qwen_tool_turns": [old]}, {**{"qwen_tool_turns": [old]}, **patch})
+    assert only_old is not None
+    assert not plugin.has_pending_tool_followup(only_old)
+    assert not only_old.get("qwen_tool_turns")
+    assert not only_old.get("qwen_tool_turns_inflight")
+
+
+def _tool_call_id_from_turn(turn: dict[str, object]) -> str | None:
+    messages = turn.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in messages:
+        if isinstance(message, dict) and isinstance(message.get("tool_call_id"), str):
+            return message["tool_call_id"]
+    return None
+
+
+def test_expired_id_window_advances_in_order_through_reconcile():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
+    live = [f"e{index}" for index in range(1, 65)]
+    plan = plugin.plan_append(
+        request_id="cap-order",
+        fence=None,
+        session_config={
+            "qwen_messages": [{"role": "user", "content": "q19", "_src": 19}],
+            "conversation": [{"role": "user", "content": f"q{index}"} for index in range(20)],
+        },
+        runtime_config={"qwen_call_anchors": {"e65": 1}, "qwen_expired_call_ids": live},
+        seq=1,
+        turn_seq=1,
+        payload={"type": "conversation"},
+        final=True,
+        sampling_params=None,
+    )
+    prompt = dict(plan.prompt)
+    patch = plugin.runtime_patch_for_submitted_prompt(prompt)
+    assert patch is not None
+    assert patch["qwen_expired_call_ids"] == [f"e{index}" for index in range(2, 66)]
+    # A newer anchor forces reconcile to return. The saturated expiry list must
+    # stay in submission order, not grow the oldest id back onto the end.
+    current = {
+        "qwen_call_anchors": {"e65": 1, "call_fresh": 20},
+        "qwen_expired_call_ids": live,
+    }
+    updated = dict(current)
+    updated.update(patch)
+    reconciled = plugin.reconcile_submitted_runtime(current, updated)
+    assert reconciled is not None
+    assert reconciled["qwen_expired_call_ids"] == [f"e{index}" for index in range(2, 66)]
+    assert reconciled["qwen_call_anchors"] == {"call_fresh": 20}
 
 
 def test_stream_and_session_close_drop_thinker_cursors():

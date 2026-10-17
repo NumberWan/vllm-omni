@@ -107,6 +107,19 @@ def _tool_turns(runtime_config: Mapping[str, object], key: str) -> list[dict[str
     return [turn for turn in raw if isinstance(turn, dict)]
 
 
+def _call_ids_of(turns: object) -> list[str]:
+    if not isinstance(turns, list):
+        return []
+    found: list[str] = []
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        call_id = _tool_call_id(turn)
+        if call_id and call_id not in found:
+            found.append(call_id)
+    return found
+
+
 def _tool_call_id(turn: Mapping[str, object]) -> str | None:
     messages = turn.get("messages")
     if not isinstance(messages, list):
@@ -450,6 +463,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             patch["qwen_call_anchors"] = prompt.pop("_qwen_call_anchors")
         if "_qwen_expired_call_ids" in prompt:
             patch["qwen_expired_call_ids"] = prompt.pop("_qwen_expired_call_ids")
+        if "_qwen_dropped_tool_call_ids" in prompt:
+            # Seen by reconcile, then removed. Not session runtime.
+            patch["_qwen_dropped_tool_call_ids"] = prompt.pop("_qwen_dropped_tool_call_ids")
         return patch or None
 
     def reconcile_submitted_runtime(
@@ -470,6 +486,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         live_response_ids = _live_tool_response_ids(current)
         result = dict(updated)
         changed = False
+        dropped_raw = result.pop("_qwen_dropped_tool_call_ids", None)
+        if dropped_raw is not None:
+            changed = True
+        dropped_ids = (
+            {item for item in dropped_raw if isinstance(item, str)} if isinstance(dropped_raw, list) else set()
+        )
         seen_call_ids: set[str] = set()
         for key in ("qwen_tool_turns", "qwen_tool_turns_inflight"):
             raw = result.get(key)
@@ -509,7 +531,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         carried: list[dict[str, object]] = []
         for turn in _tool_turns(current, "qwen_tool_turns"):
             call_id = _tool_call_id(turn)
-            if call_id and call_id not in seen_call_ids:
+            if call_id and call_id not in seen_call_ids and call_id not in dropped_ids:
                 carried.append(turn)
         if carried:
             changed = True
@@ -522,34 +544,45 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         )
         current_anchors = current.get("qwen_call_anchors")
         patch_anchors = result.get("qwen_call_anchors")
-        if isinstance(current_anchors, Mapping):
-            base_anchors = (
+        if isinstance(current_anchors, Mapping) or isinstance(patch_anchors, Mapping):
+            # plan_append only removes anchors. Keep the live map, minus ids this
+            # snapshot already expired, so a result accepted during the yield is
+            # not given its old anchor back.
+            source = current_anchors if isinstance(current_anchors, Mapping) else {}
+            merged_anchors = {
+                key: value
+                for key, value in source.items()
+                if isinstance(key, str) and isinstance(value, int) and key not in expired_ids
+            }
+            patch_kept = (
                 {key: value for key, value in patch_anchors.items() if isinstance(key, str) and isinstance(value, int)}
                 if isinstance(patch_anchors, Mapping)
                 else {}
             )
-            merged_anchors = dict(base_anchors)
-            for key, value in current_anchors.items():
-                if not isinstance(key, str) or not isinstance(value, int):
-                    continue
-                if key in merged_anchors or key in expired_ids:
-                    continue
-                merged_anchors[key] = value
-            if merged_anchors != base_anchors:
+            if merged_anchors != patch_kept:
                 changed = True
-                result["qwen_call_anchors"] = merged_anchors
+                if merged_anchors:
+                    result["qwen_call_anchors"] = merged_anchors
+                else:
+                    result.pop("qwen_call_anchors", None)
         current_expired = current.get("qwen_expired_call_ids")
-        extras = (
+        current_ids = (
             [item for item in current_expired if isinstance(item, str)] if isinstance(current_expired, list) else []
         )
-        if extras:
-            expired_state: dict[str, object] = {"qwen_expired_call_ids": result.get("qwen_expired_call_ids")}
-            before = expired_state["qwen_expired_call_ids"]
-            _remember_expired(expired_state, extras)
+        patch_ids = [item for item in patch_expired if isinstance(item, str)] if isinstance(patch_expired, list) else []
+        if patch_ids or current_ids:
+            # Current is older. Append only ids the snapshot expired after that, so
+            # a full window evicts the oldest id instead of keeping it as newest.
+            expired_state: dict[str, object] = {"qwen_expired_call_ids": current_ids}
+            before = result.get("qwen_expired_call_ids")
+            _remember_expired(expired_state, patch_ids)
             after = expired_state.get("qwen_expired_call_ids")
             if after != before:
                 changed = True
-                result["qwen_expired_call_ids"] = after
+                if after:
+                    result["qwen_expired_call_ids"] = after
+                else:
+                    result.pop("qwen_expired_call_ids", None)
         if changed:
             owner = result.get("qwen_tool_response_id")
             if isinstance(owner, str) and owner and owner not in _live_tool_response_ids(result):
@@ -1090,6 +1123,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             prompt_payload["_qwen_tool_turns_remaining"] = remaining_tool_turns
         if inflight_tool_turns is not None:
             prompt_payload["_qwen_tool_turns_inflight"] = inflight_tool_turns
+        kept_call_ids = set(_call_ids_of(remaining_tool_turns)) | set(_call_ids_of(inflight_tool_turns))
+        dropped_call_ids = [call_id for call_id in _call_ids_of(folded) if call_id not in kept_call_ids]
+        if dropped_call_ids:
+            prompt_payload["_qwen_dropped_tool_call_ids"] = dropped_call_ids
         conversation = session_config.get("conversation")
         anchors = runtime_config.get("qwen_call_anchors")
         if isinstance(conversation, list) and isinstance(anchors, Mapping):
