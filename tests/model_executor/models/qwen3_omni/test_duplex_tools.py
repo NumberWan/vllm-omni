@@ -370,6 +370,59 @@ def test_stale_submit_patch_does_not_restore_an_acknowledged_pair():
     )
 
 
+def _tool_pair(call_id: str, content: str, response_id: str | None = None) -> dict[str, object]:
+    turn: dict[str, object] = {
+        "history_len": 1,
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": call_id, "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": call_id, "content": content},
+        ],
+    }
+    if response_id is not None:
+        turn["response_id"] = response_id
+    return turn
+
+
+def test_reconcile_keeps_a_pair_a_failed_response_released():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    released = _tool_pair("call_a", "18C")
+    snapshotted = _tool_pair("call_a", "18C", "resp-a")
+    reconciled = plugin.reconcile_submitted_runtime(
+        {"qwen_tool_turns": [released]},
+        {"qwen_tool_turns": [], "qwen_tool_turns_inflight": [snapshotted], "qwen_tool_response_id": "resp-a"},
+    )
+    assert "response_id" not in reconciled["qwen_tool_turns_inflight"][0]
+    assert reconciled["qwen_tool_turns_inflight"][0]["messages"][-1]["content"] == "18C"
+    assert "qwen_tool_response_id" not in reconciled
+    acknowledged = plugin.reconcile_submitted_runtime(
+        {},
+        {"qwen_tool_turns_inflight": [snapshotted], "qwen_tool_response_id": "resp-a"},
+    )
+    assert "qwen_tool_turns_inflight" not in acknowledged
+    assert "qwen_tool_response_id" not in acknowledged
+
+
+def test_reconcile_keeps_runtime_accepted_while_planning():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    fresh = _tool_pair("call_fresh", "20C")
+    reconciled = plugin.reconcile_submitted_runtime(
+        {
+            "qwen_tool_turns": [fresh],
+            "qwen_call_anchors": {"call_fresh": 4, "call_old": 1},
+            "qwen_expired_call_ids": ["call_prev"],
+        },
+        {"qwen_tool_turns": [], "qwen_call_anchors": {"call_kept": 3}, "qwen_expired_call_ids": ["call_old"]},
+    )
+    assert reconciled["qwen_tool_turns"] == [fresh]
+    assert reconciled["qwen_call_anchors"] == {"call_kept": 3, "call_fresh": 4}
+    assert reconciled["qwen_expired_call_ids"] == ["call_old", "call_prev"]
+
+
 def test_stream_and_session_close_drop_thinker_cursors():
     plane = QwenDataPlane(lambda *args: None)
     mine = duplex_resource_request_id(DuplexFence(session_id="sess-a", epoch=1, turn_id=1), "stage0-turn1")

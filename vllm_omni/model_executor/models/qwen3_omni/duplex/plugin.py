@@ -100,15 +100,60 @@ def _remember_expired(updated: dict[str, object], expired_ids: list[str]) -> Non
     updated["qwen_expired_call_ids"] = kept
 
 
+def _tool_turns(runtime_config: Mapping[str, object], key: str) -> list[dict[str, object]]:
+    raw = runtime_config.get(key)
+    if not isinstance(raw, list):
+        return []
+    return [turn for turn in raw if isinstance(turn, dict)]
+
+
+def _tool_call_id(turn: Mapping[str, object]) -> str | None:
+    messages = turn.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        call_id = message.get("tool_call_id")
+        if isinstance(call_id, str) and call_id:
+            return call_id
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            nested = call.get("id")
+            if isinstance(nested, str) and nested:
+                return nested
+    return None
+
+
+def _with_response_owner(turn: dict[str, object], owner: object) -> dict[str, object]:
+    if isinstance(owner, str) and owner:
+        if turn.get("response_id") == owner:
+            return turn
+        return {**turn, "response_id": owner}
+    if "response_id" not in turn:
+        return turn
+    return {key: value for key, value in turn.items() if key != "response_id"}
+
+
+def _current_turns_by_call_id(runtime_config: Mapping[str, object]) -> dict[str, dict[str, object]]:
+    found: dict[str, dict[str, object]] = {}
+    # Waiting overwrites inflight. A failure puts the pair back there with no owner.
+    for key in ("qwen_tool_turns_inflight", "qwen_tool_turns"):
+        for turn in _tool_turns(runtime_config, key):
+            call_id = _tool_call_id(turn)
+            if call_id:
+                found[call_id] = turn
+    return found
+
+
 def _live_tool_response_ids(runtime_config: Mapping[str, object]) -> set[str]:
     live: set[str] = set()
     for key in ("qwen_tool_turns", "qwen_tool_turns_inflight"):
-        raw = runtime_config.get(key)
-        if not isinstance(raw, list):
-            continue
-        for turn in raw:
-            if not isinstance(turn, dict):
-                continue
+        for turn in _tool_turns(runtime_config, key):
             owner = turn.get("response_id")
             if isinstance(owner, str) and owner:
                 live.add(owner)
@@ -412,38 +457,99 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         current: Mapping[str, object],
         updated: Mapping[str, object],
     ) -> dict[str, object] | None:
-        """Drop a patched tool pair whose response the ACK already finished.
+        """Drop a patched pair the ACK finished, and keep runtime accepted since the snapshot.
 
-        ``plan_append`` snapshots runtime before it yields. An ACK in that
-        window removes the pair. Applying the snapshot afterwards would put
-        the answered pair back. A turn with no ``response_id`` is a new result
-        and stays. ``None`` means the patch did not revive a finished pair.
+        ``plan_append`` snapshots runtime before it yields. An ACK in that window
+        removes the pair. A failure puts the same pair back with no response id.
+        Match ``tool_call_id`` so that failure is not treated as the ACK. A
+        waiting result, anchor, or expired id accepted during the yield stays.
+        This does not decide whether a result may be accepted. ``None`` means
+        the patch already matches the live runtime.
         """
-        live_ids = _live_tool_response_ids(current)
+        current_by_call = _current_turns_by_call_id(current)
+        live_response_ids = _live_tool_response_ids(current)
         result = dict(updated)
         changed = False
+        seen_call_ids: set[str] = set()
         for key in ("qwen_tool_turns", "qwen_tool_turns_inflight"):
             raw = result.get(key)
             if not isinstance(raw, list):
                 continue
             kept: list[object] = []
-            dropped = False
+            key_changed = False
             for turn in raw:
                 if not isinstance(turn, dict):
                     kept.append(turn)
                     continue
+                call_id = _tool_call_id(turn)
                 owner = turn.get("response_id")
-                if isinstance(owner, str) and owner and owner not in live_ids:
-                    dropped = True
+                if call_id:
+                    seen_call_ids.add(call_id)
+                    current_turn = current_by_call.get(call_id)
+                    if current_turn is None and isinstance(owner, str) and owner:
+                        key_changed = True
+                        continue
+                    if current_turn is not None:
+                        adopted = _with_response_owner(turn, current_turn.get("response_id"))
+                        if adopted is not turn:
+                            key_changed = True
+                        kept.append(adopted)
+                        continue
+                elif isinstance(owner, str) and owner and owner not in live_response_ids:
+                    key_changed = True
                     continue
                 kept.append(turn)
-            if not dropped:
+            if not key_changed:
                 continue
             changed = True
             if kept:
                 result[key] = kept
             else:
                 result.pop(key, None)
+        carried: list[dict[str, object]] = []
+        for turn in _tool_turns(current, "qwen_tool_turns"):
+            call_id = _tool_call_id(turn)
+            if call_id and call_id not in seen_call_ids:
+                carried.append(turn)
+        if carried:
+            changed = True
+            waiting = result.get("qwen_tool_turns")
+            base = list(waiting) if isinstance(waiting, list) else []
+            result["qwen_tool_turns"] = [*base, *carried]
+        patch_expired = result.get("qwen_expired_call_ids")
+        expired_ids = (
+            {item for item in patch_expired if isinstance(item, str)} if isinstance(patch_expired, list) else set()
+        )
+        current_anchors = current.get("qwen_call_anchors")
+        patch_anchors = result.get("qwen_call_anchors")
+        if isinstance(current_anchors, Mapping):
+            base_anchors = (
+                {key: value for key, value in patch_anchors.items() if isinstance(key, str) and isinstance(value, int)}
+                if isinstance(patch_anchors, Mapping)
+                else {}
+            )
+            merged_anchors = dict(base_anchors)
+            for key, value in current_anchors.items():
+                if not isinstance(key, str) or not isinstance(value, int):
+                    continue
+                if key in merged_anchors or key in expired_ids:
+                    continue
+                merged_anchors[key] = value
+            if merged_anchors != base_anchors:
+                changed = True
+                result["qwen_call_anchors"] = merged_anchors
+        current_expired = current.get("qwen_expired_call_ids")
+        extras = (
+            [item for item in current_expired if isinstance(item, str)] if isinstance(current_expired, list) else []
+        )
+        if extras:
+            expired_state: dict[str, object] = {"qwen_expired_call_ids": result.get("qwen_expired_call_ids")}
+            before = expired_state["qwen_expired_call_ids"]
+            _remember_expired(expired_state, extras)
+            after = expired_state.get("qwen_expired_call_ids")
+            if after != before:
+                changed = True
+                result["qwen_expired_call_ids"] = after
         if changed:
             owner = result.get("qwen_tool_response_id")
             if isinstance(owner, str) and owner and owner not in _live_tool_response_ids(result):
