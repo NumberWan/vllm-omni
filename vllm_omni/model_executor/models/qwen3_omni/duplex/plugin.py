@@ -84,6 +84,9 @@ def _prune_call_anchors(anchors: Mapping[str, object], *, history_len: int) -> d
     return _split_call_anchors(anchors, history_len=history_len)[0]
 
 
+_EXPIRED_CALL_LIMIT = 64
+
+
 def _remember_expired(updated: dict[str, object], expired_ids: list[str]) -> None:
     if not expired_ids:
         return
@@ -92,7 +95,24 @@ def _remember_expired(updated: dict[str, object], expired_ids: list[str]) -> Non
     for call_id in expired_ids:
         if call_id not in kept:
             kept.append(call_id)
+    if len(kept) > _EXPIRED_CALL_LIMIT:
+        kept = kept[-_EXPIRED_CALL_LIMIT:]
     updated["qwen_expired_call_ids"] = kept
+
+
+def _live_tool_response_ids(runtime_config: Mapping[str, object]) -> set[str]:
+    live: set[str] = set()
+    for key in ("qwen_tool_turns", "qwen_tool_turns_inflight"):
+        raw = runtime_config.get(key)
+        if not isinstance(raw, list):
+            continue
+        for turn in raw:
+            if not isinstance(turn, dict):
+                continue
+            owner = turn.get("response_id")
+            if isinstance(owner, str) and owner:
+                live.add(owner)
+    return live
 
 
 class QwenDataPlane(DuplexDataPlane):
@@ -387,6 +407,49 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             patch["qwen_expired_call_ids"] = prompt.pop("_qwen_expired_call_ids")
         return patch or None
 
+    def reconcile_submitted_runtime(
+        self,
+        current: Mapping[str, object],
+        updated: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Drop a patched tool pair whose response the ACK already finished.
+
+        ``plan_append`` snapshots runtime before it yields. An ACK in that
+        window removes the pair. Applying the snapshot afterwards would put
+        the answered pair back. A turn with no ``response_id`` is a new result
+        and stays. ``None`` means the patch did not revive a finished pair.
+        """
+        live_ids = _live_tool_response_ids(current)
+        result = dict(updated)
+        changed = False
+        for key in ("qwen_tool_turns", "qwen_tool_turns_inflight"):
+            raw = result.get(key)
+            if not isinstance(raw, list):
+                continue
+            kept: list[object] = []
+            dropped = False
+            for turn in raw:
+                if not isinstance(turn, dict):
+                    kept.append(turn)
+                    continue
+                owner = turn.get("response_id")
+                if isinstance(owner, str) and owner and owner not in live_ids:
+                    dropped = True
+                    continue
+                kept.append(turn)
+            if not dropped:
+                continue
+            changed = True
+            if kept:
+                result[key] = kept
+            else:
+                result.pop(key, None)
+        if changed:
+            owner = result.get("qwen_tool_response_id")
+            if isinstance(owner, str) and owner and owner not in _live_tool_response_ids(result):
+                result.pop("qwen_tool_response_id", None)
+        return result if changed else None
+
     def bind_inflight_response(
         self,
         runtime_config: Mapping[str, object],
@@ -423,6 +486,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         committed: bool,
         awaiting_playback: bool = False,
         response_id: str | None = None,
+        release_owner: bool = False,
     ) -> dict[str, object] | None:
         """Drop a submitted tool pair only when that response stored its text.
 
@@ -467,7 +531,14 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if committed:
             updated["qwen_tool_turns"] = [turn for turn in waiting if turn not in tagged_waiting]
         elif owned:
-            restored = [turn for turn in owned if isinstance(turn, dict)]
+            restored = []
+            for turn in owned:
+                if not isinstance(turn, dict):
+                    continue
+                if release_owner:
+                    restored.append({key: value for key, value in turn.items() if key != "response_id"})
+                else:
+                    restored.append(turn)
             others = [turn for turn in waiting if turn not in tagged_waiting]
             updated["qwen_tool_turns"] = [*restored, *others]
         return updated
@@ -920,14 +991,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             kept_anchors, expired_anchors = _split_call_anchors(anchors, history_len=len(conversation))
             prompt_payload["_qwen_call_anchors"] = kept_anchors
             if expired_anchors:
-                expired_now = runtime_config.get("qwen_expired_call_ids")
-                merged = (
-                    [item for item in expired_now if isinstance(item, str)] if isinstance(expired_now, list) else []
-                )
-                for call_id in expired_anchors:
-                    if call_id not in merged:
-                        merged.append(call_id)
-                prompt_payload["_qwen_expired_call_ids"] = merged
+                expired_state: dict[str, object] = {
+                    "qwen_expired_call_ids": runtime_config.get("qwen_expired_call_ids")
+                }
+                _remember_expired(expired_state, expired_anchors)
+                prompt_payload["_qwen_expired_call_ids"] = expired_state["qwen_expired_call_ids"]
         return DuplexAppendPlan(prompt=prompt_payload)
 
     def decide_output(self, **kwargs):

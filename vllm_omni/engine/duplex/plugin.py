@@ -621,15 +621,17 @@ class DuplexModelPlugin(ABC):
         committed: bool,
         awaiting_playback: bool = False,
         response_id: str | None = None,
+        release_owner: bool = False,
     ) -> dict[str, object] | None:
         """Adjust runtime after a response ends.
 
         ``committed`` is false when the response was cancelled or failed before
         its text was stored. ``awaiting_playback`` means audio was produced and
-        a later playback ACK may still store that text. The default keeps the
-        runtime unchanged.
+        a later playback ACK may still store that text. ``release_owner`` means
+        that response failed before any playback ACK can store the answer, so a
+        retry may take the tool pair. The default keeps the runtime unchanged.
         """
-        del runtime_config, committed, awaiting_playback, response_id
+        del runtime_config, committed, awaiting_playback, response_id, release_owner
         return None
 
     def runtime_config_after_model_output(
@@ -654,6 +656,7 @@ def settle_response_runtime(
     committed: bool,
     awaiting_playback: bool = False,
     response_id: str | None = None,
+    release_owner: bool = False,
 ) -> None:
     """Let the plugin keep or drop response-scoped runtime after ``end_response``.
 
@@ -671,6 +674,7 @@ def settle_response_runtime(
         committed=committed,
         awaiting_playback=awaiting_playback,
         response_id=response_id,
+        release_owner=release_owner,
     )
     if updated is not None:
         replace(updated)

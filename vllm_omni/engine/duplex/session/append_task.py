@@ -246,7 +246,9 @@ class AppendAttempt:
         session = self.ctx.session
         failed_response_id = session.active_response_id
         session.end_response(commit_text=False)
-        settle_response_runtime(self.ctx.plugin, session, committed=False, response_id=failed_response_id)
+        settle_response_runtime(
+            self.ctx.plugin, session, committed=False, response_id=failed_response_id, release_owner=True
+        )
         self.out.emit(
             {
                 "type": "response.done",

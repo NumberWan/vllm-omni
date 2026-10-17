@@ -430,8 +430,17 @@ class ModelChannel:
                 if expected_epoch is not None and session.epoch != expected_epoch:
                     raise DuplexFenceMismatchError(session.fence, fence)
                 if runtime_patch:
-                    updated_runtime = dict(session.runtime_config)
+                    current_runtime = session.runtime_config
+                    updated_runtime = dict(current_runtime)
                     updated_runtime.update(runtime_patch)
+                    # Preparation ran off the loop, so an ACK may already have
+                    # dropped a pair this patch still carries. The hook is
+                    # optional; without it the patch is applied as before.
+                    reconcile = getattr(self._ctx.plugin, "reconcile_submitted_runtime", None)
+                    if callable(reconcile):
+                        reconciled = reconcile(current_runtime, updated_runtime)
+                        if reconciled is not None:
+                            updated_runtime = reconciled
                     session.replace_runtime_config(updated_runtime)
                     bind = getattr(self._ctx.plugin, "bind_inflight_response", None)
                     if callable(bind):
@@ -804,7 +813,7 @@ class ModelChannel:
         if self._ctx.run.closing or response_id is None:
             return
         session.end_response(commit_text=False)
-        settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id)
+        settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self._out.emit(
             {
                 "type": "response.done",
@@ -1521,7 +1530,7 @@ class ModelChannel:
         if response_turn_id is not None:
             session.complete_model_turn(response_turn_id)
         session.end_response(commit_text=False, preserve_request=True)
-        settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id)
+        settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self._out.emit(
             {
                 "type": "response.done",

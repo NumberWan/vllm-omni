@@ -1145,6 +1145,78 @@ async def test_playback_clear_before_ack_puts_the_tool_pair_back():
 
 
 @pytest.mark.asyncio
+async def test_overlap_barge_in_before_playback_keeps_the_tool_result():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        projector = h.runner.out.require_projector()
+        projector.conversation_items["item_call"] = {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        await h.run(CreateResponse())
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="sunny", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, finished=True), stage_id=2)
+        assert h.session.playback.committed_ms == 0
+        await h.run(append_audio())
+        restored = h.session.runtime_config.get("qwen_tool_turns")
+        assert isinstance(restored, list) and restored
+        assert restored[0].get("response_id") == response_id
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "18C" in prompt
+        assert "get_weather" in prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_overlap_barge_in_after_partial_playback_leaves_the_tool_pair_inflight():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        projector = h.runner.out.require_projector()
+        projector.conversation_items["item_call"] = {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        await h.run(CreateResponse())
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="sunny", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=100, committed_ms=100))
+        assert h.session.playback.committed_ms > 0
+        assert h.session.runtime_config.get("qwen_tool_turns_inflight")
+        await h.run(append_audio())
+        inflight = h.session.runtime_config.get("qwen_tool_turns_inflight")
+        assert isinstance(inflight, list) and inflight
+        assert inflight[0].get("response_id") == response_id
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_listen_audio_commit_does_not_use_video_deferred_response():
     h = await open_qwen()
     try:

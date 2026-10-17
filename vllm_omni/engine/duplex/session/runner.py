@@ -354,7 +354,7 @@ class DuplexSessionRunner:
                 session.request_resources.pop((stage_id, request_id), None)
         elif response_id == session.active_response_id:
             session.end_response(commit_text=False)
-            settle_response_runtime(self.plugin, session, committed=False, response_id=response_id)
+            settle_response_runtime(self.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self.emit(
             {
                 "type": "response.done",
@@ -1547,14 +1547,21 @@ class DuplexSessionRunner:
         old_epoch = session.epoch
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
+        audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
         committed_message = session.end_response(
             commit_text=self.model.should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
         )
+        # Playback clear keeps the id. A cancel before any audio was sent does
+        # not, so the retry can own the tool pair.
         settle_response_runtime(
-            self.plugin, session, committed=committed_message is not None, response_id=old_response_id
+            self.plugin,
+            session,
+            committed=committed_message is not None,
+            response_id=old_response_id,
+            release_owner=committed_message is None and committed_ms == 0 and not audio_started,
         )
         if old_response_id is not None:
             item_id = f"item_{old_response_id}"

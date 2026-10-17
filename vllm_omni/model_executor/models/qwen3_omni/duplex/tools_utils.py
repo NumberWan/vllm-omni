@@ -87,11 +87,12 @@ class ThinkerToolCursor:
     def absorb(self, incoming: str) -> tuple[str, dict[str, str] | None]:
         """Merge one Thinker delta and return ``(speakable, call)``.
 
-        A longer chunk that starts with the text already seen is a cumulative
-        snapshot. Any other chunk, including a repeated delta, is appended.
+        Both sides non-empty are appended. Qwen duplex requests DELTA text, so
+        a longer chunk that starts with the text already seen is another delta.
         An open tag contributes no speech and no call. ``spoken`` already
         passed a finished tag, so the same span is not parsed again. A later
-        tag with the same name and arguments is a new call.
+        tag with the same name and arguments is a new call. Text after a
+        closed tag stays speech.
         """
         self.text = _merge_text(self.text, incoming)
         speech: list[str] = []
@@ -138,15 +139,14 @@ class ThinkerToolCursor:
 
 
 def _merge_text(previous: str, incoming: str) -> str:
-    """Append a delta. A strictly longer prefix is a cumulative snapshot.
+    """Append one DELTA chunk.
 
-    An identical chunk is a repeated delta, not a snapshot resend. Collapsing
-    it dropped ``[' very', ' very', ' good']`` down to ``' very good'``.
+    Qwen duplex requests ``RequestOutputKind.DELTA``. A longer chunk that
+    starts with the text already seen is another delta, not a cumulative
+    snapshot. Replacing it dropped ``[' very', ' very good']`` to ``' very good'``.
     """
     if not incoming:
         return previous
     if not previous:
-        return incoming
-    if len(incoming) > len(previous) and incoming.startswith(previous):
         return incoming
     return previous + incoming

@@ -38,8 +38,8 @@ def test_complete_call_is_recognized_once():
     assert call is not None
     assert call["name"] == "get_current_time"
     assert json.loads(call["arguments"]) == {}
-    # A longer snapshot of the same span is not a second call.
-    again_speech, again_call = cursor.absorb(cursor.text + " thanks")
+    # The finished tag is already spoken. The next delta is speech, not another call.
+    again_speech, again_call = cursor.absorb(" thanks")
     assert again_call is None
     assert again_speech == " thanks"
     assert "<tool_call>" not in again_speech
@@ -69,8 +69,10 @@ def test_delta_chunks_are_appended_even_when_they_share_a_prefix():
     assert cursor.text == " very very good"
     grown = ThinkerToolCursor()
     grown.absorb(" very")
-    grown.absorb(" very good")
-    assert grown.text == " very good"
+    longer, longer_call = grown.absorb(" very good")
+    assert longer_call is None
+    assert longer == " very good"
+    assert grown.text == " very very good"
 
 
 def _output(text: str, *, request_id: str = "req", stage_id: int = 0, finished: bool = False, audio: bool = False):
@@ -304,6 +306,70 @@ def test_playback_keeps_the_pair_until_that_response_stores_text():
     assert "qwen_tool_response_id" not in dropped
 
 
+def test_failed_response_releases_the_owner_so_the_retry_can_drop_the_pair():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    pair = {
+        "history_len": 1,
+        "response_id": "resp-a",
+        "messages": [{"role": "tool", "content": "18C"}],
+    }
+    runtime = {
+        "qwen_tool_turns": [],
+        "qwen_tool_turns_inflight": [pair],
+        "qwen_tool_response_id": "resp-a",
+    }
+    # Playback clear keeps the id so a late ACK can still drop the pair.
+    kept = plugin.runtime_config_after_response(runtime, committed=False, response_id="resp-a")
+    assert kept["qwen_tool_turns"][0]["response_id"] == "resp-a"
+    released = plugin.runtime_config_after_response(runtime, committed=False, response_id="resp-a", release_owner=True)
+    assert "response_id" not in released["qwen_tool_turns"][0]
+    assert "qwen_tool_turns_inflight" not in released
+    bound = plugin.bind_inflight_response(
+        {"qwen_tool_turns": [], "qwen_tool_turns_inflight": released["qwen_tool_turns"]},
+        response_id="resp-b",
+    )
+    assert bound["qwen_tool_turns_inflight"][0]["response_id"] == "resp-b"
+    stored = plugin.runtime_config_after_response(bound, committed=True, response_id="resp-b")
+    assert stored["qwen_tool_turns"] == []
+    assert "qwen_tool_turns_inflight" not in stored
+    failed_again = plugin.runtime_config_after_response(
+        bound, committed=False, response_id="resp-b", release_owner=True
+    )
+    assert "response_id" not in failed_again["qwen_tool_turns"][0]
+    assert "qwen_tool_turns_inflight" not in failed_again
+
+
+def test_stale_submit_patch_does_not_restore_an_acknowledged_pair():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    answered = {
+        "history_len": 1,
+        "response_id": "resp-a",
+        "messages": [{"role": "tool", "content": "18C"}],
+    }
+    fresh = {"history_len": 2, "messages": [{"role": "tool", "content": "20C"}]}
+    # The ACK already removed A's pair. B's snapshot still carries it.
+    reconciled = plugin.reconcile_submitted_runtime(
+        {},
+        {"qwen_tool_turns": [], "qwen_tool_turns_inflight": [answered, fresh], "qwen_tool_response_id": "resp-a"},
+    )
+    assert reconciled["qwen_tool_turns_inflight"] == [fresh]
+    assert "qwen_tool_response_id" not in reconciled
+    emptied = plugin.reconcile_submitted_runtime(
+        {},
+        {"qwen_tool_turns_inflight": [answered], "qwen_tool_response_id": "resp-a"},
+    )
+    assert "qwen_tool_turns_inflight" not in emptied
+    assert "qwen_tool_response_id" not in emptied
+    # A pair the current runtime still owns is not dropped.
+    assert (
+        plugin.reconcile_submitted_runtime(
+            {"qwen_tool_turns_inflight": [answered]},
+            {"qwen_tool_turns_inflight": [answered]},
+        )
+        is None
+    )
+
+
 def test_stream_and_session_close_drop_thinker_cursors():
     plane = QwenDataPlane(lambda *args: None)
     mine = duplex_resource_request_id(DuplexFence(session_id="sess-a", epoch=1, turn_id=1), "stage0-turn1")
@@ -388,6 +454,63 @@ def test_call_anchors_older_than_the_prompt_window_are_dropped():
     assert patch is not None
     assert patch["qwen_call_anchors"] == {"call_new": 20}
     assert "_qwen_call_anchors" not in plan.prompt
+
+
+def test_expired_call_ids_keep_only_the_newest_window():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
+    oldest = [f"call_{index:03d}" for index in range(64)]
+    conversation = [{"role": "user", "content": f"q{index}"} for index in range(20)]
+    plan = plugin.plan_append(
+        request_id="cap-expired",
+        fence=None,
+        session_config={
+            "qwen_messages": [{"role": "user", "content": "q19", "_src": 19}],
+            "conversation": conversation,
+        },
+        runtime_config={
+            "qwen_call_anchors": {"call_old": 1},
+            "qwen_expired_call_ids": oldest,
+        },
+        seq=1,
+        turn_seq=1,
+        payload={"type": "conversation"},
+        final=True,
+        sampling_params=None,
+    )
+    expired = plan.prompt["_qwen_expired_call_ids"]
+    assert expired[0] == oldest[1]
+    assert expired[-1] == "call_old"
+    assert len(expired) == 64
+    assert oldest[0] not in expired
+    refused_runtime = {"qwen_expired_call_ids": expired}
+    with pytest.raises(DuplexRuntimeConfigError) as refused:
+        plugin.runtime_config_for_function_output(
+            DuplexSessionConfig(model="qwen"),
+            refused_runtime,
+            {
+                "type": "function_call_output",
+                "call_id": "call_old",
+                "name": "get_weather",
+                "arguments": "{}",
+                "output": "18C",
+            },
+            history_len=20,
+        )
+    assert refused.value.code == "invalid_function_call_output"
+    accepted = plugin.runtime_config_for_function_output(
+        DuplexSessionConfig(model="qwen"),
+        refused_runtime,
+        {
+            "type": "function_call_output",
+            "call_id": oldest[0],
+            "name": "get_weather",
+            "arguments": "{}",
+            "output": "19C",
+        },
+        history_len=20,
+    )
+    assert accepted["qwen_tool_turns"][-1]["messages"][-1]["content"] == "19C"
 
 
 def test_published_anchor_beats_the_length_when_the_result_arrives():
