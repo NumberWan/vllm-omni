@@ -466,6 +466,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if "_qwen_dropped_tool_call_ids" in prompt:
             # Seen by reconcile, then removed. Not session runtime.
             patch["_qwen_dropped_tool_call_ids"] = prompt.pop("_qwen_dropped_tool_call_ids")
+        if "_qwen_newly_expired_call_ids" in prompt:
+            # Seen by reconcile, then removed. Not session runtime.
+            patch["_qwen_newly_expired_call_ids"] = prompt.pop("_qwen_newly_expired_call_ids")
         return patch or None
 
     def reconcile_submitted_runtime(
@@ -569,13 +572,16 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         current_ids = (
             [item for item in current_expired if isinstance(item, str)] if isinstance(current_expired, list) else []
         )
-        patch_ids = [item for item in patch_expired if isinstance(item, str)] if isinstance(patch_expired, list) else []
-        if patch_ids or current_ids:
-            # Current is older. Append only ids the snapshot expired after that, so
-            # a full window evicts the oldest id instead of keeping it as newest.
+        # The patch list is the snapshot window, including ids live may already
+        # have evicted. Append only the ids this plan itself expired.
+        newly_raw = result.pop("_qwen_newly_expired_call_ids", None)
+        if newly_raw is not None:
+            changed = True
+        newly_ids = [item for item in newly_raw if isinstance(item, str)] if isinstance(newly_raw, list) else []
+        if newly_ids or current_ids:
             expired_state: dict[str, object] = {"qwen_expired_call_ids": current_ids}
             before = result.get("qwen_expired_call_ids")
-            _remember_expired(expired_state, patch_ids)
+            _remember_expired(expired_state, newly_ids)
             after = expired_state.get("qwen_expired_call_ids")
             if after != before:
                 changed = True
@@ -1139,6 +1145,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 }
                 _remember_expired(expired_state, expired_anchors)
                 prompt_payload["_qwen_expired_call_ids"] = expired_state["qwen_expired_call_ids"]
+                # Reconcile appends these onto the live list. The full window above
+                # still feeds anchor removal, but must not be appended again.
+                prompt_payload["_qwen_newly_expired_call_ids"] = expired_anchors
         return DuplexAppendPlan(prompt=prompt_payload)
 
     def decide_output(self, **kwargs):

@@ -420,9 +420,11 @@ def test_reconcile_keeps_runtime_accepted_while_planning():
             "qwen_tool_turns": [],
             "qwen_call_anchors": {"call_kept": 3, "call_x": 3},
             "qwen_expired_call_ids": ["call_old"],
+            "_qwen_newly_expired_call_ids": ["call_old"],
         },
     )
     assert reconciled["qwen_tool_turns"] == [fresh]
+    assert "_qwen_newly_expired_call_ids" not in reconciled
     # call_x was consumed during the yield. call_old was expired by the snapshot.
     assert reconciled["qwen_call_anchors"] == {"call_kept": 3, "call_fresh": 4}
     assert reconciled["qwen_expired_call_ids"] == ["call_prev", "call_old"]
@@ -505,6 +507,7 @@ def test_expired_id_window_advances_in_order_through_reconcile():
     patch = plugin.runtime_patch_for_submitted_prompt(prompt)
     assert patch is not None
     assert patch["qwen_expired_call_ids"] == [f"e{index}" for index in range(2, 66)]
+    assert patch["_qwen_newly_expired_call_ids"] == ["e65"]
     # A newer anchor forces reconcile to return. The saturated expiry list must
     # stay in submission order, not grow the oldest id back onto the end.
     current = {
@@ -517,6 +520,41 @@ def test_expired_id_window_advances_in_order_through_reconcile():
     assert reconciled is not None
     assert reconciled["qwen_expired_call_ids"] == [f"e{index}" for index in range(2, 66)]
     assert reconciled["qwen_call_anchors"] == {"call_fresh": 20}
+    assert "_qwen_newly_expired_call_ids" not in reconciled
+
+
+def test_yield_expiries_stay_ahead_of_ids_the_snapshot_already_evicted():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
+    snapshot = [f"e{index}" for index in range(1, 65)]
+    plan = plugin.plan_append(
+        request_id="cap-yield",
+        fence=None,
+        session_config={
+            "qwen_messages": [{"role": "user", "content": "q19", "_src": 19}],
+            "conversation": [{"role": "user", "content": f"q{index}"} for index in range(20)],
+        },
+        runtime_config={"qwen_call_anchors": {"e65": 1}, "qwen_expired_call_ids": snapshot},
+        seq=1,
+        turn_seq=1,
+        payload={"type": "conversation"},
+        final=True,
+        sampling_params=None,
+    )
+    prompt = dict(plan.prompt)
+    patch = plugin.runtime_patch_for_submitted_prompt(prompt)
+    assert patch is not None
+    assert patch["qwen_expired_call_ids"] == [f"e{index}" for index in range(2, 66)]
+    assert patch["_qwen_newly_expired_call_ids"] == ["e65"]
+    # The yield expired eY then eZ and already evicted e1 and e2.
+    during_yield = [f"e{index}" for index in range(3, 65)] + ["eY", "eZ"]
+    current = {"qwen_call_anchors": {"e65": 1}, "qwen_expired_call_ids": during_yield}
+    updated = dict(current)
+    updated.update(patch)
+    reconciled = plugin.reconcile_submitted_runtime(current, updated)
+    assert reconciled is not None
+    assert reconciled["qwen_expired_call_ids"] == [f"e{index}" for index in range(4, 65)] + ["eY", "eZ", "e65"]
+    assert "_qwen_newly_expired_call_ids" not in reconciled
 
 
 def test_stream_and_session_close_drop_thinker_cursors():
