@@ -439,7 +439,9 @@ class SessionControl:
                         realtime_event_id,
                     )
                     try:
-                        session.replace_config(previous_config)
+                        # Not replace_config: that would count the candidate's
+                        # seed again and bump config_generation a second time.
+                        session.restore_config(previous_config)
                     except Exception:
                         logger.exception(
                             "session.update %s could not restore its previous config",

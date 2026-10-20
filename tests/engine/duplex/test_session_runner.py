@@ -2096,6 +2096,110 @@ async def test_runtime_replace_that_cannot_finish_drops_the_uncommitted_vad(monk
 
 
 @pytest.mark.asyncio
+async def test_rejected_runtime_replace_does_not_count_the_candidate_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restoring the previous config must not go through ``replace_config``.
+
+    The forward replace already counted the candidate seed and bumped
+    ``config_generation``. A second ``replace_config`` would count the old
+    seed as well, so a later ``response.create`` sees input that never landed.
+    """
+    from vllm_omni.engine.duplex.config import DuplexSessionConfig
+
+    original = DuplexSessionConfig.apply_realtime_update
+
+    def apply_seed(self, patch, *, session_id=None, audio_started=False):
+        original(self, patch, session_id=session_id, audio_started=audio_started)
+        seed = patch.get("initial_user_text")
+        if isinstance(seed, str):
+            self.initial_user_text = seed
+
+    def explode(self, runtime_config: object) -> None:
+        del self, runtime_config
+        raise RuntimeError("runtime replace exploded")
+
+    h = await open_harness()
+    h.session.config.initial_user_text = "ask about A"
+    unanswered = h.session.unanswered_user_items()
+    generation = h.session.config_generation
+    temperature = h.session.config.temperature
+    monkeypatch.setattr(DuplexSessionConfig, "apply_realtime_update", apply_seed)
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.engine_session.DuplexEngineSession.replace_runtime_config",
+        explode,
+    )
+    try:
+        patch = _accepted_format_patch()
+        patch["initial_user_text"] = "ask about B"
+        events = await h.run(commands.UpdateSession(patch=patch, event_id="evt-seed"))
+        assert types(events) == ["session.updated"]
+        assert h.session.config.initial_user_text == "ask about A"
+        assert h.session.config.temperature == temperature
+        assert h.session.unanswered_user_items() == unanswered
+        assert h.session.config_generation == generation
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_detector_reset_failure_still_adopts_the_staged_detector(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reset failure while swapping detectors still leaves one consistent update.
+
+    ``commit`` discards the old detector either way. Keeping it after the new
+    config and overlap policy landed would advertise a VAD the runner is not
+    running.
+    """
+    from vllm_omni.engine.duplex.turn_detection import (
+        PendingTurnDetectionUpdate,
+        TurnDetectionConfig,
+        normalize_turn_detection_session_payload,
+    )
+
+    class _OldDetector:
+        def __init__(self) -> None:
+            self.config = TurnDetectionConfig(threshold=0.2)
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+            raise RuntimeError("reset exploded")
+
+    class _StagedDetector:
+        def __init__(self) -> None:
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+
+    staged = _StagedDetector()
+    old = _OldDetector()
+
+    def fake_prepare(cls, payload, *, backend_provider=None, semantic_backend_provider=None):
+        del cls, backend_provider, semantic_backend_provider
+        _configured, config = normalize_turn_detection_session_payload(payload)
+        return PendingTurnDetectionUpdate(config=config, detector=staged)
+
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.control.PendingTurnDetectionUpdate.prepare",
+        classmethod(fake_prepare),
+    )
+    h = await open_harness()
+    h.runner.control._detector = old
+    h.runner.control._config = old.config
+    try:
+        events = await h.run(commands.UpdateSession(patch=_patch_with_turn_detection(), event_id="evt-reset"))
+        assert types(events) == ["session.updated"]
+        assert old.reset_calls == 1
+        assert h.runner.control._detector is staged
+        assert h.session.config.overlap_policy == "barge_in_on_speech"
+        assert events[0].session["overlap_policy"] == h.session.config.overlap_policy
+        assert events[0].session["turn_detection"]["type"] == "server_vad"
+        assert h.session.config.extra_body["realtime_turn_detection"]["type"] == "server_vad"
+        assert h.runner.control._config is not old.config
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_publish_failure_after_replace_carries_the_accepted_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     """Once the live config is replaced, a failed publish still echoes the accepted patch."""
     calls = {"n": 0}
