@@ -99,7 +99,7 @@ class _PendingSessionUpdate:
     """A ``session.update`` submitted to the engine and not yet accepted or rejected."""
 
     event_id: str | None
-    #: ``observation_seq`` sampled before ``submit``, so the outcome is visible.
+    #: ``_observation_seq`` sampled before ``submit``, so the outcome is visible.
     after_seq: int
 
 
@@ -792,10 +792,10 @@ class OmniDuplexSessionHandler:
             pending = self._pending_session_updates.get(session_id)
             if pending is None or handle.closed:
                 return
-            seen = handle.observation_seq()
-            # Retained, not the 64-event ring: a burst of later errors can
-            # evict the acceptance from the ring before this waiter runs.
-            outcome = _session_update_outcome(handle.retained_observations_after(pending.after_seq), pending.event_id)
+            seen = handle._observation_seq()
+            # The acceptance stays on the retained list, so a burst of later
+            # errors cannot drop it before this waiter runs.
+            outcome = _session_update_outcome(handle._retained_observations_after(pending.after_seq), pending.event_id)
             if isinstance(outcome, SessionUpdated):
                 self._apply_accepted_session_defaults(session_id, outcome.session)
                 self._clear_pending_session_update(handle)
@@ -803,17 +803,17 @@ class OmniDuplexSessionHandler:
             if isinstance(outcome, ErrorEvent):
                 self._clear_pending_session_update(handle)
                 return
-            if not await handle.wait_for_observation(seen):
+            if not await handle._wait_for_observation(seen):
                 self._clear_pending_session_update(handle)
                 return
 
     def _clear_pending_session_update(self, handle: DuplexSessionHandle) -> None:
         self._pending_session_updates.pop(handle.session_id, None)
-        handle.disarm_observation_retention()
+        handle._disarm_observation_retention()
 
     def _apply_queued_session_updates(self, handle: DuplexSessionHandle) -> None:
         """Apply ``session.updated`` events the pump has not dequeued yet."""
-        for event in handle.queued_events():
+        for event in handle._queued_events():
             if isinstance(event, SessionUpdated):
                 self._apply_accepted_session_defaults(handle.session_id, event.session)
 
@@ -838,13 +838,13 @@ class OmniDuplexSessionHandler:
             event_id = command.event_id or new_event_id()
             if command.event_id != event_id:
                 command = replace(command, event_id=event_id)
-            after_seq = attachment.handle.observation_seq()
-            attachment.handle.arm_observation_retention(after_seq, event_id)
+            after_seq = attachment.handle._observation_seq()
+            attachment.handle._arm_observation_retention(after_seq, event_id)
         try:
             await attachment.handle.submit(command)
         except DuplexSessionError as exc:
             if after_seq is not None:
-                attachment.handle.disarm_observation_retention()
+                attachment.handle._disarm_observation_retention()
             await send_json(envelope.error_payload(exc.code, str(exc), event_id=command.event_id))
             return
         if after_seq is not None:

@@ -113,25 +113,22 @@ class FakeHandle:
     def output_guard(self, event: DuplexEvent):
         return self._outbox.guard(event)
 
-    def queued_events(self) -> tuple[DuplexEvent, ...]:
+    def _queued_events(self) -> tuple[DuplexEvent, ...]:
         return self._outbox.queued_events()
 
-    def observation_seq(self) -> int:
+    def _observation_seq(self) -> int:
         return self._outbox.observation_seq()
 
-    def observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
-        return self._outbox.observations_after(seq)
-
-    async def wait_for_observation(self, seen: int) -> bool:
+    async def _wait_for_observation(self, seen: int) -> bool:
         return await self._outbox.wait_for_observation(seen)
 
-    def arm_observation_retention(self, after_seq: int, event_id: str) -> None:
+    def _arm_observation_retention(self, after_seq: int, event_id: str) -> None:
         self._outbox.arm_observation_retention(after_seq, event_id)
 
-    def disarm_observation_retention(self) -> None:
+    def _disarm_observation_retention(self) -> None:
         self._outbox.disarm_observation_retention()
 
-    def retained_observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
+    def _retained_observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
         return self._outbox.retained_observations_after(seq)
 
     async def submit(self, command: commands.DuplexCommand) -> None:
@@ -999,11 +996,12 @@ async def test_takeover_during_session_update_does_not_submit_the_replaced_appen
 
 
 @pytest.mark.asyncio
-async def test_session_update_outcome_survives_observation_ring_eviction() -> None:
-    """A ``session.updated`` followed by a full observation ring is still the update's outcome.
+async def test_session_update_outcome_survives_a_burst_of_later_errors() -> None:
+    """A ``session.updated`` followed by many unrelated errors is still that update's outcome.
 
-    The ring keeps 64 control events. The acceptance has to outlive that, or
-    the next append waits for an outcome the pump may already have delivered.
+    The acceptance is kept for the waiter that submitted the update. Later
+    errors must not drop it, or the next append waits for an outcome the pump
+    may already have delivered.
     """
     omni = FakeOmni()
     handler = _handler(omni)
@@ -1015,11 +1013,8 @@ async def test_session_update_outcome_survives_observation_ring_eviction() -> No
         await _next_command(handle, commands.UpdateSession)
 
         handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
-        ring = handle._outbox._observations.maxlen
-        assert ring is not None
-        for index in range(ring):
+        for index in range(64):
             handle.deliver(ErrorEvent(code="unrelated", message=str(index), related_event_id="other"))
-        assert not any(isinstance(event, SessionUpdated) for event in handle.observations_after(0))
 
         ws.feed(_append(b"\x00" * 8))
         accepted = await _next_append(handle)

@@ -92,11 +92,9 @@ class DuplexOutputBuffer:
         # Accepted or rejected session updates, recorded at enqueue so a reader
         # still sees them after the consumer dequeues them for the wire.
         self._observation_seq = 0
-        self._observations: deque[tuple[int, DuplexEvent]] = deque(maxlen=64)
         self._observe_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
-        # The ring above drops the oldest control event after 64 arrivals. An
-        # outstanding session.update keeps its own copy until the reader that
-        # submitted it consumes the acceptance or the matching rejection.
+        # One outstanding session.update keeps its own copy until the reader
+        # that submitted it consumes the acceptance or the matching rejection.
         self._retention_after: int | None = None
         self._retention_event_id: str | None = None
         self._retention_sealed = False
@@ -154,7 +152,6 @@ class DuplexOutputBuffer:
             observe_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
             if isinstance(event, SessionUpdated | ErrorEvent):
                 self._observation_seq += 1
-                self._observations.append((self._observation_seq, event))
                 if (
                     self._retention_after is not None
                     and not self._retention_sealed
@@ -221,13 +218,8 @@ class DuplexOutputBuffer:
         with self._lock:
             return self._observation_seq
 
-    def observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
-        """Control events enqueued after ``seq``. Not removed when ``get`` dequeues them."""
-        with self._lock:
-            return tuple(event for observed_seq, event in self._observations if observed_seq > seq)
-
     def arm_observation_retention(self, after_seq: int, event_id: str) -> None:
-        """Keep this update's outcome after the 64-event ring drops it.
+        """Keep this update's outcome until the reader consumes it.
 
         ``after_seq`` is ``observation_seq()`` sampled before the update is
         submitted. Retention stops once ``session.updated`` or the error with
@@ -240,7 +232,7 @@ class DuplexOutputBuffer:
             self._retained.clear()
 
     def disarm_observation_retention(self) -> None:
-        """Drop the retained outcome. The ring is unchanged."""
+        """Drop the retained outcome."""
         with self._lock:
             self._retention_after = None
             self._retention_event_id = None
@@ -248,7 +240,7 @@ class DuplexOutputBuffer:
             self._retained.clear()
 
     def retained_observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
-        """Control events kept for the outstanding update, including ones the ring dropped."""
+        """Control events kept for the outstanding update."""
         with self._lock:
             return tuple(event for observed_seq, event in self._retained if observed_seq > seq)
 
