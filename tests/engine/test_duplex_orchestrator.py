@@ -228,7 +228,12 @@ async def _route_raw_codec_output(
     is_segment_finished: bool,
     finish_reason: FinishReason | None = FinishReason.STOP,
 ) -> None:
-    """Drive one codec poll through raw handling, the interceptor, and the projector."""
+    """Drive one codec poll through raw bookkeeping, the interceptor, and the projector.
+
+    Session-owned requests skip ``_finish_raw_terminal_requests``. The raw
+    record these tests lock is ``finished_stage_ids`` from
+    ``_apply_raw_terminal_stage_finish``.
+    """
     orchestrator.stage_pools[stage_id].output_processor.request_outputs = [processed]
     raw = OmniEngineCoreOutputs(
         outputs=[
@@ -672,6 +677,8 @@ async def test_streaming_segment_stop_keeps_response_open_until_real_terminal(mo
         assert session.active_response_id is not None
         assert request_state.streaming.segment(1).finished is True
         assert request_id in orchestrator.request_states
+        assert 1 not in request_state.finished_stage_ids
+        assert 1 not in request_state.finished_final_output_stage_ids
 
         await _route_raw_codec_output(
             orchestrator,
@@ -700,6 +707,8 @@ async def test_streaming_segment_stop_keeps_response_open_until_real_terminal(mo
         assert done[0].response_id == response_id
         assert done[0].status == "completed"
         assert session.active_response_id is None
+        assert 1 in request_state.finished_stage_ids
+        assert 1 in request_state.finished_final_output_stage_ids
     finally:
         await orchestrator.session_manager.shutdown()
 
@@ -734,6 +743,8 @@ async def test_non_streaming_terminal_completes_the_response_once(mocker) -> Non
         assert done[0].status == "completed"
         assert session.active_response_id is None
         assert request_state.streaming.segment(1).finished is False
+        assert 1 in request_state.finished_stage_ids
+        assert 1 in request_state.finished_final_output_stage_ids
     finally:
         await orchestrator.session_manager.shutdown()
 
