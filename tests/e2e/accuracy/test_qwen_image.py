@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import base64
-import gc
 import io
 import os
 from pathlib import Path
@@ -19,6 +18,7 @@ from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similar
 from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
@@ -73,35 +73,17 @@ def _local_files_only(model: str) -> bool:
     return Path(model).exists()
 
 
-# Same Omni / Diffusers pair on CUDA (H100, H200, B200) and NPU A3.
-# FLASH_ATTN_3_HUB is Hopper-only and fails on B200/A100 (#8087). TORCH_SDPA
-# matches Diffusers ``native`` and has a binding on both sides.
+# Same Omni / Diffusers pair on CUDA (H100, B200) and NPU A3.
+# FLASH_ATTN_3_HUB is Hopper-only and fails on B200/A100 (#8087). Auto-select
+# can still land on that kernel. TORCH_SDPA matches Diffusers ``native`` and
+# has a binding on both sides.
 _OMNI_CI_ATTN_BACKEND = "TORCH_SDPA"
 _DIFFUSERS_CI_ATTN_BACKEND = "native"
 _OMNI_CI_ATTN_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_CI_ATTN_BACKEND}
 
 
-def _accel_device() -> str:
-    from vllm_omni.platforms import current_omni_platform
-
-    if current_omni_platform.is_npu():
-        return "npu"
-    return "cuda"
-
-
-def _empty_device_cache() -> None:
-    gc.collect()
-    device = _accel_device()
-    if device == "npu" and hasattr(torch, "npu") and torch.npu.is_available():
-        torch.npu.empty_cache()
-        return
-    if torch.cuda.is_available():
-        torch.accelerator.empty_cache()
-
-
 def _assert_omni_backend_resolves() -> None:
     from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
-    from vllm_omni.platforms import current_omni_platform
 
     path = current_omni_platform.get_diffusion_attn_backend_cls(_OMNI_CI_ATTN_BACKEND, head_size=128)
     expected = DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
@@ -156,9 +138,9 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
-        ).to(_accel_device())
+        ).to(current_omni_platform.device_type)
         pipe.transformer.set_attention_backend(_DIFFUSERS_CI_ATTN_BACKEND)
-        generator = torch.Generator(device=_accel_device()).manual_seed(SEED)
+        generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(SEED)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT,
             negative_prompt=NEGATIVE_PROMPT,
@@ -175,7 +157,6 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
         if pipe is not None and hasattr(pipe, "maybe_free_model_hooks"):
             pipe.maybe_free_model_hooks()
         del pipe
-        _empty_device_cache()
         cleanup_test_environment()
 
 
@@ -226,9 +207,9 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
-        ).to(_accel_device())
+        ).to(current_omni_platform.device_type)
         pipe.transformer.set_attention_backend(_DIFFUSERS_CI_ATTN_BACKEND)
-        generator = torch.Generator(device=_accel_device()).manual_seed(SEED_2512)
+        generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(SEED_2512)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT_2512,
             negative_prompt=NEGATIVE_PROMPT_2512,
@@ -245,12 +226,11 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
         if pipe is not None and hasattr(pipe, "maybe_free_model_hooks"):
             pipe.maybe_free_model_hooks()
         del pipe
-        _empty_device_cache()
         cleanup_test_environment()
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "H200", "B200"], "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
 def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
@@ -270,7 +250,7 @@ def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "H200", "B200"], "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
 def test_qwen_image_2512_matches_diffusers_pixelwise(accuracy_artifact_root: Path) -> None:
     model = _model_2512_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_2512_ID)
