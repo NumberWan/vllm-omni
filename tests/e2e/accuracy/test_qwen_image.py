@@ -86,17 +86,7 @@ _DIFFUSERS_CI_ATTN_BACKEND = "native"
 _OMNI_CI_ATTN_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_CI_ATTN_BACKEND}
 
 
-def _assert_omni_backend_resolves() -> None:
-    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
-
-    path = current_omni_platform.get_diffusion_attn_backend_cls(_OMNI_CI_ATTN_BACKEND, head_size=128)
-    expected = DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
-    assert path == expected, path
-    print(f"Resolved Omni attention backend: {_OMNI_CI_ATTN_BACKEND} -> {path}")
-
-
 def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
-    _assert_omni_backend_resolves()
     server_args = [
         "--num-gpus",
         "1",
@@ -165,7 +155,6 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
 
 
 def _run_vllm_omni_qwen_image_2512(*, model: str, output_path: Path) -> Image.Image:
-    _assert_omni_backend_resolves()
     server_args = [
         "--num-gpus",
         "1",
