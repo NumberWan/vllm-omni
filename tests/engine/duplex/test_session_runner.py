@@ -3001,12 +3001,11 @@ async def test_an_append_cancelled_from_outside_fails_the_response_it_precreated
 
 @pytest.mark.asyncio
 async def test_commit_aborted_does_not_claim_the_next_commit_item_id() -> None:
-    """An aborted commit drops its pending id, so the next ack keeps its own.
+    """An aborted commit drops its own id, so a later FIFO ack keeps its own.
 
-    ``resolve_commit`` pushes the id before ``_on_commit``. When the preceding
-    append has failed, the runner emits ``commit_aborted`` through
-    ``SessionEmitter.emit_error``, which must discard that id. The next
-    successful commit must not be acknowledged with the aborted id.
+    ``resolve_commit`` pushes the id before ``_on_commit``. The abort discards
+    that id, not whatever happens to be at the head. The next acknowledgement
+    carries no explicit id, so it pops the FIFO.
     """
     h = await open_harness(auto_response=False)
     try:
@@ -3022,16 +3021,26 @@ async def test_commit_aborted_does_not_claim_the_next_commit_item_id() -> None:
         assert find(aborted, "error").code == "commit_aborted"
         assert "input_audio_buffer.committed" not in types(aborted)
         projector = h.runner.out.require_projector()
-        assert "item_abort" not in projector.pending_commit_item_ids
+        assert projector.pending_commit_item_ids == []
+
+        # No explicit id: the ack has to pop the FIFO. A leftover item_abort
+        # would come out here instead of item_fifo.
+        projector.pending_commit_item_ids.append("item_fifo")
+        h.runner.emit({"type": "input.committed", "message": {"role": "user", "content": "later"}})
+        fifo = await h.settle()
+        assert find(fifo, "input_audio_buffer.committed").to_realtime()["item_id"] == "item_fifo"
+        assert projector.pending_commit_item_ids == []
 
         # The failed append stays on the tail. A non-resumable retry is what
         # starts a new chain, so the next commit can be acknowledged.
         h.session.capabilities = replace(h.session.capabilities, supports_core_resumable_request=False)
         await h.run(append_audio())
-        accepted = await h.run(commands.Commit(create_response=False, realtime_item_id="item_next"))
+        accepted = await h.run(commands.Commit(create_response=False))
+        stopped = find(accepted, "input_audio_buffer.speech_stopped")
         committed = find(accepted, "input_audio_buffer.committed")
-        assert committed.to_realtime()["item_id"] == "item_next"
-        assert "item_abort" not in projector.pending_commit_item_ids
+        assert committed.to_realtime()["item_id"] == stopped.item_id
+        assert stopped.item_id != "item_abort"
+        assert projector.pending_commit_item_ids == []
         assert h.session.state == DuplexSessionState.OPEN
     finally:
         await close_harness(h)

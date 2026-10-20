@@ -31,7 +31,6 @@ from vllm_omni.engine.duplex.events import (
 from vllm_omni.engine.duplex.plugin import settle_response_runtime
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
-    discard_pending_commit_item,
     discard_pending_input_audio,
     project_internal_event,
 )
@@ -159,12 +158,6 @@ class SessionEmitter:
         retryable: bool | None = None,
     ) -> None:
         """Send one typed ``error`` event (``event_id`` is the client event it answers)."""
-        if code == "commit_aborted":
-            # resolve_commit already pushed a pending item id; without input.committed
-            # that id would stay in the FIFO and poison a later ack (#7636 Issue 12).
-            projector = self._projector
-            if projector is not None:
-                discard_pending_commit_item(projector)
         extra = {} if retryable is None else {"retryable": retryable}
         self.emit_events([error_event(code, message, event_id=event_id, extra=extra)])
 
