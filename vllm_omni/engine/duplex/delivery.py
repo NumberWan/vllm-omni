@@ -164,10 +164,12 @@ class DuplexOutputBuffer:
                     self._retention_after is not None
                     and not self._retention_sealed
                     and self._observation_seq > self._retention_after
+                    and _is_retained_update_outcome(event, self._retention_event_id)
                 ):
+                    # Only the settling event. Unrelated errors must not grow
+                    # this list: it outlives the outbox budget until disarm.
                     self._retained.append((self._observation_seq, event))
-                    if _is_retained_update_outcome(event, self._retention_event_id):
-                        self._retention_sealed = True
+                    self._retention_sealed = True
                 observe_waiters = self._observe_waiters
                 self._observe_waiters = []
             waiter = self._waiter
@@ -225,11 +227,11 @@ class DuplexOutputBuffer:
             return self._observation_seq
 
     def arm_observation_retention(self, after_seq: int, event_id: str) -> None:
-        """Keep this update's outcome until the reader consumes it.
+        """Keep this update's settling event until the reader consumes it.
 
         ``after_seq`` is ``observation_seq()`` sampled before the update is
-        submitted. Retention stops once ``session.updated`` or the error with
-        ``event_id`` is stored, so later unrelated errors do not accumulate.
+        submitted. Only the next ``session.updated`` or the error with
+        ``event_id`` is stored; unrelated errors are not.
         """
         with self._lock:
             self._retention_after = after_seq
@@ -246,7 +248,7 @@ class DuplexOutputBuffer:
             self._retained.clear()
 
     def retained_observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
-        """Control events kept for the outstanding update."""
+        """The settling event for the outstanding update, if it has arrived."""
         with self._lock:
             return tuple(event for observed_seq, event in self._retained if observed_seq > seq)
 

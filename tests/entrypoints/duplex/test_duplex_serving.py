@@ -996,7 +996,6 @@ async def test_takeover_during_session_update_does_not_submit_the_replaced_appen
 
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
 async def test_an_older_queued_session_updated_does_not_overwrite_a_newer_acceptance() -> None:
     """After A then B are accepted, dequeuing A must not put the wire defaults back on A.
 
@@ -1042,12 +1041,12 @@ async def test_an_older_queued_session_updated_does_not_overwrite_a_newer_accept
             await task
 
 
+@pytest.mark.asyncio
 async def test_session_update_outcome_survives_a_burst_of_later_errors() -> None:
-    """A ``session.updated`` followed by many unrelated errors is still that update's outcome.
+    """Only the settling event is retained. Unrelated errors do not grow that list.
 
-    The acceptance is kept for the waiter that submitted the update. Later
-    errors must not drop it, or the next append waits for an outcome the pump
-    may already have delivered.
+    The acceptance has to outlive a burst of later errors, or the next append
+    waits for an outcome the pump may already have delivered.
     """
     omni = FakeOmni()
     handler = _handler(omni)
@@ -1058,9 +1057,14 @@ async def test_session_update_outcome_survives_a_burst_of_later_errors() -> None
         ws.feed(update)
         await _next_command(handle, commands.UpdateSession)
 
+        for index in range(8):
+            handle.deliver(ErrorEvent(code="unrelated", message=f"before-{index}", related_event_id="other"))
+        assert handle._outbox._retained == []
+
         handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
-        for index in range(64):
-            handle.deliver(ErrorEvent(code="unrelated", message=str(index), related_event_id="other"))
+        for index in range(8):
+            handle.deliver(ErrorEvent(code="unrelated", message=f"after-{index}", related_event_id="other"))
+        assert len(handle._outbox._retained) == 1
 
         ws.feed(_append(b"\x00" * 8))
         accepted = await _next_append(handle)
