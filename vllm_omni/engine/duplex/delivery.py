@@ -99,6 +99,11 @@ class DuplexOutputBuffer:
         self._retention_event_id: str | None = None
         self._retention_sealed = False
         self._retained: list[tuple[int, DuplexEvent]] = []
+        # Latest accepted session payload, with a monotonic generation. Reader
+        # and pump both apply "latest if newer" so a later update is not
+        # overwritten when an earlier session.updated is finally dequeued.
+        self._accepted_session_seq = 0
+        self._accepted_session: dict[str, object] | None = None
 
     @property
     def pending_bytes(self) -> int:
@@ -152,6 +157,9 @@ class DuplexOutputBuffer:
             observe_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
             if isinstance(event, SessionUpdated | ErrorEvent):
                 self._observation_seq += 1
+                if isinstance(event, SessionUpdated):
+                    self._accepted_session_seq += 1
+                    self._accepted_session = dict(event.session)
                 if (
                     self._retention_after is not None
                     and not self._retention_sealed
@@ -204,14 +212,12 @@ class DuplexOutputBuffer:
         with self._lock:
             return self._is_valid(event)
 
-    def queued_events(self) -> tuple[DuplexEvent, ...]:
-        """Events still waiting behind the one the consumer is delivering.
-
-        Does not dequeue. The held event is omitted: the consumer already has it.
-        This is not ``pending_events``, which is the queued count.
-        """
+    def latest_accepted_session(self) -> tuple[int, dict[str, object] | None]:
+        """Newest accepted ``session.updated`` payload, or ``(0, None)`` if none."""
         with self._lock:
-            return tuple(pending.event for pending in self._pending)
+            if self._accepted_session is None:
+                return 0, None
+            return self._accepted_session_seq, dict(self._accepted_session)
 
     def observation_seq(self) -> int:
         """How many ``session.updated`` / ``error`` events have been enqueued."""

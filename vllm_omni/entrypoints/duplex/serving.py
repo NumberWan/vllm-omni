@@ -165,6 +165,9 @@ class OmniDuplexSessionHandler:
         #: One submitted ``session.update`` whose ``session.updated`` or rejection
         #: is not yet visible. The next format-dependent append waits on it.
         self._pending_session_updates: dict[str, _PendingSessionUpdate] = {}
+        #: Last accepted-session generation applied to each live envelope.
+        #: Reader and pump both apply "latest if newer" from the outbox.
+        self._applied_accepted_session_seq: dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Entry point                                                         #
@@ -533,10 +536,10 @@ class OmniDuplexSessionHandler:
                         resume_token=credentials.resume_token,
                     )
                 if isinstance(event, SessionUpdated):
-                    # Queued updates are also applied before the next translate.
-                    # This path still covers a client that waits for the event
-                    # itself and sends nothing in between.
-                    self._apply_accepted_session_defaults(session_id, event.session)
+                    # Reader may already have applied a newer acceptance while
+                    # this older session.updated sat in the outbox. Apply the
+                    # outbox's latest generation, not this dequeued event alone.
+                    self._apply_latest_accepted_session(session_id, handle)
                 await self._send_event(session_id, event, handle=handle)
                 if isinstance(event, SessionClosed):
                     close_reason = event.reason or event.type
@@ -550,6 +553,7 @@ class OmniDuplexSessionHandler:
             self._resync_required_sessions.discard(session_id)
             self._live_envelopes.pop(session_id, None)
             self._pending_session_updates.pop(session_id, None)
+            self._applied_accepted_session_seq.pop(session_id, None)
             attachment = None
             with suppress(Exception):
                 attachment = await self._attachment_registry.close(session_id)
@@ -770,10 +774,10 @@ class OmniDuplexSessionHandler:
             ):
                 return
         # An accepted session.update is already on the outbox once the engine
-        # emits it. Apply that before translate so the next append does not
-        # keep the previous format while the pump is still sending an earlier
-        # event. A rejected update never queues session.updated.
-        self._apply_queued_session_updates(attachment.handle)
+        # emits it. Apply the latest acceptance before translate so the next
+        # append does not keep the previous format while the pump is still
+        # sending an earlier event. A rejected update never advances this.
+        self._apply_latest_accepted_session(attachment.handle.session_id, attachment.handle)
         try:
             command = envelope.translate(payload)
         except DuplexCommandError as exc:
@@ -797,7 +801,7 @@ class OmniDuplexSessionHandler:
             # errors cannot drop it before this waiter runs.
             outcome = _session_update_outcome(handle._retained_observations_after(pending.after_seq), pending.event_id)
             if isinstance(outcome, SessionUpdated):
-                self._apply_accepted_session_defaults(session_id, outcome.session)
+                self._apply_latest_accepted_session(session_id, handle)
                 self._clear_pending_session_update(handle)
                 return
             if isinstance(outcome, ErrorEvent):
@@ -811,18 +815,16 @@ class OmniDuplexSessionHandler:
         self._pending_session_updates.pop(handle.session_id, None)
         handle._disarm_observation_retention()
 
-    def _apply_queued_session_updates(self, handle: DuplexSessionHandle) -> None:
-        """Apply ``session.updated`` events the pump has not dequeued yet."""
-        for event in handle._queued_events():
-            if isinstance(event, SessionUpdated):
-                self._apply_accepted_session_defaults(handle.session_id, event.session)
-
-    def _apply_accepted_session_defaults(self, session_id: str, session_payload: Mapping[str, object]) -> None:
-        """Apply wire defaults only after the engine accepted a session.update."""
+    def _apply_latest_accepted_session(self, session_id: str, handle: DuplexSessionHandle) -> None:
+        """Apply wire defaults from the newest accepted session, if not already applied."""
+        seq, session_payload = handle._latest_accepted_session()
+        if session_payload is None or seq <= self._applied_accepted_session_seq.get(session_id, 0):
+            return
         envelope = self._live_envelopes.get(session_id)
         if envelope is None:
             return
         envelope.apply_accepted_session(session_payload)
+        self._applied_accepted_session_seq[session_id] = seq
 
     async def _submit_command(
         self,

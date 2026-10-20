@@ -113,8 +113,8 @@ class FakeHandle:
     def output_guard(self, event: DuplexEvent):
         return self._outbox.guard(event)
 
-    def _queued_events(self) -> tuple[DuplexEvent, ...]:
-        return self._outbox.queued_events()
+    def _latest_accepted_session(self) -> tuple[int, dict[str, object] | None]:
+        return self._outbox.latest_accepted_session()
 
     def _observation_seq(self) -> int:
         return self._outbox.observation_seq()
@@ -996,6 +996,52 @@ async def test_takeover_during_session_update_does_not_submit_the_replaced_appen
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_an_older_queued_session_updated_does_not_overwrite_a_newer_acceptance() -> None:
+    """After A then B are accepted, dequeuing A must not put the wire defaults back on A.
+
+    The reader applies B from the outbox's latest generation before the next
+    append. The pump still has A's ``session.updated`` to send; applying that
+    dequeued payload alone would revert pcm_f32le to pcm16.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    release = asyncio.Event()
+    sending = asyncio.Event()
+    original_send = ws.send_json
+
+    async def blocked_send(payload: dict[str, Any]) -> None:
+        sending.set()
+        await release.wait()
+        await original_send(payload)
+
+    ws.send_json = blocked_send  # type: ignore[method-assign]
+    try:
+        handle.deliver(AudioDelta(session_id=handle.session_id, response_id="r1", delta="aGk="))
+        await asyncio.wait_for(sending.wait(), timeout=2.0)
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm16", "temperature": 0.2}))
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le", "temperature": 0.3}))
+        ws.feed(_append(b"\x00" * 8))
+        accepted = await _next_append(handle)
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+
+        # Let the pump drain A then B. Defaults must stay on B.
+        release.set()
+        await asyncio.sleep(0.05)
+        ws.feed(_append(b"\x00" * 8))
+        second = await _next_append(handle, after=1)
+        assert second.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(second) == 8
+    finally:
+        release.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
 async def test_session_update_outcome_survives_a_burst_of_later_errors() -> None:
     """A ``session.updated`` followed by many unrelated errors is still that update's outcome.
 

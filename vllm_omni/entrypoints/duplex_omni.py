@@ -243,12 +243,12 @@ class DuplexSessionHandle:
         """Recheck held audio while committing its delivery; never await inside this guard."""
         return self._outbox.guard(event)
 
-    def _queued_events(self) -> tuple[DuplexEvent, ...]:
-        """Events accepted by the engine but not yet dequeued for delivery.
+    def _latest_accepted_session(self) -> tuple[int, dict[str, object] | None]:
+        """Newest accepted ``session.updated`` payload for wire-default apply.
 
         Serving-only. Not part of the public handle (``submit`` / ``events``).
         """
-        return self._outbox.queued_events()
+        return self._outbox.latest_accepted_session()
 
     def _observation_seq(self) -> int:
         """How many ``session.updated`` / ``error`` events this session has enqueued."""
