@@ -39,26 +39,40 @@ def _is_blackwell() -> bool:
     return capability is not None and capability.major >= 10
 
 
-def _bind_optional_fa3_fwd(
-    flash_attn_func: FlashAttnFn | None,
-    flash_attn_varlen_func: FlashAttnFn | None,
-) -> tuple[FlashAttnFn | None, FlashAttnFn | None]:
-    """Optionally bind fa3-fwd dense FA3 when the package is installed.
+def _is_hopper() -> bool:
+    """True on SM90 Hopper GPUs.
 
-    ``fa3-fwd`` is intentionally not a hard dependency (#7735). When present,
-    restore pre-#7735 dense ``flash_attn_func`` so Hopper workloads do not fall
-    through to vLLM varlen emulation (#9092). When absent, leave bindings
-    unchanged so vLLM varlen + FA3 (#9100) remains the path.
+    Same compute-capability gate as ``FLASH_ATTN_3_HUB`` in the CUDA platform.
+    Used to limit the optional ``fa3-fwd`` dense restore to the architecture
+    covered by the #9092 measurements.
     """
-    if flash_attn_func is not None:
-        return flash_attn_func, flash_attn_varlen_func
+    try:
+        capability = current_omni_platform.get_device_capability()
+    except Exception:
+        return False
+    return capability is not None and capability.major == 9
+
+
+def _bind_optional_fa3_fwd_dense() -> FlashAttnFn | None:
+    """Optionally import fa3-fwd dense FA3 on Hopper when the package is installed.
+
+    ``fa3-fwd`` is intentionally not a hard dependency (#7735). When present on
+    Hopper, restore a dense FA3 callable for the unmasked dense path so those
+    workloads do not fall through to vLLM varlen emulation (#9092). The returned
+    callable is kept separate from ``flash_attn_func`` / ``flash_attn_varlen_func``
+    so masked, packed, piecewise, and FP8 paths stay on the vLLM dispatcher
+    (#9100). ``fa3-fwd`` 0.0.3 disables FP16 kernels; callers must skip this
+    binding for ``torch.float16`` inputs.
+    """
+    if not _is_hopper():
+        return None
     try:
         from fa3_fwd_interface import flash_attn_func as _fa_func
-        from fa3_fwd_interface import flash_attn_varlen_func as _fa_varlen
 
-        return _fa_func, _fa_varlen
+        logger.info("Using optional fa3-fwd dense FlashAttention-3 on Hopper")
+        return _fa_func
     except (ImportError, ModuleNotFoundError):
-        return flash_attn_func, flash_attn_varlen_func
+        return None
 
 
 @lru_cache(maxsize=1)
@@ -82,6 +96,9 @@ def is_flash_attn_4_available() -> bool:
 # Bind via aliases so mypy does not treat each candidate import as a redefinition.
 flash_attn_func: FlashAttnFn | None = None
 flash_attn_varlen_func: FlashAttnFn | None = None
+# Hopper-only optional dense FA3 from fa3-fwd. Not assigned to flash_attn_func
+# so masked/packed/piecewise/FP8 keep the vLLM varlen dispatcher.
+optional_fa3_fwd_dense_func: FlashAttnFn | None = None
 # FP8 descales are supported by vLLM's FA3 dispatcher and standalone FA3.
 FLASH_ATTN_SUPPORTS_FP8 = False
 IS_FLASH_ATTN_4 = False
@@ -147,16 +164,12 @@ else:
         except (ImportError, ModuleNotFoundError):
             pass
 
-    if not _is_blackwell():
-        # Optional FA3 dense package (not a hard dependency since #7735).
-        # When installed, prefer it for flash_attn_func so Hopper dense
-        # attention uses true FA3 instead of the slower vLLM varlen-emulated
-        # path (#9092 / post-#7735 Qwen-Image regression).
-        flash_attn_func, flash_attn_varlen_func = _bind_optional_fa3_fwd(
-            flash_attn_func,
-            flash_attn_varlen_func,
-        )
+    # Optional Hopper dense FA3 (not a hard dependency since #7735). Kept
+    # separate from flash_attn_* so only the unmasked dense path can prefer it
+    # (#9092); vLLM varlen + fa_version (#9100) remains for other routes.
+    optional_fa3_fwd_dense_func = _bind_optional_fa3_fwd_dense()
 
+    if not _is_blackwell():
         # Candidate 3: FA3 from a flash-attention source build.
         if flash_attn_varlen_func is None:
             try:
@@ -193,7 +206,21 @@ else:
 
 # If no FA backend available, SDPA backend will be selected at the platform level
 # flash_attn_func and flash_attn_varlen_func will be None
-HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not None
+HAS_FLASH_ATTN = (
+    flash_attn_func is not None or flash_attn_varlen_func is not None or optional_fa3_fwd_dense_func is not None
+)
+
+
+def dense_flash_attn_func_for(dtype: torch.dtype) -> FlashAttnFn | None:
+    """Dense FlashAttention callable for ``dtype``, if one should be used.
+
+    Prefers the optional Hopper ``fa3-fwd`` dense binding for non-FP16 inputs.
+    FP16 falls through so the caller can use vLLM varlen (#9100); ``fa3-fwd``
+    0.0.3 ships with FP16 kernels disabled.
+    """
+    if optional_fa3_fwd_dense_func is not None and dtype != torch.float16:
+        return optional_fa3_fwd_dense_func
+    return flash_attn_func
 
 
 def validate_fa4_head_dims(head_dim: int, head_dim_v: int, alignment: int) -> bool:
