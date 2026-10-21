@@ -75,6 +75,48 @@ def test_vllm_varlen_version_kwargs_targets_only_vllm_dispatcher(monkeypatch):
 
 
 @pytest.mark.cpu
+def test_bind_optional_fa3_fwd_sets_dense_when_package_present(monkeypatch):
+    dense = object()
+    varlen = object()
+    fake_mod = SimpleNamespace(flash_attn_func=dense, flash_attn_varlen_func=varlen)
+    monkeypatch.setitem(sys.modules, "fa3_fwd_interface", fake_mod)
+
+    got_func, got_varlen = fa._bind_optional_fa3_fwd(None, object())
+    assert got_func is dense
+    assert got_varlen is varlen
+
+
+@pytest.mark.cpu
+def test_bind_optional_fa3_fwd_keeps_vllm_varlen_when_package_absent(monkeypatch):
+    import builtins
+
+    vllm_varlen = object()
+    monkeypatch.delitem(sys.modules, "fa3_fwd_interface", raising=False)
+    real_import = builtins.__import__
+
+    def _block_fa3_fwd(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "fa3_fwd_interface":
+            raise ModuleNotFoundError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _block_fa3_fwd)
+
+    got_func, got_varlen = fa._bind_optional_fa3_fwd(None, vllm_varlen)
+    assert got_func is None
+    assert got_varlen is vllm_varlen
+
+
+@pytest.mark.cpu
+def test_bind_optional_fa3_fwd_does_not_override_existing_dense():
+    existing_dense = object()
+    existing_varlen = object()
+
+    got_func, got_varlen = fa._bind_optional_fa3_fwd(existing_dense, existing_varlen)
+    assert got_func is existing_dense
+    assert got_varlen is existing_varlen
+
+
+@pytest.mark.cpu
 def test_dense_cuda_varlen_fallback_passes_resolved_fa_version(monkeypatch):
     captured: dict[str, Any] = {}
 

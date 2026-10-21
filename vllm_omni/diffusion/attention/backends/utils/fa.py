@@ -39,6 +39,28 @@ def _is_blackwell() -> bool:
     return capability is not None and capability.major >= 10
 
 
+def _bind_optional_fa3_fwd(
+    flash_attn_func: FlashAttnFn | None,
+    flash_attn_varlen_func: FlashAttnFn | None,
+) -> tuple[FlashAttnFn | None, FlashAttnFn | None]:
+    """Optionally bind fa3-fwd dense FA3 when the package is installed.
+
+    ``fa3-fwd`` is intentionally not a hard dependency (#7735). When present,
+    restore pre-#7735 dense ``flash_attn_func`` so Hopper workloads do not fall
+    through to vLLM varlen emulation (#9092). When absent, leave bindings
+    unchanged so vLLM varlen + FA3 (#9100) remains the path.
+    """
+    if flash_attn_func is not None:
+        return flash_attn_func, flash_attn_varlen_func
+    try:
+        from fa3_fwd_interface import flash_attn_func as _fa_func
+        from fa3_fwd_interface import flash_attn_varlen_func as _fa_varlen
+
+        return _fa_func, _fa_varlen
+    except (ImportError, ModuleNotFoundError):
+        return flash_attn_func, flash_attn_varlen_func
+
+
 @lru_cache(maxsize=1)
 def is_flash_attn_4_available() -> bool:
     """Return whether CuTe FlashAttention-4 (``flash_attn.cute``) can be imported.
@@ -126,6 +148,15 @@ else:
             pass
 
     if not _is_blackwell():
+        # Optional FA3 dense package (not a hard dependency since #7735).
+        # When installed, prefer it for flash_attn_func so Hopper dense
+        # attention uses true FA3 instead of the slower vLLM varlen-emulated
+        # path (#9092 / post-#7735 Qwen-Image regression).
+        flash_attn_func, flash_attn_varlen_func = _bind_optional_fa3_fwd(
+            flash_attn_func,
+            flash_attn_varlen_func,
+        )
+
         # Candidate 3: FA3 from a flash-attention source build.
         if flash_attn_varlen_func is None:
             try:
