@@ -32,12 +32,13 @@ HEIGHT = 512
 NUM_INFERENCE_STEPS = 20
 TRUE_CFG_SCALE = 4.0
 SEED = 42
-# Temporary calibration floors so the first TORCH_SDPA CUDA run and the first
-# NPU A3 run print SSIM / PSNR and still pass. Buildkite #15339 measured
-# SSIM 0.978375 / PSNR 31.83 on the previous CUDA path; do not reuse those
-# bounds. Replace these with the printed scores after that CI run.
-SSIM_THRESHOLD = 0.0
-PSNR_THRESHOLD = 0.0
+# H100 nightly #17701, TORCH_SDPA vs Diffusers native: SSIM 0.982257 / PSNR 32.072731.
+# A3 nightly #9423: SSIM 0.955357 / PSNR 27.170992. Bounds sit just under those scores.
+# B200 has no TORCH_SDPA measurement yet and uses the H100 bounds.
+_CUDA_SSIM_THRESHOLD = 0.98
+_CUDA_PSNR_THRESHOLD = 32.0
+_NPU_SSIM_THRESHOLD = 0.95
+_NPU_PSNR_THRESHOLD = 27.0
 
 MODEL_2512_ID = "Qwen/Qwen-Image-2512"
 MODEL_2512_ENV_VAR = "QWEN_IMAGE_2512_MODEL"
@@ -59,10 +60,24 @@ HEIGHT_2512 = 928
 NUM_INFERENCE_STEPS_2512 = 50
 TRUE_CFG_SCALE_2512 = 4.0
 SEED_2512 = 42
-# Temporary calibration ceilings covering the full [0, 1] pixel range.
-# Replace with the printed mean_abs_diff / p99_abs_diff after the first CI run.
-MEAN_ABS_DIFF_THRESHOLD_2512 = 1.0
-P99_ABS_DIFF_THRESHOLD_2512 = 1.0
+# H100 #17701 Qwen-Image-2512: mean abs 2.057e-2, p99 2.392e-1.
+# A3 did not finish 2512: the snapshot was missing and the hub was offline.
+_CUDA_MEAN_ABS_DIFF_THRESHOLD_2512 = 3e-2
+_CUDA_P99_ABS_DIFF_THRESHOLD_2512 = 4e-1
+_NPU_MEAN_ABS_DIFF_THRESHOLD_2512 = 1.0
+_NPU_P99_ABS_DIFF_THRESHOLD_2512 = 1.0
+
+
+def _similarity_thresholds() -> tuple[float, float]:
+    if current_omni_platform.is_npu():
+        return _NPU_SSIM_THRESHOLD, _NPU_PSNR_THRESHOLD
+    return _CUDA_SSIM_THRESHOLD, _CUDA_PSNR_THRESHOLD
+
+
+def _pixel_thresholds_2512() -> tuple[float, float]:
+    if current_omni_platform.is_npu():
+        return _NPU_MEAN_ABS_DIFF_THRESHOLD_2512, _NPU_P99_ABS_DIFF_THRESHOLD_2512
+    return _CUDA_MEAN_ABS_DIFF_THRESHOLD_2512, _CUDA_P99_ABS_DIFF_THRESHOLD_2512
 
 
 def _model_name() -> str:
@@ -231,14 +246,15 @@ def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
     vllm_output = _run_vllm_omni_qwen_image(model=model, output_path=output_dir / "vllm_omni.png")
     diffusers_output = _run_diffusers_qwen_image(model=model, output_path=output_dir / "diffusers.png")
 
+    ssim_threshold, psnr_threshold = _similarity_thresholds()
     assert_similarity(
         model_name=MODEL_ID,
         vllm_image=vllm_output,
         diffusers_image=diffusers_output,
         width=WIDTH,
         height=HEIGHT,
-        ssim_threshold=SSIM_THRESHOLD,
-        psnr_threshold=PSNR_THRESHOLD,
+        ssim_threshold=ssim_threshold,
+        psnr_threshold=psnr_threshold,
     )
 
 
@@ -257,10 +273,11 @@ def test_qwen_image_2512_matches_diffusers_pixelwise(accuracy_artifact_root: Pat
     print(f"  vllm_omni: {vllm_output_path}")
     print(f"  diffusers: {diffusers_output_path}")
 
+    mean_threshold, p99_threshold = _pixel_thresholds_2512()
     assert_images_pixel_close(
         model_name=MODEL_2512_ID,
         vllm_image=vllm_output,
         diffusers_image=diffusers_output,
-        mean_threshold=MEAN_ABS_DIFF_THRESHOLD_2512,
-        p99_threshold=P99_ABS_DIFF_THRESHOLD_2512,
+        mean_threshold=mean_threshold,
+        p99_threshold=p99_threshold,
     )
