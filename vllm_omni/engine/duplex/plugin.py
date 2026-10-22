@@ -535,17 +535,6 @@ class DuplexModelPlugin(ABC):
         del stage_id, segment_finished, output, context
         return False
 
-    def may_abort_ephemeral_request(self, request_id: str) -> bool:
-        """Whether a new commit may abort this ephemeral request id.
-
-        Abort is decided before the plugin sees the append, so the session
-        has to ask. Default yes. Return False when output for this id has
-        already started and must keep running: the session opens a new turn
-        and leaves the id draining. This is not barge-in.
-        """
-        del request_id
-        return True
-
     def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
         """Output stages that may keep running after the next user turn starts.
 

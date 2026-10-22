@@ -100,20 +100,17 @@ def stage1_tts_text(orchestrator: Any, output: Any, *, cache: dict[str, object] 
 
 
 def _note_talker_handoff(orchestrator: Any, req_state: Any) -> None:
-    """Record this id before the submit await.
+    """Set the concurrent-turn release flag before the Talker submit await.
 
     The output stage is not bound yet, and intercept has not set the release
-    flag. A commit in that window must open the next input turn only.
-    Streaming stays on so a later codec segment stop is not the duplex turn end.
+    flag. Main's append path already opens the next turn when Stage0 is busy
+    and this flag is true. Streaming stays on so a later codec segment stop
+    is not the duplex turn end.
     """
     streaming = getattr(req_state, "streaming", None)
     if streaming is not None:
         streaming.enabled = True
     request_id = getattr(req_state, "request_id", None)
-    plane = getattr(getattr(orchestrator, "plugin", None), "data_plane", None)
-    preserve = getattr(plane, "preserve_ephemeral_request", None)
-    if callable(preserve) and isinstance(request_id, str) and request_id:
-        preserve(request_id)
     manager = getattr(orchestrator, "session_manager", None)
     if manager is None or not isinstance(request_id, str):
         return
@@ -194,10 +191,7 @@ def plan_partial_stage_output(
     # is_final_update=True is a non-resumable end sentinel: it discards this
     # text and sets streaming_input=False on the in-flight sentence, so
     # Code2Wav sees a short codec and the user hears a blip.
-    # A text remainder stays resumable; the followup is the one end sentinel.
-    # An empty remainder is already that sentinel, so it must not also queue
-    # a second close_only. A one-shot sentence stays a single submit.
-    queue_close_after = finished and prior_emits > 0 and not close_only
+    queue_close_after = bool(chunk) and finished and not close_only and prior_emits > 0
     _note_talker_handoff(orchestrator, req_state)
     logger.info(
         "[AURA] sentence TTS req=%s finished=%s close_only=%s text_len=%d queue_close_after=%s",

@@ -76,7 +76,6 @@ def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState
         draining_stage_ids=lambda *, stage_count: frozenset({2, 3}) if stage_count >= 4 else frozenset(),
         prepare_prompt_config=lambda config, **kwargs: config,
         prepare_append_plan=lambda **kwargs: _plan(),
-        may_abort_ephemeral_request=lambda request_id: True,
     )
 
     async def prepare_append_plan(**kwargs):
@@ -171,103 +170,6 @@ async def test_vision_follow_aborts_before_stage2_is_bound() -> None:
 
     aborted = [ids for ids, abort in port.cleanups if abort and request_id in ids]
     assert aborted
-
-
-@pytest.mark.asyncio
-async def test_speech_after_terminal_vision_opens_a_new_turn() -> None:
-    """A finished vision turn leaves the id terminal with Stage0 unbound.
-
-    The next speech must not reuse that id: the projector drops any later
-    Stage1 text for a terminal request.
-    """
-    session = _ephemeral_session()
-    request_id = _bind_stage0(session)
-    session.request_resources.pop((0, request_id), None)
-    port = _StagePort()
-    run = DuplexRunState(concurrent_turn_requests_released=False)
-    channel = _channel(session, port, run)
-    channel._ctx.plugin.data_plane = SimpleNamespace(is_terminal=lambda rid: rid == request_id)
-
-    result = await channel._append_via_data_plane(
-        {"is_speech": True},
-        final=True,
-        operation_id="speech-after-vision",
-        expected_epoch=None,
-    )
-
-    opened = _opened_request_id(result)
-    assert opened.endswith("stage0-turn1")
-    assert opened != request_id
-    aborted = [ids for ids, abort in port.cleanups if abort and request_id in ids]
-    assert aborted
-
-
-@pytest.mark.asyncio
-async def test_preserved_ephemeral_survives_after_release_flag_clears() -> None:
-    """The release flag is cleared by the next input bind. The preserved id stays."""
-    session = _ephemeral_session()
-    request_id = _bind_stage0(session)
-    port = _StagePort()
-    run = DuplexRunState(concurrent_turn_requests_released=False)
-    channel = _channel(session, port, run)
-    channel._ctx.plugin.may_abort_ephemeral_request = lambda rid, kept=request_id: rid != kept
-
-    result = await channel._append_via_data_plane(
-        {"is_speech": False},
-        final=True,
-        operation_id="vision-after-flag-clear",
-        expected_epoch=None,
-    )
-
-    aborted = [ids for ids, abort in port.cleanups if abort and request_id in ids]
-    assert not aborted
-    assert _opened_request_id(result).endswith("stage0-turn1")
-
-
-@pytest.mark.asyncio
-async def test_vision_follow_does_not_abort_inflight_talker() -> None:
-    """Stage1 already handed this id to Talker. A vision follow opens the next turn only."""
-    session = _ephemeral_session()
-    request_id = _bind_inflight_talker(session)
-    port = _StagePort()
-    run = DuplexRunState(concurrent_turn_requests_released=False)
-    channel = _channel(session, port, run)
-
-    result = await channel._append_via_data_plane(
-        {"is_speech": False},
-        final=True,
-        operation_id="vision",
-        expected_epoch=None,
-    )
-
-    aborted = [ids for ids, abort in port.cleanups if abort and request_id in ids]
-    assert not aborted
-    assert result is not None
-    opened = _opened_request_id(result)
-    assert opened.endswith("stage0-turn1")
-    assert opened != request_id
-    assert session.request_resources.get((2, request_id)) is not None
-    assert session.request_resources.get((3, request_id)) is not None
-
-    # The follow-up vision names the talker id again: Stage0 was unbound, the
-    # response turn is still 0, and stages 2/3 are draining. It must not
-    # resubmit or abort that id.
-    session.bind_response_turn(0)
-    for key in list(session.request_resources):
-        if key[0] == 0:
-            session.request_resources.pop(key)
-    run.concurrent_turn_requests_released = False
-    result_again = await channel._append_via_data_plane(
-        {"is_speech": False},
-        final=True,
-        operation_id="vision-again",
-        expected_epoch=None,
-    )
-    aborted_again = [ids for ids, abort in port.cleanups if abort and request_id in ids]
-    assert not aborted_again
-    opened_again = _opened_request_id(result_again)
-    assert opened_again != request_id
-    assert "stage0-turn0" not in opened_again
 
 
 @pytest.mark.asyncio
