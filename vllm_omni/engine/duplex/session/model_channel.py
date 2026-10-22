@@ -322,6 +322,10 @@ class ModelChannel:
             return False
         return bool(is_terminal(request_id))
 
+    def _ephemeral_request_must_keep_running(self, request_id: str) -> bool:
+        """The plugin says a new commit must not abort this ephemeral id."""
+        return not self._ctx.plugin.may_abort_ephemeral_request(request_id)
+
     async def _append_via_data_plane(
         self,
         payload: object,
@@ -345,28 +349,26 @@ class ModelChannel:
         draining_stages = self._draining_stage_ids()
         draining_ids = {rid for sid, rid in session.request_resources if sid in draining_stages}
         # Ephemeral turn-commit cannot submit_update on a finished stage0 id.
-        # Bump turn_id and open a fresh ephemeral request instead. A Talker
-        # that is already draining shares this id even after Stage0's binding
-        # was dropped; resubmitting it aborts the utterance before Code2Wav.
+        # Bump turn_id and open a fresh ephemeral request instead. An id the
+        # plugin still needs, or one already draining, shares this id even
+        # after the input binding was dropped; resubmitting it aborts that output.
         stage0_busy = session.stage_request_submitted(stage_id, request_id)
-        handoff_inflight = request_id in getattr(self._ctx.run, "talker_handoff_request_ids", ())
-        # A finished vision turn marks this id terminal but releases the Stage0
+        keep_running = self._ephemeral_request_must_keep_running(request_id)
+        # A finished turn marks this id terminal but releases the input
         # binding, so the next speech would reuse it. The projector then drops
-        # the new Stage1 text (10:12 早上好 / 我想问).
+        # the new text.
         terminal_reuse = self._data_plane_terminal(request_id)
-        if not resumable and (stage0_busy or request_id in draining_ids or handoff_inflight or terminal_reuse):
+        if not resumable and (stage0_busy or request_id in draining_ids or keep_running or terminal_reuse):
             stale_ephemeral_id = request_id
             # Keys are ``(stage_id, request_id)``; values are DuplexRequestResource.
             stale_keys = list(session.request_resources.keys())
             stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
-            # Sentence TTS submits Talker before Stage1's release flag is set.
-            # A vision follow in that window used to abort the shared request
-            # id, so the utterance never reached Code2Wav. Draining stages
-            # already bound are the same overlap the flag allows: open a new
-            # stage0 turn and leave them running.
+            # Output may already be running before the release flag is set.
+            # Draining stages already bound are the same overlap the flag
+            # allows: open a new input turn and leave them running.
             draining_inflight = request_id in draining_ids or any(sid in draining_stages for sid, _ in stale_keys)
             concurrent_turn = session.capabilities.supports_concurrent_turn_requests and (
-                self._ctx.run.concurrent_turn_requests_released or draining_inflight or handoff_inflight
+                self._ctx.run.concurrent_turn_requests_released or draining_inflight or keep_running
             )
             # Prior TTS may still drain under the same response_id; acceptance
             # is gated by supports_concurrent_turn_requests, not a per-turn drain id.
@@ -392,10 +394,10 @@ class ModelChannel:
                         # Already-draining ids keep their original response_id.
                         session.bind_draining_request(rid, prior_response_id)
                 self._ctx.run.concurrent_turn_requests_released = False
-                if handoff_inflight and prior_response_id is not None:
-                    # Stage2 may not be in request_resources yet. Keep the
-                    # handed-off id admissible so its text and later audio are
-                    # not dropped once this commit becomes the active request.
+                if keep_running and prior_response_id is not None:
+                    # The output stage may not be bound yet. Keep the id
+                    # admissible so its later output is not dropped once this
+                    # commit becomes the active request.
                     session.bind_draining_request(stale_ephemeral_id, prior_response_id)
                 if prior_response_id is not None:
                     session.snapshot_active_response_for_drain()
@@ -1194,13 +1196,6 @@ class ModelChannel:
             self._out.emit(payload)
             return close_reason, emitted_response
         context_text = model_result.get("model_context_text")
-        handed_to_talker = isinstance(data_plane_request_id, str) and data_plane_request_id in getattr(
-            self._ctx.run, "talker_handoff_request_ids", ()
-        )
-        if is_listen is True and handed_to_talker:
-            # Sentence TTS already gave this id real text. A later silent
-            # classification must not overwrite history or abort Talker.
-            return close_reason, emitted_response
         if isinstance(context_text, str) and isinstance(data_plane_request_id, str):
             self._ctx.plugin.commit_model_context(
                 session_id=duplex_session_id_from_request_id(data_plane_request_id),

@@ -190,11 +190,22 @@ class AuraDataPlaneSession(DuplexDataPlane):
         self._encode_audio = encode_audio
         self._requests: dict[str, _RequestState] = {}
         self._closed: set[str] = set()
+        # Ephemeral ids whose output already started. A later commit must not
+        # abort them. Dropped with the session in ``close_session``.
+        self._preserved_ephemeral_request_ids: set[str] = set()
 
     def begin_request(self, request_id: str) -> None:
         self._closed.discard(request_id)
         state = self._requests.setdefault(request_id, _RequestState())
         state.terminal = False
+
+    def preserve_ephemeral_request(self, request_id: str) -> None:
+        """This id's output has started; a later commit must not abort it."""
+        if request_id:
+            self._preserved_ephemeral_request_ids.add(request_id)
+
+    def ephemeral_request_may_abort(self, request_id: str) -> bool:
+        return request_id not in self._preserved_ephemeral_request_ids
 
     def is_terminal(self, request_id: str | None) -> bool:
         if request_id is None:
@@ -225,6 +236,11 @@ class AuraDataPlaneSession(DuplexDataPlane):
         self._closed = {
             request_id
             for request_id in self._closed
+            if not duplex_resource_request_belongs_to_session(request_id, session_id)
+        }
+        self._preserved_ephemeral_request_ids = {
+            request_id
+            for request_id in self._preserved_ephemeral_request_ids
             if not duplex_resource_request_belongs_to_session(request_id, session_id)
         }
         from vllm_omni.model_executor.models.aura_omni.duplex.history import drop_session_history

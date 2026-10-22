@@ -347,6 +347,40 @@ def test_decide_output_spoken_sentence_keeps_talker_despite_silent_id() -> None:
     )
 
 
+def test_preserved_ephemeral_request_is_not_abortable_or_listen() -> None:
+    plugin = AuraDuplexPlugin(_encode_audio)
+    fence = DuplexFence("sess-preserve", epoch=0, turn_id=0)
+    request_id = duplex_ephemeral_stage_request_id(fence, stage_id=0)
+    assert plugin.may_abort_ephemeral_request(request_id) is True
+    plugin.data_plane.preserve_ephemeral_request(request_id)
+    assert plugin.may_abort_ephemeral_request(request_id) is False
+
+    class _Completion:
+        text = ""
+        cumulative_text = ""
+        token_ids = [AURA_SILENT_TOKEN_ID]
+        finished = True
+
+    class _Output:
+        outputs = [_Completion()]
+
+    _Output.request_id = request_id
+
+    assert (
+        plugin.decide_output(
+            stage_id=1,
+            final_stage_id=3,
+            segment_finished=True,
+            segment_token_ids=(AURA_SILENT_TOKEN_ID,),
+            segment_output_metadata={},
+            output=_Output(),
+        )
+        is None
+    )
+    plugin.data_plane.close_session("sess-preserve")
+    assert plugin.may_abort_ephemeral_request(request_id) is True
+
+
 def test_decide_output_chinese_silence_is_not_special_token() -> None:
     plugin = AuraDuplexPlugin(_encode_audio)
 

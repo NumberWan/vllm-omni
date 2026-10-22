@@ -76,6 +76,7 @@ def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState
         draining_stage_ids=lambda *, stage_count: frozenset({2, 3}) if stage_count >= 4 else frozenset(),
         prepare_prompt_config=lambda config, **kwargs: config,
         prepare_append_plan=lambda **kwargs: _plan(),
+        may_abort_ephemeral_request=lambda request_id: True,
     )
 
     async def prepare_append_plan(**kwargs):
@@ -202,14 +203,14 @@ async def test_speech_after_terminal_vision_opens_a_new_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_talker_handoff_survives_after_release_flag_clears() -> None:
-    """The release flag is cleared by the next Stage0 bind. The handed-off id stays."""
+async def test_preserved_ephemeral_survives_after_release_flag_clears() -> None:
+    """The release flag is cleared by the next input bind. The preserved id stays."""
     session = _ephemeral_session()
     request_id = _bind_stage0(session)
     port = _StagePort()
     run = DuplexRunState(concurrent_turn_requests_released=False)
-    run.talker_handoff_request_ids.add(request_id)
     channel = _channel(session, port, run)
+    channel._ctx.plugin.may_abort_ephemeral_request = lambda rid, kept=request_id: rid != kept
 
     result = await channel._append_via_data_plane(
         {"is_speech": False},

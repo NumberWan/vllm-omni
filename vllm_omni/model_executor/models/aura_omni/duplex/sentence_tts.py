@@ -100,23 +100,27 @@ def stage1_tts_text(orchestrator: Any, output: Any, *, cache: dict[str, object] 
 
 
 def _note_talker_handoff(orchestrator: Any, req_state: Any) -> None:
-    """Mark this id handed to Talker before the submit await.
+    """Record this id before the submit await.
 
-    Stage2 is not bound yet, and intercept has not set the release flag. A
-    commit in that window must open the next Stage0 only. Streaming stays on
-    so a later codec segment stop is not the duplex turn end.
+    The output stage is not bound yet, and intercept has not set the release
+    flag. A commit in that window must open the next input turn only.
+    Streaming stays on so a later codec segment stop is not the duplex turn end.
     """
     streaming = getattr(req_state, "streaming", None)
     if streaming is not None:
         streaming.enabled = True
+    request_id = getattr(req_state, "request_id", None)
+    plane = getattr(getattr(orchestrator, "plugin", None), "data_plane", None)
+    preserve = getattr(plane, "preserve_ephemeral_request", None)
+    if callable(preserve) and isinstance(request_id, str) and request_id:
+        preserve(request_id)
     manager = getattr(orchestrator, "session_manager", None)
-    if manager is None:
+    if manager is None or not isinstance(request_id, str):
         return
-    runner = manager.runner_for_request_id(req_state.request_id)
+    runner = manager.runner_for_request_id(request_id)
     if runner is None or not runner.session.capabilities.supports_concurrent_turn_requests:
         return
     runner.run.concurrent_turn_requests_released = True
-    runner.run.talker_handoff_request_ids.add(req_state.request_id)
 
 
 def plan_partial_stage_output(

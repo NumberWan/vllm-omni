@@ -387,6 +387,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             return True
         return bool(getattr(output, "finished", False))
 
+    def may_abort_ephemeral_request(self, request_id: str) -> bool:
+        return self.data_plane.ephemeral_request_may_abort(request_id)
+
     def decide_output(
         self,
         *,
@@ -400,6 +403,11 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         del final_stage_id, segment_output_metadata
         # Stage1 silent → short-circuit TTS/Code2Wav.
         if stage_id != 1 or not segment_finished:
+            return None
+        # Output for this id already started. A later silent token must not
+        # classify the same request as listen: that aborts it.
+        request_id = getattr(output, "request_id", None)
+        if isinstance(request_id, str) and not self.may_abort_ephemeral_request(request_id):
             return None
         completion = _first_completion(output)
         token_ids = _completion_token_ids(completion) or list(segment_token_ids)
