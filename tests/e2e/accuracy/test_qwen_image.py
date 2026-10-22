@@ -32,11 +32,13 @@ HEIGHT = 512
 NUM_INFERENCE_STEPS = 20
 TRUE_CFG_SCALE = 4.0
 SEED = 42
-# Floors so CI prints SSIM and PSNR. Replace with the eager remeasure.
-_CUDA_SSIM_THRESHOLD = 0.0
-_CUDA_PSNR_THRESHOLD = 0.0
-_NPU_SSIM_THRESHOLD = 0.0
-_NPU_PSNR_THRESHOLD = 0.0
+# H100 #17798, eager TORCH_SDPA vs Diffusers native: SSIM 0.989517 / PSNR 34.677647.
+# A3 #9532: SSIM 0.955357 / PSNR 27.170992. Bounds sit just under those scores.
+# B200 has no eager measurement yet and uses the H100 bounds.
+_CUDA_SSIM_THRESHOLD = 0.98
+_CUDA_PSNR_THRESHOLD = 34.6
+_NPU_SSIM_THRESHOLD = 0.95
+_NPU_PSNR_THRESHOLD = 27.0
 
 PROMPT_PIXELWISE = (
     "A 20-year-old East Asian girl with delicate, charming features and large, bright brown eyes—expressive and "
@@ -51,16 +53,27 @@ NEGATIVE_PROMPT_PIXELWISE = (
     "低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。"
     "构图混乱。文字模糊，扭曲。"
 )
-WIDTH_PIXELWISE = 1664
-HEIGHT_PIXELWISE = 928
+# CUDA keeps the 1664x928 case. A3 #9532 OOM there (61.3 GiB, weights 52.48 GiB),
+# so NPU uses 768x432. Prompt and step count stay the same.
+_CUDA_WIDTH_PIXELWISE = 1664
+_CUDA_HEIGHT_PIXELWISE = 928
+_NPU_WIDTH_PIXELWISE = 768
+_NPU_HEIGHT_PIXELWISE = 432
 NUM_INFERENCE_STEPS_PIXELWISE = 50
 TRUE_CFG_SCALE_PIXELWISE = 4.0
 SEED_PIXELWISE = 42
-# Floors so CI prints mean and p99 absolute error. Replace with the eager remeasure.
-_CUDA_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 1.0
-_CUDA_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 1.0
+# H100 #17798 at 1664x928: mean abs 4.108345e-03, p99 3.529412e-02.
+# Bounds sit just above those errors. NPU 768x432 has no score yet.
+_CUDA_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 1e-2
+_CUDA_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 5e-2
 _NPU_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 1.0
 _NPU_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 1.0
+
+
+def _pixelwise_size() -> tuple[int, int]:
+    if current_omni_platform.is_npu():
+        return _NPU_WIDTH_PIXELWISE, _NPU_HEIGHT_PIXELWISE
+    return _CUDA_WIDTH_PIXELWISE, _CUDA_HEIGHT_PIXELWISE
 
 
 def _similarity_thresholds() -> tuple[float, float]:
@@ -173,13 +186,14 @@ def _run_vllm_omni_qwen_image_pixelwise(*, model: str, output_path: Path) -> Ima
         _OMNI_CI_ATTN_BACKEND,
         "--enforce-eager",
     ]
+    width, height = _pixelwise_size()
     with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_CI_ATTN_ENV) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
                 "model": omni_server.model,
                 "prompt": PROMPT_PIXELWISE,
-                "size": f"{WIDTH_PIXELWISE}x{HEIGHT_PIXELWISE}",
+                "size": f"{width}x{height}",
                 "n": 1,
                 "response_format": "b64_json",
                 "negative_prompt": NEGATIVE_PROMPT_PIXELWISE,
@@ -210,12 +224,13 @@ def _run_diffusers_qwen_image_pixelwise(*, model: str, output_path: Path) -> Ima
             local_files_only=_local_files_only(model),
         ).to(current_omni_platform.device_type)
         pipe.transformer.set_attention_backend(_DIFFUSERS_CI_ATTN_BACKEND)
+        width, height = _pixelwise_size()
         generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(SEED_PIXELWISE)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT_PIXELWISE,
             negative_prompt=NEGATIVE_PROMPT_PIXELWISE,
-            width=WIDTH_PIXELWISE,
-            height=HEIGHT_PIXELWISE,
+            width=width,
+            height=height,
             num_inference_steps=NUM_INFERENCE_STEPS_PIXELWISE,
             true_cfg_scale=TRUE_CFG_SCALE_PIXELWISE,
             generator=generator,
