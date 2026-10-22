@@ -33,7 +33,7 @@ NUM_INFERENCE_STEPS = 20
 TRUE_CFG_SCALE = 4.0
 SEED = 42
 # H100 #17798, eager TORCH_SDPA vs Diffusers native: SSIM 0.989517 / PSNR 34.677647.
-# A3 #9532: SSIM 0.955357 / PSNR 27.170992. Bounds sit just under those scores.
+# A3 #9532 and #9545: SSIM 0.955357 / PSNR 27.170992. Bounds sit just under those scores.
 # B200 has no eager measurement yet and uses the H100 bounds.
 _CUDA_SSIM_THRESHOLD = 0.98
 _CUDA_PSNR_THRESHOLD = 34.6
@@ -63,11 +63,12 @@ NUM_INFERENCE_STEPS_PIXELWISE = 50
 TRUE_CFG_SCALE_PIXELWISE = 4.0
 SEED_PIXELWISE = 42
 # H100 #17798 at 1664x928: mean abs 4.108345e-03, p99 3.529412e-02.
-# Bounds sit just above those errors. NPU 768x432 has no score yet.
+# A3 #9545 at 768x432: mean abs 1.399533e-02, p99 1.882353e-01.
+# Bounds sit just above those errors.
 _CUDA_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 1e-2
 _CUDA_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 5e-2
-_NPU_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 1.0
-_NPU_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 1.0
+_NPU_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 2e-2
+_NPU_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 2.5e-1
 
 
 def _pixelwise_size() -> tuple[int, int]:
