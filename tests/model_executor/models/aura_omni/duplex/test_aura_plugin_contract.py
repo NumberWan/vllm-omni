@@ -324,27 +324,29 @@ def test_decide_output_silent_short_circuits() -> None:
 def test_decide_output_spoken_sentence_keeps_talker_despite_silent_id() -> None:
     plugin = AuraDuplexPlugin(_encode_audio)
     spoken = "是的，我看到你了。"
-
-    class _Completion:
-        text = spoken
-        cumulative_text = spoken
-        token_ids = [11, 22, AURA_SILENT_TOKEN_ID]
-        finished = True
-
-    class _Output:
-        outputs = [_Completion()]
-
-    assert (
-        plugin.decide_output(
-            stage_id=1,
-            final_stage_id=3,
-            segment_finished=True,
-            segment_token_ids=(11, 22, AURA_SILENT_TOKEN_ID),
-            segment_output_metadata={},
-            output=_Output(),
+    # include_stop_str_in_output appends the stop marker to a spoken finish.
+    for text in (spoken, spoken + SILENT_TEXT):
+        output = SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    text=text,
+                    cumulative_text=text,
+                    token_ids=[11, 22, AURA_SILENT_TOKEN_ID],
+                    finished=True,
+                )
+            ]
         )
-        is None
-    )
+        assert (
+            plugin.decide_output(
+                stage_id=1,
+                final_stage_id=3,
+                segment_finished=True,
+                segment_token_ids=(11, 22, AURA_SILENT_TOKEN_ID),
+                segment_output_metadata={},
+                output=output,
+            )
+            is None
+        )
 
 
 def test_decide_output_chinese_silence_is_not_special_token() -> None:
