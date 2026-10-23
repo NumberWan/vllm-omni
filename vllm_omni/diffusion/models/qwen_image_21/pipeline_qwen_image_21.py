@@ -1293,6 +1293,27 @@ class QwenImage21Pipeline(
         first = kv_cache[0]
         return "decode" if any("key" in branch for branch in first.values()) else "prefill"
 
+    def _release_idle_decode_graphs(self, img_shapes: list | None) -> None:
+        """Free finished requests' static prefix copies before the next prefill allocates."""
+        manager = getattr(self.transformer, "_decode_graph_manager", None)
+        if manager is None or not img_shapes:
+            return
+        manager.release_idle_entries(keep_img_shapes=img_shapes[0])
+
+    def release_step_request(self, state: "StepRequestState") -> None:
+        """Drop this request's prefix KV and geometry when the runner retires it.
+
+        The same-layout decode graph stays. Its owner weakref dies with this
+        cache, and the next identical request replays it. Other layouts are
+        released before the next prefill, not here.
+        """
+        extra = getattr(state, "extra", None)
+        if isinstance(extra, dict):
+            extra["kv_cache"] = None
+        release_geometry = getattr(self.transformer, "release_request_geometry", None)
+        if release_geometry is not None:
+            release_geometry()
+
     @staticmethod
     def _assemble_kv_cache(
         states: list["StepRequestState"],
@@ -1487,6 +1508,8 @@ class QwenImage21Pipeline(
         states = list(input_batch.states)
         if not states:
             raise ValueError("QwenImage21Pipeline.denoise_step requires per-request states on the InputBatch.")
+        if self._kv_cache_phase(states[0].extra.get("kv_cache")) == "prefill":
+            self._release_idle_decode_graphs(input_batch.img_shapes)
 
         latents = input_batch.latents
         timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)

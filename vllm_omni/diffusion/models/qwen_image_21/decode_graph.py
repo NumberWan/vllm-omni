@@ -459,6 +459,39 @@ class QwenImage21DecodeGraphManager:
         # the next replay (of this or another graph on the pool) overwrites it.
         return entry.output.clone()
 
+    def release_idle_entries(self, keep_img_shapes: list | tuple | None = None) -> None:
+        """Drop static prefix K/V left by finished requests on other layouts.
+
+        Each entry keeps a full clone of the text+condition prefix. A finished
+        request's owner weakref is already dead, but the entry used to stay
+        until the LRU filled (default 8). Repeated requests with different
+        image layouts therefore stacked those copies until the next prefill
+        allocation ran out of memory (#8831).
+
+        In-flight owners are kept: another request may still be replaying that
+        graph. A dead owner whose layout matches ``keep_img_shapes`` is also
+        kept, so the next identical request replays instead of recapturing.
+        """
+        keep = None if keep_img_shapes is None else tuple(tuple(shape) for shape in keep_img_shapes)
+        released = False
+        for key in list(self.entries):
+            owner = self._owners.get(key)
+            if owner is not None and owner() is not None:
+                continue
+            # key[3] is the img_shapes tuple built by register_prefill.
+            if keep is not None and key[3] == keep:
+                continue
+            self.entries.pop(key, None)
+            self._owners.pop(key, None)
+            released = True
+        if released:
+            logger.info(
+                "Released idle Qwen-Image-2.1 decode-graph prefix copies (kept layout=%s, remaining=%d).",
+                keep,
+                len(self.entries),
+            )
+            current_omni_platform.empty_cache()
+
     def clear(self) -> None:
         """Drop all entries, freeing buffers and captured graphs."""
         self.entries.clear()

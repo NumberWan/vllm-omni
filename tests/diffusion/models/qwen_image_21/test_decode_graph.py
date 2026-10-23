@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import gc
 import weakref
 
 import pytest
@@ -61,6 +62,13 @@ def register(manager, cache, layout=(1, 2, 2)):
     )
 
 
+def entry_key(manager, layout):
+    want = (tuple(layout),)
+    matches = [key for key in manager.entries if key[3] == want]
+    assert len(matches) == 1, matches
+    return matches[0]
+
+
 def decode(manager, cache, layout=(1, 2, 2)):
     device = cache[0]["cond"]["key"].device
     return manager.try_decode(
@@ -72,6 +80,41 @@ def decode(manager, cache, layout=(1, 2, 2)):
         img_mask=torch.tensor([[False, False, True]], device=device),
         encoder_hidden_states_mask=None,
     )
+
+
+@pytest.mark.cpu
+def test_release_idle_entries_drops_dead_other_layouts(graph_case):
+    manager, device, cleanup = graph_case
+    manager.max_entries = 8
+    other = (1, 2, 2)
+    live = (1, 4, 2)
+    reuse = (1, 8, 2)
+
+    finished = make_cache(device, 1.0)
+    register(manager, finished, other)
+    other_key = entry_key(manager, other)
+    static_prefix = weakref.ref(manager.entries[other_key].k[0])
+    del finished
+
+    still_running = make_cache(device, 2.0)
+    register(manager, still_running, live)
+    live_key = entry_key(manager, live)
+
+    reusable = make_cache(device, 3.0)
+    register(manager, reusable, reuse)
+    reuse_key = entry_key(manager, reuse)
+    del reusable
+    gc.collect()
+
+    manager.release_idle_entries(keep_img_shapes=[reuse])
+
+    assert other_key not in manager.entries
+    gc.collect()
+    assert static_prefix() is None
+    assert live_key in manager.entries
+    assert manager._owners[live_key]() is still_running[0]["cond"]["key"]
+    assert reuse_key in manager.entries
+    assert cleanup
 
 
 @pytest.mark.cpu
