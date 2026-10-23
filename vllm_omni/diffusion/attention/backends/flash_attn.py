@@ -204,6 +204,14 @@ class FlashAttentionBackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_dense_4d_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        # CUDA/ROCm/MUSA route masked attention through the varlen wrapper,
+        # which only accepts a 2D key-validity mask. Ascend feeds the dense
+        # block mask to npu_fusion_attention and accepts 4D directly.
+        return current_omni_platform.is_npu()
+
+    @classmethod
     def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
         del attention_spec
         if not current_omni_platform.is_cuda():
@@ -983,6 +991,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """XPU flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
+            flash_attn_varlen_func,
         )
 
         if not HAS_FLASH_ATTN:
@@ -990,6 +999,18 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "FlashAttentionBackend requires Flash Attention. "
                 "Please assure vllm-xpu-kernels properly installed. "
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
+
+        # Spans take precedence over attn_mask, matching forward_cuda.
+        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            return piecewise_attn(
+                query,
+                key,
+                value,
+                attn_metadata.full_attn_spans,
+                self.softmax_scale,
+                partial(FlashAttentionImpl._flash_varlen_wrapper, attn_func=flash_attn_varlen_func),
+                query_ranges=attn_metadata.query_ranges,
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
