@@ -83,7 +83,7 @@ def test_denoising_releases_prefix_kv_and_geometry_without_clearing_graphs(mode)
     assert pipeline.transformer._request_geometry_owner is None
     assert pipeline.transformer.sequence_prepare._request_geometry is None
     pipeline.transformer._decode_graph_manager.clear.assert_not_called()
-    pipeline.transformer._decode_graph_manager.release_idle_entries.assert_called_with(keep_img_shapes=[(1, 2, 2)])
+    pipeline.transformer._decode_graph_manager.release_idle_entries.assert_called_once_with()
 
 
 def test_release_step_request_drops_request_kv_without_dropping_graphs():
@@ -106,12 +106,12 @@ def test_release_step_request_drops_request_kv_without_dropping_graphs():
     pipeline.transformer._decode_graph_manager.release_idle_entries.assert_not_called()
 
 
-def test_step_prefill_releases_idle_graphs_for_the_upcoming_layout():
+def test_step_prefill_releases_idle_graphs():
     from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import QwenImage21Pipeline
 
     pipeline = _Pipeline("success")
-    QwenImage21Pipeline._release_idle_decode_graphs(pipeline, [[(1, 2, 2)], [(1, 2, 2)]])
-    pipeline.transformer._decode_graph_manager.release_idle_entries.assert_called_once_with(keep_img_shapes=[(1, 2, 2)])
+    QwenImage21Pipeline._release_idle_decode_graphs(pipeline)
+    pipeline.transformer._decode_graph_manager.release_idle_entries.assert_called_once_with()
 
 
 def test_dropped_step_request_releases_geometry_and_prefix_without_explicit_finalization():
