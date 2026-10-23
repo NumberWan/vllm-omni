@@ -52,18 +52,19 @@ class _StagePort:
 class _Manager:
     stage_request_id = staticmethod(DuplexSessionManager.stage_request_id)
 
-    def ensure_stage_request(self, session, *, stage_id: int, fence):
+    def ensure_stage_request(self, session, *, stage_id: int, fence, final_stage_id: int | None = None):
         request_id = self.stage_request_id(
             fence,
             stage_id=stage_id,
             resumable=session.capabilities.supports_core_resumable_request,
         )
+        session.reserve_stage_request(stage_id, request_id, fence=fence)
         return DuplexStageRequestContext(
             request_id=request_id,
             session_id=session.session_id,
             fence=fence,
             stage_id=stage_id,
-            final_stage_id=3,
+            final_stage_id=3 if final_stage_id is None else final_stage_id,
             config_generation=session.config_generation,
             sampling_params=(SamplingParams(max_tokens=8),),
             session_config=session.config.as_dict(),
@@ -74,8 +75,13 @@ class _Manager:
 def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState) -> ModelChannel:
     plugin = SimpleNamespace(
         draining_stage_ids=lambda *, stage_count: frozenset({2, 3}) if stage_count >= 4 else frozenset(),
+        input_stage_id=lambda payload: 0,
         prepare_prompt_config=lambda config, **kwargs: config,
+        extra_prompt_config=lambda runtime_config: {},
+        runtime_patch_for_submitted_prompt=lambda prompt: None,
+        commit_append_plan=lambda request_id: None,
         prepare_append_plan=lambda **kwargs: _plan(),
+        data_plane=SimpleNamespace(close_stream=lambda request_id: None),
     )
 
     async def prepare_append_plan(**kwargs):
@@ -92,6 +98,7 @@ def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState
         tasks=DuplexSessionTasks(),
         run=run,
         services=SimpleNamespace(),
+        history_calibration=None,
     )
     return ModelChannel(
         ctx,
@@ -166,6 +173,7 @@ async def test_vision_follow_aborts_before_stage2_is_bound() -> None:
         final=True,
         operation_id="vision-before-bind",
         expected_epoch=None,
+        input_audio_part=None,
     )
 
     aborted = [ids for ids, abort in port.cleanups if abort and request_id in ids]
@@ -186,6 +194,7 @@ async def test_released_vision_follow_does_not_abort_draining_talker() -> None:
         final=True,
         operation_id="vision-after-release",
         expected_epoch=None,
+        input_audio_part=None,
     )
 
     aborted = [ids for ids, abort in port.cleanups if abort and request_id in ids]
@@ -367,6 +376,7 @@ async def test_sentence_tts_handoff_does_not_abort_before_stage2_bind(monkeypatc
             final=True,
             operation_id="vision-during-tts",
             expected_epoch=None,
+            input_audio_part=None,
         )
         return await original_forward(*args, **kwargs)
 
