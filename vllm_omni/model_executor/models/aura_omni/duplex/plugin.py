@@ -22,6 +22,12 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputDecision,
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, EncodeAudio
+from vllm_omni.model_executor.models.aura_omni.control_tokens import (
+    AURA_V1,
+    AURA_V2,
+    profile_for_stop_ids,
+    stop_ids_for_profile,
+)
 from vllm_omni.model_executor.models.aura_omni.duplex.capabilities import aura_duplex_capabilities
 from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import (
     AuraDataPlaneContext,
@@ -30,19 +36,20 @@ from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import (
 from vllm_omni.model_executor.models.aura_omni.duplex.session import AuraServingSessionState
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     DEFAULT_AURA_SYSTEM_PROMPT,
+    DEFAULT_AURA_V2_SYSTEM_PROMPT,
     SILENT_TEXT,
     is_effectively_silent,
 )
 
-# AURA v1 (Qwen3-VL) silent / ChatML turn-end ids.
-AURA_SILENT_TOKEN_ID = 151669
-AURA_IM_END_TOKEN_ID = 151645
-AURA_SILENT_TOKEN_IDS = frozenset({AURA_SILENT_TOKEN_ID})
+# v1 id, kept for callers that compare against the Qwen3-VL silent token.
+# The live family is ``AuraDuplexPlugin._profile``, chosen from stage stop ids.
+AURA_SILENT_TOKEN_ID = AURA_V1.silent_id
 
 _PRIVATE_KEYS = frozenset(
     {
         "aura_system_prompt",
         "aura_history_revision",
+        "aura_two_token",
     }
 )
 
@@ -142,6 +149,14 @@ class AuraDuplexPlugin(DuplexModelPlugin):
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
         self.data_plane = AuraDataPlaneSession(encode_audio)
+        # Empty sampling defaults stay on v1. A stage that already lists the
+        # v2 silent or im_end id switches this before the first request.
+        self._profile = AURA_V1
+
+    def _default_system_prompt(self) -> str:
+        if self._profile is AURA_V2:
+            return DEFAULT_AURA_V2_SYSTEM_PROMPT
+        return DEFAULT_AURA_SYSTEM_PROMPT
 
     def configure_sampling_params(
         self,
@@ -153,15 +168,23 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         configured = list(defaults)
         if len(configured) > 1 and isinstance(configured[1], SamplingParams):
             stage1 = configured[1].clone()
-            stop_ids = list(stage1.stop_token_ids or [])
-            for stop_id in (AURA_SILENT_TOKEN_ID, AURA_IM_END_TOKEN_ID):
-                if stop_id not in stop_ids:
-                    stop_ids.append(stop_id)
-            stage1.stop_token_ids = stop_ids
-            # 151669 is a stop id: keep it in the completion so decide_output /
-            # aura2tts can see <|silent|> instead of an empty detokenized string.
+            self._profile = profile_for_stop_ids(stage1.stop_token_ids)
+            stage1.stop_token_ids = stop_ids_for_profile(stage1.stop_token_ids, self._profile)
+            # Silent / im_end are stop ids: keep them in the completion so
+            # decide_output / aura2tts can see <|silent|> instead of an empty
+            # detokenized string. <|respond|> stays off the stop list.
             stage1.include_stop_str_in_output = True
             stage1.skip_special_tokens = False
+            if self._profile is AURA_V2:
+                # Match inference two-token: greedy + logits processor opt-in.
+                stage1.temperature = 0.0
+                stage1.min_tokens = 0
+                stage1.repetition_penalty = 1.0
+                stage1.presence_penalty = 0.0
+                stage1.frequency_penalty = 0.0
+                extra = dict(stage1.extra_args or {})
+                extra["aura_mode"] = "streaming"
+                stage1.extra_args = extra
             configured[1] = stage1
         # Codec EOS (2150) and the 240-token cap are defaults for an unset
         # Talker config. A value already set by yaml or the caller is kept,
@@ -238,12 +261,14 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             has_audio = True
         if not has_audio and not mm:
             raise ValueError("AURA duplex commit requires audio and/or video_frames")
-        system_prompt = runtime_config.get("aura_system_prompt", DEFAULT_AURA_SYSTEM_PROMPT)
+        system_prompt = runtime_config.get("aura_system_prompt", self._default_system_prompt())
+        two_token = bool(runtime_config.get("aura_two_token", self._profile is AURA_V2))
 
         additional_information: dict[str, object] = {
             "aura_system_prompt": system_prompt,
             "aura_session_id": fence.session_id,
             "aura_duplex": True,
+            "aura_two_token": two_token,
             "session_id": fence.session_id,
             "epoch": fence.epoch,
             "turn_id": fence.turn_id,
@@ -405,7 +430,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         text = getattr(completion, "text", None) if completion is not None else None
         cumulative = getattr(completion, "cumulative_text", None) if completion is not None else None
         text_blob = " ".join(part for part in (text, cumulative) if isinstance(part, str))
-        # A finished Stage1 chunk can carry stop id 151669 and still be spoken.
+        # A finished Stage1 chunk can carry the silent stop id and still be spoken.
         # include_stop_str_in_output leaves <|silent|> on that text.
         # is_effectively_silent is only the exact marker, so a sentence with
         # the marker still appended is spoken. Classifying it as listen aborts
@@ -420,10 +445,15 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         )
         if spoken is not None:
             return None
-        # Empty finished Stage1 is silent: stop_token 151669 is often omitted from
-        # token_ids/text unless include_stop_str_in_output is set.
+        # Empty finished Stage1 is silent: the silent stop id is often omitted from
+        # token_ids/text unless include_stop_str_in_output is set. A leading
+        # respond id means the turn spoke (even if the body is still empty).
+        respond_id = self._profile.respond_id
+        silent_ids = frozenset({self._profile.silent_id})
+        if token_ids and respond_id is not None and token_ids[0] == respond_id:
+            return None
         is_silent = (
-            any(sid in token_ids for sid in AURA_SILENT_TOKEN_IDS)
+            any(sid in token_ids for sid in silent_ids)
             or (isinstance(text, str) and is_effectively_silent(text))
             or (isinstance(cumulative, str) and is_effectively_silent(cumulative))
             or SILENT_TEXT in text_blob
@@ -431,8 +461,8 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         if not is_silent and not token_ids and not text_blob.strip():
             is_silent = True
         if not is_silent and token_ids:
-            is_silent = token_ids[0] in AURA_SILENT_TOKEN_IDS or (
-                len(token_ids) > 3 and any(sid in token_ids[:6] for sid in AURA_SILENT_TOKEN_IDS)
+            is_silent = token_ids[0] in silent_ids or (
+                len(token_ids) > 3 and any(sid in token_ids[:6] for sid in silent_ids)
             )
         if not is_silent:
             return None
@@ -463,10 +493,12 @@ class AuraDuplexPlugin(DuplexModelPlugin):
     ) -> dict[str, object]:
         del model_config
         extra = config.extra_body if isinstance(config.extra_body, dict) else {}
-        system_prompt = extra.get("aura_system_prompt") or config.instructions or DEFAULT_AURA_SYSTEM_PROMPT
+        default_prompt = self._default_system_prompt()
+        system_prompt = extra.get("aura_system_prompt") or config.instructions or default_prompt
         runtime: dict[str, object] = {
             "aura_system_prompt": str(system_prompt),
             "instructions": str(system_prompt),
+            "aura_two_token": self._profile is AURA_V2,
             "tts_task_type": str(extra.get("tts_task_type") or "CustomVoice"),
             "tts_language": str(extra.get("tts_language") or "Chinese"),
             "tts_speaker": str(extra.get("tts_speaker") or "Vivian"),
@@ -489,6 +521,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         # instructions, then the prompt already installed (or the default).
         # setdefault would keep the creation-time prompt and ignore a later
         # session.update.instructions.
+        default_prompt = self._default_system_prompt()
         explicit = extra.get("aura_system_prompt") if "aura_system_prompt" in extra else None
         if isinstance(explicit, str) and explicit:
             prompt = explicit
@@ -496,13 +529,10 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             prompt = str(config.instructions)
         else:
             current_prompt = current.get("aura_system_prompt")
-            prompt = (
-                str(current_prompt)
-                if isinstance(current_prompt, str) and current_prompt
-                else DEFAULT_AURA_SYSTEM_PROMPT
-            )
+            prompt = str(current_prompt) if isinstance(current_prompt, str) and current_prompt else default_prompt
         updated["aura_system_prompt"] = prompt
         updated["instructions"] = str(config.instructions) if config.instructions else prompt
+        updated["aura_two_token"] = self._profile is AURA_V2
         for key in _TTS_EXTRA_KEYS:
             if key in extra and extra[key] is not None:
                 updated[key] = extra[key]

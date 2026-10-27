@@ -81,7 +81,10 @@ def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState
         runtime_patch_for_submitted_prompt=lambda prompt: None,
         commit_append_plan=lambda request_id: None,
         prepare_append_plan=lambda **kwargs: _plan(),
-        data_plane=SimpleNamespace(close_stream=lambda request_id: None),
+        data_plane=SimpleNamespace(
+            close_stream=lambda request_id: None,
+            mark_terminal=lambda request_id: None,
+        ),
     )
 
     async def prepare_append_plan(**kwargs):
@@ -102,7 +105,7 @@ def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState
     )
     return ModelChannel(
         ctx,
-        SimpleNamespace(emit=lambda payload: None),
+        SimpleNamespace(emit=lambda payload: None, auto_responds=lambda: False),
         close_from_runtime=lambda reason: _done(),
         schedule_silence_continuation=lambda *args, **kwargs: _done(),
         abort_request=lambda *args, **kwargs: _done(),
@@ -200,6 +203,33 @@ async def test_released_vision_follow_does_not_abort_draining_talker() -> None:
     aborted = [ids for ids, abort in port.cleanups if abort and request_id in ids]
     assert not aborted
     assert session.turn_id == 1
+    assert session.request_resources.get((2, request_id)) is not None
+    assert session.request_resources.get((3, request_id)) is not None
+
+
+@pytest.mark.asyncio
+async def test_unreleased_vision_follow_does_not_abort_already_bound_talker() -> None:
+    """Gate closed after a prior Stage0 bind, but Talker/Code2Wav still drain.
+
+    Vision-follow flood used to abort the shared ephemeral and kill TTS even
+    though stages 2/3 were already bound.
+    """
+    session = _ephemeral_session()
+    request_id = _bind_inflight_talker(session)
+    port = _StagePort()
+    run = DuplexRunState(concurrent_turn_requests_released=False)
+    channel = _channel(session, port, run)
+
+    await channel._append_via_data_plane(
+        {"is_speech": False},
+        final=True,
+        operation_id="vision-while-tts-drains",
+        expected_epoch=None,
+        input_audio_part=None,
+    )
+
+    aborted = [ids for ids, abort in port.cleanups if abort and request_id in ids]
+    assert not aborted
     assert session.request_resources.get((2, request_id)) is not None
     assert session.request_resources.get((3, request_id)) is not None
 
@@ -438,6 +468,45 @@ async def test_sentence_tts_off_still_submits_full_text(monkeypatch: pytest.Monk
     orchestrator.request_states[request_id] = req_state
     await orchestrator._route_output(1, 0, _spoken_output(request_id), req_state, None)
     assert calls == ["initial"]
+
+
+@pytest.mark.asyncio
+async def test_silent_listen_ends_the_ephemeral_turn() -> None:
+    """10:13: a listen that releases the turn must also advance the turn id.
+
+    Otherwise the next commit reuses this id and its own release pops the
+    orchestrator state of a turn whose Talker work is still running.
+    """
+    session = _ephemeral_session()
+    request_id = _bind_stage0(session)
+    port = _StagePort()
+    run = DuplexRunState(concurrent_turn_requests_released=False)
+    channel = _channel(session, port, run)
+
+    await channel._on_model_listen(
+        {
+            "is_listen": True,
+            "data_plane_request_id": request_id,
+            "model_context_text": "<|silent|>",
+            "reason": "aura_silent",
+            "model_listen": True,
+        },
+        model_turn_id=0,
+        data_plane_request_id=request_id,
+        expected_epoch=None,
+    )
+
+    assert session.turn_id == 1
+    assert not session.stage_request_submitted(0, request_id)
+
+    result = await channel._append_via_data_plane(
+        {"is_speech": True},
+        final=True,
+        operation_id="speech-after-listen",
+        expected_epoch=None,
+        input_audio_part=None,
+    )
+    assert _opened_request_id(result).endswith("stage0-turn1")
 
 
 def test_project_output_yields_spoken_stage1_text() -> None:

@@ -16,6 +16,12 @@ import soundfile as sf
 from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.aura_omni.control_tokens import (
+    QWEN_NEWLINE_ID,
+    chatml_prefix,
+    chatml_suffix,
+    profile_for_token_ids,
+)
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
 )
@@ -25,20 +31,21 @@ DEFAULT_AURA_SYSTEM_PROMPT = (
     "Respond only when a response is needed based on the user's message or the visual context. "
     "Otherwise, output `<|silent|>` to signify silence."
 )
+# Same text as AURA_demo-main/gateway/actor.py SYSTEM_PROMPT (aura_v1_system_prompt).
+# The longer Chinese tool prompt in that file is not wired and is not used here.
+DEFAULT_AURA_V2_SYSTEM_PROMPT = (
+    "You are receiving a live video stream where the final frame is the present moment. "
+    "Respond only when a response is needed based on the user's message or the visual context. "
+    "Otherwise, output `<|silent|>` to signify silence."
+)
 
 SILENT_TEXT = "<|silent|>"
-QWEN_IM_START_ID = 151644
-QWEN_IM_END_ID = 151645
-QWEN_ASSISTANT_ID = 77091
-QWEN_NEWLINE_ID = 198
-QWEN_ASSISTANT_PREFIX_IDS = [QWEN_IM_START_ID, QWEN_ASSISTANT_ID, QWEN_NEWLINE_ID]
-QWEN_ASSISTANT_SUFFIX_IDS = [
-    QWEN_IM_END_ID,
-    QWEN_NEWLINE_ID,
-    QWEN_IM_START_ID,
-    QWEN_ASSISTANT_ID,
-    QWEN_NEWLINE_ID,
-]
+# AURA_v2 two-token checkpoints emit this as the first body token when speaking.
+# It is not spoken and must not reach TTS / the client transcript.
+RESPOND_TEXT = "<|respond|>"
+# Qwen3.5 chat template with enable_thinking=False ends generation prompts this way.
+AURA_V2_EMPTY_THINK_PREFIX = "<think>\n\n</think>\n\n"
+
 DEFAULT_QWEN3_TTS_REF_AUDIO = "vllm-omni/tests/assets/qwen3_tts/clone_2.wav"
 DEFAULT_QWEN3_TTS_REF_TEXT = (
     "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
@@ -238,21 +245,34 @@ def _extract_token_ids(source_output: Any) -> list[int]:
 
 
 def _trim_aura_response_token_ids(token_ids: list[int]) -> list[int]:
+    """Drop chatml wrapper, a leading ``<|respond|>``, and the matching im_end.
+
+    v1 and v2 use different ids for the same strings. The wrapper that is
+    actually present selects the family, so a v2 body is not cut on v1's
+    ``151645`` when that id shows up as an ordinary piece.
+    """
+    profile = profile_for_token_ids(token_ids)
     ids = list(token_ids)
-    if ids[: len(QWEN_ASSISTANT_PREFIX_IDS)] == QWEN_ASSISTANT_PREFIX_IDS:
-        ids = ids[len(QWEN_ASSISTANT_PREFIX_IDS) :]
-    if QWEN_IM_END_ID in ids:
-        ids = ids[: ids.index(QWEN_IM_END_ID)]
-    while ids and ids[-1] in {QWEN_IM_START_ID, QWEN_IM_END_ID, QWEN_NEWLINE_ID}:
+    prefix = chatml_prefix(profile)
+    if ids[: len(prefix)] == prefix:
+        ids = ids[len(prefix) :]
+    if profile.respond_id is not None and ids and ids[0] == profile.respond_id:
+        ids = ids[1:]
+    if profile.im_end_id in ids:
+        ids = ids[: ids.index(profile.im_end_id)]
+    trail = {profile.im_start_id, profile.im_end_id, QWEN_NEWLINE_ID}
+    while ids and ids[-1] in trail:
         ids.pop()
     return ids
 
 
 def _qwen3_tts_assistant_token_ids_from_aura(source_output: Any) -> list[int]:
-    content_ids = _trim_aura_response_token_ids(_extract_token_ids(source_output))
+    raw_ids = _extract_token_ids(source_output)
+    content_ids = _trim_aura_response_token_ids(raw_ids)
     if not content_ids:
         return []
-    return QWEN_ASSISTANT_PREFIX_IDS + content_ids + QWEN_ASSISTANT_SUFFIX_IDS
+    profile = profile_for_token_ids(raw_ids)
+    return chatml_prefix(profile) + content_ids + chatml_suffix(profile)
 
 
 def _source_prompt_by_request_id(source_outputs: list[Any], prompt: Any) -> dict[str, dict[str, Any]]:
@@ -287,15 +307,21 @@ def _aura_prompt(
     transcript: str,
     multi_modal_data: dict[str, Any],
     history_prefix: str = "",
+    *,
+    two_token: bool = False,
 ) -> str:
     vision = _vision_placeholder(multi_modal_data)
     query = transcript.strip()
     user_body = f"{vision}{query}" if query else vision
+    assistant = "<|im_start|>assistant\n"
+    if two_token:
+        # Match inference / checkpoint chat template (enable_thinking=False).
+        assistant += AURA_V2_EMPTY_THINK_PREFIX
     return (
         f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         f"{history_prefix}"
         f"<|im_start|>user\n{user_body}<|im_end|>\n"
-        "<|im_start|>assistant\n"
+        f"{assistant}"
     )
 
 
@@ -304,19 +330,31 @@ def _strip_assistant_text(text: str) -> str:
 
     Stage1 uses ``skip_special_tokens=False`` so ``<|silent|>`` / ``<|im_end|>``
     remain visible for silent detection; strip ChatML markers (not silent)
-    before spoken TTS / transcript emission.
+    before spoken TTS / transcript emission. AURA_v2 also strips a leading
+    ``<|respond|>`` control marker: it decides speak vs silent and is not speech.
     """
     cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL | re.IGNORECASE)
     # Drop an unclosed leading think block if the model is still inside it.
     cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = cleaned.replace("</think>", "")
     cleaned = re.sub(r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>", "", cleaned)
-    return cleaned.strip()
+    stripped = cleaned.strip()
+    if stripped.startswith(RESPOND_TEXT):
+        stripped = stripped[len(RESPOND_TEXT) :].lstrip()
+    return stripped
 
 
 def is_effectively_silent(text: str | None) -> bool:
-    """True for empty / whitespace-only / exact ``<|silent|>`` Stage1 text."""
+    """True for empty / whitespace-only / exact ``<|silent|>`` Stage1 text.
+
+    A bare ``<|respond|>`` is not silence: the spoken body may still be streaming.
+    """
     if not isinstance(text, str):
+        return False
+    raw = text.strip()
+    if not raw:
+        return True
+    if raw == RESPOND_TEXT or (raw.startswith(RESPOND_TEXT) and not raw[len(RESPOND_TEXT) :].strip()):
         return False
     stripped = _strip_assistant_text(text)
     return not stripped or stripped == SILENT_TEXT
@@ -415,7 +453,7 @@ def next_duplex_sentence_chunk(state: dict[str, Any], raw_text: str, *, finished
         return None
     raw = raw_text or ""
     already = int(state.get("emits", 0))
-    if already == 0 and (is_silent_text_prefix(raw) or is_effectively_silent(raw)):
+    if already == 0 and (is_control_text_prefix(raw) or is_effectively_silent(raw)):
         return None
     think_open = "<think>" in raw.lower() and "</think>" not in raw.lower()
     tool_pending = _tool_marker_pending(raw)
@@ -469,6 +507,20 @@ def is_silent_text_prefix(text: str | None) -> bool:
     if not stripped:
         return True
     return SILENT_TEXT.startswith(stripped)
+
+
+def is_control_text_prefix(text: str | None) -> bool:
+    """True while streamed text is still a prefix of silent or respond.
+
+    AURA_v2 may emit ``<|respond|>`` before the spoken body. Hold that marker
+    (and partial prefixes) so it does not leak as client / TTS text.
+    """
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return SILENT_TEXT.startswith(stripped) or RESPOND_TEXT.startswith(stripped)
 
 
 def _normalize_asr_transcript(transcript: str) -> str:
@@ -528,6 +580,13 @@ def asr2aura(
 
             history = get_or_create_session_history(session_id)
             current_video = _one_video_item(multi_modal_data.get("video"))
+            if history.pending_user is not None:
+                logger.info(
+                    "[asr2aura] pending_overwrite session=%s prior_pending_len=%d is_speech=%s",
+                    session_id,
+                    len(history.pending_user),
+                    additional_info.get("is_speech"),
+                )
             history.begin_user_turn(transcript, video=current_video)
             history_prefix = history.render_prefix()
             prior_videos = history.retained_videos()
@@ -564,12 +623,14 @@ def asr2aura(
                     len(last_assistant) if isinstance(last_assistant, str) else 0,
                 )
 
+        two_token = bool(additional_info.get("aura_two_token"))
         next_input: dict[str, Any] = {
             "prompt": _aura_prompt(
                 str(system_prompt),
                 transcript,
                 prompt_mm,
                 history_prefix=history_prefix,
+                two_token=two_token,
             ),
         }
         if isinstance(session_id, str) and session_id:

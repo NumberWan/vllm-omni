@@ -351,22 +351,35 @@ class ModelChannel:
             # Keys are ``(stage_id, request_id)``; values are DuplexRequestResource.
             stale_keys = [key for key in session.request_resources if not duplex_is_auxiliary_request(key[1])]
             stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
-            concurrent_turn = session.capabilities.supports_concurrent_turn_requests and (
-                self._ctx.run.concurrent_turn_requests_released
+            concurrent_released = bool(self._ctx.run.concurrent_turn_requests_released)
+            concurrent_turn = session.capabilities.supports_concurrent_turn_requests and concurrent_released
+            draining_stages = self._draining_stage_ids()
+            # Gate may already be closed by a prior Stage0 bind while Talker /
+            # Code2Wav still drain on the shared ephemeral id. Aborting that id
+            # kills in-flight TTS (vision-follow flood). Keep drain whenever
+            # those stages are bound or already marked draining.
+            has_draining_work = session.capabilities.supports_concurrent_turn_requests and any(
+                sid in draining_stages or session.is_draining_request(rid) for sid, rid in stale_keys
             )
+            preserve_drain = concurrent_turn or has_draining_work
             # Prior TTS may still drain under the same response_id; acceptance
             # is gated by supports_concurrent_turn_requests, not a per-turn drain id.
             session.complete_model_turn(fence.turn_id)
             fence = DuplexFence(session.session_id, epoch=session.epoch, turn_id=session.turn_id)
             request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=False)
             session.request_resources.pop((stage_id, stale_ephemeral_id), None)
-            if concurrent_turn:
-                # Input gate already released after assistant text/silent final,
-                # so non-draining stages are idle. Drop their session bindings
-                # only — do not abort engine work. Stages the plugin marks as
-                # draining keep running under the prior response_id.
+            if preserve_drain:
+                # Non-draining stages are idle (or about to be superseded). Drop
+                # their session bindings only — do not abort engine work. Stages
+                # the plugin marks as draining keep running under the prior
+                # response_id.
+                logger.info(
+                    "duplex_ephemeral_supersede mode=drain session=%s stale_ids=%s concurrent_released=%s",
+                    session.session_id,
+                    stale_ids,
+                    concurrent_released,
+                )
                 prior_response_id = session.active_response_id
-                draining_stages = self._draining_stage_ids()
                 for sid, rid in stale_keys:
                     if sid not in draining_stages:
                         session.request_resources.pop((sid, rid), None)
@@ -381,9 +394,15 @@ class ModelChannel:
                 else:
                     session.bind_response_turn(fence.turn_id)
             elif stale_ids:
-                # Input gate not released yet (e.g. commit while Stage1 is still
-                # running): abort the whole prior ephemeral so a later output
-                # stage is not left orphaned.
+                # Input gate not released and Talker not bound yet (e.g. commit
+                # while Stage1 is still running): abort the whole prior
+                # ephemeral so a later output stage is not left orphaned.
+                logger.info(
+                    "duplex_ephemeral_supersede mode=abort session=%s stale_ids=%s concurrent_released=%s",
+                    session.session_id,
+                    stale_ids,
+                    concurrent_released,
+                )
                 try:
                     await self._ctx.stage_port.cleanup(stale_ids, abort=True)
                 except Exception:
@@ -1113,6 +1132,13 @@ class ModelChannel:
                     "playback": session.playback.as_dict(),
                 }
             )
+        if not session.capabilities.supports_core_resumable_request and model_turn_id is not None:
+            # An ephemeral turn that ends on a listen owns the same stage ids as
+            # one that spoke (``_complete_model_turn_without_output`` already
+            # advances there). Without this the turn id is stuck, so the next
+            # commit reuses this id and its release pops a still-running output
+            # stage of the turn before it.
+            session.complete_model_turn(model_turn_id)
         await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
 

@@ -18,8 +18,8 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
+    is_control_text_prefix,
     is_effectively_silent,
-    is_silent_text_prefix,
 )
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
@@ -57,22 +57,28 @@ def _unwrap(output: object) -> tuple[object, object | None, int | None]:
     return output, completion, int(stage_id) if isinstance(stage_id, int) else None
 
 
-def _strip_think(text: str) -> str:
-    """Drop Qwen3-VL ``<think>...</think>`` wrappers from assistant text."""
+def _spoken_text(text: str) -> str:
+    """Drop think / ChatML / leading ``<|respond|>`` before client or TTS text."""
     from vllm_omni.model_executor.stage_input_processors.aura_omni import _strip_assistant_text
 
     return _strip_assistant_text(text)
 
 
-def _text_from(output: object, completion: object | None) -> str:
+def _raw_text_from(output: object, completion: object | None) -> str:
+    """Stage1 text with control tokens still visible (silent / respond)."""
     for candidate in (completion, output):
         if candidate is None:
             continue
         for attr in ("cumulative_text", "text"):
             value = getattr(candidate, attr, None)
             if isinstance(value, str) and value:
-                return _strip_think(value)
+                return value
     return ""
+
+
+def _text_from(output: object, completion: object | None) -> str:
+    raw = _raw_text_from(output, completion)
+    return _spoken_text(raw) if raw else ""
 
 
 def _multimodal(output: object, completion: object | None) -> dict[str, object]:
@@ -264,8 +270,14 @@ class AuraDataPlaneSession(DuplexDataPlane):
         metadata = dict(getattr(decision, "metadata", {}) or {})
         if metadata.get("model_listen") or metadata.get("duplex_native_decision") == "listen":
             state.silent = True
+            listen_source = metadata.get("listen_source")
+            if not isinstance(listen_source, str) or not listen_source.strip():
+                listen_source = "aura_silent"
             # DIRECT_RESPONSE skips aura2tts. The session runner commits
             # model context from model_context_text; this projector does not.
+            # reason/listen_source ride the existing channel listen payload;
+            # model_listen must stay True so reason!=model_listen does not
+            # flip the boolean (model_channel._on_model_listen).
             yield _event(
                 stage_role="thinker",
                 is_listen=True,
@@ -274,6 +286,9 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 end_of_turn=True,
                 silent=True,
                 model_context_text=SILENT_TEXT,
+                reason=listen_source,
+                listen_source=listen_source,
+                model_listen=True,
                 # Prewarm already reserved Stage2/3 on Stage0 submit. Silent
                 # short-circuit never feeds codec chunks; abort frees those seats.
                 abort_data_plane_request=True,
@@ -281,20 +296,23 @@ class AuraDataPlaneSession(DuplexDataPlane):
             state.terminal = True
             return
 
-        text = _text_from(output, completion)
-        if text and text != state.text_sent:
-            state.text_sent = text
-            if is_effectively_silent(text):
+        raw_text = _raw_text_from(output, completion)
+        spoken = _spoken_text(raw_text) if raw_text else ""
+        if raw_text and raw_text != state.text_sent:
+            # Keep raw for model_context (AURA_v2 history includes <|respond|>).
+            state.text_sent = raw_text
+            if is_effectively_silent(raw_text):
                 state.silent = True
-            # Hold deltas that are still a <|silent|> prefix until short-circuit.
-            if not state.silent and not is_silent_text_prefix(text):
+            # Hold silent / respond control prefixes until the body (or silent
+            # short-circuit) arrives. Client text is the spoken strip only.
+            if not state.silent and not is_control_text_prefix(raw_text) and spoken:
                 emit = (
-                    text
+                    spoken
                     if not state.text_emitted
-                    else (text[len(state.text_emitted) :] if text.startswith(state.text_emitted) else text)
+                    else (spoken[len(state.text_emitted) :] if spoken.startswith(state.text_emitted) else spoken)
                 )
                 if emit:
-                    state.text_emitted = text
+                    state.text_emitted = spoken
                     yield _event(
                         stage_role="thinker",
                         is_listen=False,
@@ -373,6 +391,9 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 end_of_turn=True,
                 silent=True,
                 model_context_text=SILENT_TEXT,
+                reason="aura_silent",
+                listen_source="aura_silent",
+                model_listen=True,
                 abort_data_plane_request=True,
             )
             state.terminal = True

@@ -8,8 +8,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import AuraDataPlaneSession
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _encode_audio(audio: object, sample_rate: int, fmt: str, speed: float | None) -> str | None:
@@ -144,8 +147,12 @@ def test_project_marks_finished_silent_text_as_listen() -> None:
         outputs=[SimpleNamespace(text="<|silent|>", cumulative_text="<|silent|>", finished=True)],
     )
     events = list(plane.project({"data_plane_outputs": [final]}))
-    assert any(e.get("silent") and e.get("is_listen") for e in events)
+    listen = [e for e in events if e.get("silent") and e.get("is_listen")]
+    assert listen
     assert any(e.get("abort_data_plane_request") is True for e in events)
+    assert listen[-1].get("listen_source") == "aura_silent"
+    assert listen[-1].get("reason") == "aura_silent"
+    assert listen[-1].get("model_listen") is True
 
 
 def test_project_finished_spoken_turn_carries_model_context() -> None:
@@ -163,3 +170,5 @@ def test_project_finished_spoken_turn_carries_model_context() -> None:
     assert context and context[-1]["model_context_text"] == "你好。"
     assert context[-1].get("is_listen") is False
     assert context[-1].get("text") == ""
+    assert context[-1].get("listen_source") is None
+    assert context[-1].get("reason") is None

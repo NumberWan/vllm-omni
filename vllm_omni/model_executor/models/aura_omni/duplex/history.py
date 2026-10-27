@@ -33,6 +33,12 @@ class SessionHistory:
     pending_video: object | None = None
 
     def render_prefix(self) -> str:
+        """ChatML prefix for the next Stage1 turn.
+
+        Same as v1: stored user/assistant text is written back as-is, and a
+        user turn that still has pixels gets one video placeholder. v2 spoken
+        turns keep their leading ``<|respond|>`` in that stored text.
+        """
         rendered: list[str] = []
         for message in self.messages:
             role = message.get("role")
