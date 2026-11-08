@@ -72,7 +72,9 @@ class _Manager:
         )
 
 
-def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState) -> ModelChannel:
+def _channel(
+    session: DuplexEngineSession, port: _StagePort, run: DuplexRunState, *, auto_responds: bool = False
+) -> ModelChannel:
     plugin = SimpleNamespace(
         draining_stage_ids=lambda *, stage_count: frozenset({2, 3}) if stage_count >= 4 else frozenset(),
         input_stage_id=lambda payload: 0,
@@ -94,7 +96,7 @@ def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState
     plugin.prepare_append_plan = prepare_append_plan
     ctx = SimpleNamespace(
         session=session,
-        model_state=SimpleNamespace(),
+        model_state=SimpleNamespace(clear_continuation=lambda: None),
         plugin=plugin,
         stage_port=port,
         manager=_Manager(),
@@ -105,7 +107,7 @@ def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState
     )
     return ModelChannel(
         ctx,
-        SimpleNamespace(emit=lambda payload: None, auto_responds=lambda: False),
+        SimpleNamespace(emit=lambda payload: None, auto_responds=lambda: auto_responds),
         close_from_runtime=lambda reason: _done(),
         schedule_silence_continuation=lambda *args, **kwargs: _done(),
         abort_request=lambda *args, **kwargs: _done(),
@@ -481,12 +483,13 @@ async def test_silent_listen_ends_the_ephemeral_turn() -> None:
     request_id = _bind_stage0(session)
     port = _StagePort()
     run = DuplexRunState(concurrent_turn_requests_released=False)
-    channel = _channel(session, port, run)
+    channel = _channel(session, port, run, auto_responds=True)
 
     await channel._on_model_listen(
         {
             "is_listen": True,
             "data_plane_request_id": request_id,
+            "end_of_turn": True,
             "model_context_text": "<|silent|>",
             "reason": "aura_silent",
             "model_listen": True,

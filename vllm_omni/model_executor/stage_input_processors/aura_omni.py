@@ -309,6 +309,8 @@ def _aura_prompt(
     history_prefix: str = "",
     *,
     two_token: bool = False,
+    tools_block: str = "",
+    include_user_turn: bool = True,
 ) -> str:
     vision = _vision_placeholder(multi_modal_data)
     query = transcript.strip()
@@ -317,12 +319,12 @@ def _aura_prompt(
     if two_token:
         # Match inference / checkpoint chat template (enable_thinking=False).
         assistant += AURA_V2_EMPTY_THINK_PREFIX
-    return (
-        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-        f"{history_prefix}"
-        f"<|im_start|>user\n{user_body}<|im_end|>\n"
-        f"{assistant}"
-    )
+    system = f"{tools_block}\n\n{system_prompt}" if tools_block else system_prompt
+    # A tool-followup turn (``include_user_turn=False``) has no new user
+    # utterance: the prior assistant's <tool_call> plus the appended
+    # <tool_response> (both already in history_prefix) are the whole query.
+    user_turn = f"<|im_start|>user\n{user_body}<|im_end|>\n" if include_user_turn else ""
+    return f"<|im_start|>system\n{system}<|im_end|>\n{history_prefix}{user_turn}{assistant}"
 
 
 def _strip_assistant_text(text: str) -> str:
@@ -441,6 +443,19 @@ def _tool_marker_pending(text: str) -> bool:
     return "<tool_call" in lowered or "</tool_call" in lowered
 
 
+def _strip_tool_call_for_speech(text: str) -> str:
+    """Drop a ``<tool_call>`` block (and anything after it) from TTS/display text.
+
+    Does not touch ``is_effectively_silent``/history text: a turn that is
+    only a tool call still counts as spoken (the two-token ``<|respond|>``
+    check in ``decide_output`` is the source of truth for that), it just has
+    nothing left to say out loud until the follow-up turn answers.
+    """
+    from vllm_omni.model_executor.models.aura_omni.duplex.tools_utils import strip_tool_call_markup
+
+    return strip_tool_call_markup(text)
+
+
 def next_duplex_sentence_chunk(state: dict[str, Any], raw_text: str, *, finished: bool) -> str | None:
     """Return the next Talker sentence, or None when this output must not start TTS.
 
@@ -489,6 +504,10 @@ def next_duplex_sentence_chunk(state: dict[str, Any], raw_text: str, *, finished
     state["pending"] = ""
     remainder = _strip_assistant_text(pending).strip()
     if not remainder or is_effectively_silent(remainder):
+        return None
+    remainder = _strip_tool_call_for_speech(remainder).strip()
+    if not remainder:
+        # Held-back text was only a <tool_call> block: nothing to speak yet.
         return None
     state["emits"] = already + 1
     state["last"] = remainder
@@ -573,6 +592,11 @@ def asr2aura(
         history_prefix = ""
         prompt_mm = multi_modal_data
         session_id = additional_info.get("session_id") or additional_info.get("aura_session_id")
+        # A tool-followup turn answers an already-appended <tool_response>; it
+        # has no new user utterance, so the usual begin/commit user-turn
+        # pairing is skipped (``commit_turn`` already supports a bare
+        # assistant append when nothing is pending).
+        tool_followup = bool(additional_info.get("aura_tool_followup"))
         if additional_info.get("aura_duplex") and isinstance(session_id, str) and session_id:
             from vllm_omni.model_executor.models.aura_omni.duplex.history import (
                 get_or_create_session_history,
@@ -580,14 +604,15 @@ def asr2aura(
 
             history = get_or_create_session_history(session_id)
             current_video = _one_video_item(multi_modal_data.get("video"))
-            if history.pending_user is not None:
-                logger.info(
-                    "[asr2aura] pending_overwrite session=%s prior_pending_len=%d is_speech=%s",
-                    session_id,
-                    len(history.pending_user),
-                    additional_info.get("is_speech"),
-                )
-            history.begin_user_turn(transcript, video=current_video)
+            if not tool_followup:
+                if history.pending_user is not None:
+                    logger.info(
+                        "[asr2aura] pending_overwrite session=%s prior_pending_len=%d is_speech=%s",
+                        session_id,
+                        len(history.pending_user),
+                        additional_info.get("is_speech"),
+                    )
+                history.begin_user_turn(transcript, video=current_video)
             history_prefix = history.render_prefix()
             prior_videos = history.retained_videos()
             # Native get_vllm_inputs: every retained clip is a <|video_pad|> in
@@ -624,6 +649,9 @@ def asr2aura(
                 )
 
         two_token = bool(additional_info.get("aura_two_token"))
+        from vllm_omni.model_executor.models.aura_omni.duplex.tools_utils import build_tools_block
+
+        tools_block = build_tools_block(additional_info.get("aura_tools") or [])
         next_input: dict[str, Any] = {
             "prompt": _aura_prompt(
                 str(system_prompt),
@@ -631,6 +659,8 @@ def asr2aura(
                 prompt_mm,
                 history_prefix=history_prefix,
                 two_token=two_token,
+                tools_block=tools_block,
+                include_user_turn=not tool_followup,
             ),
         }
         if isinstance(session_id, str) and session_id:
@@ -818,14 +848,21 @@ def aura2tts(
     next_inputs: list[OmniTokensPrompt] = []
     for idx, source_output in enumerate(source_outputs):
         raw_text = _extract_text(source_output).strip()
-        text = _strip_assistant_text(raw_text)
+        full_text = _strip_assistant_text(raw_text)
         src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
         additional_info = src_prompt.get("additional_information") or {}
         close_only = bool(additional_info.get("aura_tts_close_only"))
-        if is_effectively_silent(text) and not close_only:
+        # Check silence on the untruncated text: a tool-call-only turn (no
+        # natural-language prefix) is not silent, it just has nothing left to
+        # speak this round (the <tool_call> body is dropped below).
+        if is_effectively_silent(full_text) and not close_only:
             continue
+        text = _strip_tool_call_for_speech(full_text)
         if close_only:
             text = ""
+        elif not text:
+            # Tool-call-only turn: nothing to speak until the follow-up answer.
+            continue
         task_type = _first_value(additional_info.get("tts_task_type"), "Base")
         language = _first_value(additional_info.get("tts_language"), "English")
         instruct = _first_value(additional_info.get("tts_instruct"), "")

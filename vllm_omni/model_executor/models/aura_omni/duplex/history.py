@@ -37,12 +37,19 @@ class SessionHistory:
 
         Same as v1: stored user/assistant text is written back as-is, and a
         user turn that still has pixels gets one video placeholder. v2 spoken
-        turns keep their leading ``<|respond|>`` in that stored text.
+        turns keep their leading ``<|respond|>`` in that stored text. A
+        ``tool_response`` entry (``append_tool_response``) renders as the
+        template's own tool-result shape: a ``user``-role turn wrapping
+        ``<tool_response>``, with no pairing user message of its own.
         """
         rendered: list[str] = []
         for message in self.messages:
             role = message.get("role")
             content = message.get("content")
+            if role == "tool_response":
+                if isinstance(content, str) and content:
+                    rendered.append(f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n")
+                continue
             if role not in {"user", "assistant"} or not isinstance(content, str):
                 continue
             body = content
@@ -64,6 +71,15 @@ class SessionHistory:
     def begin_user_turn(self, transcript: str, video: object | None = None) -> None:
         self.pending_user = transcript.strip()
         self.pending_video = video
+
+    def append_tool_response(self, output: str) -> None:
+        """Splice a tool result in after the assistant turn that called it.
+
+        Not paired through ``pending_user``: the follow-up Stage1 turn that
+        reads this back has no new user utterance of its own
+        (``asr2aura`` skips ``begin_user_turn`` for that turn).
+        """
+        self.messages.append({"role": "tool_response", "content": output or ""})
 
     def commit_turn(self, assistant_text: str) -> None:
         user = self.pending_user or ""

@@ -1132,15 +1132,47 @@ class ModelChannel:
                     "playback": session.playback.as_dict(),
                 }
             )
-        if not session.capabilities.supports_core_resumable_request and model_turn_id is not None:
-            # An ephemeral turn that ends on a listen owns the same stage ids as
-            # one that spoke (``_complete_model_turn_without_output`` already
-            # advances there). Without this the turn id is stuck, so the next
-            # commit reuses this id and its release pops a still-running output
-            # stage of the turn before it.
-            session.complete_model_turn(model_turn_id)
         await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
+
+    async def _finish_ephemeral_tool_call_turn(
+        self,
+        model_result: Mapping[str, object],
+        *,
+        data_plane_request_id: object,
+    ) -> None:
+        """Free a non-resumable turn whose only output is a function call.
+
+        ``auto_response`` keeps ``active_request_id`` after a normal completion,
+        and the function-call branch never reaches that completion. A later
+        ``response.create`` then returns without starting the tool follow-up.
+        """
+        session = self._ctx.session
+        response_id = session.active_response_id
+        if response_id is not None:
+            session.end_response(commit_text=False, preserve_request=False)
+            self._out.emit(
+                {
+                    "type": "response.done",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": session.epoch,
+                    "committed": False,
+                    "playback": session.playback.as_dict(),
+                }
+            )
+        else:
+            session.clear_request()
+        if isinstance(data_plane_request_id, str):
+            data_plane = self._ctx.plugin.data_plane
+            mark_terminal = getattr(data_plane, "mark_terminal", None)
+            if callable(mark_terminal):
+                mark_terminal(data_plane_request_id)
+            await self._abort_request([data_plane_request_id], notify=False)
+        model_turn_id = coerce_int(model_result.get("model_turn_id"))
+        if model_turn_id is not None:
+            session.complete_model_turn(model_turn_id)
+        await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
 
     async def _expose_function_call(self, function_call: Mapping[str, object]) -> None:
         """Register a recognized call before publishing it.
@@ -1259,6 +1291,17 @@ class ModelChannel:
             )
             return close_reason, True
         if isinstance(function_call, dict):
+            if (
+                not session.capabilities.supports_core_resumable_request
+                and self._ctx.plugin.function_call_releases_turn(model_result)
+            ):
+                # The call is the whole turn. response.create for the tool
+                # result is dropped while this request id is still bound, and
+                # this branch returns before the normal end-of-turn release.
+                await self._finish_ephemeral_tool_call_turn(
+                    model_result,
+                    data_plane_request_id=data_plane_request_id,
+                )
             await self._expose_function_call(function_call)
             return close_reason, True
         if model_result.get("requires_stage_handoff") is True or model_result.get("requires_tts_stage") is True:

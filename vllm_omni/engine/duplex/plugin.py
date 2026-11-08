@@ -746,6 +746,19 @@ class DuplexModelPlugin(ABC):
         del model_result
         return None
 
+    def function_call_releases_turn(self, model_result: Mapping[str, object]) -> bool:
+        """Whether publishing this call finishes a non-resumable turn.
+
+        The function-call branch returns before the normal end-of-turn path.
+        A call that still has speech, or a model that emits its own terminal
+        event afterwards, must keep the default: releasing here would abort
+        that speech. A model whose call has nothing left to speak overrides
+        this so the request is free before the client sends the tool result
+        and ``response.create``.
+        """
+        del model_result
+        return False
+
     def runtime_config_for_function_output(
         self,
         config: DuplexSessionConfig,

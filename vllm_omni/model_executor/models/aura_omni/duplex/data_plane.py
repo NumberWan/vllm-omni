@@ -16,6 +16,10 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_turn_id_from_request_id,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
+from vllm_omni.model_executor.models.aura_omni.duplex.tools_utils import (
+    extract_finished_tool_call,
+    safe_streaming_prefix,
+)
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
     is_control_text_prefix,
@@ -297,7 +301,10 @@ class AuraDataPlaneSession(DuplexDataPlane):
             return
 
         raw_text = _raw_text_from(output, completion)
-        spoken = _spoken_text(raw_text) if raw_text else ""
+        # Hold a <tool_call> tag (complete or still forming) out of the
+        # client-visible transcript stream; the natural-language prefix
+        # before it, if any, still streams normally.
+        spoken = safe_streaming_prefix(_spoken_text(raw_text)) if raw_text else ""
         if raw_text and raw_text != state.text_sent:
             # Keep raw for model_context (AURA_v2 history includes <|respond|>).
             state.text_sent = raw_text
@@ -342,6 +349,25 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 end_of_turn=False,
                 model_context_text=state.text_sent,
             )
+            call = extract_finished_tool_call(state.text_sent)
+            if call is not None:
+                # A separate event: the engine's function-call branch returns
+                # immediately once it recognizes one, before it would reach
+                # the model_context_text handling on this same event.
+                # No spoken prefix means this turn has nothing left for TTS.
+                # The session must drop the ephemeral request before the
+                # client sends the tool result; otherwise response.create is
+                # discarded while the finished request id is still bound.
+                spoken = safe_streaming_prefix(_spoken_text(state.text_sent))
+                yield _event(
+                    stage_role="thinker",
+                    is_listen=False,
+                    data_plane_request_id=request_id,
+                    text="",
+                    end_of_turn=False,
+                    aura_function_call=call,
+                    aura_tool_call_ends_turn=not spoken,
+                )
         is_final_audio_stage = stage_id is None or stage_id >= 3
         mm = _multimodal(output, completion)
         audio = _audio_value(mm)
@@ -368,6 +394,10 @@ class AuraDataPlaneSession(DuplexDataPlane):
                     sample_rate_hz=sample_rate,
                     audio_duration_ms=duration_ms,
                     end_of_turn=end_of_turn,
+                    # A sentence-TTS Talker request can still be parked waiting
+                    # for more text when Code2Wav ends the turn; without an
+                    # abort it keeps a max_num_seqs slot forever.
+                    abort_data_plane_request=end_of_turn,
                 )
                 if end_of_turn:
                     state.terminal = True
@@ -380,6 +410,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 data_plane_request_id=request_id,
                 text="",
                 end_of_turn=True,
+                abort_data_plane_request=True,
             )
             state.terminal = True
         elif finished and state.silent and not state.terminal:

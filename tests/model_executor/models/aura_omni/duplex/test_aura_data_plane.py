@@ -45,6 +45,7 @@ def test_project_unwraps_data_plane_outputs_and_emits_audio_then_done() -> None:
     assert events, "project must not silently drop the runner envelope"
     assert any(event.get("audio") == "encoded-audio" for event in events)
     assert events[-1].get("end_of_turn") is True
+    assert events[-1].get("abort_data_plane_request") is True
     assert events[0].get("data_plane_request_id") == request_id
 
 
@@ -83,6 +84,10 @@ def test_project_sends_only_the_new_tail_of_a_growing_waveform() -> None:
     assert first[0]["audio_duration_ms"] == round(8 * 1000 / 24000)
     assert second[0]["audio_duration_ms"] == round(4 * 1000 / 24000)
     assert second[-1].get("end_of_turn") is True
+    # A parked sentence-TTS Talker request must be aborted with the turn, not
+    # only forgotten; mid-turn chunks must not abort it.
+    assert not first[0].get("abort_data_plane_request")
+    assert second[-1].get("abort_data_plane_request") is True
 
 
 def test_project_holds_silent_token_prefix() -> None:
