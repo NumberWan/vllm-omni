@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+from typing import Any, Protocol
 from urllib.parse import urlencode
 
 import uvicorn
@@ -30,7 +31,52 @@ def _join_ws_url(base: str, path: str, query: str) -> str:
     return base.rstrip("/") + path + (("?" + query) if query else "")
 
 
-async def _pump_client_to_backend(client: WebSocket, backend) -> None:
+class ToolExecutor(Protocol):
+    """Runs the client side of function calling on the browser's behalf."""
+
+    @property
+    def realtime_tools(self) -> list[dict[str, Any]]: ...
+
+    async def run(self, name: str, arguments: str) -> str: ...
+
+
+def _json_event(text: str) -> dict[str, Any] | None:
+    try:
+        event = json.loads(text)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def _with_session_tools(text: str, tools: ToolExecutor) -> str:
+    """Add the executor's tools to a ``session.update`` that has none."""
+    event = _json_event(text)
+    if event is None or event.get("type") != "session.update" or not isinstance(event.get("session"), dict):
+        return text
+    if "tools" in event["session"]:
+        return text
+    event["session"] = {**event["session"], "tools": tools.realtime_tools}
+    return json.dumps(event)
+
+
+def _finished_function_call(event: dict[str, Any]) -> dict[str, Any] | None:
+    """The call in a ``response.output_item.done``; the arguments event carries no name."""
+    item = event.get("item")
+    if event.get("type") != "response.output_item.done" or not isinstance(item, dict):
+        return None
+    if item.get("type") != "function_call" or not isinstance(item.get("call_id"), str) or not item["call_id"]:
+        return None
+    return item
+
+
+async def _answer_function_call(backend, tools: ToolExecutor, call: dict[str, Any]) -> None:
+    output = await tools.run(str(call.get("name") or ""), str(call.get("arguments") or ""))
+    item = {"type": "function_call_output", "call_id": call["call_id"], "output": output}
+    await backend.send(json.dumps({"type": "conversation.item.create", "item": item}))
+    await backend.send(json.dumps({"type": "response.create"}))
+
+
+async def _pump_client_to_backend(client: WebSocket, backend, tools: ToolExecutor | None = None) -> None:
     try:
         while True:
             message = await client.receive()
@@ -38,7 +84,7 @@ async def _pump_client_to_backend(client: WebSocket, backend) -> None:
                 await backend.close()
                 return
             if message.get("text") is not None:
-                await backend.send(message["text"])
+                await backend.send(message["text"] if tools is None else _with_session_tools(message["text"], tools))
             elif message.get("bytes") is not None:
                 await backend.send(message["bytes"])
     except (WebSocketDisconnect, websockets.ConnectionClosed):
@@ -46,13 +92,22 @@ async def _pump_client_to_backend(client: WebSocket, backend) -> None:
             await backend.close()
 
 
-async def _pump_backend_to_client(client: WebSocket, backend) -> None:
+async def _pump_backend_to_client(client: WebSocket, backend, tools: ToolExecutor | None = None) -> None:
+    calls: set[asyncio.Task] = set()
     try:
         async for message in backend:
             if isinstance(message, bytes):
                 await client.send_bytes(message)
-            else:
-                await client.send_text(message)
+                continue
+            await client.send_text(message)
+            if tools is None:
+                continue
+            event = _json_event(message)
+            call = _finished_function_call(event) if event is not None else None
+            if call is not None:
+                task = asyncio.create_task(_answer_function_call(backend, tools, call))
+                calls.add(task)
+                task.add_done_callback(calls.discard)
     except (WebSocketDisconnect, websockets.ConnectionClosed):
         return
     except RuntimeError as exc:
@@ -76,6 +131,7 @@ def build_app(
     profile: str = "minicpm-native",
     turn_mode: str = "manual",
     speech_input: bool = False,
+    tool_executor: ToolExecutor | None = None,
 ) -> FastAPI:
     if profile not in {"minicpm-native", "qwen3-turn", "aura-ptt", "joyai-turn"}:
         raise ValueError(f"Unknown profile: {profile}")
@@ -156,8 +212,8 @@ def build_app(
                 max_size=64 * 1024 * 1024,
             ) as backend:
                 tasks = {
-                    asyncio.create_task(_pump_client_to_backend(websocket, backend)),
-                    asyncio.create_task(_pump_backend_to_client(websocket, backend)),
+                    asyncio.create_task(_pump_client_to_backend(websocket, backend, tool_executor)),
+                    asyncio.create_task(_pump_backend_to_client(websocket, backend, tool_executor)),
                 }
                 done, pending = await asyncio.wait(
                     tasks,
@@ -193,7 +249,7 @@ def build_app(
     return app
 
 
-def main(default_profile: str = "minicpm-native") -> None:
+def main(default_profile: str = "minicpm-native", tool_executor: ToolExecutor | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7862)
@@ -239,6 +295,7 @@ def main(default_profile: str = "minicpm-native") -> None:
             profile=args.profile,
             turn_mode=args.turn_mode,
             speech_input=args.speech_input,
+            tool_executor=tool_executor,
         ),
         host=args.host,
         port=args.port,

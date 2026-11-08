@@ -789,7 +789,9 @@
         if (!pendingCommits.size) clearTimeout(turnTimeout);
         responseComplete = true;
         finishTranscript('assistant');
-        releaseVisionTurn(responseId);
+        // Hold vision-follow until the tool follow-up answers, or a camera
+        // commit can preempt it.
+        if (!action.toolCall) releaseVisionTurn(responseId);
         requestPlaybackDrain(responseId);
         finishResponseIfReady();
         break;

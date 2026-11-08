@@ -81,6 +81,11 @@
     },
     mapEvent(event) {
       if (event.type === 'response.listen') return { kind: 'listen' };
+      // A call-only response: the UI server runs the tool and sends the
+      // result + response.create, so this done must not reopen vision-follow.
+      const output = event.type === 'response.done' && Array.isArray(event.response?.output) ? event.response.output : [];
+      const call = output.find(item => item && item.type === 'function_call');
+      if (call) return { ...profiles.event(event), toolCall: call.name || 'tool' };
       if (event.type === 'playback.acknowledged') {
         return { kind: 'ack', committedMs: (event.event || event).committed_ms || 0 };
       }

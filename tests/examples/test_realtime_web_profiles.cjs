@@ -796,6 +796,23 @@ test('AURA does not open a second bubble for the same sentence after response.do
   await app.ui.stopSession({ terminal: false });
 });
 
+test('AURA holds vision-follow from a tool call until its follow-up answers', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  await app.ui.handleEvent({ type: 'response.created', response_id: 'r1' });
+  assert.equal(app.ui.state().visionTurnLocked, true);
+  await app.ui.handleEvent({
+    type: 'response.done',
+    response_id: 'r1',
+    response: { id: 'r1', output: [{ type: 'function_call', name: 'calculator', call_id: 'c1', arguments: '{}' }] },
+  });
+  assert.equal(app.ui.state().visionTurnLocked, true);
+  await app.ui.handleEvent({ type: 'response.created', response_id: 'r2' });
+  await app.ui.handleEvent({ type: 'response.done', response_id: 'r2' });
+  assert.equal(app.ui.state().visionTurnLocked, false);
+  await app.ui.stopSession({ terminal: false });
+});
+
 function visionAppends(app) {
   return app.sockets[0].sent.filter(e => e.type === 'input_audio_buffer.append' && e.is_speech === false);
 }
