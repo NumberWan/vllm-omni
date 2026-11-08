@@ -29,11 +29,9 @@ from examples.online_serving.aura_omni.native_gateway_web_demo.server import (
     app as bridge_app,
 )
 
-DEMO_ROOT = (
-    Path(__file__).resolve().parents[3]
-    / "examples/online_serving/aura_omni/native_gateway_web_demo"
-)
+DEMO_ROOT = Path(__file__).resolve().parents[3] / "examples/online_serving/aura_omni/native_gateway_web_demo"
 ORIGINAL_EVAL_SHA256 = "c7b33d9a6c4a9faa09b84c1697895f56a671ea224043a6466f9267e05b867afe"
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_index_stops_playback_on_ptt() -> None:
@@ -83,9 +81,7 @@ def _decode_envelope(raw: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_warmup_runs_browser_aligned_silent_turn_before_voice(
-    monkeypatch, tmp_path
-) -> None:
+async def test_warmup_runs_browser_aligned_silent_turn_before_voice(monkeypatch, tmp_path) -> None:
     wav_path = tmp_path / "input.wav"
     with wave.open(str(wav_path), "wb") as writer:
         writer.setnchannels(1)
@@ -236,9 +232,7 @@ def test_native_text_and_eval_video_map_to_manual_queries(monkeypatch) -> None:
             message = json.loads(payload)
             self.sent.append(message)
             if message["type"] == "video.query":
-                await self.responses.put(
-                    json.dumps({"type": "response.start", "request_id": "typed"})
-                )
+                await self.responses.put(json.dumps({"type": "response.start", "request_id": "typed"}))
                 await self.responses.put(
                     json.dumps(
                         {
@@ -248,9 +242,7 @@ def test_native_text_and_eval_video_map_to_manual_queries(monkeypatch) -> None:
                         }
                     )
                 )
-                await self.responses.put(
-                    json.dumps({"type": "response.done", "request_id": "typed"})
-                )
+                await self.responses.put(json.dumps({"type": "response.done", "request_id": "typed"}))
 
         def __aiter__(self):
             return self
@@ -268,6 +260,7 @@ def test_native_text_and_eval_video_map_to_manual_queries(monkeypatch) -> None:
     monkeypatch.setattr(native_server.websockets, "connect", lambda *_args, **_kwargs: aura)
     client = TestClient(bridge_app)
     with client.websocket_connect("/ws?tts=0") as websocket:
+        assert websocket.receive_json()["type"] == "session"
         websocket.send_json(
             {
                 "type": "video",

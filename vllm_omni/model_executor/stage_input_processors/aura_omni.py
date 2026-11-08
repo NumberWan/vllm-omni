@@ -618,6 +618,9 @@ def _request_output_text(request: Any) -> str:
 
 
 _BOX_TTS_PATTERN = re.compile(r"<\|box_start\|>.*?(?:<\|box_end\|>|$)", re.DOTALL)
+# AURA_v2 emits this before the answer. Qwen3-TTS has no such token and reads it aloud.
+_AURA_RESPOND_TOKEN = "<|respond|>"
+_AURA_RESPOND_TOKEN_ID = 248077
 
 
 def _clean_tts_text(text: Any) -> str:
@@ -627,10 +630,12 @@ def _clean_tts_text(text: Any) -> str:
     mid-gen sentence TTS treats as boundaries, producing gibberish audio while
     the UI correctly draws ``ShowToUser`` boxes from the raw text path.
     Incomplete ``<|box_start|>`` spans (still streaming) are also dropped.
+    ``<|respond|>`` is dropped so Talker does not speak it as the word "response".
     """
     if not isinstance(text, str):
         return ""
     text = _BOX_TTS_PATTERN.sub("", text)
+    text = text.replace(_AURA_RESPOND_TOKEN, "")
     return " ".join(text.split()).strip()
 
 
@@ -677,11 +682,7 @@ def _aura_prompt(system_prompt: str, transcript: str, multi_modal_data: dict[str
     assistant_prefix = aura_assistant_generation_prefix()
     if assistant_prefix == AURA_ASSISTANT_PREFIX_V1:
         assistant_prefix = f"{AURA_ASSISTANT_PREFIX_V1}\n"
-    return (
-        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-        f"<|im_start|>user\n{user_body}<|im_end|>\n"
-        f"{assistant_prefix}"
-    )
+    return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_body}<|im_end|>\n{assistant_prefix}"
 
 
 def build_aura_input(
@@ -1206,6 +1207,7 @@ def asr2aura(
 
     return next_inputs
 
+
 def asr2aura_async_chunk(
     transfer_manager: Any,
     multimodal_output: Any | None = None,
@@ -1577,24 +1579,14 @@ def _approx_qwen_token_count(text: str) -> int:
     i = 0
     while i < len(text):
         code = ord(text[i])
-        if (
-            0x4E00 <= code <= 0x9FFF
-            or 0x3400 <= code <= 0x4DBF
-            or 0x3000 <= code <= 0x303F
-            or 0xFF00 <= code <= 0xFFEF
-        ):
+        if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF or 0x3000 <= code <= 0x303F or 0xFF00 <= code <= 0xFFEF:
             n += 1
             i += 1
             continue
         j = i + 1
         while j < len(text):
             cj = ord(text[j])
-            if (
-                0x4E00 <= cj <= 0x9FFF
-                or 0x3400 <= cj <= 0x4DBF
-                or 0x3000 <= cj <= 0x303F
-                or 0xFF00 <= cj <= 0xFFEF
-            ):
+            if 0x4E00 <= cj <= 0x9FFF or 0x3400 <= cj <= 0x4DBF or 0x3000 <= cj <= 0x303F or 0xFF00 <= cj <= 0xFFEF:
                 break
             j += 1
         n += max(1, (j - i + 3) // 4)
@@ -1810,7 +1802,9 @@ def build_tts_talker_input(
 ) -> OmniTokensPrompt | None:
     """Build the Qwen3-TTS Talker input shared by sync and async-chunk paths."""
     text = _clean_tts_text(text)
-    content_ids = _trim_aura_response_token_ids(content_ids)
+    content_ids = [
+        token_id for token_id in _trim_aura_response_token_ids(content_ids) if token_id != _AURA_RESPOND_TOKEN_ID
+    ]
     if is_effectively_silent(text) or _is_silent_token_prefix(content_ids):
         return None
 
@@ -1993,8 +1987,7 @@ def aura2tts_async_chunk(
     additional_info = _request_additional_info(request)
     tool_enabled = _first_bool(additional_info.get("aura_tool_enabled"), False)
     logger.info(
-        "[aura2tts_async_chunk] req=%s is_finished_arg=%s request_finished=%s "
-        "content_ids=%d output_text_len=%d",
+        "[aura2tts_async_chunk] req=%s is_finished_arg=%s request_finished=%s content_ids=%d output_text_len=%d",
         request_id,
         is_finished,
         finished,
@@ -2069,12 +2062,7 @@ def aura2tts_async_chunk(
     # silent. Tool markers are fail-closed on tools-disabled routing too.
     think_pending = "<think>" in full_text or "</think>" in full_text
     tool_marker_pending = has_aura_tool_call_marker(full_text or request_text, content_ids)
-    sentence_tts = (
-        _sentence_tts_enabled()
-        and not tool_enabled
-        and not think_pending
-        and not tool_marker_pending
-    )
+    sentence_tts = _sentence_tts_enabled() and not tool_enabled and not think_pending and not tool_marker_pending
     # Append only newly seen text into the sentence buffer.
     emitted_prefix = str(state.get("aura2tts_emitted_prefix", ""))
     if full_text.startswith(emitted_prefix):
@@ -2093,8 +2081,7 @@ def aura2tts_async_chunk(
         state["aura2tts_pending_sentence"] = pending_buf
         if sentence is None:
             logger.info(
-                "[aura2tts_async_chunk] req=%s waiting for sentence boundary "
-                "pending_len=%d accumulated_text_len=%d",
+                "[aura2tts_async_chunk] req=%s waiting for sentence boundary pending_len=%d accumulated_text_len=%d",
                 request_id,
                 len(pending_buf),
                 len(full_text),
@@ -2150,8 +2137,7 @@ def aura2tts_async_chunk(
             )
             return _aura2tts_empty_finished_payload()
         logger.info(
-            "[aura2tts_async_chunk] req=%s emitting safe tool preamble TTS "
-            "text_len=%d tool_enabled=%s",
+            "[aura2tts_async_chunk] req=%s emitting safe tool preamble TTS text_len=%d tool_enabled=%s",
             request_id,
             len(preamble),
             tool_enabled,

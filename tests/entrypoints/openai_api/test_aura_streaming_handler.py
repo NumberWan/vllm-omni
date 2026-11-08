@@ -135,9 +135,7 @@ def test_ensure_frames_for_audio_turn_uses_recent_buffer():
     config = AuraStreamingVideoSessionConfig(model="test")
     state = _session_state()
     assert state.turn_frame_arrays == []
-    assert (
-        handler.ensure_frames_for_audio_turn([], state, config) is False
-    ), "empty session buffer cannot seed frames"
+    assert handler.ensure_frames_for_audio_turn([], state, config) is False, "empty session buffer cannot seed frames"
 
     raw = _make_jpeg(10, 20, 30)
     b64 = _b64(raw)
@@ -384,8 +382,7 @@ async def test_process_query_merges_cross_turn_penalty_sampling_params():
 @pytest.mark.asyncio
 async def test_tool_loop_drains_pass1_executes_once_and_resumes(monkeypatch):
     raw_tool = (
-        "<think>use mock</think><tool_call><function=mock_echo>"
-        "<parameter=text>hello</parameter></function></tool_call>"
+        "<think>use mock</think><tool_call><function=mock_echo><parameter=text>hello</parameter></function></tool_call>"
     )
     generated_ids: list[str] = []
     drained_ids: list[str] = []
@@ -414,9 +411,7 @@ async def test_tool_loop_drains_pass1_executes_once_and_resumes(monkeypatch):
             for text in texts:
                 yield SimpleNamespace(
                     final_output_type="text",
-                    request_output=SimpleNamespace(
-                        outputs=[SimpleNamespace(text=text, cumulative_text=text)]
-                    ),
+                    request_output=SimpleNamespace(outputs=[SimpleNamespace(text=text, cumulative_text=text)]),
                 )
             drained_ids.append(request_id)
 
@@ -530,9 +525,7 @@ async def test_tool_loop_drains_pass1_executes_once_and_resumes(monkeypatch):
         "response.audio.done",
         "response.done",
     ]
-    transcript_done = next(
-        event for event in websocket.events if event["type"] == "user.transcript.done"
-    )
+    transcript_done = next(event for event in websocket.events if event["type"] == "user.transcript.done")
     assert transcript_done["text"] == "請回聲 hello"
     tool_done = next(event for event in websocket.events if event["type"] == "response.tool.done")
     assert tool_done["content"] == '{"ok":true,"result":{"text":"hello"}}'
@@ -555,9 +548,7 @@ async def test_tool_loop_drains_pass1_executes_once_and_resumes(monkeypatch):
 @pytest.mark.asyncio
 async def test_tool_intent_gate_retries_visual_question_without_executing(monkeypatch):
     raw_tool = (
-        "<tool_call><function=WebSearch><parameter=query>"
-        "2024-10-01 人民幣匯率"
-        "</parameter></function></tool_call>"
+        "<tool_call><function=WebSearch><parameter=query>2024-10-01 人民幣匯率</parameter></function></tool_call>"
     )
 
     class FakeEngine:
@@ -674,10 +665,7 @@ async def test_tool_intent_gate_retries_visual_question_without_executing(monkey
 @pytest.mark.asyncio
 async def test_tool_intent_gate_escalates_when_user_asks_for_tool(monkeypatch):
     """Routing hallucination + clear tool intent → escalate to tools-enabled."""
-    raw_tool = (
-        "<tool_call><function=calculator>"
-        "<parameter=expression>37 * 19</parameter></function></tool_call>"
-    )
+    raw_tool = "<tool_call><function=calculator><parameter=expression>37 * 19</parameter></function></tool_call>"
 
     class FakeEngine:
         async def get_tokenizer(self):
@@ -891,16 +879,12 @@ async def test_tool_loop_preamble_audio_overlaps_delayed_tool(monkeypatch):
             if request_id.endswith("p1"):
                 yield SimpleNamespace(
                     final_output_type="transcript",
-                    request_output=SimpleNamespace(
-                        outputs=[SimpleNamespace(text="查一下", cumulative_text="查一下")]
-                    ),
+                    request_output=SimpleNamespace(outputs=[SimpleNamespace(text="查一下", cumulative_text="查一下")]),
                 )
                 yield SimpleNamespace(
                     final_output_type="text",
                     finished=True,
-                    request_output=SimpleNamespace(
-                        outputs=[SimpleNamespace(text=raw_tool, cumulative_text=raw_tool)]
-                    ),
+                    request_output=SimpleNamespace(outputs=[SimpleNamespace(text=raw_tool, cumulative_text=raw_tool)]),
                 )
                 await asyncio.sleep(0.03)
                 yield SimpleNamespace(final_output_type="audio", request_output=None)
@@ -949,6 +933,7 @@ async def test_tool_loop_preamble_audio_overlaps_delayed_tool(monkeypatch):
         tool_executor=executor,
         tool_tokenizer_path="/workspace/models/AURA_v2",
     )
+
     async def fake_preprocess(chat_request):
         return chat_request
 
@@ -1004,16 +989,12 @@ async def test_tool_loop_async_chunk_off_still_emits_preamble_without_overlap_cl
             if request_id.endswith("p1"):
                 yield SimpleNamespace(
                     final_output_type="text",
-                    request_output=SimpleNamespace(
-                        outputs=[SimpleNamespace(text=raw_tool, cumulative_text=raw_tool)]
-                    ),
+                    request_output=SimpleNamespace(outputs=[SimpleNamespace(text=raw_tool, cumulative_text=raw_tool)]),
                 )
                 return
             yield SimpleNamespace(
                 final_output_type="text",
-                request_output=SimpleNamespace(
-                    outputs=[SimpleNamespace(text="好。", cumulative_text="好。")]
-                ),
+                request_output=SimpleNamespace(outputs=[SimpleNamespace(text="好。", cumulative_text="好。")]),
             )
 
     def fake_parse(_tokenizer, raw, *, request_id, tool_schemas):
@@ -1042,6 +1023,7 @@ async def test_tool_loop_async_chunk_off_still_emits_preamble_without_overlap_cl
         tool_executor=AuraToolExecutor(),
         tool_tokenizer_path="/workspace/models/AURA_v2",
     )
+
     async def fake_preprocess(chat_request):
         return chat_request
 
@@ -1137,6 +1119,7 @@ async def test_tool_pass_only_publishes_finished_asr_transcript(monkeypatch):
             )
 
     published: list[str] = []
+
     async def publish_transcript(text: str) -> None:
         published.append(text)
 
@@ -1162,9 +1145,7 @@ async def test_tool_pass_only_publishes_finished_asr_transcript(monkeypatch):
 def test_canonical_aura_response_text_prefers_decoded_ids():
     streaming = "会被罚款30元。"
     decoded = "会被罚款3000元。"
-    assert (
-        canonical_aura_response_text(streaming_text=streaming, decoded_text=decoded) == decoded
-    )
+    assert canonical_aura_response_text(streaming_text=streaming, decoded_text=decoded) == decoded
 
 
 def test_canonical_aura_response_text_keeps_streaming_when_decode_empty():
@@ -1172,17 +1153,12 @@ def test_canonical_aura_response_text_keeps_streaming_when_decode_empty():
 
 
 def test_canonical_aura_response_text_keeps_silent_marker():
-    assert (
-        canonical_aura_response_text(streaming_text=SILENT_TEXT, decoded_text="会被罚款3000元。")
-        == SILENT_TEXT
-    )
+    assert canonical_aura_response_text(streaming_text=SILENT_TEXT, decoded_text="会被罚款3000元。") == SILENT_TEXT
 
 
 def test_canonical_aura_response_text_rejects_wrong_vocab_latin_soup():
     streaming = "没看到，画面里就一个戴眼镜的男生在摸头发。"
-    decoded = (
-        "Trilogy-même getting拥有 democrat departamento widget Nay诗词/utility責任eworld conexao通过对_r"
-    )
+    decoded = "Trilogy-même getting拥有 democrat departamento widget Nay诗词/utility責任eworld conexao通过对_r"
     assert canonical_aura_response_text(streaming_text=streaming, decoded_text=decoded) == streaming
 
 
@@ -1193,6 +1169,26 @@ def test_decode_aura_content_ids_strips_think_wrappers():
             return "<think>内部推理</think>会被罚款3000元。"
 
     assert decode_aura_content_ids_for_display(FakeTokenizer(), [11, 22, 33]) == "会被罚款3000元。"
+
+
+def test_decode_aura_content_ids_keeps_box_markup_for_clients():
+    class FakeTokenizer:
+        def decode(self, token_ids: list[int]) -> str:
+            del token_ids
+            return "<|box_start|>(375.0,269.0),(628.0,728.0)<|box_end|>"
+
+    decoded = decode_aura_content_ids_for_display(FakeTokenizer(), [11, 22, 33])
+    assert decoded == "<|box_start|>(375.0,269.0),(628.0,728.0)<|box_end|>"
+    assert canonical_aura_response_text(streaming_text="(375.0,269.0),(628.0,728.0)", decoded_text=decoded) == decoded
+
+
+def test_decode_aura_content_ids_strips_respond_marker():
+    class FakeTokenizer:
+        def decode(self, token_ids: list[int]) -> str:
+            del token_ids
+            return "<|respond|>你好！我是一個AI助手。"
+
+    assert decode_aura_content_ids_for_display(FakeTokenizer(), [11, 22, 33]) == "你好！我是一個AI助手。"
 
 
 @pytest.mark.asyncio
@@ -1431,4 +1427,3 @@ async def test_user_barge_in_soak_does_not_deadlock():
         assert len(handler.started) == idx + 2
     assert len(handler.cancelled) == 8
     await _finish_session(handler, ws, task)
-

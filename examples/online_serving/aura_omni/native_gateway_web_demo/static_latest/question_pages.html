@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>随机问答翻页</title>
+  <style>
+    :root {
+      --bg: #f5f9ff;
+      --card: #ffffff;
+      --text: #1f2a44;
+      --muted: #5f6b85;
+      --primary: #4f8cff;
+      --primary-hover: #3b74e6;
+      --border: #dbe6ff;
+      --shadow: 0 12px 36px rgba(45, 93, 182, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      background: linear-gradient(180deg, #f7fbff 0%, #eef5ff 100%);
+      color: var(--text);
+      padding: 20px;
+    }
+
+    .container {
+      width: min(760px, 100%);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      padding: 28px 24px;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .title {
+      font-size: 20px;
+      font-weight: 700;
+      margin: 0;
+    }
+
+    .progress {
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      font-size: 13px;
+      color: var(--primary);
+      border: 1px solid #c9dcff;
+      background: #edf4ff;
+      border-radius: 999px;
+      padding: 6px 12px;
+      margin-bottom: 14px;
+    }
+
+    .question-card {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 22px;
+      background: #fbfdff;
+      min-height: 130px;
+      display: flex;
+      align-items: center;
+      font-size: 24px;
+      line-height: 1.5;
+      margin-bottom: 18px;
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .hint {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    button {
+      appearance: none;
+      border: none;
+      border-radius: 10px;
+      background: var(--primary);
+      color: #fff;
+      padding: 11px 18px;
+      font-size: 15px;
+      cursor: pointer;
+      transition: background-color 0.2s ease, transform 0.08s ease;
+    }
+
+    button:hover {
+      background: var(--primary-hover);
+    }
+
+    button:active {
+      transform: translateY(1px);
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <div class="header">
+      <h1 class="title">随机问题翻页练习</h1>
+      <span class="progress" id="progress">第 1 / 20 题</span>
+    </div>
+
+    <div class="chip" id="categoryChip">分类：天气</div>
+
+    <section class="question-card" id="questionCard">
+      今天北京天气怎么样？
+    </section>
+
+    <div class="actions">
+      <span class="hint">每次点击按钮切换到下一题（到末尾后自动重新打乱）</span>
+      <button id="nextBtn">下一题</button>
+    </div>
+  </main>
+
+  <script>
+    const questionBank = [
+      // 天气类
+      { category: "天气", text: "今天北京天气怎么样？" },
+      { category: "天气", text: "请告诉我上海现在的天气情况。" },
+      { category: "天气", text: "深圳今晚会下雨吗？" },
+      { category: "天气", text: "成都明天白天大概多少度？" },
+      { category: "天气", text: "杭州这周末的天气适合出行吗？" },
+
+      // 数学类
+      { category: "数学", text: "请计算：37 + 58 等于多少？" },
+      { category: "数学", text: "请计算：125 ÷ 5 的结果是多少？" },
+      { category: "数学", text: "请计算：12 × 14 等于多少？" },
+      { category: "数学", text: "请计算：(45 - 18) × 2 等于多少？" },
+      { category: "数学", text: "请计算：3² + 4² 的和是多少？" },
+
+      // 汇率类
+      { category: "汇率", text: "1 美元兑换人民币大约是多少？" },
+      { category: "汇率", text: "100 人民币大约能换多少日元？" },
+      { category: "汇率", text: "50 欧元大概可以兑换多少美元？" },
+      { category: "汇率", text: "200 港币换成人民币大约多少钱？" },
+      { category: "汇率", text: "1000 韩元大概等于多少人民币？" },
+
+      // 事实类
+      { category: "事实", text: "地球上最大的海洋是哪个？" },
+      { category: "事实", text: "水在标准大气压下沸点是多少摄氏度？" },
+      { category: "事实", text: "中国的首都是哪座城市？" },
+      { category: "事实", text: "太阳系中离太阳最近的行星是什么？" },
+      { category: "事实", text: "世界上面积最大的国家是哪一个？" }
+    ];
+
+    const questionCard = document.getElementById("questionCard");
+    const categoryChip = document.getElementById("categoryChip");
+    const progress = document.getElementById("progress");
+    const nextBtn = document.getElementById("nextBtn");
+
+    let currentIndex = 0;
+    let shuffledQuestions = [];
+
+    function shuffleQuestions(list) {
+      const arr = [...list];
+      for (let i = arr.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    }
+
+    function renderQuestion() {
+      const current = shuffledQuestions[currentIndex];
+      categoryChip.textContent = `分类：${current.category}`;
+      questionCard.textContent = current.text;
+      progress.textContent = `第 ${currentIndex + 1} / ${shuffledQuestions.length} 题`;
+      nextBtn.textContent = currentIndex === shuffledQuestions.length - 1 ? "重新开始" : "下一题";
+    }
+
+    function nextQuestion() {
+      if (currentIndex >= shuffledQuestions.length - 1) {
+        shuffledQuestions = shuffleQuestions(questionBank);
+        currentIndex = 0;
+        renderQuestion();
+        return;
+      }
+
+      currentIndex += 1;
+      renderQuestion();
+    }
+
+    nextBtn.addEventListener("click", nextQuestion);
+
+    shuffledQuestions = shuffleQuestions(questionBank);
+    renderQuestion();
+  </script>
+</body>
+</html>

@@ -9,7 +9,35 @@ browser (Native /ws) -> protocol bridge -> AURA_v2 Omni (:8666)
 
 ## Frontend provenance
 
-`eval.html` and `question_pages.html` are byte-for-byte copies from
+The start scripts serve `static_latest/` by default. Set
+`STATIC_DIR=.../static` for the 2026-08 page; the bridge speaks to both.
+
+`static_latest/index.html` is a byte-for-byte copy of `static/index.html` from
+the latest Aura Gateway package (`AURA_v2_latest_front/aura_gateway.zip`,
+2026-11-08), SHA-256
+`81a459d2cf624edd9f86dc8d2afa6c9b95fd7d80e1bbad3bf6b8491a5249060f`.
+`static_latest/eval.html` and `question_pages.html` are the files below: the
+latest `eval.html` needs Gateway eval/dashboard routes this bridge does not
+serve.
+
+Latest-page differences the bridge handles:
+
+- The bridge sends a `session` message first; the page sends nothing before it.
+- Every downstream message carries `direction`, `session_id`, and `chunk_id`.
+  `chunk_id` is the upstream chunk that started the Omni turn. The page starts a
+  new playback turn on a new `chunk_id`, so all audio of one Omni `request_id`
+  (tool preamble included) shares one id.
+- PTT arrives as `multimodal` (WAV + fresh frames). Audio and `audio.done` go
+  first; the frames follow, so they cannot auto-trigger a vision turn ahead of
+  the voice turn. Strokes drawn on screen are therefore not seen by that voice
+  turn.
+- `enable_toolcall=false` sets `tool_mode=none`. `system_prompt` is ignored:
+  the default preset equals the server prompt, and the `<|respond|>` preset is
+  not handled by this pipeline.
+- `CLIENT_TOOL_RESULT ...` text (echoed after ShowToUser) is dropped.
+- `GET /models` lists the served model.
+
+`static/eval.html` and `question_pages.html` are byte-for-byte copies from
 `/home/wtk/AURA_demo-main/gateway/static/` as of 2026-08-20.
 `index.html` is that same page plus a small PTT `stopPlayback()` patch so a new
 hold-to-talk mutes leftover TTS. Omni pipeline TTS is not cancelled.

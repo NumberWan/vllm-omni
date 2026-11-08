@@ -30,7 +30,7 @@ BRIDGE_PORT="${BRIDGE_PORT:-9999}"
 LOG_DIR="${LOG_DIR:-/tmp/aura_v2_native_2gpu}"
 PID_FILE="${PID_FILE:-$LOG_DIR/server.pid}"
 BRIDGE_PID_FILE="${BRIDGE_PID_FILE:-$LOG_DIR/bridge.pid}"
-STATIC_DIR="${STATIC_DIR:-$SCRIPT_DIR/static}"
+STATIC_DIR="${STATIC_DIR:-$SCRIPT_DIR/static_latest}"
 AURA_GPUS="${AURA_GPUS:-auto}"
 # Base voice clone does NOT support instruction control; keep empty for Base.
 DEFAULT_TTS_INSTRUCT=""

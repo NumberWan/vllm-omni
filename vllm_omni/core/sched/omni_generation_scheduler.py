@@ -62,12 +62,13 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # WAITING for another segment — generate() would hang.
             request.resumable = False
             return True
-        if (
-            request.resumable
-            and not request.streaming_queue
-            and adapter is not None
-            and adapter.receives_chunks
-        ):
+        if request.status == RequestStatus.FINISHED_STOPPED:
+            # Pending-finish already marked the request done. Re-enqueueing it
+            # as WAITING duplicates NewRequestData and crashes Stage3
+            # ``np.repeat`` (shape (1,) vs (2,)).
+            request.resumable = False
+            return True
+        if request.resumable and not request.streaming_queue and adapter is not None and adapter.receives_chunks:
             # Downstream async-chunk stages receive the next segment from the
             # connector, not from an API StreamingUpdate. Enqueue them as
             # schedulable before the base class can park them in skipped_waiting.
@@ -126,9 +127,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # we can stop the scheduling here.
                 break
             # async_chunk: don't schedule placeholder tokens when no new chunk is available.
+            # num_in_flight_tokens > 0 means schedule() already advanced computed
+            # tokens for a chunk whose waveform has not been applied yet.
+            # Queuing finish here frees that request and drops the tail audio.
             if required_tokens <= 0:
-                if self.chunk_transfer_adapter is not None and self.chunk_transfer_adapter.is_done_receiving_chunks(
-                    request.request_id
+                if (
+                    self.chunk_transfer_adapter is not None
+                    and self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id)
+                    and request.num_in_flight_tokens <= 0
                 ):
                     self._pending_finish_reqs.append(request)
                 req_index += 1
@@ -180,6 +186,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.chunk_transfer_adapter is None and request.status == RequestStatus.FINISHED_STOPPED
             ):
                 # Pop the finished request from waiting queue and don't schedule it
+                self.waiting.pop_request()
+                continue
+            if request.request_id in num_scheduled_tokens or any(
+                running.request_id == request.request_id for running in self.running
+            ):
                 self.waiting.pop_request()
                 continue
 
@@ -435,19 +446,19 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             adapter = self.chunk_transfer_adapter
             upstream_exhausted = bool(
-                adapter is not None
-                and request.request_id
-                in getattr(adapter, "upstream_exhausted_requests", ())
+                adapter is not None and request.request_id in getattr(adapter, "upstream_exhausted_requests", ())
             )
-            done_receiving = bool(
-                adapter is not None and adapter.is_done_receiving_chunks(request.request_id)
-            )
+            done_receiving = bool(adapter is not None and adapter.is_done_receiving_chunks(request.request_id))
             prompt_len = len(request.prompt_token_ids or [])
             computed = int(request.num_computed_tokens or 0)
+            # This step's tokens were just settled. A remaining count belongs to
+            # a newer scheduled chunk (async batch queue) whose waveform is not
+            # in this update. Finishing now drops that tail.
+            waveform_still_scheduled = request.num_in_flight_tokens > 0
 
             # One-shot generation request: finish after its current input unit
             # has been fully processed.
-            if (
+            if not waveform_still_scheduled and (
                 request.status == RequestStatus.FINISHED_STOPPED
                 or (adapter is None and computed >= request.num_prompt_tokens)
                 or (done_receiving and computed >= prompt_len)
@@ -461,7 +472,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # scheduling parks required_tokens==0 without draining pending
             # finish). generate() then waits forever for ECO.finished.
             # Once upstream is exhausted, this decode step is the last — finish.
-            elif not stopped and upstream_exhausted:
+            elif not waveform_still_scheduled and not stopped and upstream_exhausted:
                 logger.info(
                     "[gen_sched] force_finish_upstream_exhausted req=%s "
                     "computed=%s prompt_len=%s mm=%s done_receiving=%s",
@@ -533,9 +544,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_nans_in_logits=request.num_nans_in_logits,
                     is_segment_finished=is_segment_finished,
                 )
-                outputs[request.client_index][-1].stage_ready_ts = getattr(
-                    request, "_omni_stage_ready_ts", None
-                )
+                outputs[request.client_index][-1].stage_ready_ts = getattr(request, "_omni_stage_ready_ts", None)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
@@ -560,10 +569,15 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 computed = int(request.num_computed_tokens or 0)
                 if prompt_len > 0 and computed < prompt_len:
                     continue
+                # schedule() already counted this chunk in num_computed_tokens
+                # and num_in_flight_tokens. The waveform is still in the batch
+                # queue. An empty finish here frees the request, and the later
+                # update drops the audio because the request is already finished.
+                if request.num_in_flight_tokens > 0:
+                    continue
                 if request not in self._pending_finish_reqs:
                     logger.info(
-                        "[gen_sched] queue_pending_finish_exhausted req=%s "
-                        "computed=%s prompt_len=%s",
+                        "[gen_sched] queue_pending_finish_exhausted req=%s computed=%s prompt_len=%s",
                         request.request_id,
                         computed,
                         prompt_len,

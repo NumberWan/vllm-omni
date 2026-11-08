@@ -29,6 +29,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 import wave
 from array import array
 from dataclasses import dataclass, field
@@ -68,19 +69,20 @@ TOOL_MODE = os.environ.get("TOOL_MODE", "auto")
 MAX_TOOL_DEPTH = int(os.environ.get("MAX_TOOL_DEPTH", "5"))
 AUTO_TRIGGER = os.environ.get("AUTO_TRIGGER", "1").strip().lower() in {"1", "true", "yes", "on"}
 TTS_DUMP_DIR = Path(os.environ.get("AURA_TTS_DUMP_DIR", "/tmp/aura_v2_native_demo_tts")).expanduser()
-FRAME_DUMP_DIR = Path(
-    os.environ.get("AURA_FRAME_DUMP_DIR", "/tmp/aura_v2_native_demo/frames")
-).expanduser()
+FRAME_DUMP_DIR = Path(os.environ.get("AURA_FRAME_DUMP_DIR", "/tmp/aura_v2_native_demo/frames")).expanduser()
 FRAME_DUMP_ENABLED = os.environ.get("AURA_FRAME_DUMP", "1").strip().lower() in {
     "1",
     "true",
     "yes",
     "on",
 }
-EVAL_VIDEO_DIR = Path(
-    os.environ.get("AURA_EVAL_VIDEO_DIR", "/tmp/aura_v2_native_eval/videos")
-).expanduser()
+EVAL_VIDEO_DIR = Path(os.environ.get("AURA_EVAL_VIDEO_DIR", "/tmp/aura_v2_native_eval/videos")).expanduser()
 _frame_dump_idx = 0
+_active_sessions = 0
+# Typed results the latest frontend echoes back after a client-side tool
+# (ShowToUser). Omni already keeps the box in history; forwarding would open
+# an extra spoken turn.
+_CLIENT_TOOL_RESULT_PREFIX = "CLIENT_TOOL_RESULT "
 
 app = FastAPI(title="AURA_v2 Omni ↔ original AURA demo bridge")
 
@@ -130,6 +132,11 @@ async def health():
         "auto_trigger": AUTO_TRIGGER,
         **_tts_config(),
     }
+
+
+@app.get("/models")
+async def list_models():
+    return [{"name": Path(AURA_MODEL).name, "native": False, "id": ""}]
 
 
 _NO_CACHE = {
@@ -282,10 +289,19 @@ if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-def _envelope(msg_type: str, data: dict, *, session_id: str | None = None) -> str:
-    out: dict = {"type": msg_type, "data": data}
-    if session_id:
-        out["session_id"] = session_id
+def _envelope(msg_type: str, data: dict, *, session_id: str | None = None, chunk_id: int = 0) -> str:
+    # Superset of both frontends: the 2026-08 page reads type/data only; the
+    # latest page drops non-downstream / foreign-session messages and groups
+    # audio playback by chunk_id (the upstream chunk that started the turn).
+    out: dict = {
+        "direction": "downstream",
+        "type": msg_type,
+        "session_id": session_id or "",
+        "chunk_id": int(chunk_id),
+        "video_timestamp_ms": 0,
+        "wall_time_ms": int(time.time() * 1000),
+        "data": data,
+    }
     return json.dumps(out, ensure_ascii=False)
 
 
@@ -469,6 +485,7 @@ class _NativeTurn:
     done_sent: bool = False
     suppress_audio: bool = False
     audio_emitted: bool = False
+    chunk_id: int = 0
 
 
 class NativeEventTranslator:
@@ -479,6 +496,24 @@ class NativeEventTranslator:
 
     def __init__(self) -> None:
         self.turns: dict[str, _NativeTurn] = {}
+        self._latest_chunk_id = 0
+        self._query_chunk_id: int | None = None
+
+    def note_upstream(self, chunk_id: int, *, query: bool) -> None:
+        """Remember which upstream chunk the next Omni turn answers.
+
+        A user query (PTT / typed) claims the next turn; otherwise the turn
+        belongs to the newest periodic video chunk. Ids only grow, so the
+        latest frontend never drops a new turn's audio as interrupted.
+        """
+        self._latest_chunk_id = max(self._latest_chunk_id, chunk_id)
+        if query:
+            self._query_chunk_id = chunk_id
+
+    def _new_turn(self, request_id: str) -> _NativeTurn:
+        chunk_id = self._query_chunk_id if self._query_chunk_id is not None else self._latest_chunk_id
+        self._query_chunk_id = None
+        return _NativeTurn(request_id=request_id, chunk_id=chunk_id)
 
     def barge_in(self, session_id: str = "") -> list[str]:
         """Drop in-flight TTS and close the Native turn so playback can stop now."""
@@ -491,7 +526,9 @@ class NativeEventTranslator:
 
     def _turn(self, event: dict) -> _NativeTurn:
         request_id = str(event.get("request_id") or self._LEGACY)
-        return self.turns.setdefault(request_id, _NativeTurn(request_id=request_id))
+        if request_id not in self.turns:
+            self.turns[request_id] = self._new_turn(request_id)
+        return self.turns[request_id]
 
     @staticmethod
     def _tool_output(content: object) -> str:
@@ -531,7 +568,7 @@ class NativeEventTranslator:
         return cls._BOX_PATTERN.sub("", text).strip(), boxes
 
     @staticmethod
-    def _show_to_user_events(boxes: list[list[int]], session_id: str) -> list[str]:
+    def _show_to_user_events(boxes: list[list[int]], session_id: str, chunk_id: int) -> list[str]:
         if not boxes:
             return []
         tool_id = f"box_{int(time.time() * 1000)}"
@@ -544,6 +581,7 @@ class NativeEventTranslator:
                 "arguments": {"boxes": boxes, "duration_ms": 3000},
             },
             session_id=session_id,
+            chunk_id=chunk_id,
         )
         done = _envelope(
             "toolcall",
@@ -551,21 +589,19 @@ class NativeEventTranslator:
                 "status": "success",
                 "id": tool_id,
                 "name": "ShowToUser",
-                "output": (
-                    "[BBOX Parser Result] ShowToUser toolcall dispatched "
-                    f"to client with {len(boxes)} box(es)."
-                ),
+                "output": (f"[BBOX Parser Result] ShowToUser toolcall dispatched to client with {len(boxes)} box(es)."),
                 "error": "",
             },
             session_id=session_id,
+            chunk_id=chunk_id,
         )
         return [started, done]
 
-    def _emit_text(self, text: str, session_id: str) -> list[str]:
+    def _emit_text(self, text: str, session_id: str, chunk_id: int) -> list[str]:
         cleaned, boxes = self._parse_box_tokens(text)
-        output = self._show_to_user_events(boxes, session_id)
+        output = self._show_to_user_events(boxes, session_id, chunk_id)
         if cleaned:
-            output.append(_envelope("text", {"text": cleaned}, session_id=session_id))
+            output.append(_envelope("text", {"text": cleaned}, session_id=session_id, chunk_id=chunk_id))
         return output
 
     @staticmethod
@@ -573,25 +609,27 @@ class NativeEventTranslator:
         if turn.done_sent:
             return []
         turn.done_sent = True
-        return [_envelope("turn_done", {}, session_id=session_id)]
+        return [_envelope("turn_done", {}, session_id=session_id, chunk_id=turn.chunk_id)]
 
     def observe(self, event: dict, *, session_id: str) -> list[str]:
         event_type = str(event.get("type") or "")
+        if event_type == "response.start":
+            request_id = str(event.get("request_id") or self._LEGACY)
+            self.turns[request_id] = self._new_turn(request_id)
+            return []
         turn = self._turn(event)
         output: list[str] = []
 
-        if event_type == "response.start":
-            self.turns[turn.request_id] = _NativeTurn(request_id=turn.request_id)
-        elif event_type == "user.transcript.done":
+        if event_type == "user.transcript.done":
             text = str(event.get("text") or "").strip()
             if text:
-                output.append(_envelope("asr_text", {"text": text}, session_id=session_id))
+                output.append(_envelope("asr_text", {"text": text}, session_id=session_id, chunk_id=turn.chunk_id))
         elif event_type == "response.text.delta":
             turn.text_buf += str(event.get("delta") or "")
         elif event_type == "response.tool.preamble.text":
             text = str(event.get("text") or "").strip()
             if text:
-                output.extend(self._emit_text(text, session_id))
+                output.extend(self._emit_text(text, session_id, turn.chunk_id))
         elif event_type == "response.text.done":
             text = str(event.get("text") or turn.text_buf).strip()
             turn.text_buf = ""
@@ -603,7 +641,7 @@ class NativeEventTranslator:
                 turn.silent = True
                 output.extend(self._done(turn, session_id))
             elif cleaned or boxes:
-                output.extend(self._emit_text(text, session_id))
+                output.extend(self._emit_text(text, session_id, turn.chunk_id))
         elif event_type in {"response.audio.delta", "response.tool.preamble.audio.delta"}:
             if turn.suppress_audio:
                 return output
@@ -633,6 +671,7 @@ class NativeEventTranslator:
                                         "sample_rate": turn.sample_rate,
                                     },
                                     session_id=session_id,
+                                    chunk_id=turn.chunk_id,
                                 )
                             )
                             turn.audio_emitted = True
@@ -648,6 +687,7 @@ class NativeEventTranslator:
                             "sample_rate": turn.sample_rate,
                         },
                         session_id=session_id,
+                        chunk_id=turn.chunk_id,
                     )
                 )
                 turn.audio_chunks.clear()
@@ -667,6 +707,7 @@ class NativeEventTranslator:
                             "sample_rate": turn.sample_rate,
                         },
                         session_id=session_id,
+                        chunk_id=turn.chunk_id,
                     )
                 )
             turn.audio_chunks.clear()
@@ -681,6 +722,7 @@ class NativeEventTranslator:
                             "sample_rate": turn.sample_rate,
                         },
                         session_id=session_id,
+                        chunk_id=turn.chunk_id,
                     )
                 )
                 turn.audio_chunks.clear()
@@ -694,7 +736,7 @@ class NativeEventTranslator:
             arguments = event.get("arguments")
             if isinstance(arguments, dict):
                 data["arguments"] = arguments
-            output.append(_envelope("toolcall", data, session_id=session_id))
+            output.append(_envelope("toolcall", data, session_id=session_id, chunk_id=turn.chunk_id))
         elif event_type == "response.tool.done":
             completed = event.get("status") == "completed"
             data = {
@@ -705,13 +747,14 @@ class NativeEventTranslator:
             content = self._tool_output(event.get("content"))
             if content:
                 data["output" if completed else "error"] = content
-            output.append(_envelope("toolcall", data, session_id=session_id))
+            output.append(_envelope("toolcall", data, session_id=session_id, chunk_id=turn.chunk_id))
         elif event_type == "error":
             output.append(
                 _envelope(
                     "error",
                     {"message": str(event.get("message") or event.get("error") or event)},
                     session_id=session_id,
+                    chunk_id=turn.chunk_id,
                 )
             )
             output.extend(self._done(turn, session_id))
@@ -723,12 +766,20 @@ async def _send_client(ws: WebSocket, payload: str) -> None:
 
 
 async def _bridge_session(client: WebSocket) -> None:
-    session_id = "unknown"
+    global _active_sessions
+    session_id = uuid.uuid4().hex
     last_frames: list[str] = []
     dumper = _TtsTurnDumper(TTS_DUMP_DIR)
     translator = NativeEventTranslator()
     tts_enabled = client.query_params.get("tts", "1") != "0"
+    enable_toolcall = client.query_params.get("enable_toolcall", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
     await client.accept()
+    _active_sessions += 1
 
     try:
         async with websockets.connect(AURA_WS_URL, max_size=32 * 1024 * 1024) as aura:
@@ -749,7 +800,7 @@ async def _bridge_session(client: WebSocket) -> None:
                         "tts_language": TTS_LANGUAGE,
                         "tts_speaker": TTS_SPEAKER,
                         "tts_instruct": TTS_INSTRUCT,
-                        "tool_mode": TOOL_MODE,
+                        "tool_mode": TOOL_MODE if enable_toolcall else "none",
                         "max_tool_depth": MAX_TOOL_DEPTH,
                     }
                 )
@@ -761,31 +812,45 @@ async def _bridge_session(client: WebSocket) -> None:
                 TTS_INSTRUCT,
                 TTS_LANGUAGE,
             )
+            # The latest frontend sends nothing until it learns its session id.
+            await _send_client(
+                client,
+                _envelope(
+                    "session",
+                    {"session_id": session_id, "active_sessions": _active_sessions},
+                    session_id=session_id,
+                ),
+            )
 
             async def client_to_aura() -> None:
-                nonlocal session_id
+                nonlocal last_frames
                 while True:
                     raw = await client.receive_text()
                     try:
                         msg = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    session_id = str(msg.get("session_id") or session_id)
                     mtype = str(msg.get("type") or "")
                     data = msg.get("data") if isinstance(msg.get("data"), dict) else {}
+                    try:
+                        chunk_id = int(msg.get("chunk_id") or 0)
+                    except (TypeError, ValueError):
+                        chunk_id = 0
 
                     if mtype == "video":
                         frames = _parse_video_frames(str(data.get("video_url") or ""))
                         if frames:
                             last_frames = frames
                         _dump_incoming_frames(frames)
+                        text = str(data.get("text") or "").strip()
+                        translator.note_upstream(chunk_id, query=bool(text))
                         for fr in frames:
                             await aura.send(json.dumps({"type": "video.frame", "data": fr}))
-                        text = str(data.get("text") or "").strip()
                         if text or not tts_enabled:
                             await aura.send(json.dumps({"type": "video.query", "text": text}))
 
-                    elif mtype == "audio":
+                    elif mtype in {"audio", "multimodal"}:
+                        translator.note_upstream(chunk_id, query=True)
                         for payload in translator.barge_in(session_id):
                             await _send_client(client, payload)
                         b64 = str(data.get("audio_b64") or "")
@@ -814,9 +879,22 @@ async def _bridge_session(client: WebSocket) -> None:
                                 )
                             )
                         await aura.send(json.dumps({"type": "audio.done"}))
+                        # Fresh PTT frames go in after audio.done: sent first,
+                        # they can auto-trigger a vision turn ahead of the voice
+                        # turn. The voice turn uses the periodic frames already
+                        # buffered (same as the audio-only path).
+                        if mtype == "multimodal":
+                            frames = _parse_video_frames(str(data.get("video_url") or ""))
+                            if frames:
+                                last_frames = frames
+                            _dump_incoming_frames(frames)
+                            for fr in frames:
+                                await aura.send(json.dumps({"type": "video.frame", "data": fr}))
 
                     elif mtype == "text":
                         text = str(data.get("text") or "").strip()
+                        if text.startswith(_CLIENT_TOOL_RESULT_PREFIX):
+                            continue
                         if not text:
                             await _send_client(
                                 client,
@@ -827,6 +905,7 @@ async def _bridge_session(client: WebSocket) -> None:
                                 ),
                             )
                             continue
+                        translator.note_upstream(chunk_id, query=True)
                         for payload in translator.barge_in(session_id):
                             await _send_client(client, payload)
                         if last_frames:
@@ -870,10 +949,11 @@ async def _bridge_session(client: WebSocket) -> None:
     except Exception as exc:
         LOG.exception("bridge session error: %s", exc)
         try:
-            await _send_client(client, _envelope("error", {"message": str(exc)}))
+            await _send_client(client, _envelope("error", {"message": str(exc)}, session_id=session_id))
         except Exception:
             pass
     finally:
+        _active_sessions -= 1
         with contextlib.suppress(Exception):
             await client.close()
 

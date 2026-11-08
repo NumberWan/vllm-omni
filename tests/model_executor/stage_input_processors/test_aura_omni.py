@@ -12,6 +12,14 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
+    _clean_tts_text,
+    _estimate_assistant_prompt_tokens,
+    _estimate_instruct_prompt_tokens,
+    _estimate_tts_max_new_tokens,
+    _estimate_tts_prompt_len_from_token_ids,
+    _pop_emit_ready_tts_text,
+    _pop_native_tts_sentence,
+    _tts_content_char_count,
     asr2aura,
     asr2aura_async_chunk,
     aura2tts,
@@ -22,14 +30,6 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     resolve_aura_async_chunk_stage_payload,
     unpack_aura_video_ndarray,
     video_tuple_from_deferred_multi_modal,
-    _estimate_assistant_prompt_tokens,
-    _estimate_instruct_prompt_tokens,
-    _estimate_tts_max_new_tokens,
-    _estimate_tts_prompt_len_from_token_ids,
-    _pop_emit_ready_tts_text,
-    _pop_native_tts_sentence,
-    _clean_tts_text,
-    _tts_content_char_count,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
     SessionHistory,
@@ -632,8 +632,7 @@ def test_aura_tool_pass_is_deferred_then_withheld_from_tts_and_history(monkeypat
     assert aura2tts_async_chunk(transfer_manager, None, request, is_finished=False) is None
     request.output_token_ids = [1, 2, 248058, 4]
     request.output_text = (
-        "我先檢查。<tool_call><function=mock_echo>"
-        "<parameter=text>hello</parameter></function></tool_call>"
+        "我先檢查。<tool_call><function=mock_echo><parameter=text>hello</parameter></function></tool_call>"
     )
     payload = aura2tts_async_chunk(transfer_manager, None, request, is_finished=True)
 
@@ -679,10 +678,7 @@ def test_aura_tool_pass_does_not_speak_xml_or_unfinished_think(monkeypatch, outp
 def test_tools_disabled_routing_pass_withholds_hallucinated_tool_xml(monkeypatch):
     """Intent-gate routing (tools off) must not speak raw <tool_call> XML."""
     monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
-    xml = (
-        "<tool_call><function=calculator>"
-        "<parameter=expression>37 * 19</parameter></function></tool_call>"
-    )
+    xml = "<tool_call><function=calculator><parameter=expression>37 * 19</parameter></function></tool_call>"
     additional = {
         "aura_session_id": "tool-routing-hallucination",
         "aura_system_prompt": ["system"],
@@ -716,10 +712,7 @@ def test_tools_disabled_routing_pass_withholds_hallucinated_tool_xml(monkeypatch
 
 
 def test_aura_sync_path_withholds_tool_xml_when_tools_disabled():
-    xml = (
-        "<tool_call><function=calculator>"
-        "<parameter=expression>1+1</parameter></function></tool_call>"
-    )
+    xml = "<tool_call><function=calculator><parameter=expression>1+1</parameter></function></tool_call>"
     prompt = {
         "additional_information": {
             "aura_session_id": "sync-xml",
@@ -800,8 +793,7 @@ def test_aura_tool_pass2_final_answer_tts_and_commits_once():
             assert messages[-1] == {
                 "role": "user",
                 "content": (
-                    "工具已成功。只逐字輸出工具結果 JSON 的 summary 字段；"
-                    "禁止改寫或增刪任何數字，也不要再調用工具。"
+                    "工具已成功。只逐字輸出工具結果 JSON 的 summary 字段；禁止改寫或增刪任何數字，也不要再調用工具。"
                 ),
             }
             return "rendered-pass-2"
@@ -902,6 +894,8 @@ def test_clean_tts_text_strips_box_markup():
     assert _clean_tts_text(f"手机在左边。{box}") == "手机在左边。"
     # Incomplete mid-stream box must also be held back from TTS.
     assert _clean_tts_text("<|box_start|>(401.0,472.0),") == ""
+    assert _clean_tts_text("<|respond|>看到了，你現在正看著鏡頭說話。") == "看到了，你現在正看著鏡頭說話。"
+    assert _clean_tts_text("<|respond|>") == ""
 
 
 def test_pop_emit_ready_tts_text_holds_short_sentence_until_merge():
@@ -925,9 +919,7 @@ def test_pop_emit_ready_tts_text_batches_until_default_min_chars():
     assert rest == "今天天气很好。"
 
     # 23 content chars — still under the default 30 floor.
-    held, rest = _pop_emit_ready_tts_text(
-        "有。画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，"
-    )
+    held, rest = _pop_emit_ready_tts_text("有。画面正中央坐着一位戴着眼镜、黑色耳机的年轻男子，")
     assert held is None
     assert "年轻男子" in rest
 
@@ -1162,11 +1154,10 @@ def test_build_aura_input_ignores_api_session_registry():
     """API ``AuraSessionState.history`` / ``register_session`` must not drive prompts."""
     clear_all_sessions()
     from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
-        SessionHistory as SH,
         register_session,
     )
 
-    api_history = SH(system_prompt="system")
+    api_history = SessionHistory(system_prompt="system")
     api_history.add_user_message("API-only turn")
     api_history.add_assistant_message("should-not-appear")
     register_session("aura-ignore-api", api_history)
@@ -1267,6 +1258,7 @@ def test_build_aura_input_commit_rounds_increment_via_aura2tts_async_chunk():
     assert history.current_rounds == 1
     assert SILENT_TEXT in history.get_vllm_inputs()["prompt"]
 
+
 def test_resolve_aura_async_chunk_stage_payload_builds_prompt_from_passthrough():
     clear_all_sessions()
     video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
@@ -1349,6 +1341,7 @@ def test_pack_aura_video_ndarray_roundtrips_pixels():
 def test_deferred_video_wire_format_survives_additional_information_msgpack():
     """Regression: nested ndarray under scalar_data must not become ['|u1', shape, buf]."""
     from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
     from vllm_omni.engine import AdditionalInformationPayload
     from vllm_omni.engine.serialization import (
         deserialize_additional_information,
@@ -1373,9 +1366,7 @@ def test_deferred_video_wire_format_survives_additional_information_msgpack():
     decoded = MsgpackDecoder(AdditionalInformationPayload).decode(encoded)
     restored_info = deserialize_additional_information(decoded)
 
-    video_tuple = video_tuple_from_deferred_multi_modal(
-        restored_info.get("deferred_multi_modal_data")
-    )
+    video_tuple = video_tuple_from_deferred_multi_modal(restored_info.get("deferred_multi_modal_data"))
     assert video_tuple is not None
     arr, meta = video_tuple
     assert arr.shape == (2, 4, 4, 3)

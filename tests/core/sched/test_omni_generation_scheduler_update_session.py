@@ -308,13 +308,139 @@ def test_upstream_exhausted_running_request_swept_into_pending_finish() -> None:
         model_runner_output,
     )
 
-    finished_ids = {
-        out.request_id
-        for client_outs in outputs.values()
-        for out in client_outs.outputs
-        if out.finished
-    }
+    finished_ids = {out.request_id for client_outs in outputs.values() for out in client_outs.outputs if out.finished}
     assert session.request_id in finished_ids
+
+
+def test_in_flight_tail_is_not_finished_before_its_waveform() -> None:
+    """Async schedule advances computed tokens before the waveform update.
+
+    The empty finish used to free the request while that chunk was still
+    queued, so the later update dropped the tail audio.
+    """
+    session = _make_request(request_id="req-code2wav-tail")
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.prompt_token_ids = [1] * 16
+    session.num_computed_tokens = 16
+    session.num_in_flight_tokens = 8
+
+    other = _make_request(request_id="req-other-tail")
+    other.status = RequestStatus.RUNNING
+    other.prompt_token_ids = [1]
+    other.num_computed_tokens = 0
+    other.num_in_flight_tokens = 1
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session, other.request_id: other}
+    sched.perf_metrics = None
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        is_done_receiving_chunks=lambda rid: rid == session.request_id,
+        upstream_exhausted_requests={session.request_id},
+        segment_finished_requests=set(),
+        cleanup=MagicMock(),
+    )
+    sched._handle_stopped_request.return_value = True
+    sched._free_request.return_value = (None, None)
+    sched.running = [session, other]
+    sched.waiting = MagicMock()
+    sched.skipped_waiting = MagicMock()
+    sched.structured_output_manager.should_advance.return_value = False
+    sched._pending_finish_reqs = []
+    sched.recompute_kv_load_failures = False
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {other.request_id: 1}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {other.request_id: 0}
+    model_runner_output.routed_experts = None
+    model_runner_output.multimodal_outputs = None
+
+    outputs = OmniGenerationScheduler.update_from_output(
+        sched,
+        scheduler_output,
+        model_runner_output,
+    )
+
+    finished_ids = {out.request_id for client_outs in outputs.values() for out in client_outs.outputs if out.finished}
+    assert session.request_id not in finished_ids
+    assert session.status == RequestStatus.RUNNING
+    assert session not in sched._pending_finish_reqs
+
+
+def test_in_batch_step_does_not_finish_while_newer_chunk_is_scheduled() -> None:
+    """Settling the older chunk must not finish a newer in-flight waveform."""
+    session = _make_request(request_id="req-code2wav-overlap")
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.prompt_token_ids = [1] * 32
+    session.num_computed_tokens = 32
+    # This update settles 8 tokens; 8 more belong to the queued tail chunk.
+    session.num_in_flight_tokens = 16
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session}
+    sched.perf_metrics = None
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        is_done_receiving_chunks=lambda _request_id: True,
+        upstream_exhausted_requests={session.request_id},
+        segment_finished_requests=set(),
+        cleanup=MagicMock(),
+    )
+    sched._handle_stopped_request.return_value = True
+    sched._free_request.return_value = (None, None)
+    sched.running = [session]
+    sched.waiting = MagicMock()
+    sched.skipped_waiting = MagicMock()
+    sched.structured_output_manager.should_advance.return_value = False
+    sched._pending_finish_reqs = []
+    sched.recompute_kv_load_failures = False
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {session.request_id: 8}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.routed_experts = None
+    model_runner_output.multimodal_outputs = [{"audio": object()}]
+
+    outputs = OmniGenerationScheduler.update_from_output(
+        sched,
+        scheduler_output,
+        model_runner_output,
+    )
+
+    output = outputs[session.client_index].outputs[0]
+    assert output.finished is False
+    assert session.num_in_flight_tokens == 8
+    sched._handle_stopped_request.assert_not_called()
 
 
 class TestReplaceSessionWithStreamingUpdate:
