@@ -79,19 +79,63 @@ def _is_user_commit(text: str) -> bool:
     return event is not None and event.get("type") == "input_audio_buffer.commit"
 
 
-async def _answer_function_call(backend, tools: ToolExecutor, call: dict[str, Any], *, follow_up: bool = True) -> None:
+def _hold_follow_up_for_response_done(state: dict[str, Any]) -> None:
+    """The function-call item is published before ``response.done``.
+
+    A follow-up ``response.create`` in that gap is rejected with
+    ``response_already_active``.
+    """
+    state["awaiting_done"] = True
+    state["pending_gen"] = state["gen"]
+
+
+def _follow_up_ready(state: dict[str, Any], generation: int) -> bool:
+    """True when the tool result may start a response now.
+
+    Called after the tool returns. False means ``response.done`` has not
+    arrived yet; the done handler will start it.
+    """
+    if state["gen"] != generation:
+        return False
+    if state["awaiting_done"]:
+        state["ready"] = True
+        return False
+    return True
+
+
+def _take_deferred_follow_up(state: dict[str, Any]) -> bool:
+    """Call on ``response.done``. True when the tool result is already waiting."""
+    state["awaiting_done"] = False
+    if state["ready"] and state["pending_gen"] == state["gen"]:
+        state["ready"] = False
+        return True
+    return False
+
+
+async def _answer_function_call(
+    backend,
+    tools: ToolExecutor,
+    call: dict[str, Any],
+    *,
+    follow_up: bool = True,
+    follow_state: dict[str, Any] | None = None,
+) -> None:
+    generation = follow_state["gen"] if follow_state is not None else None
     output = await tools.run(str(call.get("name") or ""), str(call.get("arguments") or ""))
     item = {"type": "function_call_output", "call_id": call["call_id"], "output": output}
     await backend.send(json.dumps({"type": "conversation.item.create", "item": item}))
-    if follow_up:
-        await backend.send(json.dumps({"type": "response.create"}))
+    if not follow_up:
+        return
+    if follow_state is not None and not _follow_up_ready(follow_state, generation):
+        return
+    await backend.send(json.dumps({"type": "response.create"}))
 
 
 async def _pump_client_to_backend(
     client: WebSocket,
     backend,
     tools: ToolExecutor | None = None,
-    tool_followups: list[int] | None = None,
+    tool_followups: dict[str, Any] | None = None,
 ) -> None:
     try:
         while True:
@@ -102,7 +146,10 @@ async def _pump_client_to_backend(
             if message.get("text") is not None:
                 text = message["text"]
                 if tool_followups is not None and _is_user_commit(text):
-                    tool_followups[0] = 0
+                    tool_followups["gen"] += 1
+                    tool_followups["count"] = 0
+                    tool_followups["awaiting_done"] = False
+                    tool_followups["ready"] = False
                 await backend.send(text if tools is None else _with_session_tools(text, tools))
             elif message.get("bytes") is not None:
                 await backend.send(message["bytes"])
@@ -115,7 +162,7 @@ async def _pump_backend_to_client(
     client: WebSocket,
     backend,
     tools: ToolExecutor | None = None,
-    tool_followups: list[int] | None = None,
+    tool_followups: dict[str, Any] | None = None,
 ) -> None:
     calls: set[asyncio.Task] = set()
     try:
@@ -127,13 +174,21 @@ async def _pump_backend_to_client(
             if tools is None:
                 continue
             event = _json_event(message)
+            if event is None:
+                continue
+            kind = event.get("type")
+            if tool_followups is not None and kind == "response.done" and _take_deferred_follow_up(tool_followups):
+                await backend.send(json.dumps({"type": "response.create"}))
             call = _finished_function_call(event) if event is not None else None
             if call is not None:
-                count = tool_followups[0] if tool_followups is not None else 0
+                count = tool_followups["count"] if tool_followups is not None else 0
                 follow_up = count < _MAX_TOOL_FOLLOWUPS
                 if tool_followups is not None and follow_up:
-                    tool_followups[0] = count + 1
-                task = asyncio.create_task(_answer_function_call(backend, tools, call, follow_up=follow_up))
+                    tool_followups["count"] = count + 1
+                    _hold_follow_up_for_response_done(tool_followups)
+                task = asyncio.create_task(
+                    _answer_function_call(backend, tools, call, follow_up=follow_up, follow_state=tool_followups)
+                )
                 calls.add(task)
                 task.add_done_callback(calls.discard)
     except (WebSocketDisconnect, websockets.ConnectionClosed):
@@ -239,7 +294,13 @@ def build_app(
                 backend_url,
                 max_size=64 * 1024 * 1024,
             ) as backend:
-                tool_followups = [0]
+                tool_followups = {
+                    "count": 0,
+                    "gen": 0,
+                    "pending_gen": 0,
+                    "awaiting_done": False,
+                    "ready": False,
+                }
                 tasks = {
                     asyncio.create_task(_pump_client_to_backend(websocket, backend, tool_executor, tool_followups)),
                     asyncio.create_task(_pump_backend_to_client(websocket, backend, tool_executor, tool_followups)),

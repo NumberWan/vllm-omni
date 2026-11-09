@@ -481,6 +481,19 @@ class DuplexModelPlugin(ABC):
             "sample_rate_hz": int(self.silence_continuation_sample_rate_hz),
         }
 
+    def startup_warmup_turn(self) -> dict[str, object] | None:
+        """One spoken warmup append, or None to keep the shared probe.
+
+        The shared video-turn probe sends a short tone plus one frame. A model
+        that treats an empty transcript as silence never reaches its later
+        stages on that input. Override this with the same fields as an
+        ``input_audio_buffer.append`` (base64 ``audio``, ``format``,
+        ``sample_rate_hz``, and optionally ``is_speech`` and ``video_frames``)
+        plus ``instructions`` when the shared warmup prompt is wrong for the
+        model. None leaves the shared probe unchanged.
+        """
+        return None
+
     # ---- engine policy (was DuplexRuntimeExtension) ----
 
     @abstractmethod

@@ -89,7 +89,8 @@ main { width: min(1040px, calc(100% - 40px)); margin: 28px auto 48px; }
   width: 100% !important;
   height: auto !important;
   max-height: 480px;
-  aspect-ratio: 4 / 3;
+  object-fit: contain;
+  background: #000;
 }
 .call-actions:has(.camera-preview-large) #highlightLayer {
   display: block;

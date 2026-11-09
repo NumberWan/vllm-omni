@@ -317,7 +317,8 @@
     if (display.width < 1 || display.height < 1) return;
     const frameW = cameraPreview.videoWidth || display.width;
     const frameH = cameraPreview.videoHeight || display.height;
-    const scale = Math.max(display.width / frameW, display.height / frameH);
+    // The preview is the whole frame (object-fit: contain), same pixels the model sees.
+    const scale = Math.min(display.width / frameW, display.height / frameH);
     const drawnW = frameW * scale;
     const drawnH = frameH * scale;
     const drawnLeft = (display.width - drawnW) / 2;

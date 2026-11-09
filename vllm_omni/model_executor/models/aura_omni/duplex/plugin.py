@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import binascii
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -143,6 +144,12 @@ def _first_completion(output: object) -> object | None:
     return None
 
 
+# 16 kHz pcm16 of a short spoken request ("请只说：暖机完成。"). A tone is
+# transcribed as an empty string, and an empty request is answered with
+# <|silent|>, which never reaches Talker or Code2Wav.
+_WARMUP_REQUEST_PCM = Path(__file__).with_name("warmup_request.pcm")
+
+
 class AuraDuplexPlugin(DuplexModelPlugin):
     """Turn-commit AURA: one ephemeral four-stage request per utterance."""
 
@@ -155,6 +162,17 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         # Empty sampling defaults stay on v1. A stage that already lists the
         # v2 silent or im_end id switches this before the first request.
         self._profile = AURA_V1
+
+    def startup_warmup_turn(self) -> dict[str, object] | None:
+        pcm = _WARMUP_REQUEST_PCM.read_bytes()
+        if not pcm:
+            return None
+        return {
+            "audio": base64.b64encode(pcm).decode("ascii"),
+            "format": "pcm16",
+            "sample_rate_hz": 16000,
+            "is_speech": True,
+        }
 
     def _default_system_prompt(self) -> str:
         if self._profile is AURA_V2:

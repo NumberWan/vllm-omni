@@ -1009,6 +1009,7 @@ test('AURA hold-to-talk stops local playback and does not cancel the response', 
   await app.ui.startSession();
   receive(app, { type: 'response.created', response: { id: 'old' } });
   receive(app, audioChunk('old'));
+  receive(app, audioChunk('old'));
   await app.ui.awaitQueue();
   const player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
   for (let index = 0; index < 75; index++) renderPlayback(player);

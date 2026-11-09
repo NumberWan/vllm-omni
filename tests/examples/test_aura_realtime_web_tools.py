@@ -113,6 +113,51 @@ def test_function_call_is_answered_then_followed_up() -> None:
     asyncio.run(server._answer_function_call(_Backend(), _Tools(), call, follow_up=False))
     assert [message["type"] for message in sent] == ["conversation.item.create"]
     assert server._is_user_commit('{"type":"input_audio_buffer.commit"}')
+
+
+def test_follow_up_waits_until_the_tool_response_is_done() -> None:
+    sent: list[dict] = []
+
+    class _Backend:
+        async def send(self, message: str) -> None:
+            sent.append(json.loads(message))
+
+    call = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "calculator",
+        "arguments": '{"expression": "1+1"}',
+    }
+    state = {"count": 0, "gen": 0, "pending_gen": 0, "awaiting_done": False, "ready": False}
+    server._hold_follow_up_for_response_done(state)
+    asyncio.run(server._answer_function_call(_Backend(), _Tools(), call, follow_state=state))
+    assert [message["type"] for message in sent] == ["conversation.item.create"]
+    assert state["ready"] is True
+    assert server._take_deferred_follow_up(state) is True
+    assert server._take_deferred_follow_up(state) is False
+
+    state["ready"] = True
+    state["pending_gen"] = 0
+    state["gen"] = 1
+    assert server._take_deferred_follow_up(state) is False
+
+    class _CommitDuringTool(_Tools):
+        async def run(self, name: str, arguments: str) -> str:
+            state["gen"] += 1
+            state["awaiting_done"] = False
+            state["ready"] = False
+            return await super().run(name, arguments)
+
+    state.update({"awaiting_done": True, "ready": False, "gen": 0, "pending_gen": 0})
+    sent.clear()
+    asyncio.run(server._answer_function_call(_Backend(), _CommitDuringTool(), call, follow_state=state))
+    assert [message["type"] for message in sent] == ["conversation.item.create"]
+    assert state["ready"] is False
+
+    state.update({"awaiting_done": False, "ready": False, "gen": 2, "pending_gen": 0})
+    sent.clear()
+    asyncio.run(server._answer_function_call(_Backend(), _Tools(), call, follow_state=state))
+    assert [message["type"] for message in sent] == ["conversation.item.create", "response.create"]
     assert not server._is_user_commit('{"type":"input_audio_buffer.append"}')
     item = sent[0]["item"]
     assert item["type"] == "function_call_output"
