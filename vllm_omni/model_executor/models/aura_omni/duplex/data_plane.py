@@ -22,6 +22,7 @@ from vllm_omni.model_executor.models.aura_omni.duplex.tools_utils import (
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     SILENT_TEXT,
+    _speech_text,
     is_control_text_prefix,
     is_effectively_silent,
 )
@@ -368,6 +369,19 @@ class AuraDataPlaneSession(DuplexDataPlane):
                     aura_function_call=call,
                     aura_tool_call_ends_turn=not spoken,
                 )
+            elif not _speech_text(state.text_sent):
+                # Grounding box only. The client already has the tokens to
+                # draw. Do not wait for Talker; abort the prewarmed seats.
+                state.terminal = True
+                yield _event(
+                    stage_role="thinker",
+                    is_listen=False,
+                    data_plane_request_id=request_id,
+                    text="",
+                    end_of_turn=True,
+                    abort_data_plane_request=True,
+                )
+                return
         is_final_audio_stage = stage_id is None or stage_id >= 3
         mm = _multimodal(output, completion)
         audio = _audio_value(mm)

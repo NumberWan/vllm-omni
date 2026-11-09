@@ -337,9 +337,8 @@ def test_asr2aura_tool_followup_has_no_new_user_turn_but_reads_history() -> None
     drop_session_history("sess-asr-followup")
 
 
-def test_next_duplex_sentence_chunk_batches_until_min_chars(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_next_duplex_sentence_chunk_waits_for_the_whole_utterance(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("VLLM_AURA_SENTENCE_TTS", raising=False)
-    monkeypatch.delenv("VLLM_AURA_SENTENCE_TTS_MIN_CHARS", raising=False)
     from vllm_omni.model_executor.stage_input_processors.aura_omni import (
         next_duplex_sentence_chunk,
     )
@@ -348,10 +347,9 @@ def test_next_duplex_sentence_chunk_batches_until_min_chars(monkeypatch: pytest.
     first = "甲" * 12 + "。"
     assert next_duplex_sentence_chunk(state, first, finished=False) is None
     second = first + "乙" * 20 + "。"
-    chunk = next_duplex_sentence_chunk(state, second, finished=False)
-    assert chunk is not None
-    assert chunk.startswith("甲" * 12)
-    assert "乙" * 20 in chunk
+    assert next_duplex_sentence_chunk(state, second, finished=False) is None
+    chunk = next_duplex_sentence_chunk(state, second, finished=True)
+    assert chunk == second
 
 
 def test_next_duplex_sentence_chunk_holds_think_silent_and_flushes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -389,6 +387,30 @@ def test_next_duplex_sentence_chunk_finish_truncates_tool_call_from_speech(
     )
     # Nothing left to speak this round once the tag is dropped; not an error.
     assert next_duplex_sentence_chunk({}, tool_only, finished=True) is None
+
+
+def test_next_duplex_sentence_chunk_does_not_speak_a_grounding_box(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_AURA_SENTENCE_TTS", "1")
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        next_duplex_sentence_chunk,
+    )
+
+    box = "<|respond|><|box_start|>(712.0,531.0),(888.0,662.0)<|box_end|>"
+    assert next_duplex_sentence_chunk({}, box, finished=True) is None
+    prose = "<|respond|>在這裡。<|box_start|>10,20,30,40<|box_end|>"
+    assert next_duplex_sentence_chunk({}, prose, finished=True) == "在這裡。"
+
+
+def test_aura2tts_skips_a_box_only_turn():
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import aura2tts
+
+    prompt = {"additional_information": {"tts_task_type": "CustomVoice", "tts_speaker": "Vivian"}}
+    assert aura2tts([_source_output("<|box_start|>(712.0,531.0),(888.0,662.0)<|box_end|>")], prompt=[prompt]) == []
+    [tts_input] = aura2tts(
+        [_source_output("在這裡。<|box_start|>10,20,30,40<|box_end|>")],
+        prompt=[prompt],
+    )
+    assert tts_input["additional_information"]["text"] == ["在這裡。"]
 
 
 def test_next_duplex_sentence_chunk_disabled(monkeypatch: pytest.MonkeyPatch) -> None:

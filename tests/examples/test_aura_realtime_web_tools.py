@@ -109,6 +109,11 @@ def test_function_call_is_answered_then_followed_up() -> None:
     assert server._finished_function_call({"type": "response.output_item.done", "item": {"type": "message"}}) is None
     asyncio.run(server._answer_function_call(_Backend(), _Tools(), call))
     assert [message["type"] for message in sent] == ["conversation.item.create", "response.create"]
+    sent.clear()
+    asyncio.run(server._answer_function_call(_Backend(), _Tools(), call, follow_up=False))
+    assert [message["type"] for message in sent] == ["conversation.item.create"]
+    assert server._is_user_commit('{"type":"input_audio_buffer.commit"}')
+    assert not server._is_user_commit('{"type":"input_audio_buffer.append"}')
     item = sent[0]["item"]
     assert item["type"] == "function_call_output"
     assert item["call_id"] == "call_1"

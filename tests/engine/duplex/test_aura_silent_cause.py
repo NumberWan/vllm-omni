@@ -324,14 +324,14 @@ def _stage1_chunk(request_id: str, text: str, *, finished: bool):
 
 
 @pytest.mark.asyncio
-async def test_empty_remainder_close_only_forwards_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    """17:30: mid-gen full sentence then empty finish must close Talker once."""
+async def test_whole_utterance_is_one_talker_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A growing Stage1 transcript waits, then Talker gets the full text once."""
     from tests.engine.test_duplex_orchestrator import _build
 
     monkeypatch.delenv("VLLM_AURA_SENTENCE_TTS", raising=False)
     orchestrator, clients, _, _ = _build(stages=4, plugin=AuraDuplexPlugin(lambda *args: None))
     orchestrator.async_chunk = True
-    close_only_forwards: list[bool] = []
+    forwarded: list[bool] = []
 
     def aura2tts(source_outputs, prompt=None, **kwargs):
         del source_outputs, kwargs
@@ -339,8 +339,8 @@ async def test_empty_remainder_close_only_forwards_once(monkeypatch: pytest.Monk
         if not isinstance(info, dict):
             info = {}
         close_only = bool(info.get("aura_tts_close_only"))
+        forwarded.append(close_only)
         if close_only:
-            close_only_forwards.append(True)
             return [{"prompt_token_ids": [0], "additional_information": {"text": ""}}]
         return [{"prompt_token_ids": [11, 22, 33], "additional_information": {"text": SPOKEN}}]
 
@@ -367,9 +367,9 @@ async def test_empty_remainder_close_only_forwards_once(monkeypatch: pytest.Monk
 
     sentence = "看到了，我正盯着呢。现在我看到一个戴眼镜、穿黑T恤的男生，他正戴着耳机坐在办公桌前。"
     await orchestrator._route_output(1, 0, _stage1_chunk(request_id, sentence, finished=False), req_state, None)
-    assert close_only_forwards == []
+    assert forwarded == []
     await orchestrator._route_output(1, 0, _stage1_chunk(request_id, sentence, finished=True), req_state, None)
-    assert len(close_only_forwards) == 1
+    assert forwarded == [False]
 
 
 @pytest.mark.asyncio

@@ -8,10 +8,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from threading import Lock
 
-# Native gateway (AURA_demo-main/gateway/actor.py): keep up to 45 video
-# rounds, then strip the video payload from the oldest 30. Text stays.
+# Native gateway trims after the new user message is in context and before
+# inference (AURA_demo-main/gateway/actor.py _trim_video_context). Crossing 45
+# video messages drops the oldest 30, so the prompt holds 16, not 46.
 # Empty user + <|silent|> after the strip is dropped as a pair.
-# Total conversation rounds are effectively unbounded (Native default 999).
+# Message-count trim runs only in that same step (Native default 999 rounds).
 _MAX_VIDEO_ROUNDS = 45
 _VIDEO_ROUNDS_TO_REMOVE = 30
 _MAX_CONVERSATION_ROUNDS = 999
@@ -71,6 +72,9 @@ class SessionHistory:
     def begin_user_turn(self, transcript: str, video: object | None = None) -> None:
         self.pending_user = transcript.strip()
         self.pending_video = video
+        # The pending clip is the newest video. Trim before render_prefix so
+        # this turn's prompt never contains the 46th clip.
+        self.prune()
 
     def append_tool_response(self, output: str) -> None:
         """Splice a tool result in after the assistant turn that called it.
@@ -101,32 +105,41 @@ class SessionHistory:
         self.prune()
 
     def prune(self) -> None:
+        """Drop oldest videos once stored clips plus the pending clip pass 45.
+
+        Matches the gateway: the new clip counts, the oldest 30 lose pixels,
+        and the message cap is applied only as part of that same trim.
+        """
         video_indices = [
             index
             for index, message in enumerate(self.messages)
             if message.get("role") == "user" and message.get("video") is not None
         ]
-        if len(video_indices) > self.max_video_rounds:
-            drop: set[int] = set()
-            for index in video_indices[: self.video_rounds_to_remove]:
-                user_message = self.messages[index]
-                user_message["video"] = None
-                text = user_message.get("content")
-                if isinstance(text, str) and text.strip():
-                    continue
-                nxt = index + 1
-                if nxt >= len(self.messages) or self.messages[nxt].get("role") != "assistant":
-                    continue
-                assistant = self.messages[nxt].get("content")
-                if isinstance(assistant, str) and assistant.strip() in {_SILENT, ""}:
-                    drop.add(index)
-                    drop.add(nxt)
-            if drop:
-                self.messages = [message for index, message in enumerate(self.messages) if index not in drop]
-        user_count = sum(1 for message in self.messages if message.get("role") == "user")
-        overflow = user_count - self.max_conversation_rounds
-        if overflow > 0:
-            self.messages = self.messages[overflow * 2 :]
+        pending_extra = 1 if self.pending_video is not None else 0
+        if len(video_indices) + pending_extra <= self.max_video_rounds:
+            return
+        drop: set[int] = set()
+        for index in video_indices[: self.video_rounds_to_remove]:
+            user_message = self.messages[index]
+            user_message["video"] = None
+            text = user_message.get("content")
+            if isinstance(text, str) and text.strip():
+                continue
+            nxt = index + 1
+            if nxt >= len(self.messages) or self.messages[nxt].get("role") != "assistant":
+                continue
+            assistant = self.messages[nxt].get("content")
+            if isinstance(assistant, str) and assistant.strip() in {_SILENT, ""}:
+                drop.add(index)
+                drop.add(nxt)
+        if drop:
+            self.messages = [message for index, message in enumerate(self.messages) if index not in drop]
+        # No system row is stored here, so the cap is the conversation pairs
+        # themselves. Native keeps ctx[0] because that row is the system prompt.
+        max_messages = self.max_conversation_rounds * 2
+        remove = (len(self.messages) - max_messages) // 2 * 2
+        if remove > 0:
+            self.messages = self.messages[remove:]
 
 
 def get_or_create_session_history(session_id: str) -> SessionHistory:

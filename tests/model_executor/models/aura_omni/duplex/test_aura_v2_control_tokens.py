@@ -234,8 +234,8 @@ def test_v2_default_system_prompt_matches_native() -> None:
     runtime = asyncio.run(plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=None))
     assert runtime["aura_two_token"] is True
     assert runtime["aura_system_prompt"] == DEFAULT_AURA_V2_SYSTEM_PROMPT
-    assert "<|silent|>" in str(runtime["aura_system_prompt"])
-    assert "<|respond|>" not in str(runtime["aura_system_prompt"])
+    assert "output `<|respond|>` followed immediately" in str(runtime["aura_system_prompt"])
+    assert "output exactly `<|silent|>`" in str(runtime["aura_system_prompt"])
 
 
 def test_asr2aura_two_token_appends_empty_think_shell() -> None:

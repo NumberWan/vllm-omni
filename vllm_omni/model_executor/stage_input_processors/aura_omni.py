@@ -31,12 +31,15 @@ DEFAULT_AURA_SYSTEM_PROMPT = (
     "Respond only when a response is needed based on the user's message or the visual context. "
     "Otherwise, output `<|silent|>` to signify silence."
 )
-# Same text as AURA_demo-main/gateway/actor.py SYSTEM_PROMPT (aura_v1_system_prompt).
-# The longer Chinese tool prompt in that file is not wired and is not used here.
+# Native AURA_v2 gateway prompt, "回复时输出 <|respond|>" preset
+# (aura_gateway/static/index.html SYSTEM_PROMPT_PRESETS[0]). The older
+# "需要时直接回复" text is the v1 prompt and is not used for v2.
 DEFAULT_AURA_V2_SYSTEM_PROMPT = (
+    "You are a real-time multimodal AI companion in a live video conversation with the user. "
     "You are receiving a live video stream where the final frame is the present moment. "
-    "Respond only when a response is needed based on the user's message or the visual context. "
-    "Otherwise, output `<|silent|>` to signify silence."
+    "Decide whether a response is needed based on the user's message or the visual context. "
+    "If a response is needed, output `<|respond|>` followed immediately by the response content. "
+    "If no response is needed, output exactly `<|silent|>` to signify silence."
 )
 
 SILENT_TEXT = "<|silent|>"
@@ -327,6 +330,28 @@ def _aura_prompt(
     return f"<|im_start|>system\n{system}<|im_end|>\n{history_prefix}{user_turn}{assistant}"
 
 
+_BOX_SPAN_RE = re.compile(r"<\|box_start\|>(.*?)<\|box_end\|>", re.DOTALL)
+_BOX_TAIL_RE = re.compile(r"<\|box(?:_start(?:\|.*)?)?$")
+
+
+def _strip_box_tokens_for_speech(text: str) -> str:
+    """Drop grounding boxes before Talker.
+
+    The client still receives the tokens and draws them. A box is not speech:
+    ``<|box_start|>(x1,y1),(x2,y2)<|box_end|>`` and a trailing unclosed tag
+    are removed. History keeps the original text.
+    """
+    cleaned = _BOX_SPAN_RE.sub("", text or "")
+    cleaned = cleaned.replace("<|box_end|>", "")
+    return _BOX_TAIL_RE.sub("", cleaned).strip()
+
+
+def _speech_text(text: str) -> str:
+    """Text Talker should receive. Empty means this turn has nothing to say."""
+    spoken = _strip_tool_call_for_speech(_strip_assistant_text(text))
+    return _strip_box_tokens_for_speech(spoken).strip()
+
+
 def _strip_assistant_text(text: str) -> str:
     """Remove think wrappers and ChatML specials before TTS / client text.
 
@@ -362,80 +387,13 @@ def is_effectively_silent(text: str | None) -> bool:
     return not stripped or stripped == SILENT_TEXT
 
 
-# Native AURA sentence boundaries for incremental Stage1→TTS handoff.
-# Same rule as AURA_026 ``aura2tts_async_chunk``. Duplex applies it in the
-# orchestrator (not SHM ``from_stage_1``, which clears Talker text).
-_NATIVE_TTS_SENT_ENDS = frozenset("。！？；.!?;\n")
-_NATIVE_TTS_COMMA_ENDS = frozenset("，,")
-_NATIVE_TTS_MIN_CHARS = 10
-_NATIVE_TTS_MIN_EMIT_CHARS = 30
-
-
 def _sentence_tts_enabled() -> bool:
-    """Emit TTS per sentence while Stage1 still generates.
+    """Hand Stage1 text to Talker when the turn finishes.
 
     Default on. Disable with ``VLLM_AURA_SENTENCE_TTS=0``.
     """
     raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS") or "1").strip().lower()
     return raw not in {"0", "false", "off", "no"}
-
-
-def _sentence_tts_min_emit_chars() -> int:
-    """Minimum content chars before a mid-generation TTS handoff."""
-    raw = (os.environ.get("VLLM_AURA_SENTENCE_TTS_MIN_CHARS") or "").strip()
-    if not raw:
-        return _NATIVE_TTS_MIN_EMIT_CHARS
-    try:
-        return max(1, min(200, int(raw)))
-    except ValueError:
-        return _NATIVE_TTS_MIN_EMIT_CHARS
-
-
-def _tts_content_char_count(text: str) -> int:
-    """Count alphanumeric / CJK content chars (ignore punctuation/whitespace)."""
-    return sum(1 for ch in text if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
-
-
-def _pop_native_tts_sentence(buf: str) -> tuple[str | None, str]:
-    """Pop one sentence from ``buf``; return (sentence_or_None, rest)."""
-    if not buf:
-        return None, buf
-    split_pos = -1
-    for i, ch in enumerate(buf):
-        if ch in _NATIVE_TTS_SENT_ENDS:
-            split_pos = i + 1
-            break
-        if ch in _NATIVE_TTS_COMMA_ENDS and i + 1 >= _NATIVE_TTS_MIN_CHARS:
-            split_pos = i + 1
-            break
-    if split_pos < 0:
-        return None, buf
-    sentence = buf[:split_pos]
-    rest = buf[split_pos:]
-    if not sentence.strip():
-        return _pop_native_tts_sentence(rest)
-    return sentence, rest
-
-
-def _pop_emit_ready_tts_text(
-    buf: str,
-    min_chars: int | None = None,
-) -> tuple[str | None, str]:
-    """Pop sentences until content length >= ``min_chars``."""
-    if min_chars is None:
-        min_chars = _sentence_tts_min_emit_chars()
-    parts: list[str] = []
-    rest = buf
-    while True:
-        sentence, rest = _pop_native_tts_sentence(rest)
-        if sentence is None:
-            break
-        parts.append(sentence)
-        if _tts_content_char_count("".join(parts)) >= min_chars:
-            return "".join(parts), rest
-    if not parts:
-        return None, buf
-    return None, "".join(parts) + rest
 
 
 def _tool_marker_pending(text: str) -> bool:
@@ -457,11 +415,12 @@ def _strip_tool_call_for_speech(text: str) -> str:
 
 
 def next_duplex_sentence_chunk(state: dict[str, Any], raw_text: str, *, finished: bool) -> str | None:
-    """Return the next Talker sentence, or None when this output must not start TTS.
+    """Return the whole utterance once Stage1 finishes, else None.
 
-    ``state`` is per Stage1 request and is mutated. Stage1 finish flushes any
-    leftover even under the min-char floor. Silent, an unclosed ``<think>``,
-    and tool markers do not emit mid-generation. A silent finish returns None
+    CustomVoice non-streaming bakes the text present at the first Talker
+    prefill and then ends. A clause handed off earlier never reaches that
+    prompt, so playback stops at the first comma. Silent, an unclosed
+    ``<think>``, and tool markers do not emit. A silent finish returns None
     so the legacy full-text path can drop TTS.
     """
     if not _sentence_tts_enabled():
@@ -493,21 +452,13 @@ def next_duplex_sentence_chunk(state: dict[str, Any], raw_text: str, *, finished
         state["emitted_prefix"] = emitted_prefix
 
     if not finished:
-        sentence, pending = _pop_emit_ready_tts_text(pending)
         state["pending"] = pending
-        if sentence is None:
-            return None
-        state["emits"] = already + 1
-        state["last"] = sentence.strip()
-        return state["last"]
+        return None
 
     state["pending"] = ""
-    remainder = _strip_assistant_text(pending).strip()
+    remainder = _speech_text(pending)
     if not remainder or is_effectively_silent(remainder):
-        return None
-    remainder = _strip_tool_call_for_speech(remainder).strip()
-    if not remainder:
-        # Held-back text was only a <tool_call> block: nothing to speak yet.
+        # Tool-call block or a grounding box: nothing left to speak.
         return None
     state["emits"] = already + 1
     state["last"] = remainder
@@ -857,7 +808,7 @@ def aura2tts(
         # speak this round (the <tool_call> body is dropped below).
         if is_effectively_silent(full_text) and not close_only:
             continue
-        text = _strip_tool_call_for_speech(full_text)
+        text = _speech_text(raw_text)
         if close_only:
             text = ""
         elif not text:

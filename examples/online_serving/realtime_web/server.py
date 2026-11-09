@@ -69,14 +69,30 @@ def _finished_function_call(event: dict[str, Any]) -> dict[str, Any] | None:
     return item
 
 
-async def _answer_function_call(backend, tools: ToolExecutor, call: dict[str, Any]) -> None:
+# A failed search result makes the model call again. Stop opening follow-ups
+# after this many, or one question can spin for the life of the session.
+_MAX_TOOL_FOLLOWUPS = 3
+
+
+def _is_user_commit(text: str) -> bool:
+    event = _json_event(text)
+    return event is not None and event.get("type") == "input_audio_buffer.commit"
+
+
+async def _answer_function_call(backend, tools: ToolExecutor, call: dict[str, Any], *, follow_up: bool = True) -> None:
     output = await tools.run(str(call.get("name") or ""), str(call.get("arguments") or ""))
     item = {"type": "function_call_output", "call_id": call["call_id"], "output": output}
     await backend.send(json.dumps({"type": "conversation.item.create", "item": item}))
-    await backend.send(json.dumps({"type": "response.create"}))
+    if follow_up:
+        await backend.send(json.dumps({"type": "response.create"}))
 
 
-async def _pump_client_to_backend(client: WebSocket, backend, tools: ToolExecutor | None = None) -> None:
+async def _pump_client_to_backend(
+    client: WebSocket,
+    backend,
+    tools: ToolExecutor | None = None,
+    tool_followups: list[int] | None = None,
+) -> None:
     try:
         while True:
             message = await client.receive()
@@ -84,7 +100,10 @@ async def _pump_client_to_backend(client: WebSocket, backend, tools: ToolExecuto
                 await backend.close()
                 return
             if message.get("text") is not None:
-                await backend.send(message["text"] if tools is None else _with_session_tools(message["text"], tools))
+                text = message["text"]
+                if tool_followups is not None and _is_user_commit(text):
+                    tool_followups[0] = 0
+                await backend.send(text if tools is None else _with_session_tools(text, tools))
             elif message.get("bytes") is not None:
                 await backend.send(message["bytes"])
     except (WebSocketDisconnect, websockets.ConnectionClosed):
@@ -92,7 +111,12 @@ async def _pump_client_to_backend(client: WebSocket, backend, tools: ToolExecuto
             await backend.close()
 
 
-async def _pump_backend_to_client(client: WebSocket, backend, tools: ToolExecutor | None = None) -> None:
+async def _pump_backend_to_client(
+    client: WebSocket,
+    backend,
+    tools: ToolExecutor | None = None,
+    tool_followups: list[int] | None = None,
+) -> None:
     calls: set[asyncio.Task] = set()
     try:
         async for message in backend:
@@ -105,7 +129,11 @@ async def _pump_backend_to_client(client: WebSocket, backend, tools: ToolExecuto
             event = _json_event(message)
             call = _finished_function_call(event) if event is not None else None
             if call is not None:
-                task = asyncio.create_task(_answer_function_call(backend, tools, call))
+                count = tool_followups[0] if tool_followups is not None else 0
+                follow_up = count < _MAX_TOOL_FOLLOWUPS
+                if tool_followups is not None and follow_up:
+                    tool_followups[0] = count + 1
+                task = asyncio.create_task(_answer_function_call(backend, tools, call, follow_up=follow_up))
                 calls.add(task)
                 task.add_done_callback(calls.discard)
     except (WebSocketDisconnect, websockets.ConnectionClosed):
@@ -211,9 +239,14 @@ def build_app(
                 backend_url,
                 max_size=64 * 1024 * 1024,
             ) as backend:
+                tool_followups = [0]
                 tasks = {
-                    asyncio.create_task(_pump_client_to_backend(websocket, backend, tool_executor)),
-                    asyncio.create_task(_pump_backend_to_client(websocket, backend, tool_executor)),
+                    asyncio.create_task(
+                        _pump_client_to_backend(websocket, backend, tool_executor, tool_followups)
+                    ),
+                    asyncio.create_task(
+                        _pump_backend_to_client(websocket, backend, tool_executor, tool_followups)
+                    ),
                 }
                 done, pending = await asyncio.wait(
                     tasks,

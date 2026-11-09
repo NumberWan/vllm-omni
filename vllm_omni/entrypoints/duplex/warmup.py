@@ -35,6 +35,8 @@ logger = init_logger(__name__)
 # First-request compiles (Triton mRoPE, vision pos-embed, Talker torch.compile,
 # Code2Wav) landed ~30–40 s after the socket was already "ready" on a cold
 # process, then the short reply still has to be spoken. Hold clients past that.
+# The probe sends one commit and then only receives, so the throwaway session's
+# idle timeout must cover this same wait or the server drops the socket first.
 DUPLEX_WARMUP_CLIENT_WAIT_S = 180
 DUPLEX_WARMUP_AUDIO_WAIT_S = 150
 _WARMUP_SAMPLE_RATE_HZ = 16000
@@ -181,7 +183,7 @@ async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None,
         "output_audio_format": "pcm16",
         "sample_rate_hz": unit["sample_rate_hz"],
         "audio": {"input": {"sample_rate_hz": unit["sample_rate_hz"]}},
-        "idle_timeout_s": 60,
+        "idle_timeout_s": DUPLEX_WARMUP_CLIENT_WAIT_S,
         "turn_detection": None,
         "extra_body": {"auto_response": native_append},
     }
@@ -329,7 +331,7 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             "modalities": ["audio", "text"],
             "input_audio_format": "pcm_f32le",
             "output_audio_format": "pcm16",
-            "idle_timeout_s": 60,
+            "idle_timeout_s": DUPLEX_WARMUP_CLIENT_WAIT_S,
             "turn_detection": None,
             "extra_body": {"auto_response": native_append},
         }

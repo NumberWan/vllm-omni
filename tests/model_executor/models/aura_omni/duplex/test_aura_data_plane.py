@@ -177,3 +177,24 @@ def test_project_finished_spoken_turn_carries_model_context() -> None:
     assert context[-1].get("text") == ""
     assert context[-1].get("listen_source") is None
     assert context[-1].get("reason") is None
+
+
+def test_project_box_only_turn_keeps_the_tokens_and_ends_without_audio() -> None:
+    plane = AuraDataPlaneSession(_encode_audio)
+    request_id = "duplex-s.abc.e.0.r.stage1-turn6"
+    plane.begin_request(request_id)
+    box = "<|box_start|>(712.0,531.0),(888.0,662.0)<|box_end|>"
+    final = SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        stage_id=1,
+        outputs=[SimpleNamespace(text=box, cumulative_text=box, finished=True)],
+    )
+    events = list(plane.project({"data_plane_outputs": [final]}))
+    assert any(event.get("text") == box for event in events)
+    context = [event for event in events if event.get("model_context_text")]
+    assert context and context[-1]["model_context_text"] == box
+    assert events[-1].get("end_of_turn") is True
+    assert events[-1].get("abort_data_plane_request") is True
+    assert all(event.get("is_listen") is not True for event in events)
+    assert all(not event.get("audio") for event in events)
