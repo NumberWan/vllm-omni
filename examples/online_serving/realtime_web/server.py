@@ -241,12 +241,8 @@ def build_app(
             ) as backend:
                 tool_followups = [0]
                 tasks = {
-                    asyncio.create_task(
-                        _pump_client_to_backend(websocket, backend, tool_executor, tool_followups)
-                    ),
-                    asyncio.create_task(
-                        _pump_backend_to_client(websocket, backend, tool_executor, tool_followups)
-                    ),
+                    asyncio.create_task(_pump_client_to_backend(websocket, backend, tool_executor, tool_followups)),
+                    asyncio.create_task(_pump_backend_to_client(websocket, backend, tool_executor, tool_followups)),
                 }
                 done, pending = await asyncio.wait(
                     tasks,

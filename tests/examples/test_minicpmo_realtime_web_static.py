@@ -246,6 +246,7 @@ def test_aura_holds_playback_until_the_second_chunk() -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for the AudioWorklet regression test")
+    assert node is not None
     aura = (STATIC_ROOT / "profiles" / "aura_ptt.js").read_text(encoding="utf-8")
     app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
     minicpm = (STATIC_ROOT / "profiles" / "minicpm_native.js").read_text(encoding="utf-8")
