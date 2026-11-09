@@ -1,22 +1,16 @@
-# AURA Omni deploy profile: Qwen3-ASR -> AURA/Qwen3-VL -> Qwen3-TTS Talker -> Code2Wav.
-#
-# Supported online path is Realtime duplex (`/v1/realtime?duplex=1`).
-# The aura_omni pipeline declares duplex_plugin; DuplexOmniEngine requires
-# session_mode: duplex (same pattern as MiniCPM-o duplex deploys).
-# For Realtime, set async_chunk: true (see aura_omni_duplex_smoke.yaml).
-#
-# Pass `--deploy-config vllm_omni/deploy/aura_omni.yaml` and point the parent
-# `--model` at any local placeholder repo if needed; each stage overrides its
-# own model below.
+# AURA_v2 duplex default deploy (private line): performance-bench layout.
+# 2 GPU: Stage1 on GPU1, ASR / Talker / Code2Wav on GPU0. No eager.
+# Stage1 = AURA_v2 (qwen3_5 / checkpoint-1318), max_model_len 65536, FLASHINFER.
+# Online path: Realtime duplex (`/v1/realtime?duplex=1`).
 pipeline: aura_omni
+# Qwen3-TTS Stage2→3 codec handoff requires async_chunk=true (same as native /
+# duplex explore). async_chunk=false reaches talker/code_predictor then never
+# delivers audio to Stage3/client.
+async_chunk: true
 session_mode: duplex
 duplex_session:
-  max_sessions: 1
-# Default false: safer if this file is ever loaded by turn-based OmniOrchestrator,
-# which does not apply DuplexOmniOrchestrator._stage_receives_async_chunks().
-# Duplex Realtime Stage2→3 (Talker/Code2Wav) still needs async chunks — set
-# async_chunk: true for /v1/realtime?duplex=1 (see aura_omni_duplex_smoke.yaml).
-async_chunk: false
+  # Session admission only. Orthogonal to per-stage max_num_seqs.
+  max_sessions: 16
 
 connectors:
   connector_of_shared_memory:
@@ -28,21 +22,22 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 72
-      # initial=1 can stall Code2Wav on the first undersized chunk under duplex.
+      # initial=1 can stall Code2Wav on the first undersized chunk.
       initial_codec_chunk_frames: 8
       decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
 
 stages:
   - stage_id: 0
-    max_num_seqs: 8
-    gpu_memory_utilization: 0.1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.08
+    enforce_eager: false
     trust_remote_code: true
     enable_prefix_caching: true
     async_scheduling: true
-    max_model_len: 8192
-    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    max_num_batched_tokens: 2048
     devices: "0"
-    model: Qwen/Qwen3-ASR-1.7B
+    model: /workspace/models/Qwen3-ASR-1.7B
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -50,71 +45,78 @@ stages:
       max_tokens: 256
 
   - stage_id: 1
-    max_num_seqs: 4
-    gpu_memory_utilization: 0.4
-    trust_remote_code: true
-    enable_prefix_caching: true
-    async_scheduling: true
-    max_model_len: 262144
-    max_num_batched_tokens: 15360
-    devices: "0"
-    model: aurateam/AURA
-    default_sampling_params:
-      temperature: 0.5
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 256
-      repetition_penalty: 1.0
-
-  - stage_id: 2
     max_num_seqs: 8
-    gpu_memory_utilization: 0.2
-    trust_remote_code: true
-    enable_prefix_caching: false
-    async_scheduling: true
-    max_num_batched_tokens: 512
-    max_model_len: 4096
-    devices: "0"
-    output_connectors:
-      to_stage_3: connector_of_shared_memory
-    model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-    # model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
-    default_sampling_params:
-      temperature: 0.9
-      top_k: 50
-      max_tokens: 4096
-      seed: 42
-      repetition_penalty: 1.05
-    subtalker_sampling_params:
-      do_sample: true
-      temperature: 0.9
-      top_k: 50
-      top_p: 1.0
-
-  - stage_id: 3
-    max_num_seqs: 8
-    gpu_memory_utilization: 0.2
+    gpu_memory_utilization: 0.9
     enforce_eager: false
     trust_remote_code: true
+    # Qwen3.5 hybrid attention has multiple KV groups. Updated main refuses
+    # omni prefix caching unless there is a single full-attention group.
     enable_prefix_caching: false
-    async_scheduling: true
-    max_num_batched_tokens: 65536
+    # Two-token logits reads the live output list; async can leave it stale.
+    async_scheduling: false
     max_model_len: 65536
-    devices: "0"
-    input_connectors:
-      from_stage_2: connector_of_shared_memory
-    model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-    # model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    max_num_batched_tokens: 8192
+    devices: "1"
+    attention_backend: FLASHINFER
+    model: /workspace/models/AURA_v2
+    model_arch: AuraQwen3_5ForConditionalGeneration
+    logits_processors:
+      - "vllm_omni.model_executor.models.aura_omni.two_token_logits:AuraTwoTokenLogitsProcessor"
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 65536
+      # 1 control + body budget (inference default).
+      max_tokens: 1025
+      min_tokens: 0
+      repetition_penalty: 1.0
+      stop_token_ids: [248070, 248046]
+
+  - stage_id: 2
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.15
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    attention_backend: FLASHINFER
+    # Stage1→2 is orchestrator-fed via aura2tts. Only Stage2→3 uses SHM.
+    output_connectors:
+      to_stage_3: connector_of_shared_memory
+    model: /workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    default_sampling_params:
+      temperature: 0.5
+      top_k: 50
+      max_tokens: 240
+      min_tokens: 8
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.5
+      top_k: 50
+      top_p: 1.0
+
+  - stage_id: 3
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.15
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 16384
+    max_model_len: 16384
+    devices: "0"
+    input_connectors:
+      from_stage_2: connector_of_shared_memory
+    model: /workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 16384
       seed: 42
       repetition_penalty: 1.0
-
-platforms:
-  npu:
-    stages:
-      - stage_id: 2
-        enforce_eager: true

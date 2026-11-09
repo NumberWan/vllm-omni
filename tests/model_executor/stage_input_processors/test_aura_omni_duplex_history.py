@@ -53,6 +53,40 @@ def test_asr2aura_supports_video_only_observation() -> None:
     assert next_input["multi_modal_data"].get("image") == ["frame"]
 
 
+def test_asr2aura_forced_user_text_replaces_an_empty_transcript() -> None:
+    drop_session_history("duplex-warmup")
+    prompt = {
+        "additional_information": {
+            "aura_duplex": True,
+            "session_id": "duplex-warmup",
+            "is_speech": True,
+            "aura_forced_user_text": "请只说：暖机完成。",
+            "deferred_multi_modal_data": {"image": ["frame"]},
+        },
+        "multi_modal_data": {},
+    }
+    [next_input] = asr2aura([_source_output("")], prompt=[prompt])
+    assert "请只说：暖机完成。" in next_input["prompt"]
+    drop_session_history("duplex-warmup")
+
+
+def test_asr2aura_forced_user_text_does_not_override_vision_follow() -> None:
+    drop_session_history("duplex-warmup-vision")
+    prompt = {
+        "additional_information": {
+            "aura_duplex": True,
+            "session_id": "duplex-warmup-vision",
+            "is_speech": False,
+            "aura_forced_user_text": "请只说：暖机完成。",
+            "deferred_multi_modal_data": {"image": ["frame"]},
+        },
+        "multi_modal_data": {},
+    }
+    [next_input] = asr2aura([_source_output("noise")], prompt=[prompt])
+    assert "暖机完成" not in next_input["prompt"]
+    drop_session_history("duplex-warmup-vision")
+
+
 def test_asr2aura_duplex_empty_transcript_is_not_a_vision_user_turn() -> None:
     drop_session_history("duplex-vision")
     prompt = {

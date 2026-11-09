@@ -1439,6 +1439,11 @@ class DuplexSessionRunner:
         payload["is_speech"] = (
             False if video_only else overlap_policy.input_looks_like_speech(self.session, event, payload)
         )
+        # The commit buffer rebuilds its payload and would drop this hint.
+        # AURA's warmup probe sets it so Stage1 sees a real request.
+        forced_user_text = event.get("aura_forced_user_text")
+        if isinstance(forced_user_text, str) and forced_user_text.strip():
+            payload["aura_forced_user_text"] = forced_user_text.strip()
         auto_responds = self._session_auto_responds()
         defer_append = False
         buffer_overlap_audio = True

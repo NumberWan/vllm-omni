@@ -67,6 +67,7 @@ class AuraPcmAppendBuffer(PcmAppendBuffer):
         self._frame_queue: list[str] = []
         self._reservations: list[AuraPcmAppendReservation] = []
         self._had_speech = False
+        self._forced_user_text = ""
 
     @property
     def pending_byte_count(self) -> int:
@@ -79,6 +80,7 @@ class AuraPcmAppendBuffer(PcmAppendBuffer):
         self._frame_queue.clear()
         self._reservations.clear()
         self._had_speech = False
+        self._forced_user_text = ""
 
     def clear_force_listen(self) -> None:
         return
@@ -123,6 +125,9 @@ class AuraPcmAppendBuffer(PcmAppendBuffer):
         self._sample_rate_hz = sample_rate_hz
         self._buffer.extend(raw)
         self._had_speech = self._had_speech or bool(payload.get("is_speech", True))
+        forced = payload.get("aura_forced_user_text")
+        if isinstance(forced, str) and forced.strip() and payload.get("is_speech", True) is not False:
+            self._forced_user_text = forced.strip()
         return None
 
     def prepare_commit(
@@ -158,6 +163,9 @@ class AuraPcmAppendBuffer(PcmAppendBuffer):
             "is_speech": self._had_speech,
             "aura_turn_commit": True,
         }
+        if self._forced_user_text:
+            payload["aura_forced_user_text"] = self._forced_user_text
+        self._forced_user_text = ""
         video_bytes = 0
         if self._frame_queue:
             payload["video_frames"] = list(self._frame_queue)

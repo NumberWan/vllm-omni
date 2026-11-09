@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import binascii
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -144,10 +143,10 @@ def _first_completion(output: object) -> object | None:
     return None
 
 
-# 16 kHz pcm16 of a short spoken request ("请只说：暖机完成。"). A tone is
-# transcribed as an empty string, and an empty request is answered with
-# <|silent|>, which never reaches Talker or Code2Wav.
-_WARMUP_REQUEST_PCM = Path(__file__).with_name("warmup_request.pcm")
+# Spoken request the warmup turn hands to Stage1. A tone is transcribed as an
+# empty string, and an empty request is answered with <|silent|>, which never
+# reaches Talker or Code2Wav. The shared probe still supplies the tone and frame.
+_WARMUP_USER_TEXT = "请只说：暖机完成。"
 
 
 class AuraDuplexPlugin(DuplexModelPlugin):
@@ -164,15 +163,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         self._profile = AURA_V1
 
     def startup_warmup_turn(self) -> dict[str, object] | None:
-        pcm = _WARMUP_REQUEST_PCM.read_bytes()
-        if not pcm:
-            return None
-        return {
-            "audio": base64.b64encode(pcm).decode("ascii"),
-            "format": "pcm16",
-            "sample_rate_hz": 16000,
-            "is_speech": True,
-        }
+        return {"user_text": _WARMUP_USER_TEXT}
 
     def _default_system_prompt(self) -> str:
         if self._profile is AURA_V2:
@@ -303,6 +294,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             "tts_language": runtime_config.get("tts_language", "Chinese"),
             "tts_speaker": runtime_config.get("tts_speaker", "Vivian"),
         }
+        forced_user_text = payload.get("aura_forced_user_text")
+        if isinstance(forced_user_text, str) and forced_user_text.strip() and is_speech:
+            additional_information["aura_forced_user_text"] = forced_user_text.strip()
         item_id = payload.get("realtime_item_id")
         if isinstance(item_id, str) and item_id:
             additional_information["realtime_item_id"] = item_id

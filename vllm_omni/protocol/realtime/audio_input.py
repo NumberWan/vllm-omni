@@ -68,6 +68,9 @@ REALTIME_INPUT_HINT_KEYS = (
     "force_listen",
     "text",
     "transcript",
+    # AURA startup warmup: the user turn Stage1 should see when ASR of the
+    # probe tone would be empty. Other models ignore it.
+    "aura_forced_user_text",
 )
 
 
@@ -248,7 +251,7 @@ def decode_audio_append(
             audio_bytes = base64.b64decode(cast("str", audio), validate=True)
         except (binascii.Error, ValueError) as exc:
             raise RealtimeProtocolError("input audio is not valid base64", code="bad_audio", event_id=event_id) from exc
-    hints: dict[str, object] = {}
+    hints = {}
     if hints_source is not None:
         copy_realtime_input_hints(hints_source, hints)
     copy_realtime_input_hints(event, hints)

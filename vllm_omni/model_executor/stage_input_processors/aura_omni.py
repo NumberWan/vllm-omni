@@ -531,6 +531,15 @@ def asr2aura(
         # Vision-follow: placeholder zeros may ASR into noise; trust client is_speech.
         if additional_info.get("is_speech") is False:
             transcript = ""
+        # Startup warmup: the probe tone transcribes as empty, so Stage1 would
+        # answer <|silent|> and never reach Talker. The probe supplies the request.
+        forced_user_text = additional_info.get("aura_forced_user_text")
+        if (
+            isinstance(forced_user_text, str)
+            and forced_user_text.strip()
+            and additional_info.get("is_speech") is not False
+        ):
+            transcript = forced_user_text.strip()
         multi_modal_data = {}
         source_multi_modal_data = src_prompt.get("multi_modal_data") or {}
         if isinstance(source_multi_modal_data, dict):

@@ -44,18 +44,15 @@ def _encode_audio(audio: object, sample_rate: int, fmt: str, speed: float | None
     return "ZmFrZQ=="
 
 
-def test_aura_warmup_turn_is_spoken_pcm16() -> None:
+def test_aura_warmup_turn_supplies_the_spoken_request() -> None:
     plugin = load_duplex_plugin(
         "vllm_omni.model_executor.models.aura_omni.duplex.plugin.AuraDuplexPlugin",
         _encode_audio,
     )
     turn = plugin.startup_warmup_turn()
     assert turn is not None
-    assert turn["format"] == "pcm16"
-    assert turn["sample_rate_hz"] == 16000
-    pcm = base64.b64decode(str(turn["audio"]))
-    assert len(pcm) > 16000 and len(pcm) % 2 == 0
-    assert any(pcm)
+    assert turn["user_text"] == "请只说：暖机完成。"
+    assert "audio" not in turn
 
 
 def test_load_aura_duplex_plugin_and_sampling_arity() -> None:
@@ -117,6 +114,25 @@ def test_commit_only_buffer_emits_on_commit() -> None:
     assert commit.payload.get("aura_turn_commit") is True
     assert commit.payload.get("video_frames") == ["aGVsbG8="]
     commit.commit()
+
+
+def test_commit_buffer_keeps_forced_user_text() -> None:
+    buf = AuraPcmAppendBuffer()
+    samples = np.zeros(1600, dtype="<f4")
+    payload = {
+        "type": "audio",
+        "format": "pcm_f32le",
+        "sample_rate_hz": 16000,
+        "audio": base64.b64encode(samples.tobytes()).decode("ascii"),
+        "is_speech": True,
+        "aura_forced_user_text": "请只说：暖机完成。",
+    }
+    assert buf.prepare_append(payload, operation_id="op1", chunk_period_ms=1000, allow_emit=True) is None
+    commit = buf.prepare_commit(operation_id="c1", chunk_period_ms=1000)
+    assert commit.payload is not None
+    assert commit.payload.get("aura_forced_user_text") == "请只说：暖机完成。"
+    again = buf.prepare_commit(operation_id="c2", chunk_period_ms=1000)
+    assert again.payload is None or "aura_forced_user_text" not in (again.payload or {})
 
 
 def test_commit_reservation_includes_video_bytes() -> None:

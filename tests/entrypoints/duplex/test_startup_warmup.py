@@ -65,6 +65,17 @@ def test_plugin_warmup_turn_replaces_the_shared_tone() -> None:
     assert turn["video_frames"]
 
 
+def test_plugin_user_text_keeps_the_shared_tone() -> None:
+    class _Plugin:
+        def startup_warmup_turn(self) -> dict[str, object]:
+            return {"user_text": "请只说：暖机完成。"}
+
+    turn = video_warmup_turn(_Plugin())
+    assert turn["format"] == "pcm_f32le"
+    assert turn["audio"] == _short_pcm_f32le_b64()
+    assert turn["user_text"] == "请只说：暖机完成。"
+
+
 def test_incomplete_plugin_warmup_turn_keeps_the_shared_tone() -> None:
     class _Plugin:
         def startup_warmup_turn(self) -> dict[str, object]:

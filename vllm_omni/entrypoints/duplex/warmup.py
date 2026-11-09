@@ -113,15 +113,29 @@ _DEFAULT_SILENCE_SAMPLES = 16000
 _DEFAULT_SILENCE_SAMPLE_RATE_HZ = 16000
 
 
+def _warmup_user_text(candidate: object) -> str:
+    if not isinstance(candidate, dict):
+        return ""
+    text = candidate.get("user_text")
+    return text.strip() if isinstance(text, str) else ""
+
+
 def video_warmup_turn(plugin: object | None) -> dict[str, object]:
     """The one append a video-required warmup sends.
 
     ``audio`` is base64. A plugin ``startup_warmup_turn`` replaces the shared
     tone when it returns audio and a format; anything incomplete keeps the tone.
+    ``user_text`` is kept either way: a model that treats an empty transcript as
+    silence puts the request here instead of depending on ASR of the tone.
     The shared frame and instructions fill keys the plugin leaves out.
     """
     factory = getattr(plugin, "startup_warmup_turn", None)
-    candidate = factory() if callable(factory) else None
+    try:
+        candidate = factory() if callable(factory) else None
+    except Exception:
+        logger.exception("Duplex warmup turn factory failed; using the shared tone.")
+        candidate = None
+    user_text = _warmup_user_text(candidate)
     if (
         isinstance(candidate, dict)
         and isinstance(candidate.get("audio"), str)
@@ -132,7 +146,7 @@ def video_warmup_turn(plugin: object | None) -> dict[str, object]:
         rate = candidate.get("sample_rate_hz", _WARMUP_SAMPLE_RATE_HZ)
         frames = candidate.get("video_frames")
         instructions = candidate.get("instructions")
-        return {
+        turn = {
             "audio": candidate["audio"],
             "format": candidate["format"],
             "sample_rate_hz": int(rate) if isinstance(rate, int) else _WARMUP_SAMPLE_RATE_HZ,
@@ -142,14 +156,25 @@ def video_warmup_turn(plugin: object | None) -> dict[str, object]:
                 instructions if isinstance(instructions, str) and instructions.strip() else _WARMUP_INSTRUCTIONS
             ),
         }
-    return {
-        "audio": _short_pcm_f32le_b64(),
-        "format": "pcm_f32le",
-        "sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ,
-        "is_speech": True,
-        "video_frames": [_warmup_jpeg_b64()],
-        "instructions": _WARMUP_INSTRUCTIONS,
-    }
+    else:
+        turn = {
+            "audio": _short_pcm_f32le_b64(),
+            "format": "pcm_f32le",
+            "sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ,
+            "is_speech": True,
+            "video_frames": [_warmup_jpeg_b64()],
+            "instructions": _WARMUP_INSTRUCTIONS,
+        }
+    if user_text:
+        turn["user_text"] = user_text
+    return turn
+
+
+def _warmup_forced_user_text(turn: dict[str, object]) -> dict[str, str]:
+    text = turn.get("user_text")
+    if isinstance(text, str) and text.strip():
+        return {"aura_forced_user_text": text.strip()}
+    return {}
 
 
 def warmup_output_kind(event: object) -> str | None:
@@ -292,7 +317,8 @@ async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None,
             for _ in range(1 if kind == "video_turn" else warmup_frames):
                 if pump.done():
                     pump.result()
-                await asyncio.wait_for(handle.append_audio(audio, **append_kwargs), timeout=30)
+                hints = _warmup_forced_user_text(turn) if kind == "video_turn" else None
+                await asyncio.wait_for(handle.append_audio(audio, hints=hints or None, **append_kwargs), timeout=30)
                 if kind != "video_turn":
                     await asyncio.sleep(0.08)
             if not native_append:
@@ -436,18 +462,16 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
                 logger.warning("Duplex warmup: no session.created within 30 s; aborting warmup.")
                 return
             if spoken_turn is not None:
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "input_audio_buffer.append",
-                            "audio": spoken_turn["audio"],
-                            "format": spoken_turn["format"],
-                            "sample_rate_hz": spoken_turn["sample_rate_hz"],
-                            "is_speech": spoken_turn["is_speech"],
-                            "video_frames": spoken_turn["video_frames"],
-                        }
-                    )
-                )
+                append_event: dict[str, object] = {
+                    "type": "input_audio_buffer.append",
+                    "audio": spoken_turn["audio"],
+                    "format": spoken_turn["format"],
+                    "sample_rate_hz": spoken_turn["sample_rate_hz"],
+                    "is_speech": spoken_turn["is_speech"],
+                    "video_frames": spoken_turn["video_frames"],
+                }
+                append_event.update(_warmup_forced_user_text(spoken_turn))
+                await ws.send(json.dumps(append_event))
                 sent = 1
             else:
                 while sent < warmup_frames:
