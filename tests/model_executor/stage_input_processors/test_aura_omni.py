@@ -286,8 +286,11 @@ def test_aura2tts_speaks_only_the_prose_prefix_before_a_tool_call():
 
 def test_normalize_asr_transcript_strips_qwen3_asr_markup() -> None:
     raw = "language Chinese<asr_text>出现《古韵》这本书的时候，提醒我。"
-    assert _normalize_asr_transcript(raw) == "出现《古韵》这本书的时候，提醒我。"
-    assert _normalize_asr_transcript("出现古韵这本书的时候提醒我。") == "出现古韵这本书的时候提醒我。"
+    assert _normalize_asr_transcript(raw) == "出现《古韵》这本书的时候，提醒我"
+    assert _normalize_asr_transcript("出现古韵这本书的时候提醒我。") == "出现古韵这本书的时候提醒我"
+    assert _normalize_asr_transcript("你好！？") == "你好"
+    assert _normalize_asr_transcript("see you...") == "see you"
+    assert _normalize_asr_transcript("3.14") == "3.14"
 
 
 def test_asr2aura_builds_tools_block_from_additional_info() -> None:

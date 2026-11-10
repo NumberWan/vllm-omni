@@ -516,7 +516,9 @@ def _normalize_asr_transcript(transcript: str) -> str:
             text = parts[2].strip()
         elif len(parts) == 2:
             text = ""
-    return text
+    # Native clean_asr_text drops trailing punctuation only. The same string
+    # is the Stage1 prompt and the user turn stored in session history.
+    return text.rstrip("。！？!?.,；;：:")
 
 
 def asr2aura(
