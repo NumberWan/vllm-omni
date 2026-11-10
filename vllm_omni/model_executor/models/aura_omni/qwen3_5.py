@@ -55,3 +55,7 @@ class AuraQwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
 class AuraQwen3_5ForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     # Stage1 AURA → TTS only needs finished text / token ids.
     requires_full_prefix_cached_hidden_states = False
+    # Qwen3.5 is hybrid (full attention + GDN), so the Omni stage-output cache
+    # refuses it. Native KV + aligned recurrent-state caching still serves the
+    # shared history prefix across turns.
+    uses_native_kv_cache_only = True

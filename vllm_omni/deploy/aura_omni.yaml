@@ -49,9 +49,11 @@ stages:
     gpu_memory_utilization: 0.9
     enforce_eager: false
     trust_remote_code: true
-    # Qwen3.5 hybrid attention has multiple KV groups. Updated main refuses
-    # omni prefix caching unless there is a single full-attention group.
-    enable_prefix_caching: false
+    # Qwen3.5 hybrid attention has multiple KV groups, which the Omni
+    # stage-output cache refuses. The model sets uses_native_kv_cache_only, so
+    # this turns on vLLM's native KV + aligned GDN-state prefix cache only
+    # (vLLM derives mamba_cache_mode=align from this flag).
+    enable_prefix_caching: true
     # Two-token logits reads the live output list; async can leave it stale.
     async_scheduling: false
     max_model_len: 65536
