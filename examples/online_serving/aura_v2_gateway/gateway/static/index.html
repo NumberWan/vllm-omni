@@ -1,0 +1,1708 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no,viewport-fit=cover">
+<title>Aura - 视频通话</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{
+  width:100%;
+  height:100%;
+  height:100dvh;
+  overflow:hidden;
+  overscroll-behavior:none;
+  background:#000;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  color:#fff;
+  touch-action:manipulation;
+}
+#app{position:fixed;inset:0;width:100%;height:100%;overflow:hidden}
+
+#cameraVideo{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:0;background:#000}
+#highlightLayer{position:absolute;inset:0;z-index:10;pointer-events:none;overflow:hidden}
+#drawCanvas{position:absolute;inset:0;width:100%;height:100%;z-index:15;pointer-events:none;touch-action:none}
+#app.drawing #drawCanvas{pointer-events:auto;cursor:crosshair}
+#app.drawing #chatScroll{pointer-events:none}
+#drawTools{display:flex;align-items:center;justify-content:center;gap:10px}
+#drawTools button{min-height:40px;padding:0 14px;border-radius:20px;border:1px solid rgba(255,255,255,.25);background:rgba(0,0,0,.6);color:#fff;font-size:14px;cursor:pointer;touch-action:manipulation}
+#drawToggleBtn[aria-pressed="true"]{background:#a51f2b;border-color:#ff6262}
+#drawTools button:disabled{opacity:.4;cursor:default}
+#drawHint{position:absolute;z-index:25;top:max(48px,calc(env(safe-area-inset-top,0px) + 36px));left:50%;transform:translateX(-50%);max-width:90%;padding:6px 12px;border-radius:12px;background:rgba(0,0,0,.65);font-size:12px;text-align:center;pointer-events:none}
+#drawHint:empty{display:none}
+.highlight-box{position:absolute;border:3px solid #ffeb3b;border-radius:10px;box-shadow:0 0 0 9999px rgba(0,0,0,0.08),0 0 24px rgba(255,235,59,0.65);animation:highlightPulse .9s ease-in-out infinite alternate;transform-origin:center center}
+.highlight-label{position:absolute;left:0;top:-30px;max-width:min(220px,100%);padding:4px 8px;border-radius:999px;background:rgba(0,0,0,0.72);color:#ffeb3b;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.highlight-label.inside{top:6px;left:6px}
+
+#permOverlay{z-index:100;position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#1a1a2e;gap:24px;padding:max(24px,env(safe-area-inset-top,0px)) max(24px,env(safe-area-inset-right,0px)) max(24px,env(safe-area-inset-bottom,0px)) max(24px,env(safe-area-inset-left,0px))}
+#permOverlay.hidden{display:none}
+#permOverlay h1{font-size:28px;font-weight:600;color:#667eea}
+#permOverlay p{color:#aaa;font-size:14px;text-align:center;max-width:min(320px,100%);line-height:1.6;padding:0 8px}
+.btn-primary{padding:14px 48px;border-radius:40px;border:none;font-size:18px;font-weight:600;color:#fff;cursor:pointer;background:#667eea;transition:opacity .15s}
+.btn-primary:hover{opacity:.85}
+
+#settingsPanel{
+  z-index:50;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  background:rgba(30,30,50,0.85);backdrop-filter:blur(20px);border-radius:20px;
+  padding:28px 22px;width:min(440px,calc(100% - 24px - env(safe-area-inset-left,0px) - env(safe-area-inset-right,0px)));
+  max-height:calc(100% - 24px - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px));
+  overflow-y:auto;-webkit-overflow-scrolling:touch;
+  border:1px solid rgba(255,255,255,0.1);display:flex;flex-direction:column;gap:18px
+}
+#settingsPanel.hidden{display:none}
+#settingsPanel h2{text-align:center;font-size:20px;font-weight:500;color:#ddd}
+.setting-row{display:flex;justify-content:space-between;align-items:center;gap:12px;min-width:0}
+.setting-row label{font-size:14px;color:#aaa;flex-shrink:0}
+.setting-row select{padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.08);color:#fff;font-size:14px;outline:none;max-width:58%;min-width:0}
+.setting-row select option{background:#1a1a2e}
+.setting-row input[type="checkbox"]{width:18px;height:18px;accent-color:#667eea;cursor:pointer;flex-shrink:0}
+.setting-stack{display:flex;flex-direction:column;gap:8px;min-width:0}
+.setting-stack label{font-size:14px;color:#aaa}
+.setting-stack select{width:100%;max-width:none;padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.08);color:#fff;font-size:14px;outline:none}
+.setting-stack select option{background:#1a1a2e}
+.setting-stack textarea{width:100%;min-height:108px;resize:vertical;padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.14);background:rgba(0,0,0,0.25);color:rgba(255,255,255,0.72);font-size:12px;line-height:1.45;outline:none;font-family:inherit}
+#callBtn{width:100%;padding:14px;border-radius:40px;border:none;font-size:18px;font-weight:600;color:#fff;cursor:pointer;background:#4CAF50;transition:opacity .15s;margin-top:4px}
+#callBtn:disabled{opacity:0.5;cursor:not-allowed}
+
+#statusBadge{z-index:40;position:absolute;top:max(12px,env(safe-area-inset-top,12px));right:max(12px,env(safe-area-inset-right,12px));padding:4px 10px;border-radius:12px;font-size:11px;background:rgba(0,0,0,0.45);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.08);display:none;color:rgba(255,255,255,0.6)}
+#statusBadge.connected{color:rgba(255,255,255,0.8);border-color:rgba(76,175,80,0.4)}
+#statusBadge .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;vertical-align:middle;background:rgba(255,255,255,0.3)}
+#statusBadge.connected .dot{background:#4CAF50;animation:pulse 2s infinite}
+
+#chatPanel{z-index:20;position:absolute;left:0;bottom:0;width:100%;max-height:60vh;display:flex;flex-direction:column;pointer-events:none;padding:0 max(20px,env(safe-area-inset-right,20px)) 0 max(20px,env(safe-area-inset-left,20px))}
+#chatPanel:not(.active){display:none}
+#chatScroll{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding-bottom:120px;width:100%;max-width:900px;margin:0 auto;pointer-events:auto;-webkit-overflow-scrolling:touch;scroll-behavior:smooth}
+#chatScroll::-webkit-scrollbar{width:4px}
+#chatScroll::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.15);border-radius:4px}
+
+.msg{max-width:80%;padding:8px 16px;border-radius:12px;font-size:17px;line-height:1.5;word-break:break-word;animation:fadeIn .25s;background:rgba(0,0,0,0.6)}
+.msg.user{align-self:flex-end;color:#fff;border-bottom-right-radius:4px;border-right:3px solid rgba(102,126,234,0.6)}
+.msg.assistant{align-self:flex-start;color:#fff;border-bottom-left-radius:4px;border-left:3px solid rgba(255,255,255,0.3)}
+.msg.tool{align-self:flex-start;background:rgba(0,0,0,0.5);color:rgba(255,255,255,0.6);font-size:12px;padding:5px 12px;border-left:2px solid #ffc107;border-radius:4px 10px 10px 4px;max-width:85%}
+.msg.tool .tool-name{font-weight:600;color:#ffc107}
+.msg.tool .tool-status{color:rgba(255,255,255,0.35);font-size:10px;margin-left:4px}
+.msg.tool .tool-output{padding-top:3px;color:rgba(255,255,255,0.5);font-size:10px;white-space:pre-wrap;max-height:80px;overflow-y:auto}
+.msg.error{align-self:flex-start;background:rgba(0,0,0,0.6);color:#ef5350;border-left:2px solid #ef5350;border-radius:4px 10px 10px 4px;font-size:13px;max-width:85%}
+
+.tool-spinner{display:inline-block;width:10px;height:10px;border:2px solid rgba(255,193,7,0.2);border-top-color:#ffc107;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px}
+.tool-done{color:#81c784;margin-right:3px;font-weight:bold;font-size:13px}
+
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+@keyframes highlightPulse{from{transform:scale(1);opacity:.92}to{transform:scale(1.015);opacity:1}}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+#controls{z-index:30;position:absolute;bottom:0;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:14px;padding-bottom:max(24px,env(safe-area-inset-bottom,24px));padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px);width:100%;max-width:100%;pointer-events:none}
+#controls:not(.active){display:none}
+#controls>*{pointer-events:auto}
+
+#controlsRow{display:flex;align-items:center;justify-content:center;gap:24px;flex-wrap:wrap;padding:0 12px}
+
+#pttBtn{min-width:140px;height:52px;padding:0 32px;border-radius:26px;border:none;background:rgba(255,255,255,0.92);color:#333;font-size:17px;font-weight:600;letter-spacing:1px;cursor:pointer;transition:all .15s;user-select:none;-webkit-user-select:none;touch-action:manipulation;box-shadow:0 2px 12px rgba(0,0,0,0.3)}
+#pttBtn:active{transform:scale(0.96)}
+#pttBtn.recording{background:#e53935;color:#fff;box-shadow:0 0 28px rgba(229,57,53,0.45)}
+
+#endCallBtn{min-width:72px;height:48px;padding:0 20px;border-radius:24px;border:none;background:#e53935;color:#fff;font-size:15px;font-weight:600;letter-spacing:1px;cursor:pointer;transition:all .15s;box-shadow:0 2px 12px rgba(229,57,53,0.35)}
+#endCallBtn:active{transform:scale(0.94);opacity:.85}
+
+#flipBtn,#textBtn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.55);font-size:16px;cursor:pointer;transition:all .15s;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+#flipBtn:active,#textBtn:active{background:rgba(255,255,255,0.15)}
+#textBtn.active{background:rgba(102,126,234,0.35);border-color:rgba(102,126,234,0.6);color:#fff}
+
+#textInputRow{display:none;align-items:center;gap:8px;width:100%;max-width:560px;padding:0 12px}
+#textInputRow.active{display:flex}
+#textInput{flex:1;min-width:0;height:44px;padding:0 16px;border-radius:22px;border:1px solid rgba(255,255,255,0.18);background:rgba(0,0,0,0.55);backdrop-filter:blur(8px);color:#fff;font-size:16px;outline:none}
+#textInput::placeholder{color:rgba(255,255,255,0.4)}
+#textInput:focus{border-color:rgba(102,126,234,0.7)}
+#sendTextBtn{height:44px;padding:0 18px;border-radius:22px;border:none;background:#667eea;color:#fff;font-size:15px;font-weight:600;cursor:pointer;flex-shrink:0;transition:all .15s}
+#sendTextBtn:active{transform:scale(0.96);opacity:.85}
+
+#callHistory{z-index:40;position:absolute;top:max(12px,env(safe-area-inset-top,12px));left:max(12px,env(safe-area-inset-left,12px));padding:4px 10px;border-radius:12px;font-size:11px;background:rgba(0,0,0,0.35);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.06);display:none;color:rgba(255,255,255,0.5);gap:4px;align-items:center}
+#asrTiming{z-index:45;position:absolute;top:calc(max(12px,env(safe-area-inset-top,12px)) + 28px);left:max(12px,env(safe-area-inset-left,12px));padding:3px 8px;border-radius:10px;font-size:10px;background:rgba(0,0,0,0.5);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.08);display:none;color:rgba(255,255,255,0.5);font-family:monospace;max-width:min(520px,calc(100% - 24px));line-height:1.4}
+#callHistory .num{color:rgba(255,255,255,0.7);font-weight:600}
+#modelBadge{z-index:40;position:absolute;top:max(12px,env(safe-area-inset-top,12px));left:50%;transform:translateX(-50%);padding:4px 14px;border-radius:12px;font-size:12px;background:rgba(0,0,0,0.45);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.08);display:none;color:rgba(255,255,255,0.7);font-weight:500;white-space:nowrap;max-width:calc(100% - 160px);overflow:hidden;text-overflow:ellipsis}
+
+@media (max-width:480px) {
+  #chatPanel{max-height:50vh;padding:0 max(10px,env(safe-area-inset-right,10px)) 0 max(10px,env(safe-area-inset-left,10px))}
+  #chatScroll{padding-bottom:80px}
+  .msg{font-size:14px;padding:6px 12px;max-width:88%}
+  .msg.tool{font-size:10px}
+  #pttBtn{min-width:110px;height:44px;padding:0 20px;font-size:14px}
+  #endCallBtn{min-width:60px;height:42px;padding:0 16px;font-size:13px}
+  #flipBtn,#textBtn{width:34px;height:34px;font-size:14px}
+  #textInput{height:40px;font-size:15px;padding:0 14px}
+  #sendTextBtn{height:40px;padding:0 14px;font-size:14px}
+  #controls{gap:10px;padding-bottom:max(16px,env(safe-area-inset-bottom,16px))}
+  #controlsRow{gap:16px}
+  #settingsPanel{padding:22px 16px;gap:14px;border-radius:16px}
+  #settingsPanel h2{font-size:18px}
+  .setting-row label{font-size:13px}
+  .setting-row select,.setting-stack select{font-size:13px;padding:7px 10px}
+  .setting-stack label{font-size:13px}
+  .setting-stack textarea{font-size:11px;min-height:96px}
+  #callBtn{font-size:16px;padding:12px}
+  .highlight-label{font-size:12px;max-width:min(160px,100%)}
+}
+@media (min-width:768px) {
+  #chatPanel{max-height:65vh}
+  #chatScroll{padding-bottom:140px}
+  .msg{font-size:19px;padding:10px 20px}
+}
+#chatPanel #chatScroll{padding-bottom:var(--control-clearance,170px)}
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div id="permOverlay">
+    <div style="font-size:64px;opacity:0.6">📷</div>
+    <h1>Aura</h1>
+    <p>需要摄像头和麦克风权限以开始视频通话</p>
+    <button class="btn-primary" id="permBtn">允许权限</button>
+  </div>
+
+  <video id="cameraVideo" autoplay playsinline muted></video>
+  <div id="highlightLayer"></div>
+  <canvas id="drawCanvas" aria-hidden="true"></canvas>
+  <div id="drawHint" role="status" aria-live="polite"></div>
+
+  <div id="settingsPanel">
+    <h2>通话设置</h2>
+    <div class="setting-row">
+      <label>发送分辨率</label>
+      <select id="resSelect">
+        <option value="224">224p</option>
+        <option value="480">480p</option>
+        <option value="720" selected>720p (推荐)</option>
+        <option value="1080">1080p</option>
+        <option value="1920">1920p</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <label>发送间隔</label>
+      <select id="intervalSelect">
+        <option value="1" selected>1 秒 (推荐)</option>
+        <option value="1.5">1.5 秒</option>
+        <option value="2">2 秒</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <label>模型选择</label>
+      <select id="modelSelect"></select>
+    </div>
+    <div class="setting-row">
+      <label>每次帧数</label>
+      <select id="framesSelect">
+        <option value="2" selected>2 帧</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <label for="enableToolcall">enable_toolcall</label>
+      <input type="checkbox" id="enableToolcall" checked>
+    </div>
+    <div class="setting-stack">
+      <label for="systemPromptSelect">System Prompt</label>
+      <select id="systemPromptSelect"></select>
+      <textarea id="systemPromptPreview" readonly aria-label="当前 System Prompt"></textarea>
+    </div>
+    <button id="callBtn">📞 拨通电话</button>
+  </div>
+
+  <div id="statusBadge"><span class="dot"></span><span id="statusText">未连接</span></div>
+  <div id="modelBadge"><span id="modelNameText"></span></div>
+  <div id="callHistory">对话 <span class="num" id="msgCount">0</span> 条</div>
+  <div id="asrTiming">ASR: --</div>
+
+  <div id="chatPanel">
+    <div id="chatScroll"></div>
+  </div>
+
+  <div id="controls">
+    <div id="drawTools">
+      <button id="drawToggleBtn" type="button" aria-label="开启或关闭画笔" aria-pressed="false">✎ 画笔</button>
+      <button id="clearDrawBtn" type="button" aria-label="清除全部笔迹" disabled>清除</button>
+    </div>
+    <div id="textInputRow">
+      <input id="textInput" type="text" placeholder="输入文字..." autocomplete="off" enterkeyhint="send">
+      <button id="sendTextBtn">发送</button>
+    </div>
+    <div id="controlsRow">
+      <button id="textBtn" title="文字输入">⌨</button>
+      <button id="flipBtn">⇄</button>
+      <button id="endCallBtn">挂断</button>
+      <button id="pttBtn">按住说话</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ============================================================
+   STATE
+   ============================================================ */
+const state = {
+  ws: null,
+  stream: null,
+  connected: false,
+  inCall: false,
+  sessionId: '',
+  chunkSeq: 0,
+  audioTurnId: null,
+  interruptedAudioTurnId: null,
+  msgCount: 0,
+  pendingToolMsg: {},
+  availableModels: [],
+  videoChunkGeometry: {},
+  latestVideoChunkId: null,
+  latestVideoTimestampMs: -1,
+  lastAudioSendTs: 0,
+};
+
+/* ============================================================
+   DOM REFS
+   ============================================================ */
+const $ = id => document.getElementById(id);
+const cameraVideo = $('cameraVideo');
+const highlightLayer = $('highlightLayer');
+const permOverlay  = $('permOverlay');
+const permBtn      = $('permBtn');
+const settingsPnl  = $('settingsPanel');
+const callBtn      = $('callBtn');
+const chatPanel    = $('chatPanel');
+const chatScroll   = $('chatScroll');
+const controls     = $('controls');
+const pttBtn       = $('pttBtn');
+const endCallBtn   = $('endCallBtn');
+const flipBtn      = $('flipBtn');
+const textBtn      = $('textBtn');
+const textInputRow = $('textInputRow');
+const textInput    = $('textInput');
+const sendTextBtn  = $('sendTextBtn');
+const statusBdg    = $('statusBadge');
+const statusText   = $('statusText');
+const modelBadge   = $('modelBadge');
+const modelNameText = $('modelNameText');
+const callHist     = $('callHistory');
+const asrTiming    = $('asrTiming');
+const msgCountEl   = $('msgCount');
+const intervalSelect = $('intervalSelect');
+const framesSelect   = $('framesSelect');
+const resSelect      = $('resSelect');
+const modelSelect    = $('modelSelect');
+const enableToolcall = $('enableToolcall');
+const systemPromptSelect = $('systemPromptSelect');
+const systemPromptPreview = $('systemPromptPreview');
+
+// Keep the last message above the drawing tools and the optional text input.
+const controlsObserver = new ResizeObserver(() => {
+  const height = controls.getBoundingClientRect().height;
+  if (!height) return;
+  chatPanel.style.setProperty('--control-clearance', `${height + 12}px`);
+  requestAnimationFrame(() => {
+    chatScroll.scrollTo({ top: chatScroll.scrollHeight, behavior: 'instant' });
+  });
+});
+controlsObserver.observe(controls);
+
+const SYSTEM_PROMPT_PRESETS = [
+  {
+    label: '回复时输出 <|respond|>',
+    text: 'You are a real-time multimodal AI companion in a live video conversation with the user. You are receiving a live video stream where the final frame is the present moment. Decide whether a response is needed based on the user\'s message or the visual context. If a response is needed, output `<|respond|>` followed immediately by the response content. If no response is needed, output exactly `<|silent|>` to signify silence.',
+  },
+  {
+    label: '需要时直接回复（默认）',
+    text: 'You are receiving a live video stream where the final frame is the present moment. Respond only when a response is needed based on the user\'s message or the visual context. Otherwise, output `<|silent|>` to signify silence.',
+  },
+];
+
+function initSystemPrompts() {
+  SYSTEM_PROMPT_PRESETS.forEach((preset, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = preset.label;
+    systemPromptSelect.appendChild(opt);
+  });
+  systemPromptSelect.value = '0';
+  syncSystemPromptPreview();
+  systemPromptSelect.addEventListener('change', syncSystemPromptPreview);
+}
+
+function syncSystemPromptPreview() {
+  const idx = parseInt(systemPromptSelect.value, 10) || 0;
+  systemPromptPreview.value = SYSTEM_PROMPT_PRESETS[idx]?.text || '';
+}
+
+function selectedSystemPrompt() {
+  const idx = parseInt(systemPromptSelect.value, 10) || 0;
+  return SYSTEM_PROMPT_PRESETS[idx]?.text || '';
+}
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+function uuid() { return state.sessionId; }
+function ts() { return Date.now(); }
+function nextChunkId() {
+  state.chunkSeq += 1;
+  return state.chunkSeq;
+}
+
+function isGpuBurner(m) {
+  const id = String(m?.id || '').toLowerCase();
+  const name = String(m?.name || '').toLowerCase();
+  return id === 'gpu-burner' || name === 'gpu-burner' || name.includes('gpu_burner') || name.includes('gpu-burner');
+}
+
+async function fetchModels() {
+  try {
+    const resp = await fetch('/models');
+    const models = await resp.json();
+    state.availableModels = (Array.isArray(models) ? models : []).filter(m => !isGpuBurner(m));
+    modelSelect.innerHTML = '';
+    state.availableModels.forEach((m, i) => {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = m.native ? (m.name + '（原生）') : m.name;
+      modelSelect.appendChild(opt);
+    });
+  } catch (e) {
+    console.warn('Failed to fetch models:', e);
+    modelSelect.innerHTML = '<option value="0">默认模型</option>';
+  }
+}
+
+function wsUrl() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${proto}//${location.host}/ws`;
+  const params = new URLSearchParams();
+  const modelIdx = parseInt(modelSelect.value) || 0;
+  const model = state.availableModels[modelIdx];
+  if (model?.name) {
+    params.set('model_name', model.name);
+  }
+  params.set('enable_toolcall', enableToolcall.checked ? 'true' : 'false');
+  const systemPrompt = selectedSystemPrompt();
+  if (systemPrompt) params.set('system_prompt', systemPrompt);
+  return `${url}?${params}`;
+}
+
+function sendMsg(type, data) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  if (!state.sessionId) return;
+  const now = ts();
+  const msg = {
+    direction: 'upstream',
+    type,
+    session_id: uuid(),
+    chunk_id: nextChunkId(),
+    video_timestamp_ms: state.callStartTs != null ? now - state.callStartTs : 0,
+    wall_time_ms: now,
+    data,
+  };
+  state.ws.send(JSON.stringify(msg));
+  return msg;
+}
+
+/* ============================================================
+   PERMISSION
+   ============================================================ */
+async function requestMedia() {
+  const originalText = permBtn.textContent;
+  permBtn.disabled = true;
+  permBtn.textContent = '请求权限中...';
+
+  try {
+    state.stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 }, facingMode: { ideal: 'environment' } },
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+    cameraVideo.srcObject = state.stream;
+    permOverlay.classList.add('hidden');
+    settingsPnl.classList.remove('hidden');
+  } catch (e) {
+    alert('无法获取摄像头/麦克风权限: ' + e.message);
+  } finally {
+    permBtn.disabled = false;
+    permBtn.textContent = originalText;
+  }
+}
+
+permBtn.addEventListener('click', requestMedia);
+
+/* ============================================================
+   SCREEN ANNOTATIONS — source-frame coordinates, cached raster output
+   ============================================================ */
+const drawCanvas = $('drawCanvas');
+const drawCtx = drawCanvas.getContext('2d');
+const drawToggleBtn = $('drawToggleBtn');
+const clearDrawBtn = $('clearDrawBtn');
+const drawHint = $('drawHint');
+const DRAW_COLOR = '#ff2d2d';
+const MAX_DRAW_POINTS = 12000;
+const drawing = {
+  mode: false, pointerId: null, stroke: null, strokes: [], points: 0,
+  revision: 0, generation: 0, sourceAspect: 0, layoutKey: '',
+  dirty: new Map(), raf: null, fullRedraw: true,
+  cache: document.createElement('canvas'), cacheKey: '',
+  pendingTurn: null, hintTimer: null,
+};
+let _queryQueue = Promise.resolve();
+let _samplingTask = null;
+let _textSending = false;
+
+function resetPendingFrames() {
+  _pendingFrames = [];
+  _pendingGeometry = null;
+}
+
+function annotationHint(text) {
+  clearTimeout(drawing.hintTimer);
+  drawHint.textContent = text;
+  drawing.hintTimer = setTimeout(() => {
+    drawHint.textContent = drawing.mode ? '在画面上圈选或写字，再语音或文字提问' : '';
+  }, 3000);
+}
+
+function finishStroke() {
+  const id = drawing.pointerId;
+  drawing.pointerId = null;
+  drawing.stroke = null;
+  if (id !== null && drawCanvas.hasPointerCapture(id)) drawCanvas.releasePointerCapture(id);
+}
+
+function setDrawMode(enabled) {
+  finishStroke();
+  drawing.mode = Boolean(enabled && state.inCall);
+  $('app').classList.toggle('drawing', drawing.mode);
+  drawToggleBtn.setAttribute('aria-pressed', String(drawing.mode));
+  drawToggleBtn.textContent = drawing.mode ? '✓ 画笔' : '✎ 画笔';
+  clearTimeout(drawing.hintTimer);
+  drawHint.textContent = drawing.mode ? '在画面上圈选或写字，再语音或文字提问' : '';
+  scheduleDraw(true);
+}
+
+function clearStrokes() {
+  finishStroke();
+  drawing.generation++;
+  drawing.strokes = [];
+  drawing.points = 0;
+  drawing.revision++;
+  drawing.pendingTurn = null;
+  drawing.dirty.clear();
+  drawing.cacheKey = '';
+  drawing.cache.width = drawing.cache.height = 1;
+  clearDrawBtn.disabled = true;
+  resetPendingFrames();
+  // Clear immediately even when rAF is suspended in a background tab.
+  drawCtx.setTransform(1, 0, 0, 1, 0, 0);
+  drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+  scheduleDraw(true);
+}
+
+function resetAnnotations() {
+  _samplingTask = null;
+  clearStrokes();
+  setDrawMode(false);
+}
+
+function annotationSnapshot() {
+  return {
+    revision: drawing.revision,
+    strokes: drawing.strokes.map(st => ({ width: st.width, points: st.points.slice() })),
+  };
+}
+
+function queryContext() {
+  return { sessionId: state.sessionId, ws: state.ws, generation: drawing.generation };
+}
+
+function queryIsCurrent(context) {
+  return state.inCall && context?.sessionId && context.sessionId === state.sessionId &&
+    context.ws === state.ws && context.ws?.readyState === WebSocket.OPEN &&
+    context.generation === drawing.generation;
+}
+
+function rememberAnnotationQuery(msg, snapshot, context) {
+  if (msg && snapshot.strokes.length && queryIsCurrent(context) && drawing.revision === snapshot.revision) {
+    drawing.pendingTurn = { sessionId: msg.session_id, chunkId: msg.chunk_id,
+      revision: snapshot.revision, generation: context.generation, failed: false };
+  }
+}
+
+function finishAnnotationQuery(msg, failed = false) {
+  const turn = drawing.pendingTurn;
+  if (!turn || msg.session_id !== turn.sessionId || msg.chunk_id !== turn.chunkId) return;
+  if (failed) { turn.failed = true; return; }
+  drawing.pendingTurn = null;
+  if (!turn.failed && turn.generation === drawing.generation &&
+      turn.revision === drawing.revision && drawing.pointerId === null) clearStrokes();
+}
+
+function enqueueQuery(context, task) {
+  const run = _queryQueue.then(async () => {
+    if (!queryIsCurrent(context)) return;
+    try { await task(); }
+    catch (e) {
+      if (queryIsCurrent(context)) addMsg('error', '⚠ 发送失败，已保留笔迹，请重试：' + escapeHtml(e.message));
+    }
+  });
+  _queryQueue = run.catch(() => {});
+  return run;
+}
+
+// Both preview and JPEG are projections of the same source-frame coordinates.
+function paintStroke(ctx, stroke, crop, sourceW, sourceH, width, height, from = 0) {
+  const points = stroke.points;
+  if (!points.length) return;
+  const project = p => ({ x: (p.fx * sourceW - crop.sx) / crop.sw * width,
+    y: (p.fy * sourceH - crop.sy) / crop.sh * height });
+  const lineWidth = Math.max(2, stroke.width * sourceW / crop.sw * width);
+  ctx.strokeStyle = ctx.fillStyle = DRAW_COLOR;
+  ctx.lineWidth = lineWidth;
+  ctx.lineCap = ctx.lineJoin = 'round';
+  if (points.length === 1) {
+    const p = project(points[0]);
+    ctx.beginPath(); ctx.arc(p.x, p.y, lineWidth / 2, 0, 2 * Math.PI); ctx.fill();
+    return;
+  }
+  const start = Math.max(0, from - 1);
+  const p = project(points[start]);
+  ctx.beginPath(); ctx.moveTo(p.x, p.y);
+  for (let i = start + 1; i < points.length; i++) {
+    const q = project(points[i]); ctx.lineTo(q.x, q.y);
+  }
+  ctx.stroke();
+}
+
+function scheduleDraw(full = false) {
+  drawing.fullRedraw ||= full;
+  if (drawing.raf !== null) return;
+  drawing.raf = requestAnimationFrame(renderDrawing);
+}
+
+function renderDrawing() {
+  drawing.raf = null;
+  if (!drawing.mode && !drawing.strokes.length) {
+    drawCanvas.width = drawCanvas.height = 1;
+    return;
+  }
+  const rect = visibleDisplayRect();
+  if (!rect.width || !rect.height) return;
+  // Cap preview DPR at 2; source points and sent JPEG keep their own precision.
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(rect.width * dpr), h = Math.round(rect.height * dpr);
+  if (drawCanvas.width !== w || drawCanvas.height !== h) {
+    drawCanvas.width = w; drawCanvas.height = h; drawing.fullRedraw = true;
+  }
+  const parent = $('app').getBoundingClientRect();
+  Object.assign(drawCanvas.style, { left: `${rect.left - parent.left}px`, top: `${rect.top - parent.top}px`,
+    width: `${rect.width}px`, height: `${rect.height}px` });
+  drawCtx.setTransform(w / rect.width, 0, 0, h / rect.height, 0, 0);
+  const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
+  if (drawing.fullRedraw) drawCtx.clearRect(0, 0, rect.width, rect.height);
+  if (vw && vh) {
+    const crop = coverCropRect(vw, vh, rect.width, rect.height);
+    if (drawing.fullRedraw) {
+      for (const st of drawing.strokes) paintStroke(drawCtx, st, crop, vw, vh, rect.width, rect.height);
+    } else {
+      for (const [st, from] of drawing.dirty) paintStroke(drawCtx, st, crop, vw, vh, rect.width, rect.height, from);
+    }
+  }
+  drawing.dirty.clear();
+  drawing.fullRedraw = false;
+}
+
+function compositeAnnotations(ctx, geometry, snapshot) {
+  if (!snapshot.strokes.length) return;
+  const { frameSize: size, sourceSize: source, crop } = geometry;
+  const key = JSON.stringify([snapshot.revision, size, source, crop]);
+  if (drawing.cacheKey !== key) {
+    const cache = drawing.cache;
+    if (cache.width !== size.width || cache.height !== size.height) {
+      cache.width = size.width; cache.height = size.height;
+    }
+    const layer = cache.getContext('2d');
+    layer.clearRect(0, 0, size.width, size.height);
+    for (const st of snapshot.strokes) paintStroke(layer, st, crop, source.width, source.height, size.width, size.height);
+    drawing.cacheKey = key;
+  }
+  ctx.save();
+  ctx.drawImage(drawing.cache, 0, 0);
+  ctx.restore();
+}
+
+function addDrawPoint(e, first = false) {
+  const rect = visibleDisplayRect();
+  const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
+  if (!rect.width || !rect.height || !vw || !vh) return;
+  const x = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+  const y = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
+  const crop = coverCropRect(vw, vh, rect.width, rect.height);
+  const point = { fx: (crop.sx + x / rect.width * crop.sw) / vw,
+    fy: (crop.sy + y / rect.height * crop.sh) / vh };
+  const st = drawing.stroke;
+  const last = st?.points.at(-1);
+  if (last && Math.hypot((point.fx - last.fx) * vw / crop.sw * rect.width,
+      (point.fy - last.fy) * vh / crop.sh * rect.height) < 1.5) return;
+  if (drawing.points >= MAX_DRAW_POINTS) {
+    annotationHint('笔迹已达上限，请清除后继续'); finishStroke(); return;
+  }
+  if (first) {
+    drawing.stroke = { width: 4 * crop.sw / rect.width / vw, points: [] };
+    drawing.strokes.push(drawing.stroke);
+  }
+  const stroke = drawing.stroke;
+  if (!stroke) return;
+  if (!drawing.dirty.has(stroke)) drawing.dirty.set(stroke, stroke.points.length);
+  stroke.points.push(point);
+  drawing.points++;
+  drawing.revision++;
+  clearDrawBtn.disabled = false;
+  scheduleDraw();
+}
+
+drawCanvas.addEventListener('pointerdown', e => {
+  if (!drawing.mode || !state.inCall || cameraVideo.readyState < 2 ||
+      drawing.pointerId !== null || e.button !== 0) return;
+  e.preventDefault();
+  drawing.pointerId = e.pointerId;
+  drawCanvas.setPointerCapture(e.pointerId);
+  addDrawPoint(e, true);
+});
+drawCanvas.addEventListener('pointermove', e => {
+  if (e.pointerId !== drawing.pointerId) return;
+  e.preventDefault();
+  addDrawPoint(e);
+});
+drawCanvas.addEventListener('pointerup', e => {
+  if (e.pointerId !== drawing.pointerId) return;
+  addDrawPoint(e); finishStroke();
+});
+for (const event of ['pointercancel', 'lostpointercapture']) {
+  drawCanvas.addEventListener(event, e => { if (e.pointerId === drawing.pointerId) finishStroke(); });
+}
+drawToggleBtn.addEventListener('click', () => setDrawMode(!drawing.mode));
+clearDrawBtn.addEventListener('click', () => { clearStrokes(); annotationHint('已清除笔迹'); });
+
+function syncAnnotationGeometry() {
+  const { width, height } = visibleDisplayRect();
+  const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
+  const aspect = vh ? vw / vh : 0;
+  if (aspect && drawing.sourceAspect && Math.abs(aspect - drawing.sourceAspect) > .01) {
+    const hadStrokes = drawing.strokes.length > 0;
+    resetAnnotations();
+    if (hadStrokes) annotationHint('画面方向已改变，请重新标注');
+  }
+  if (aspect) drawing.sourceAspect = aspect;
+  const key = [width, height, vw, vh, window.devicePixelRatio].join(':');
+  if (key !== drawing.layoutKey) {
+    drawing.layoutKey = key;
+    finishStroke();
+    resetPendingFrames();
+    scheduleDraw(true);
+  }
+}
+for (const event of ['loadedmetadata', 'resize']) cameraVideo.addEventListener(event, syncAnnotationGeometry);
+
+/* ============================================================
+   VIDEO CAPTURE
+   ── Canvas-based frame capture: 30fps display, configurable send
+   ── Uniform sampling: capture every (interval/frames) ms
+   ── Sends batch when #frames accumulated == framesPerSend
+   ============================================================ */
+let _frameTimer = null;
+let _frameCanvas = null;
+let _frameCtx = null;
+let _pendingFrames = [];
+let _pendingGeometry = null;
+let _framesPerSend = 2;
+let _sendInterval = 5000;
+let _captureMaxDim = 720;
+
+function captureVideoFrame(snapshot = drawing) {
+  syncAnnotationGeometry();
+  const video = cameraVideo;
+  if (!_frameCanvas || !_frameCtx || video.readyState < 2) return null;
+
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return null;
+
+  const size = captureCanvasSize(_captureMaxDim);
+  if (_frameCanvas.width !== size.width || _frameCanvas.height !== size.height) {
+    _frameCanvas.width = size.width;
+    _frameCanvas.height = size.height;
+  }
+  // Cover-crop the camera frame into a canvas that matches the on-screen
+  // video (object-fit: cover). Model bbox coords are then in visible-screen space.
+  const crop = coverCropRect(vw, vh, _frameCanvas.width, _frameCanvas.height);
+  _frameCtx.drawImage(
+    video,
+    crop.sx, crop.sy, crop.sw, crop.sh,
+    0, 0, _frameCanvas.width, _frameCanvas.height,
+  );
+  const geometry = {
+    displayRect: visibleDisplayRect(),
+    frameSize: { width: _frameCanvas.width, height: _frameCanvas.height },
+    sourceSize: { width: vw, height: vh },
+    crop,
+  };
+  compositeAnnotations(_frameCtx, geometry, snapshot);
+  const dataUrl = _frameCanvas.toDataURL('image/jpeg', 0.7);
+  return {
+    b64: dataUrl.substring(dataUrl.indexOf(';base64,') + 8),
+    geometry,
+  };
+}
+
+function sendVideoPacket(type, frames, geometry, extraData = {}) {
+  if (!geometry || frames.length === 0) return null;
+  const msg = sendMsg(type, {
+    video_url: 'data:video/jpeg;base64,' + frames.join(','),
+    video_width: geometry.frameSize.width,
+    video_height: geometry.frameSize.height,
+    frame_count: frames.length,
+    ...extraData,
+  });
+  if (msg) {
+    rememberVideoChunkGeometry(msg.chunk_id, msg.video_timestamp_ms, geometry);
+  }
+  return msg;
+}
+
+function startVideoCapture() {
+  stopVideoCapture();
+  _sendInterval = (parseFloat(intervalSelect.value) || 1) * 1000;
+  _framesPerSend = parseInt(framesSelect.value) || 2;
+  _captureMaxDim = parseInt(resSelect.value) || 720;
+  const size = captureCanvasSize(_captureMaxDim);
+
+  _frameCanvas = document.createElement('canvas');
+  _frameCanvas.width = size.width;
+  _frameCanvas.height = size.height;
+  _frameCtx = _frameCanvas.getContext('2d');
+  _pendingFrames = [];
+  _pendingGeometry = null;
+
+  // Uniform sampling
+  const captureInterval = Math.round(_sendInterval / _framesPerSend);
+
+  _frameTimer = setInterval(() => {
+    if (_samplingTask || !state.sessionId || document.hidden) return;
+    const frame = captureVideoFrame();
+    if (!frame) return;
+    _pendingFrames.push(frame.b64);
+    _pendingGeometry = frame.geometry;
+
+    if (_pendingFrames.length >= _framesPerSend) {
+      sendVideoPacket('video', _pendingFrames, _pendingGeometry);
+      _pendingFrames = [];
+      _pendingGeometry = null;
+    }
+  }, captureInterval);
+}
+
+function stopVideoCapture() {
+  if (_frameTimer) { clearInterval(_frameTimer); _frameTimer = null; }
+  _frameCanvas = null;
+  _frameCtx = null;
+  _pendingFrames = [];
+  _pendingGeometry = null;
+}
+
+/* ============================================================
+   AUDIO PTT -> WAV (ASR requires WAV)
+   ============================================================ */
+let pttCtx = null, pttSource = null, pttProcessor = null, pcmChunks = [];
+let pttQueryContext = null;
+
+function startPtt() {
+  if (!state.stream || !state.inCall || pttProcessor || !state.sessionId) return;
+  pttQueryContext = queryContext();
+  interruptAudioPlayback();
+  pcmChunks = [];
+  try {
+    pttCtx = new (window.AudioContext || window.webkitAudioContext)();
+    pttSource = pttCtx.createMediaStreamSource(state.stream);
+    pttProcessor = pttCtx.createScriptProcessor(4096, 1, 1);
+    pttSource.connect(pttProcessor);
+    pttProcessor.connect(pttCtx.destination);
+
+    pttProcessor.onaudioprocess = e => {
+      const input = e.inputBuffer.getChannelData(0);
+      const pcm = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        pcm[i] = Math.max(-32768, Math.min(32767, input[i] * 32768));
+      }
+      pcmChunks.push(pcm);
+    };
+
+    pttBtn.classList.add('recording');
+    pttBtn.textContent = '松开发送';
+  } catch (e) {
+    console.warn('PTT start failed:', e);
+  }
+}
+
+function stopPtt(send = true) {
+  if (!pttProcessor) return;
+  pttSource.disconnect();
+  pttProcessor.disconnect();
+  const sampleRate = pttCtx ? pttCtx.sampleRate : 48000;
+  if (pttCtx && pttCtx.state !== 'closed') pttCtx.close();
+  pttCtx = null; pttSource = null; pttProcessor = null;
+
+  pttBtn.classList.remove('recording');
+  pttBtn.textContent = '按住说话';
+
+  const chunks = pcmChunks;
+  pcmChunks = [];
+  if (send !== false && chunks.length && queryIsCurrent(pttQueryContext)) {
+    sendWavAudio(chunks, sampleRate, pttQueryContext);
+  }
+  pttQueryContext = null;
+}
+
+function nextVideoFrame(timeoutMs) {
+  return new Promise(resolve => {
+    let callback = null;
+    const finish = ready => {
+      clearTimeout(timer);
+      if (callback !== null) cameraVideo.cancelVideoFrameCallback(callback);
+      resolve(ready);
+    };
+    const timer = setTimeout(() => finish(!cameraVideo.requestVideoFrameCallback), timeoutMs);
+    if (cameraVideo.requestVideoFrameCallback) {
+      callback = cameraVideo.requestVideoFrameCallback(() => finish(true));
+    }
+  });
+}
+
+async function collectMultimodalFrames(snapshot, context, minFrames = 2) {
+  syncAnnotationGeometry();
+  if (!queryIsCurrent(context)) return null;
+  // Annotated questions always get fresh frames sharing an immutable drawing.
+  const frames = snapshot.strokes.length ? [] : _pendingFrames.slice();
+  let geometry = snapshot.strokes.length ? null : _pendingGeometry;
+  resetPendingFrames();
+  const task = {};
+  _samplingTask = task;
+  const deadline = Date.now() + 1000;
+  let lastFrameTime = null;
+  try {
+    while (frames.length < minFrames && queryIsCurrent(context) && Date.now() < deadline && !document.hidden) {
+      if (frames.length) {
+        const ready = await nextVideoFrame(Math.min(100, Math.max(1, deadline - Date.now())));
+        if (!ready) continue;
+        if (!queryIsCurrent(context) || Date.now() >= deadline || document.hidden) break;
+        if (cameraVideo.currentTime === lastFrameTime) continue;
+      }
+      const frame = captureVideoFrame(snapshot);
+      if (!queryIsCurrent(context)) return null;
+      if (frame) {
+        if (geometry && JSON.stringify(geometry) !== JSON.stringify(frame.geometry)) frames.length = 0;
+        frames.push(frame.b64);
+        geometry = frame.geometry;
+        lastFrameTime = cameraVideo.currentTime;
+      }
+      if (!frame) await nextVideoFrame(100);
+    }
+    return frames.length >= minFrames && geometry && queryIsCurrent(context) ? { frames, geometry } : null;
+  } finally {
+    if (_samplingTask === task) _samplingTask = null;
+  }
+}
+
+async function sendWavAudio(chunks, sampleRate, context = queryContext()) {
+  const snapshot = annotationSnapshot();
+  if (snapshot.strokes.length) drawing.pendingTurn = null;
+  return enqueueQuery(context, async () => {
+    let totalLen = 0;
+    for (const c of chunks) totalLen += c.length;
+    const allPcm = new Int16Array(totalLen);
+    let offset = 0;
+    for (const c of chunks) { allPcm.set(c, offset); offset += c.length; }
+
+    const dataLen = allPcm.length * 2;
+    const buf = new ArrayBuffer(44 + dataLen);
+    const dv = new DataView(buf);
+    function w(off, s) { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); }
+    w(0, 'RIFF'); dv.setUint32(4, 36 + dataLen, true); w(8, 'WAVE'); w(12, 'fmt ');
+    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, sampleRate, true); dv.setUint32(28, sampleRate * 2, true);
+    dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    w(36, 'data'); dv.setUint32(40, dataLen, true);
+    for (let i = 0; i < allPcm.length; i++) dv.setInt16(44 + i * 2, allPcm[i], true);
+
+    const blob = new Blob([buf], { type: 'audio/wav' });
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('音频编码失败，请重新录音'));
+      reader.readAsDataURL(blob);
+    });
+    if (!queryIsCurrent(context)) return;
+    const video = await collectMultimodalFrames(snapshot, context);
+    if (!queryIsCurrent(context)) return;
+    if (!video) throw new Error('无法截取至少 2 帧视频，请重新录音');
+    const idx = dataUrl.indexOf(';base64,');
+    const b64 = idx >= 0 ? dataUrl.substring(idx + 8) : dataUrl.split(',').pop();
+    state.lastAudioSendTs = Date.now();
+    const msg = sendVideoPacket('multimodal', video.frames, video.geometry, { audio_b64: b64 });
+    if (!msg) throw new Error('连接已断开，请重新录音');
+    rememberAnnotationQuery(msg, snapshot, context);
+  });
+}
+
+pttBtn.addEventListener('mousedown', e => { e.preventDefault(); startPtt(); });
+pttBtn.addEventListener('mouseup', stopPtt);
+pttBtn.addEventListener('mouseleave', stopPtt);
+pttBtn.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (!window._pttTouch) { window._pttTouch = true; startPtt(); }
+});
+pttBtn.addEventListener('touchend', () => { window._pttTouch = false; stopPtt(); });
+pttBtn.addEventListener('touchcancel', () => { window._pttTouch = false; stopPtt(); });
+
+/* ============================================================
+   TEXT QUERY
+   ── Annotated questions carry their own fresh video frames.
+   ============================================================ */
+function toggleTextInput(show) {
+  const visible = show === undefined ? !textInputRow.classList.contains('active') : show;
+  textInputRow.classList.toggle('active', visible);
+  textBtn.classList.toggle('active', visible);
+  if (visible) textInput.focus();
+  else textInput.blur();
+}
+
+async function sendTextQuery() {
+  const text = textInput.value.trim();
+  if (!text || !state.inCall || _textSending) return;
+  const context = queryContext();
+  if (!queryIsCurrent(context)) {
+    addMsg('error', '⚠ 连接尚未就绪，请稍后重试'); return;
+  }
+  const snapshot = annotationSnapshot();
+  interruptAudioPlayback();
+  if (snapshot.strokes.length) drawing.pendingTurn = null;
+  _textSending = true;
+  sendTextBtn.disabled = true;
+  try {
+    await enqueueQuery(context, async () => {
+      let msg;
+      if (snapshot.strokes.length) {
+        const video = await collectMultimodalFrames(snapshot, context);
+        if (!queryIsCurrent(context)) return;
+        if (!video) throw new Error('无法截取画面，请重试');
+        msg = sendVideoPacket('video', video.frames, video.geometry, { text });
+      } else {
+        msg = sendMsg('text', { text });
+      }
+      if (!msg) throw new Error('连接已断开，请重试');
+      rememberAnnotationQuery(msg, snapshot, context);
+      if (textInput.value.trim() === text) textInput.value = '';
+      addMsg('user', escapeHtml(text));
+    });
+  } finally {
+    _textSending = false;
+    sendTextBtn.disabled = false;
+  }
+}
+
+textBtn.addEventListener('click', () => toggleTextInput());
+sendTextBtn.addEventListener('click', sendTextQuery);
+textInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.isComposing) {
+    e.preventDefault();
+    sendTextQuery();
+  }
+});
+
+/* Camera flip */
+let _facingFront = false;
+async function flipCamera() {
+  if (!state.stream || flipBtn.disabled) return;
+  flipBtn.disabled = true;
+  const stream = state.stream;
+  const sessionId = state.sessionId;
+  const facingFront = !_facingFront;
+  try {
+    const newStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: { exact: facingFront ? 'user' : 'environment' } },
+      audio: false,
+    });
+    if (state.stream !== stream || state.sessionId !== sessionId || !state.inCall) {
+      newStream.getTracks().forEach(track => track.stop()); return;
+    }
+    stopPtt(false);
+    resetAnnotations();
+    dropHeldHighlight();
+    drawing.sourceAspect = 0;
+    const oldTrack = stream.getVideoTracks()[0];
+    stream.removeTrack(oldTrack);
+    stream.addTrack(newStream.getVideoTracks()[0]);
+    oldTrack.stop();
+    _facingFront = facingFront;
+    cameraVideo.srcObject = stream;
+  } catch (e) {
+    addMsg('error', '⚠ 无法切换摄像头：' + escapeHtml(e.message));
+  } finally {
+    flipBtn.disabled = false;
+  }
+}
+flipBtn.addEventListener('click', flipCamera);
+
+/* ============================================================
+   AUDIO PLAYBACK
+   ============================================================ */
+/* Same playback as the vllm-omni realtime_web aura-ptt page: every packet goes
+   into one continuous PCM queue in static/playback_worklet.js, played at 1.3x
+   with pitch kept. The worklet holds a turn's first packet (~0.64 s) until the
+   second one arrives or the turn drains, and rebuffers on underrun. */
+const OUTPUT_RATE = 24000;
+const INITIAL_PLAYBACK_BUFFER_MS = 400;
+const PLAYBACK_SPEED = 1.3;
+
+let _audioCtx = null;
+let _playbackReady = null;
+
+function openPlayback() {
+  if (_playbackReady) return _playbackReady;
+  const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: OUTPUT_RATE });
+  _audioCtx = ctx;
+  _playbackReady = ctx.audioWorklet.addModule('static/playback_worklet.js').then(() => {
+    const node = new AudioWorkletNode(ctx, 'fullduplex-pcm-playback');
+    node.connect(ctx.destination);
+    return node;
+  }).catch(e => {
+    console.warn('Playback init failed:', e);
+    _playbackReady = null;
+    return null;
+  });
+  return _playbackReady;
+}
+
+function postPlayback(message, transfer) {
+  openPlayback().then(node => { if (node) node.port.postMessage(message, transfer || []); });
+}
+
+function wavToInt16(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const view = new DataView(bytes.buffer);
+  let pos = 12, rate = OUTPUT_RATE;
+  while (pos + 8 <= bytes.length) {
+    const id = String.fromCharCode(bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]);
+    const size = view.getUint32(pos + 4, true);
+    if (id === 'fmt ') rate = view.getUint32(pos + 12, true);
+    if (id === 'data') {
+      const n = Math.min(size, bytes.length - pos - 8) >> 1;
+      return { pcm: new Int16Array(bytes.buffer.slice(pos + 8, pos + 8 + n * 2)), rate };
+    }
+    pos += 8 + size + (size & 1);
+  }
+  return null;
+}
+
+function resampleInt16(input, sourceRate, targetRate) {
+  if (sourceRate === targetRate) return input;
+  const ratio = sourceRate / targetRate;
+  const output = new Int16Array(Math.floor(input.length / ratio));
+  for (let index = 0; index < output.length; index += 1) {
+    const start = Math.floor(index * ratio);
+    const end = Math.max(start + 1, Math.min(input.length, Math.floor((index + 1) * ratio)));
+    let sum = 0;
+    for (let source = start; source < end; source += 1) sum += input[source];
+    output[index] = sum / (end - start);
+  }
+  return output;
+}
+
+function interruptAudioPlayback() {
+  state.interruptedAudioTurnId = state.audioTurnId;
+  if (_playbackReady) postPlayback({ type: 'clear' });
+}
+
+function shouldDropAudioTurn(turnId) {
+  return (
+    state.interruptedAudioTurnId != null &&
+    turnId != null &&
+    turnId <= state.interruptedAudioTurnId
+  );
+}
+
+function enqueueAudio(b64, sampleRate, turnId) {
+  if (shouldDropAudioTurn(turnId)) return;
+  if (turnId !== state.audioTurnId) {
+    interruptAudioPlayback();
+    state.audioTurnId = turnId;
+    state.interruptedAudioTurnId = null;
+  }
+  let decoded;
+  try { decoded = wavToInt16(b64); } catch (e) { console.warn('Audio decode error:', e); return; }
+  if (!decoded || decoded.pcm.length === 0) return;
+  openPlayback();
+  if (_audioCtx.state === 'suspended') _audioCtx.resume();
+  const pcm = resampleInt16(decoded.pcm, decoded.rate || sampleRate || OUTPUT_RATE, _audioCtx.sampleRate);
+  postPlayback({
+    type: 'audio',
+    pcm,
+    responseId: turnId,
+    initialBufferMs: INITIAL_PLAYBACK_BUFFER_MS,
+    playbackSpeed: PLAYBACK_SPEED,
+    holdUntilSecondChunk: true,
+  }, [pcm.buffer]);
+}
+
+/* The turn's text / turn_done means no more packets for now: a one-packet
+   sentence starts at once and the tail fades out instead of rebuffering. */
+function drainAudioTurn(turnId) {
+  if (turnId == null || turnId !== state.audioTurnId || !_playbackReady) return;
+  postPlayback({ type: 'drain', responseId: turnId });
+}
+
+/* ============================================================
+   CONVERSATION UI
+   ============================================================ */
+function addMsg(role, html) {
+  const el = document.createElement('div');
+  el.className = `msg ${role}`;
+  el.innerHTML = html;
+  chatScroll.appendChild(el);
+  chatScroll.scrollTop = chatScroll.scrollHeight;
+  state.msgCount++;
+  msgCountEl.textContent = state.msgCount;
+}
+
+function formatToolArguments(args) {
+  if (!args || Object.keys(args).length === 0) return '';
+  try {
+    return JSON.stringify(args, null, 2);
+  } catch {
+    return String(args);
+  }
+}
+
+function addToolMsg(id, name, status, output, args) {
+  if (status === 'started') {
+    const el = document.createElement('div');
+    el.className = 'msg tool';
+    el.dataset.toolId = id;
+    const argsText = formatToolArguments(args);
+    const argsHtml = argsText ? `<div class="tool-output">${escapeHtml(argsText)}</div>` : '';
+    el.innerHTML = `<span class="tool-spinner"></span><span class="tool-name">${name}</span><span class="tool-status">进行中...</span>${argsHtml}`;
+    chatScroll.appendChild(el);
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+    state.pendingToolMsg[id] = el;
+    return;
+  }
+  const el = state.pendingToolMsg[id];
+  if (el) {
+    const icon = status === 'success' ? '<span class="tool-done">✓</span>' : '<span class="tool-done" style="color:#ef5350">✗</span>';
+    const detail = status === 'timeout' ? '工具调用超时' : output;
+    const outputHtml = detail ? `<div class="tool-output">${escapeHtml(detail)}</div>` : '';
+    el.innerHTML = `${icon}<span class="tool-name">${name}</span><span class="tool-status">${status}</span>${outputHtml}`;
+    delete state.pendingToolMsg[id];
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+  }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+let heldHighlight = null;
+
+function clearHighlights() {
+  highlightLayer.innerHTML = '';
+}
+
+function dropHeldHighlight() {
+  heldHighlight = null;
+  clearHighlights();
+}
+
+function rememberVideoChunkGeometry(chunkId, videoTimestampMs, geometry) {
+  state.videoChunkGeometry[chunkId] = { ...geometry, chunkId, videoTimestampMs };
+  if (videoTimestampMs >= state.latestVideoTimestampMs) {
+    state.latestVideoTimestampMs = videoTimestampMs;
+    state.latestVideoChunkId = chunkId;
+  }
+  const keys = Object.keys(state.videoChunkGeometry);
+  while (keys.length > 30) {
+    const oldest = keys.shift();
+    delete state.videoChunkGeometry[oldest];
+  }
+}
+
+function cachedVideoGeometry(chunkId) {
+  if (chunkId != null && state.videoChunkGeometry[chunkId]) {
+    return state.videoChunkGeometry[chunkId];
+  }
+  return state.videoChunkGeometry[state.latestVideoChunkId] || null;
+}
+
+function visibleDisplayRect() {
+  const rect = cameraVideo.getBoundingClientRect();
+  return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+}
+
+/** Source crop window that object-fit:cover would show inside dstW×dstH. */
+function coverCropRect(srcW, srcH, dstW, dstH) {
+  const srcAspect = srcW / Math.max(1, srcH);
+  const dstAspect = dstW / Math.max(1, dstH);
+  if (srcAspect > dstAspect) {
+    const sw = srcH * dstAspect;
+    return { sx: (srcW - sw) / 2, sy: 0, sw, sh: srcH };
+  }
+  const sh = srcW / Math.max(1e-6, dstAspect);
+  return { sx: 0, sy: (srcH - sh) / 2, sw: srcW, sh };
+}
+
+/**
+ * Map a rectangle in a source (frame) onto a destination with object-fit:cover.
+ * Returns the covered image's top-left/size inside dest, in dest-local coords.
+ */
+function coverDrawnRect(frameW, frameH, destW, destH) {
+  const scale = Math.max(destW / Math.max(1, frameW), destH / Math.max(1, frameH));
+  const drawnW = frameW * scale;
+  const drawnH = frameH * scale;
+  return {
+    left: (destW - drawnW) / 2,
+    top: (destH - drawnH) / 2,
+    width: drawnW,
+    height: drawnH,
+  };
+}
+
+function captureCanvasSize(maxDim) {
+  // Canvas aspect must match the on-screen video element so the cover-crop
+  // we send is exactly what the user sees (critical on mobile portrait).
+  const displayRect = visibleDisplayRect();
+  const dispW = Math.max(1, displayRect.width);
+  const dispH = Math.max(1, displayRect.height);
+  const shortEdge = Math.min(dispW, dispH);
+  const scale = Math.min(maxDim / shortEdge, 1);
+  return {
+    width: Math.max(2, Math.round(dispW * scale / 2) * 2),
+    height: Math.max(2, Math.round(dispH * scale / 2) * 2),
+  };
+}
+
+function normalizedBoxToScreen(bbox, chunkId) {
+  if (!Array.isArray(bbox) || bbox.length < 4) return null;
+  const values = bbox.slice(0, 4).map(Number);
+  if (values.some(v => !Number.isFinite(v))) return null;
+  let [x1, y1, x2, y2] = values.map(v => Math.max(0, Math.min(1000, v)));
+  if (x2 < x1) [x1, x2] = [x2, x1];
+  if (y2 < y1) [y1, y2] = [y2, y1];
+  if (x2 - x1 < 1 || y2 - y1 < 1) return null;
+
+  // Always use the LIVE video display rect (mobile chrome / orientation).
+  // Sent JPEG was cover-cropped to the display aspect at capture time, so
+  // mapping is 1:1 when aspects still match; coverDrawnRect absorbs drift.
+  const display = visibleDisplayRect();
+  if (display.width < 1 || display.height < 1) return null;
+
+  const geometry = cachedVideoGeometry(chunkId);
+  const frameW = Math.max(1, geometry?.frameSize?.width || display.width);
+  const frameH = Math.max(1, geometry?.frameSize?.height || display.height);
+  const drawn = coverDrawnRect(frameW, frameH, display.width, display.height);
+
+  // highlightLayer is positioned over the video; convert to its local coords.
+  const layer = highlightLayer.getBoundingClientRect();
+  const originX = display.left - layer.left;
+  const originY = display.top - layer.top;
+
+  let left = originX + drawn.left + drawn.width * x1 / 1000;
+  let top = originY + drawn.top + drawn.height * y1 / 1000;
+  let width = drawn.width * (x2 - x1) / 1000;
+  let height = drawn.height * (y2 - y1) / 1000;
+
+  // Clip to the visible video area (never draw under phone edges / letterbox).
+  const clipL = originX;
+  const clipT = originY;
+  const clipR = originX + display.width;
+  const clipB = originY + display.height;
+  if (left < clipL) { width -= clipL - left; left = clipL; }
+  if (top < clipT) { height -= clipT - top; top = clipT; }
+  if (left + width > clipR) width = clipR - left;
+  if (top + height > clipB) height = clipB - top;
+  if (width < 1 || height < 1) return null;
+
+  return { left, top, width, height, nearTop: top - clipT < 34 };
+}
+
+function parseShowToUserBoxes(raw) {
+  // Normalize model output into [[x1,y1,x2,y2], ...]. Handles stringified /
+  // malformed forms like "[[119.0, 300.0),(419.0, 800.0], ...]".
+  const group = (nums) => {
+    const boxes = [];
+    for (let i = 0; i + 3 < nums.length; i += 4) {
+      boxes.push(nums.slice(i, i + 4));
+    }
+    return boxes;
+  };
+  const fromText = (text) => {
+    const nums = String(text).match(/-?\d+(?:\.\d+)?/g);
+    return nums ? group(nums.map(Number).filter(Number.isFinite)) : [];
+  };
+
+  if (raw == null) return [];
+  if (typeof raw === 'string') {
+    const text = raw.trim();
+    if (!text) return [];
+    try { return parseShowToUserBoxes(JSON.parse(text)); } catch (_) {}
+    return fromText(text);
+  }
+  if (!Array.isArray(raw)) return [];
+  if (raw.length === 0) return [];
+  if (raw.every(v => typeof v === 'number')) return group(raw.filter(Number.isFinite));
+  if (raw.every(v => Array.isArray(v) && v.length >= 4)) {
+    return raw.map(v => v.slice(0, 4).map(Number));
+  }
+  if (raw.every(v => Array.isArray(v) && v.length === 2)) {
+    return group(raw.flat().map(Number).filter(Number.isFinite));
+  }
+  return fromText(JSON.stringify(raw));
+}
+
+function parseShowToUserLabels(raw) {
+  if (raw == null) return [];
+  if (Array.isArray(raw)) return raw.map(v => String(v).trim()).filter(Boolean);
+  if (typeof raw === 'string') {
+    const text = raw.trim();
+    if (!text) return [];
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return parseShowToUserLabels(parsed);
+      if (typeof parsed === 'string' && parsed.trim()) return [parsed.trim()];
+    } catch (_) {}
+    return text.split(/[,，\n]+/).map(s => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+  }
+  return [];
+}
+
+function showToUser(args, chunkId) {
+  let inputBoxes = parseShowToUserBoxes(args?.boxes);
+  if (!inputBoxes.length) inputBoxes = parseShowToUserBoxes(args?.box);
+  if (!inputBoxes.length) inputBoxes = parseShowToUserBoxes(args?.bbox);
+  if (!inputBoxes.length) {
+    if (Array.isArray(args?.boxes) && args.boxes.length === 0) dropHeldHighlight();
+    return null;
+  }
+  const boxes = inputBoxes.map(bbox => normalizedBoxToScreen(bbox, chunkId)).filter(Boolean);
+  if (boxes.length === 0) return null;
+  const labels = parseShowToUserLabels(args?.labels);
+  const legacyLabel = args?.label;
+  // Grounding boxes omit duration_ms and stay until the next assistant reply,
+  // matching the realtime page. An explicit duration still times out.
+  const explicitDuration = args?.duration_ms != null && args.duration_ms !== '';
+  const durationMs = explicitDuration
+    ? Math.max(500, Math.min(Number(args.duration_ms) || 1000, 15000))
+    : 0;
+  heldHighlight = durationMs ? null : { args, chunkId };
+  clearHighlights();
+
+  for (const [idx, box] of boxes.entries()) {
+    const el = document.createElement('div');
+    el.className = 'highlight-box';
+    el.style.left = `${box.left}px`;
+    el.style.top = `${box.top}px`;
+    el.style.width = `${box.width}px`;
+    el.style.height = `${box.height}px`;
+    const text = labels[idx] || (idx === 0 ? legacyLabel : null);
+    if (text) {
+      const label = document.createElement('div');
+      label.className = 'highlight-label' + (box.nearTop ? ' inside' : '');
+      label.textContent = String(text);
+      el.appendChild(label);
+    }
+    highlightLayer.appendChild(el);
+    if (durationMs) {
+      setTimeout(() => {
+        if (el.parentNode === highlightLayer) el.remove();
+      }, durationMs);
+    }
+  }
+  return null;
+}
+
+function repaintHeldHighlight() {
+  const held = heldHighlight;
+  if (held) showToUser(held.args, held.chunkId);
+}
+
+function sendClientToolResult(toolName, toolId, result) {
+  if (result == null) return;
+  const resultText = typeof result === 'string' ? result : JSON.stringify(result);
+  sendMsg('text', {
+    text: `CLIENT_TOOL_RESULT ${toolName}${toolId ? ` (${toolId})` : ''}: ${resultText}`,
+  });
+}
+
+function runClientTool(data) {
+  if (data.name === 'ShowToUser') {
+    return showToUser(data.arguments || {}, data.chunk_id);
+  }
+  return null;
+}
+
+async function handleToolcallStarted(data) {
+  const result = await runClientTool(data);
+  sendClientToolResult(data.name, data.id, result);
+}
+
+/* ============================================================
+   WEBSOCKET
+   ============================================================ */
+function connectWs() {
+  if (state.ws && state.ws.readyState !== WebSocket.CLOSED && state.ws.readyState !== WebSocket.CLOSING) {
+    state.ws.onclose = null;
+    state.ws.onerror = null;
+    state.ws.close();
+  }
+  state.sessionId = '';
+  const url = wsUrl();
+  const ws = new WebSocket(url);
+  state.ws = ws;
+
+  ws.onopen = () => {
+    if (state.ws !== ws) return;
+    state.connected = true;
+    statusBdg.classList.add('connected');
+    statusText.textContent = '已连接，等待会话';
+  };
+
+  ws.onmessage = e => {
+    if (state.ws !== ws) return;
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    handleMessage(msg);
+  };
+
+  ws.onclose = () => {
+    if (state.ws !== ws) return;
+    stopPtt(false);
+    stopVideoCapture();
+    resetAnnotations();
+    state.connected = false;
+    statusBdg.classList.remove('connected');
+    statusText.textContent = '已断开';
+    state.sessionId = '';
+    state.ws = null;
+    if (state.inCall) reconnectWs();
+  };
+
+  ws.onerror = () => {
+    if (state.ws !== ws) return;
+    statusText.textContent = '连接失败';
+  };
+}
+
+function handleMessage(msg) {
+  if (msg.direction !== 'downstream') return;
+  if (msg.type !== 'session' && msg.session_id !== state.sessionId) return;
+  const type = msg.type;
+  const data = msg.data || {};
+
+  switch (type) {
+    case 'session':
+      stopPtt(false);
+      stopVideoCapture();
+      resetAnnotations();
+      interruptAudioPlayback();
+      state.sessionId = msg.session_id || data.session_id || '';
+      state.chunkSeq = 0;
+      state.audioTurnId = null;
+      state.interruptedAudioTurnId = null;
+      state.videoChunkGeometry = {};
+      state.latestVideoChunkId = null;
+      state.latestVideoTimestampMs = -1;
+      dropHeldHighlight();
+      statusText.textContent = `已连接 (${data.active_sessions ?? 1})`;
+      if (state.inCall && !_frameTimer) startVideoCapture();
+      break;
+    case 'asr_text':
+      {
+        const rtt = state.lastAudioSendTs ? (Date.now() - state.lastAudioSendTs) : null;
+        const asrMs = data.asr_ms;
+        let timingHtml = '';
+        if (rtt != null && asrMs != null) {
+          const netMs = rtt - asrMs;
+          timingHtml = ` <span style="font-size:10px;color:rgba(255,255,255,0.35);font-family:monospace">[ASR:${asrMs}ms | Net:${netMs}ms | RTT:${rtt}ms]</span>`;
+          asrTiming.style.display = 'block';
+          asrTiming.textContent = `ASR: ${asrMs}ms  Net: ${netMs}ms  RTT: ${rtt}ms`;
+        }
+        addMsg('user', escapeHtml(data.text || '') + timingHtml);
+      }
+      break;
+    case 'text':
+      dropHeldHighlight();
+      {
+        let label = escapeHtml(data.text || '');
+        if (data.infer_ms != null) {
+          label += ` <span style="font-size:10px;color:rgba(255,255,255,0.35);font-family:monospace">[Model:${data.infer_ms}ms]</span>`;
+          asrTiming.style.display = 'block';
+          asrTiming.textContent = (asrTiming.textContent || '') + `  Model: ${data.infer_ms}ms`;
+        }
+        addMsg('assistant', label);
+      }
+      drainAudioTurn(msg.chunk_id);
+      break;
+    case 'audio':
+      if (data.audio) {
+        if (data.tts_ms != null && data.tts_ms > 0) {
+          asrTiming.style.display = 'block';
+          asrTiming.textContent = (asrTiming.textContent || '') + `  TTS: ${data.tts_ms}ms`;
+        }
+        enqueueAudio(data.audio, data.sample_rate || 24000, msg.chunk_id);
+      }
+      break;
+    case 'toolcall':
+      addToolMsg(data.id, data.name, data.status, data.output || data.error, data.arguments);
+      if (data.status === 'started') handleToolcallStarted({ ...data, chunk_id: msg.chunk_id });
+      break;
+    case 'error':
+      finishAnnotationQuery(msg, true);
+      addMsg('error', '⚠ ' + escapeHtml(data.message || ''));
+      break;
+    case 'turn_done':
+      drainAudioTurn(msg.chunk_id);
+      finishAnnotationQuery(msg);
+      break;
+  }
+}
+
+function disconnectWs() {
+  if (state.ws) {
+    state.ws.onclose = null;
+    state.ws.onerror = null;
+    state.ws.close();
+    state.ws = null;
+  }
+  state.connected = false;
+  state.sessionId = '';
+}
+
+function reconnectWs() {
+  if (!state.inCall) return;
+  state._retryCount = (state._retryCount || 0) + 1;
+  const delay = Math.min(1000 * Math.pow(2, state._retryCount), 30000);
+  setTimeout(() => {
+    if (state.inCall && !state.connected) connectWs();
+  }, delay);
+}
+
+/* ============================================================
+   CALL LIFECYCLE
+   ============================================================ */
+async function startCall() {
+  openPlayback();
+  if (_audioCtx.state === 'suspended') _audioCtx.resume();
+  resetAnnotations();
+  state.inCall = true;
+  state.callStartTs = ts();
+  state.chunkSeq = 0;
+  state.sessionId = '';
+
+  const selectedModel = modelSelect.options[modelSelect.selectedIndex]?.textContent || '';
+  modelNameText.textContent = selectedModel;
+  modelBadge.style.display = 'block';
+
+  settingsPnl.classList.add('hidden');
+  chatPanel.classList.add('active');
+  controls.classList.add('active');
+  statusBdg.style.display = 'block';
+  callHist.style.display = 'flex';
+  asrTiming.style.display = 'block';
+  asrTiming.textContent = '';
+  connectWs();
+}
+
+function endCall() {
+  stopPtt(false);
+  resetAnnotations();
+  window._pttTouch = false;
+  state.inCall = false;
+  state.chunkSeq = 0;
+  stopVideoCapture();
+  interruptAudioPlayback();
+  disconnectWs();
+
+  modelBadge.style.display = 'none';
+  modelNameText.textContent = '';
+  chatPanel.classList.remove('active');
+  controls.classList.remove('active');
+  statusBdg.style.display = 'none';
+  callHist.style.display = 'none';
+  asrTiming.style.display = 'none';
+
+  settingsPnl.classList.remove('hidden');
+  statusText.textContent = '未连接';
+  pttBtn.classList.remove('recording');
+  pttBtn.textContent = '按住说话';
+  textInput.value = '';
+  toggleTextInput(false);
+
+  chatScroll.innerHTML = '';
+  state.msgCount = 0;
+  msgCountEl.textContent = '0';
+  state.audioTurnId = null;
+  state.interruptedAudioTurnId = null;
+  state.pendingToolMsg = {};
+  state.videoChunkGeometry = {};
+  state.latestVideoChunkId = null;
+  state.latestVideoTimestampMs = -1;
+  dropHeldHighlight();
+}
+
+callBtn.addEventListener('click', startCall);
+endCallBtn.addEventListener('click', endCall);
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.code === 'Space' && !e.repeat && state.inCall) {
+    e.preventDefault();
+    startPtt();
+  }
+});
+document.addEventListener('keyup', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.code === 'Space' && state.inCall) {
+    e.preventDefault();
+    stopPtt();
+  }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) finishStroke();
+  else syncAnnotationGeometry();
+  if (document.visibilityState === 'visible' && state.inCall && !state.connected) {
+    connectWs();
+  }
+});
+
+window.addEventListener('resize', () => {
+  syncAnnotationGeometry();
+  repaintHeldHighlight();
+});
+window.addEventListener('orientationchange', () => {
+  finishStroke();
+  syncAnnotationGeometry();
+  repaintHeldHighlight();
+});
+if (window.visualViewport) {
+  const onViewportChange = () => { syncAnnotationGeometry(); repaintHeldHighlight(); };
+  window.visualViewport.addEventListener('resize', onViewportChange);
+  window.visualViewport.addEventListener('scroll', onViewportChange);
+}
+
+initSystemPrompts();
+fetchModels();
+console.log(`[Aura] session=${state.sessionId}`);
+</script>
+</body>
+</html>
