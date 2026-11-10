@@ -90,7 +90,7 @@ stages:
     default_sampling_params:
       temperature: 0.5
       top_k: 50
-      max_tokens: 240
+      max_tokens: 1024
       min_tokens: 8
       repetition_penalty: 1.05
       stop_token_ids: [2150]
