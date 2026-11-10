@@ -365,6 +365,10 @@ def _strip_assistant_text(text: str) -> str:
     cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = cleaned.replace("</think>", "")
     cleaned = re.sub(r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>", "", cleaned)
+    # Object-ref tags name the thing being pointed at. The words inside are
+    # speech and display text; the tags themselves are not.
+    cleaned = cleaned.replace("<|object_ref_start|>", "").replace("<|object_ref_end|>", "")
+    cleaned = re.sub(r"<\|object_ref(?:_start(?:\|.*)?)?$", "", cleaned)
     stripped = cleaned.strip()
     if stripped.startswith(RESPOND_TEXT):
         stripped = stripped[len(RESPOND_TEXT) :].lstrip()

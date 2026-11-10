@@ -399,6 +399,8 @@ def test_next_duplex_sentence_chunk_does_not_speak_a_grounding_box(monkeypatch: 
     assert next_duplex_sentence_chunk({}, box, finished=True) is None
     prose = "<|respond|>在這裡。<|box_start|>10,20,30,40<|box_end|>"
     assert next_duplex_sentence_chunk({}, prose, finished=True) == "在這裡。"
+    referred = "<|respond|><|object_ref_start|>白色方形空调出风口<|object_ref_end|>。"
+    assert next_duplex_sentence_chunk({}, referred, finished=True) == "白色方形空调出风口。"
 
 
 def test_aura2tts_skips_a_box_only_turn():
