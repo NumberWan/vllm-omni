@@ -274,3 +274,62 @@ def test_history_keeps_respond_like_v1_text() -> None:
     assert f"{RESPOND_TEXT}old answer" in prefix
     assert f"{RESPOND_TEXT}new answer" in prefix
     drop_session_history("hist-respond")
+
+
+def test_v2_history_renders_empty_think_before_every_assistant_turn() -> None:
+    """Training (ms-swift) and the native chat_template_aura.jinja put the empty
+    think block before every assistant turn, not only the one being generated."""
+    from vllm_omni.model_executor.models.aura_omni.duplex.history import (
+        drop_session_history,
+        get_or_create_session_history,
+    )
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import AURA_V2_EMPTY_THINK_PREFIX
+
+    drop_session_history("hist-think")
+    history = get_or_create_session_history("hist-think")
+    history.begin_user_turn("", video=("clip-a", {"fps": 2.0}))
+    history.commit_turn("<|silent|>")
+    history.begin_user_turn("這是什麼？", video=("clip-b", {"fps": 2.0}))
+    history.commit_turn(f"{RESPOND_TEXT}這是一隻杯子。")
+    think = AURA_V2_EMPTY_THINK_PREFIX
+    assert history.render_prefix(think_prefix=True) == (
+        "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|><|im_end|>\n"
+        f"<|im_start|>assistant\n{think}<|silent|><|im_end|>\n"
+        "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>這是什麼？<|im_end|>\n"
+        f"<|im_start|>assistant\n{think}{RESPOND_TEXT}這是一隻杯子。<|im_end|>\n"
+    )
+    # Default (v1) rendering is unchanged.
+    assert think not in history.render_prefix()
+    drop_session_history("hist-think")
+
+
+@pytest.mark.parametrize("two_token", [True, False])
+def test_asr2aura_history_think_prefix_follows_two_token(two_token: bool) -> None:
+    from vllm_omni.model_executor.models.aura_omni.duplex.history import (
+        drop_session_history,
+        get_or_create_session_history,
+    )
+    from vllm_omni.model_executor.stage_input_processors.aura_omni import (
+        AURA_V2_EMPTY_THINK_PREFIX,
+        asr2aura,
+    )
+
+    session = f"hist-think-asr2aura-{two_token}"
+    drop_session_history(session)
+    history = get_or_create_session_history(session)
+    history.messages.append({"role": "user", "content": "old", "video": None})
+    history.messages.append({"role": "assistant", "content": f"{RESPOND_TEXT}old answer"})
+    prompt = {
+        "additional_information": {
+            "aura_duplex": True,
+            "aura_session_id": session,
+            "aura_two_token": two_token,
+            "aura_system_prompt": "sys",
+        },
+        "multi_modal_data": {},
+    }
+    source = SimpleNamespace(request_id="r0", outputs=[SimpleNamespace(text="now", token_ids=[1])])
+    [next_input] = asr2aura([source], prompt=[prompt])
+    stored = f"<|im_start|>assistant\n{AURA_V2_EMPTY_THINK_PREFIX}{RESPOND_TEXT}old answer<|im_end|>"
+    assert (stored in next_input["prompt"]) is two_token
+    drop_session_history(session)

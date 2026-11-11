@@ -20,6 +20,11 @@ _VIDEO_ROUNDS_TO_REMOVE = 30
 _MAX_CONVERSATION_ROUNDS = 999
 _SILENT = "<|silent|>"
 _RESPOND = "<|respond|>"
+# AURA_v2 was trained with ms-swift's template, whose _add_non_thinking_prefix()
+# writes this empty think block before EVERY assistant turn. The native gateway
+# reproduces it with two_token_support/chat_template_aura.jinja; without it each
+# stored reply is 4 tokens short of training and the model repeats itself.
+_EMPTY_THINK = "<think>\n\n</think>\n\n"
 # Native actor._CLEAN_PATTERN. Stage1 text keeps its stop string
 # (include_stop_str_in_output), and render_prefix adds the turn's own
 # <|im_end|>, so an uncleaned reply would close twice.
@@ -56,12 +61,15 @@ class SessionHistory:
     pending_user: str | None = None
     pending_video: object | None = None
 
-    def render_prefix(self) -> str:
+    def render_prefix(self, *, think_prefix: bool = False) -> str:
         """ChatML prefix for the next Stage1 turn.
 
         Same as v1: stored user/assistant text is written back as-is, and a
         user turn that still has pixels gets one video placeholder. v2 spoken
-        turns keep their leading ``<|respond|>`` in that stored text. A
+        turns keep their leading ``<|respond|>`` in that stored text.
+        ``think_prefix`` (AURA_v2 two-token) puts the empty think block before
+        every assistant turn, as the training template and the native
+        ``chat_template_aura.jinja`` do. A
         ``tool_response`` entry (``append_tool_response``) renders as the
         template's own tool-result shape: a ``user``-role turn wrapping
         ``<tool_response>``, with no pairing user message of its own.
@@ -84,6 +92,8 @@ class SessionHistory:
             body = content
             if role == "user" and message.get("video") is not None:
                 body = "<|vision_start|><|video_pad|><|vision_end|>" + content
+            if think_prefix and role == "assistant" and body and not body.startswith("<think>"):
+                body = _EMPTY_THINK + body
             if not body:
                 continue
             rendered.append(f"<|im_start|>{role}\n{body}<|im_end|>\n")

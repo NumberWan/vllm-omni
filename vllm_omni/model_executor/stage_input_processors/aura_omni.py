@@ -577,7 +577,9 @@ def asr2aura(
                         additional_info.get("is_speech"),
                     )
                 history.begin_user_turn(transcript, video=current_video)
-            history_prefix = history.render_prefix()
+            # v2 (two-token) history carries the training template's empty
+            # think block on every assistant turn, like the native gateway.
+            history_prefix = history.render_prefix(think_prefix=bool(additional_info.get("aura_two_token")))
             prior_videos = history.retained_videos()
             # Native get_vllm_inputs: every retained clip is a <|video_pad|> in
             # order, then this turn. The placeholder on the current user message
