@@ -1399,13 +1399,9 @@ function showToUser(args, chunkId) {
   if (boxes.length === 0) return null;
   const labels = parseShowToUserLabels(args?.labels);
   const legacyLabel = args?.label;
-  // Grounding boxes omit duration_ms and stay until the next assistant reply,
-  // matching the realtime page. An explicit duration still times out.
-  const explicitDuration = args?.duration_ms != null && args.duration_ms !== '';
-  const durationMs = explicitDuration
-    ? Math.max(500, Math.min(Number(args.duration_ms) || 1000, 15000))
-    : 0;
-  heldHighlight = durationMs ? null : { args, chunkId };
+  // Native page: every box times out, 1 s when duration_ms is omitted.
+  const durationMs = Math.max(500, Math.min(Number(args?.duration_ms) || 1000, 15000));
+  heldHighlight = null;
   clearHighlights();
 
   for (const [idx, box] of boxes.entries()) {
