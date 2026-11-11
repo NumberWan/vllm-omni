@@ -343,3 +343,21 @@ def test_pending_overwrite_then_silent_commit_leaves_silent_assistant() -> None:
     assert len(history.messages[-1]["content"]) == 10
     assert history.messages[0]["content"] == ""
     drop_session_history("duplex-pending-silent")
+
+
+def test_commit_turn_cleans_assistant_text_like_native() -> None:
+    drop_session_history("duplex-clean")
+    history = get_or_create_session_history("duplex-clean")
+    history.begin_user_turn("", video=("clip-a", {"fps": 2.0}))
+    history.commit_turn("<|respond|>現在他正看著前方微笑。<|im_end|>")
+    history.begin_user_turn("", video=("clip-b", {"fps": 2.0}))
+    history.commit_turn("<|silent|><|im_end|>")
+    history.begin_user_turn("框出來")
+    history.commit_turn("<|respond|><|respond|><think>\n\n</think>\n\n<|box_start|>(1,2),(3,4)<|box_end|><|im_end|>")
+    assert [message["content"] for message in history.messages[1::2]] == [
+        "<|respond|>現在他正看著前方微笑。",
+        SILENT_TEXT,
+        "<|respond|><|box_start|>(1,2),(3,4)<|box_end|>",
+    ]
+    assert "<|im_end|><|im_end|>" not in history.render_prefix()
+    drop_session_history("duplex-clean")

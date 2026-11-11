@@ -200,3 +200,25 @@ def test_project_box_only_turn_keeps_the_tokens_and_ends_without_audio() -> None
     assert events[-1].get("abort_data_plane_request") is True
     assert all(event.get("is_listen") is not True for event in events)
     assert all(not event.get("audio") for event in events)
+
+
+def test_project_emits_every_tool_call_and_only_the_last_releases_the_turn() -> None:
+    plane = AuraDataPlaneSession(_encode_audio)
+    request_id = "duplex-s.abc.e.0.r.stage1-turn7"
+    plane.begin_request(request_id)
+    text = (
+        "<|respond|><tool_call>\n<function=get_current_datetime>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=get_current_location>\n</function>\n</tool_call>"
+    )
+    final = SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        stage_id=1,
+        outputs=[SimpleNamespace(text=text, cumulative_text=text, finished=True)],
+    )
+    calls = [event for event in plane.project({"data_plane_outputs": [final]}) if event.get("aura_function_call")]
+    assert [event["aura_function_call"]["name"] for event in calls] == [
+        "get_current_datetime",
+        "get_current_location",
+    ]
+    assert [event["aura_tool_call_ends_turn"] for event in calls] == [False, True]

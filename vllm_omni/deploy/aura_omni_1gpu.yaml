@@ -65,7 +65,7 @@ stages:
     logits_processors:
       - "vllm_omni.model_executor.models.aura_omni.two_token_logits:AuraTwoTokenLogitsProcessor"
     default_sampling_params:
-      temperature: 0.0
+      temperature: 0.2
       top_p: 1.0
       top_k: -1
       # 1 control + body budget (inference default).

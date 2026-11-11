@@ -21,7 +21,7 @@ from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPl
 from vllm_omni.model_executor.models.aura_omni.duplex.tools_utils import (
     build_tools_block,
     chat_template_tools,
-    extract_finished_tool_call,
+    extract_finished_tool_calls,
     parse_completed_tool_call,
     safe_streaming_prefix,
     strip_tool_call_markup,
@@ -44,8 +44,7 @@ def test_extract_finished_tool_call_single_parameter() -> None:
         "<tool_call>\n<function=calculator>\n<parameter=expression>\n17 * 23\n"
         "</parameter>\n</function>\n</tool_call>"
     )
-    call = extract_finished_tool_call(text)
-    assert call is not None
+    [call] = extract_finished_tool_calls(text)
     assert call["name"] == "calculator"
     assert json.loads(call["arguments"]) == {"expression": "17 * 23"}
     assert call["call_id"].startswith("call_")
@@ -59,23 +58,33 @@ def test_extract_finished_tool_call_multiple_parameters_and_json_coercion() -> N
         "<parameter=to_currency>\nTWD\n</parameter>\n"
         "</function>\n</tool_call>"
     )
-    call = extract_finished_tool_call(text)
-    assert call is not None
+    [call] = extract_finished_tool_calls(text)
     assert json.loads(call["arguments"]) == {"amount": 100, "from_currency": "USD", "to_currency": "TWD"}
 
 
 def test_extract_finished_tool_call_rejects_nan_literal() -> None:
     text = "<tool_call>\n<function=calculator>\n<parameter=expression>\nNaN\n</parameter>\n</function>\n</tool_call>"
-    call = extract_finished_tool_call(text)
-    assert call is not None
+    [call] = extract_finished_tool_calls(text)
     # "NaN" is not valid JSON by strict rules; kept as the raw string, not
     # coerced into a float that ``json.dumps`` could not even re-encode.
     assert json.loads(call["arguments"]) == {"expression": "NaN"}
 
 
-def test_extract_finished_tool_call_returns_none_without_a_tag() -> None:
-    assert extract_finished_tool_call("just a normal spoken reply") is None
-    assert extract_finished_tool_call("<tool_call>still open, no close tag") is None
+def test_extract_finished_tool_calls_empty_without_a_closed_tag() -> None:
+    assert extract_finished_tool_calls("just a normal spoken reply") == []
+    assert extract_finished_tool_calls("<tool_call>still open, no close tag") == []
+
+
+def test_extract_finished_tool_calls_returns_every_call_in_order() -> None:
+    text = (
+        "<|respond|><tool_call>\n<function=get_current_datetime>\n</function>\n</tool_call>\n"
+        "<tool_call>\nno function tag\n</tool_call>\n"
+        "<tool_call>\n<function=get_current_location>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=still_open>"
+    )
+    calls = extract_finished_tool_calls(text)
+    assert [call["name"] for call in calls] == ["get_current_datetime", "get_current_location"]
+    assert calls[0]["call_id"] != calls[1]["call_id"]
 
 
 def test_parse_completed_tool_call_missing_function_name_is_none() -> None:
@@ -151,25 +160,47 @@ def test_function_call_releases_turn_only_when_nothing_left_to_speak() -> None:
 def test_has_pending_tool_followup() -> None:
     plugin = AuraDuplexPlugin(_encode_audio)
     assert plugin.has_pending_tool_followup({}) is False
-    assert plugin.has_pending_tool_followup({"aura_tool_pending": {"output": "18C"}}) is True
-    assert plugin.has_pending_tool_followup({"aura_tool_pending": {"output": 123}}) is False
+    assert plugin.has_pending_tool_followup({"aura_tool_pending": []}) is False
+    assert plugin.has_pending_tool_followup({"aura_tool_pending": [{"output": "18C"}]}) is True
+    assert plugin.has_pending_tool_followup({"aura_tool_pending": [{"output": "18C"}, {"output": 123}]}) is False
 
 
-def test_runtime_config_for_function_output_stores_pending_result() -> None:
+def test_runtime_config_for_function_output_accumulates_pending_results() -> None:
     plugin = AuraDuplexPlugin(_encode_audio)
     config = DuplexSessionConfig(model="aurateam/AURA")
+    runtime = {"aura_system_prompt": "sys"}
+    for call_id in ("call_1", "call_2"):
+        runtime = plugin.note_published_function_call(runtime, call_id=call_id, history_len=0)
+    assert runtime["aura_tool_batch"] == ["call_1", "call_2"]
     updated = plugin.runtime_config_for_function_output(
         config,
-        {"aura_system_prompt": "sys"},
+        runtime,
         {"call_id": "call_1", "name": "get_city_weather", "arguments": '{"city": "台北"}', "output": "18C sunny"},
     )
     assert updated["aura_system_prompt"] == "sys"  # existing keys preserved
-    assert updated["aura_tool_pending"] == {
-        "call_id": "call_1",
-        "name": "get_city_weather",
-        "arguments": '{"city": "台北"}',
-        "output": "18C sunny",
-    }
+    first = {"call_id": "call_1", "name": "get_city_weather", "arguments": '{"city": "台北"}', "output": "18C sunny"}
+    assert updated["aura_tool_pending"] == [first]
+    updated = plugin.runtime_config_for_function_output(
+        config,
+        updated,
+        {"call_id": "call_2", "name": "get_current_datetime", "arguments": "{}", "output": "10:00"},
+    )
+    assert updated["aura_tool_pending"] == [
+        first,
+        {"call_id": "call_2", "name": "get_current_datetime", "arguments": "{}", "output": "10:00"},
+    ]
+
+
+def test_runtime_config_for_function_output_ignores_call_outside_current_batch() -> None:
+    plugin = AuraDuplexPlugin(_encode_audio)
+    runtime = {"aura_tool_batch": ["call_new"]}
+    updated = plugin.runtime_config_for_function_output(
+        DuplexSessionConfig(model="aurateam/AURA"),
+        runtime,
+        {"call_id": "call_old", "name": "get_current_datetime", "arguments": "{}", "output": "10:00"},
+    )
+    assert updated == runtime
+    assert plugin.has_pending_tool_followup(updated) is False
 
 
 @pytest.mark.parametrize(
@@ -191,7 +222,7 @@ def test_runtime_patch_for_submitted_prompt_clears_pending_once_consumed() -> No
     assert plugin.runtime_patch_for_submitted_prompt({"text": "x"}) is None
     prompt = {"_aura_tool_pending_consumed": True, "other": 1}
     patch = plugin.runtime_patch_for_submitted_prompt(prompt)
-    assert patch == {"aura_tool_pending": None}
+    assert patch == {"aura_tool_pending": None, "aura_tool_batch": None}
     assert "_aura_tool_pending_consumed" not in prompt
 
 
@@ -243,6 +274,20 @@ def test_plan_append_passes_aura_tools_through() -> None:
         sampling_params=SamplingParams(max_tokens=8),
     )
     assert plan.prompt["additional_information"]["aura_tools"] == tools
+    # Only a user utterance drops a batch that never got its follow-up.
+    assert "_aura_tool_pending_consumed" not in plan.prompt
+    speech = plugin.plan_append(
+        request_id="req",
+        fence=fence,
+        session_config={},
+        runtime_config={},
+        seq=2,
+        turn_seq=1,
+        payload={**payload, "is_speech": True},
+        final=True,
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+    assert speech.prompt["_aura_tool_pending_consumed"] is True
 
 
 def test_plan_append_tool_followup_builds_pad_and_appends_history() -> None:
@@ -259,12 +304,15 @@ def test_plan_append_tool_followup_builds_pad_and_appends_history() -> None:
         session_config={},
         runtime_config={
             "aura_system_prompt": "sys",
-            "aura_tool_pending": {
-                "call_id": "call_1",
-                "name": "get_city_weather",
-                "arguments": '{"city": "台北"}',
-                "output": "18C sunny",
-            },
+            "aura_tool_pending": [
+                {
+                    "call_id": "call_1",
+                    "name": "get_city_weather",
+                    "arguments": '{"city": "台北"}',
+                    "output": "18C sunny",
+                },
+                {"call_id": "call_2", "name": "get_current_datetime", "arguments": "{}", "output": "10:00"},
+            ],
         },
         seq=1,
         turn_seq=1,
@@ -277,7 +325,10 @@ def test_plan_append_tool_followup_builds_pad_and_appends_history() -> None:
     assert info["is_speech"] is False
     assert "audio" in plan.prompt["multi_modal_data"]
     assert plan.prompt["_aura_tool_pending_consumed"] is True
-    assert "<tool_response>\n18C sunny\n</tool_response>" in history.render_prefix()
+    assert (
+        "<|im_start|>user\n<tool_response>\n18C sunny\n</tool_response>\n"
+        "<tool_response>\n10:00\n</tool_response><|im_end|>\n"
+    ) in history.render_prefix()
     drop_session_history("sess-followup")
 
 
@@ -316,3 +367,19 @@ def test_append_tool_response_renders_as_user_turn_with_tool_response_tag() -> N
     history.append_tool_response("")
     assert rendered == history.render_prefix()
     drop_session_history("sess-hist-tool")
+
+
+def test_consecutive_tool_responses_share_one_user_turn() -> None:
+    drop_session_history("sess-hist-tools")
+    history = get_or_create_session_history("sess-hist-tools")
+    history.begin_user_turn("時間和城市？")
+    history.commit_turn("<|respond|><tool_call>a</tool_call><tool_call>b</tool_call>")
+    history.append_tool_response("10:00")
+    history.append_tool_response("台北")
+    history.commit_turn("<|respond|>現在十點，你在台北。")
+    assert history.render_prefix().endswith(
+        "<|im_start|>user\n<tool_response>\n10:00\n</tool_response>\n"
+        "<tool_response>\n台北\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n<|respond|>現在十點，你在台北。<|im_end|>\n"
+    )
+    drop_session_history("sess-hist-tools")

@@ -75,6 +75,12 @@ def test_body_masks_both_control_ids() -> None:
     assert out[0, 5] == 1.0
 
 
+def test_streaming_accepts_sampling_temperature() -> None:
+    AuraTwoTokenLogitsProcessor.validate_params(
+        SamplingParams(temperature=0.2, min_tokens=0, extra_args={"aura_mode": "streaming"})
+    )
+
+
 def test_offline_qa_is_a_no_op() -> None:
     proc = _proc()
     params = SamplingParams(temperature=0.0, extra_args={"aura_mode": "offline_qa"})

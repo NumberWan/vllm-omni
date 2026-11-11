@@ -62,7 +62,10 @@ _VISION_SILENCE = base64.b64encode(b"\x00\x00" * 160).decode("ascii")
 # A typed turn rides a speech commit; aura_forced_user_text replaces whatever
 # Stage0 hears in this pad.
 _TYPED_SILENCE = base64.b64encode(b"\x00\x00" * 1600).decode("ascii")
-_MAX_TOOL_FOLLOWUPS = 3
+_MAX_TOOL_FOLLOWUPS = 5
+# Calls of one model turn arrive back to back; a batch is complete once no
+# new call has arrived for this long.
+_TOOL_BATCH_GRACE_S = 0.1
 _CLOSE_WAIT_S = 5.0
 _SESSION_WAIT_S = 30.0
 # A lock whose release event never came (dropped response) must not stop
@@ -207,8 +210,14 @@ class DuplexActor:
         self._vision_locked_at: float | None = None
         # Typed questions without their own frames see the latest camera view.
         self._last_frames: list[str] = []
-        self._follow = {"count": 0, "gen": 0, "pending_gen": 0, "awaiting_done": False, "ready": False}
+        self._follow = {"count": 0, "gen": 0, "awaiting_done": 0}
         self._tool_tasks: set[asyncio.Task] = set()
+        # One batch of calls runs one by one on a single worker.
+        self._tool_queue: deque[tuple] = deque()
+        self._tool_worker: asyncio.Task | None = None
+        self._tool_last_at = 0.0
+        self._tool_dones = asyncio.Event()
+        self._tool_dones.set()
 
     def _log(self, message: str) -> None:
         print(f"[duplex:{self._session_id[:8]}] {message}", flush=True)
@@ -379,7 +388,7 @@ class DuplexActor:
             await self._send(ws, "turn_done", {}, chunk)
             return
         self._last_frames = frames
-        self._follow.update(gen=self._follow["gen"] + 1, count=0, awaiting_done=False, ready=False)
+        self._reset_tools()
         self._lock_vision()
         self._unacked.append(_Commit(chunk))
         # AURA rejects any append without video_frames, so the utterance goes
@@ -405,7 +414,7 @@ class DuplexActor:
             await self._send(ws, "turn_done", {}, chunk)
             return
         self._last_frames = frames
-        self._follow.update(gen=self._follow["gen"] + 1, count=0, awaiting_done=False, ready=False)
+        self._reset_tools()
         self._lock_vision()
         self._unacked.append(_Commit(chunk, typed=True))
         await self._backend_send(
@@ -527,12 +536,11 @@ class DuplexActor:
             await self._turn_done(ws, resp)
             return
         if kind == "response.done":
-            follow = self._follow
-            follow["awaiting_done"] = False
             if _done_has_function_call(event):
-                if follow["ready"] and follow["pending_gen"] == follow["gen"]:
-                    follow["ready"] = False
-                    await self._backend_send({"type": "response.create"})
+                follow = self._follow
+                follow["awaiting_done"] = max(0, follow["awaiting_done"] - 1)
+                if not follow["awaiting_done"]:
+                    self._tool_dones.set()
                 return
             self._release_vision(rid)
             if resp is not None and not resp.text_sent and not resp.listened:
@@ -576,7 +584,7 @@ class DuplexActor:
             chunk,
         )
 
-    # ---- tools (same follow-up rules as realtime_web/server.py) ----
+    # ---- tools (native actor: at most 5 follow-up rounds) ----
 
     async def _on_function_call(self, ws, resp: _Response | None, item: dict[str, Any]) -> None:
         name = str(item.get("name") or "")
@@ -589,52 +597,82 @@ class DuplexActor:
         await self._send(
             ws, "toolcall", {"status": "started", "id": item["call_id"], "name": name, "arguments": arguments}, chunk
         )
-        follow = self._follow
-        follow_up = follow["count"] < _MAX_TOOL_FOLLOWUPS
-        if follow_up:
-            follow["count"] += 1
-            follow["awaiting_done"] = True
-            follow["pending_gen"] = follow["gen"]
-        task = asyncio.create_task(self._run_tool(ws, resp, item, name, arguments_raw, chunk, follow_up, follow["gen"]))
-        self._tool_tasks.add(task)
-        task.add_done_callback(self._tool_tasks.discard)
+        self._follow["awaiting_done"] += 1
+        self._tool_dones.clear()
+        self._tool_queue.append((resp, item, name, arguments_raw, chunk))
+        self._tool_last_at = time.monotonic()
+        if self._tool_worker is None or self._tool_worker.done():
+            task = asyncio.create_task(self._run_tool_batch(ws, self._follow["gen"]))
+            self._tool_worker = task
+            self._tool_tasks.add(task)
+            task.add_done_callback(self._tool_tasks.discard)
 
-    async def _run_tool(self, ws, resp, item, name, arguments_raw, chunk, follow_up: bool, generation: int) -> None:
+    def _reset_tools(self) -> None:
+        """A new user turn: drop the previous turn's queued calls and round count."""
+        self._follow.update(gen=self._follow["gen"] + 1, count=0, awaiting_done=0)
+        self._tool_queue.clear()
+        self._tool_dones.set()
+        # The old worker exits on its own; the next call starts a fresh one.
+        self._tool_worker = None
+
+    async def _run_tool_batch(self, ws, generation: int) -> None:
+        """Run one turn's calls one by one, then ask for a single follow-up.
+
+        Native executes every call of a round and answers with all results at
+        once; the backend splices each ``function_call_output`` into history
+        and the one ``response.create`` reads them back together.
+        """
+        follow = self._follow
+        resp = chunk = None
+        while True:
+            while self._tool_queue and follow["gen"] == generation:
+                resp, item, name, arguments_raw, chunk = self._tool_queue.popleft()
+                await self._run_tool(ws, item, name, arguments_raw, chunk)
+            if follow["gen"] != generation:
+                return
+            wait = _TOOL_BATCH_GRACE_S - (time.monotonic() - self._tool_last_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+            # response.create is dropped while a call's response is still open.
+            await self._tool_dones.wait()
+            if follow["gen"] != generation:
+                return
+            if not self._tool_queue:
+                break
+        if follow["count"] >= _MAX_TOOL_FOLLOWUPS:
+            # No follow-up will open another response: end the turn here.
+            self._vision_locked_at = None
+            await self._send(ws, "text", {"text": "工具调用次数到达上限"}, chunk)
+            await self._turn_done(ws, resp)
+            return
+        follow["count"] += 1
+        await self._backend_send({"type": "response.create"})
+
+    async def _run_tool(self, ws, item, name, arguments_raw, chunk) -> None:
         if self._tools is None:
-            output = json.dumps({"ok": False, "error": {"code": "tools_disabled"}})
+            result = {"status": "error", "output": "", "error": f"tool not found: {name}"}
         else:
-            output = await self._tools.run(name, arguments_raw, self._last_frames[-1] if self._last_frames else "")
-        try:
-            ok = bool(json.loads(output).get("ok"))
-        except ValueError:
-            ok = False
+            result = await self._tools.run(name, arguments_raw, self._last_frames[-1] if self._last_frames else "")
         await self._send(
             ws,
             "toolcall",
             {
-                "status": "success" if ok else "error",
+                "status": result["status"],
                 "id": item["call_id"],
                 "name": name,
-                "output": output if ok else "",
-                "error": "" if ok else output,
+                "output": result["output"],
+                "error": result["error"],
             },
             chunk,
         )
         await self._backend_send(
             {
                 "type": "conversation.item.create",
-                "item": {"type": "function_call_output", "call_id": item["call_id"], "output": output},
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": item["call_id"],
+                    "output": result["output"] or result["error"],
+                },
             }
         )
-        follow = self._follow
-        if follow["gen"] != generation:
-            return
-        if not follow_up:
-            # No follow-up will open another response: end the turn here.
-            self._vision_locked_at = None
-            await self._turn_done(ws, resp)
-            return
-        if follow["awaiting_done"]:
-            follow["ready"] = True
-            return
-        await self._backend_send({"type": "response.create"})

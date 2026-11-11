@@ -62,8 +62,8 @@ class AuraTwoTokenLogitsProcessor(LogitsProcessor):
             return
         if mode != "streaming":
             raise ValueError("aura_mode must be 'streaming' or 'offline_qa'")
-        if params.temperature != 0 or params.min_tokens != 0:
-            raise ValueError("AURA two-token streaming requires temperature=0 and min_tokens=0")
+        if params.min_tokens != 0:
+            raise ValueError("AURA two-token streaming requires min_tokens=0")
         if (
             params.repetition_penalty != 1
             or params.presence_penalty != 0

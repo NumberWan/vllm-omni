@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
@@ -17,7 +18,7 @@ from vllm_omni.engine.duplex.contracts import (
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
 from vllm_omni.model_executor.models.aura_omni.duplex.tools_utils import (
-    extract_finished_tool_call,
+    extract_finished_tool_calls,
     safe_streaming_prefix,
 )
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
@@ -27,6 +28,8 @@ from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     is_effectively_silent,
 )
 from vllm_omni.outputs.duplex import get_duplex_output_decision
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,25 +353,34 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 end_of_turn=False,
                 model_context_text=state.text_sent,
             )
-            call = extract_finished_tool_call(state.text_sent)
-            if call is not None:
-                # A separate event: the engine's function-call branch returns
+            calls = extract_finished_tool_calls(state.text_sent)
+            if calls:
+                logger.info(
+                    "[aura tool_call] request=%s count=%d names=%s",
+                    request_id,
+                    len(calls),
+                    [call["name"] for call in calls],
+                )
+                # One event per call: the engine's function-call branch returns
                 # immediately once it recognizes one, before it would reach
-                # the model_context_text handling on this same event.
+                # the model_context_text handling on the same event.
                 # No spoken prefix means this turn has nothing left for TTS.
                 # The session must drop the ephemeral request before the
-                # client sends the tool result; otherwise response.create is
+                # client sends the tool results; otherwise response.create is
                 # discarded while the finished request id is still bound.
+                # Only the last call may release the turn: the session aborts
+                # the request there, and later events would be dropped.
                 spoken = safe_streaming_prefix(_spoken_text(state.text_sent))
-                yield _event(
-                    stage_role="thinker",
-                    is_listen=False,
-                    data_plane_request_id=request_id,
-                    text="",
-                    end_of_turn=False,
-                    aura_function_call=call,
-                    aura_tool_call_ends_turn=not spoken,
-                )
+                for index, call in enumerate(calls):
+                    yield _event(
+                        stage_role="thinker",
+                        is_listen=False,
+                        data_plane_request_id=request_id,
+                        text="",
+                        end_of_turn=False,
+                        aura_function_call=call,
+                        aura_tool_call_ends_turn=not spoken and index == len(calls) - 1,
+                    )
             elif not _speech_text(state.text_sent):
                 # Grounding box only. The client already has the tokens to
                 # draw. Do not wait for Talker; abort the prewarmed seats.

@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from threading import Lock
 
+import regex as re
+
 # Native gateway trims after the new user message is in context and before
 # inference (AURA_demo-main/gateway/actor.py _trim_video_context). Crossing 45
 # video messages drops the oldest 30, so the prompt holds 16, not 46.
@@ -17,7 +19,28 @@ _MAX_VIDEO_ROUNDS = 45
 _VIDEO_ROUNDS_TO_REMOVE = 30
 _MAX_CONVERSATION_ROUNDS = 999
 _SILENT = "<|silent|>"
+_RESPOND = "<|respond|>"
+# Native actor._CLEAN_PATTERN. Stage1 text keeps its stop string
+# (include_stop_str_in_output), and render_prefix adds the turn's own
+# <|im_end|>, so an uncleaned reply would close twice.
+_CLEAN_PATTERN = re.compile(
+    r"<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|"
+    r"<\|tool_call\|>|<\|tool_result\|>|<\|tool_call_end\|>|"
+    r"<\|tool_response\|>|<\|tool_use\|>|<\|tool_result_end\|>|"
+    r"<think>|</think>|<\|silent\|>"
+)
 _STORE: dict[str, SessionHistory] = {}
+
+
+def _clean_assistant_text(text: str) -> str:
+    """Stored assistant text as native keeps it: cleaned, control prefix once, empty when silent."""
+    cleaned = _CLEAN_PATTERN.sub("", text or "").strip()
+    respond = cleaned.startswith(_RESPOND)
+    while cleaned.startswith(_RESPOND):
+        cleaned = cleaned[len(_RESPOND) :].lstrip()
+    return f"{_RESPOND}{cleaned}" if respond else cleaned
+
+
 _LOCK = Lock()
 
 
@@ -42,23 +65,30 @@ class SessionHistory:
         ``tool_response`` entry (``append_tool_response``) renders as the
         template's own tool-result shape: a ``user``-role turn wrapping
         ``<tool_response>``, with no pairing user message of its own.
+        Consecutive results share that one user turn, as in the template.
         """
         rendered: list[str] = []
+        tool_results: list[str] = []
         for message in self.messages:
             role = message.get("role")
             content = message.get("content")
             if role == "tool_response":
                 if isinstance(content, str) and content:
-                    rendered.append(f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n")
+                    tool_results.append(f"\n<tool_response>\n{content}\n</tool_response>")
                 continue
             if role not in {"user", "assistant"} or not isinstance(content, str):
                 continue
+            if tool_results:
+                rendered.append("<|im_start|>user" + "".join(tool_results) + "<|im_end|>\n")
+                tool_results.clear()
             body = content
             if role == "user" and message.get("video") is not None:
                 body = "<|vision_start|><|video_pad|><|vision_end|>" + content
             if not body:
                 continue
             rendered.append(f"<|im_start|>{role}\n{body}<|im_end|>\n")
+        if tool_results:
+            rendered.append("<|im_start|>user" + "".join(tool_results) + "<|im_end|>\n")
         return "".join(rendered)
 
     def retained_videos(self) -> list[object]:
@@ -90,7 +120,7 @@ class SessionHistory:
         video = self.pending_video
         self.pending_user = None
         self.pending_video = None
-        text = (assistant_text or "").strip()
+        text = _clean_assistant_text(assistant_text)
         if not user and video is None:
             if not text or text == _SILENT:
                 return

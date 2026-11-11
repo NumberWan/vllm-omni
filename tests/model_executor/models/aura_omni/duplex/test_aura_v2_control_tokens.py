@@ -207,12 +207,10 @@ def test_v2_sampling_opts_into_two_token_logits() -> None:
     import vllm_omni.model_executor.models.aura_omni.duplex.plugin as plugin_mod
 
     plugin = plugin_mod.AuraDuplexPlugin(_encode_audio)
-    configured = plugin.configure_sampling_params(
-        runtime_config={},
-        defaults=_four_stage_defaults([AURA_V2.silent_id, AURA_V2.im_end_id]),
-    )
-    stage1 = configured[1]
-    assert stage1.temperature == 0.0
+    defaults = _four_stage_defaults([AURA_V2.silent_id, AURA_V2.im_end_id])
+    defaults[1].temperature = 0.2
+    stage1 = plugin.configure_sampling_params(runtime_config={}, defaults=defaults)[1]
+    assert stage1.temperature == 0.2
     assert stage1.min_tokens == 0
     assert (stage1.extra_args or {}).get("aura_mode") == "streaming"
 

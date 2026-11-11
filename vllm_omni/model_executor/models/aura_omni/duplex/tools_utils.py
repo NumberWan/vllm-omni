@@ -132,21 +132,24 @@ def parse_completed_tool_call(inner: str) -> dict[str, str] | None:
     return {"call_id": f"call_{uuid4().hex}", "name": name, "arguments": arguments_text}
 
 
-def extract_finished_tool_call(cumulative_text: str) -> dict[str, str] | None:
-    """Return the one completed ``<tool_call>`` in finished cumulative Stage1 text.
+def extract_finished_tool_calls(cumulative_text: str) -> list[dict[str, str]]:
+    """Return every completed ``<tool_call>`` in finished cumulative Stage1 text, in order.
 
     AURA Stage1 requests cumulative (not DELTA) text, so by the time a segment
-    finishes the whole turn is in one string. The template tells the model not
-    to add anything after ``</tool_call>``, so the first closed tag is the call.
+    finishes the whole turn is in one string. The model may emit several
+    calls back to back in one turn; a block that does not parse is skipped.
     """
+    calls: list[dict[str, str]] = []
     start = cumulative_text.find(TOOL_CALL_START)
-    if start == -1:
-        return None
-    end = cumulative_text.find(TOOL_CALL_END, start + len(TOOL_CALL_START))
-    if end == -1:
-        return None
-    inner = cumulative_text[start + len(TOOL_CALL_START) : end]
-    return parse_completed_tool_call(inner)
+    while start != -1:
+        end = cumulative_text.find(TOOL_CALL_END, start + len(TOOL_CALL_START))
+        if end == -1:
+            break
+        call = parse_completed_tool_call(cumulative_text[start + len(TOOL_CALL_START) : end])
+        if call is not None:
+            calls.append(call)
+        start = cumulative_text.find(TOOL_CALL_START, end + len(TOOL_CALL_END))
+    return calls
 
 
 def strip_tool_call_markup(text: str) -> str:
@@ -182,7 +185,7 @@ __all__ = [
     "TOOL_CALL_START",
     "build_tools_block",
     "chat_template_tools",
-    "extract_finished_tool_call",
+    "extract_finished_tool_calls",
     "parse_completed_tool_call",
     "safe_streaming_prefix",
     "strip_tool_call_markup",

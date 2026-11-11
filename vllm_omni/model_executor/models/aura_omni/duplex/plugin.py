@@ -53,6 +53,7 @@ _PRIVATE_KEYS = frozenset(
         "aura_two_token",
         "aura_tools",
         "aura_tool_pending",
+        "aura_tool_batch",
     }
 )
 
@@ -188,8 +189,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             stage1.include_stop_str_in_output = True
             stage1.skip_special_tokens = False
             if self._profile is AURA_V2:
-                # Match inference two-token: greedy + logits processor opt-in.
-                stage1.temperature = 0.0
+                # Two-token logits processor opt-in; temperature comes from yaml.
                 stage1.min_tokens = 0
                 stage1.repetition_penalty = 1.0
                 stage1.presence_penalty = 0.0
@@ -328,6 +328,10 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             "multi_modal_data": multi_modal_data,
             "additional_information": additional_information,
         }
+        if is_speech:
+            # A new utterance drops results of a batch that never got its
+            # follow-up (round cap, or the user spoke over the tools).
+            prompt["_aura_tool_pending_consumed"] = True
         return DuplexAppendPlan(prompt=prompt)
 
     def _plan_tool_followup(self, *, fence: DuplexFence, runtime_config: dict[str, object]) -> DuplexAppendPlan:
@@ -339,12 +343,13 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         (a near-silent pad, same trick as a vision-follow commit); ``is_speech
         =False`` drops whatever it ASRs into noise.
         """
-        pending = runtime_config.get("aura_tool_pending")
-        if not isinstance(pending, Mapping) or not isinstance(pending.get("output"), str):
+        if not self.has_pending_tool_followup(runtime_config):
             raise ValueError("AURA duplex tool followup has no pending result")
         from vllm_omni.model_executor.models.aura_omni.duplex.history import get_or_create_session_history
 
-        get_or_create_session_history(fence.session_id).append_tool_response(pending["output"])
+        history = get_or_create_session_history(fence.session_id)
+        for pending in runtime_config["aura_tool_pending"]:
+            history.append_tool_response(pending["output"])
         system_prompt = runtime_config.get("aura_system_prompt", self._default_system_prompt())
         two_token = bool(runtime_config.get("aura_two_token", self._profile is AURA_V2))
         sample_rate_hz = 16000
@@ -575,7 +580,11 @@ class AuraDuplexPlugin(DuplexModelPlugin):
 
     def has_pending_tool_followup(self, runtime_config: Mapping[str, object]) -> bool:
         pending = runtime_config.get("aura_tool_pending")
-        return isinstance(pending, Mapping) and isinstance(pending.get("output"), str)
+        return (
+            isinstance(pending, list)
+            and bool(pending)
+            and all(isinstance(entry, Mapping) and isinstance(entry.get("output"), str) for entry in pending)
+        )
 
     def runtime_config_for_function_output(
         self,
@@ -585,10 +594,11 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         *,
         history_len: int | None = None,
     ) -> dict[str, object]:
-        """Accept a tool result: hold it for the next bare ``response.create``.
+        """Accept a tool result: queue it for the next bare ``response.create``.
 
-        One call at a time: a later result before the pending one is answered
-        replaces it (matches the 7 Safe tools' one-shot, non-overlapping use).
+        Results of one batch of calls accumulate in arrival order; the
+        follow-up splices them all into history as one user turn. A result
+        for a call outside the current batch is settled but not kept.
         """
         del config, history_len
         call_id = item.get("call_id")
@@ -611,18 +621,33 @@ class AuraDuplexPlugin(DuplexModelPlugin):
                 code="invalid_function_call_output",
             )
         updated = dict(current)
-        updated["aura_tool_pending"] = {
-            "call_id": call_id,
-            "name": name,
-            "arguments": arguments,
-            "output": output,
-        }
+        batch = current.get("aura_tool_batch")
+        if not isinstance(batch, list) or call_id not in batch:
+            return updated
+        pending = current.get("aura_tool_pending")
+        updated["aura_tool_pending"] = [
+            *(pending if isinstance(pending, list) else ()),
+            {"call_id": call_id, "name": name, "arguments": arguments, "output": output},
+        ]
+        return updated
+
+    def note_published_function_call(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        call_id: str,
+        history_len: int,
+    ) -> dict[str, object] | None:
+        del history_len
+        batch = runtime_config.get("aura_tool_batch")
+        updated = dict(runtime_config)
+        updated["aura_tool_batch"] = [*(batch if isinstance(batch, list) else ()), call_id]
         return updated
 
     def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
         if "_aura_tool_pending_consumed" in prompt:
             prompt.pop("_aura_tool_pending_consumed")
-            return {"aura_tool_pending": None}
+            return {"aura_tool_pending": None, "aura_tool_batch": None}
         return None
 
     def create_session_state(self) -> AuraServingSessionState:
