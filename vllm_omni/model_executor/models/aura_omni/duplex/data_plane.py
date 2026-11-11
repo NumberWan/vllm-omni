@@ -372,7 +372,8 @@ class AuraDataPlaneSession(DuplexDataPlane):
             elif not _speech_text(state.text_sent):
                 # Grounding box only. The client already has the tokens to
                 # draw. Do not wait for Talker; abort the prewarmed seats.
-                state.terminal = True
+                # Flag terminal only after the end event is consumed: the
+                # session drops any event whose request is already terminal.
                 yield _event(
                     stage_role="thinker",
                     is_listen=False,
@@ -381,6 +382,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
                     end_of_turn=True,
                     abort_data_plane_request=True,
                 )
+                state.terminal = True
                 return
         is_final_audio_stage = stage_id is None or stage_id >= 3
         mm = _multimodal(output, completion)

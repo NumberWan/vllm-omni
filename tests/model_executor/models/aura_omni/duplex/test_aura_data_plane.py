@@ -190,7 +190,9 @@ def test_project_box_only_turn_keeps_the_tokens_and_ends_without_audio() -> None
         stage_id=1,
         outputs=[SimpleNamespace(text=box, cumulative_text=box, finished=True)],
     )
-    events = list(plane.project({"data_plane_outputs": [final]}))
+    # The session drops an event whose request is already terminal, so check
+    # the flag per event the way it does.
+    events = [event for event in plane.project({"data_plane_outputs": [final]}) if not plane.is_terminal(request_id)]
     assert any(event.get("text") == box for event in events)
     context = [event for event in events if event.get("model_context_text")]
     assert context and context[-1]["model_context_text"] == box
