@@ -603,7 +603,7 @@ class DuplexActor:
         if self._tools is None:
             output = json.dumps({"ok": False, "error": {"code": "tools_disabled"}})
         else:
-            output = await self._tools.run(name, arguments_raw)
+            output = await self._tools.run(name, arguments_raw, self._last_frames[-1] if self._last_frames else "")
         try:
             ok = bool(json.loads(output).get("ok"))
         except ValueError:

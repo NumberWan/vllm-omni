@@ -30,9 +30,9 @@ STATIC_DIR = Path(__file__).parent / "static"
 app = FastAPI(title="Aura Gateway (duplex)")
 _tools = None
 if os.getenv("AURA_GATEWAY_TOOLS", "1") != "0":
-    from examples.online_serving.aura_omni.realtime_web.tools import AuraToolExecutor
+    from gateway.native_tools import NativeGatewayTools
 
-    _tools = AuraToolExecutor()
+    _tools = NativeGatewayTools()
 
 
 @app.get("/")
