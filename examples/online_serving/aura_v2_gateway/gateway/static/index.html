@@ -1532,8 +1532,6 @@ function handleMessage(msg) {
         if (rtt != null && asrMs != null) {
           const netMs = rtt - asrMs;
           timingHtml = ` <span style="font-size:10px;color:rgba(255,255,255,0.35);font-family:monospace">[ASR:${asrMs}ms | Net:${netMs}ms | RTT:${rtt}ms]</span>`;
-          asrTiming.style.display = 'block';
-          asrTiming.textContent = `ASR: ${asrMs}ms  Net: ${netMs}ms  RTT: ${rtt}ms`;
         }
         addMsg('user', escapeHtml(data.text || '') + timingHtml);
       }
@@ -1554,8 +1552,6 @@ function handleMessage(msg) {
         let label = escapeHtml(data.text || '');
         if (data.infer_ms != null) {
           label += ` <span style="font-size:10px;color:rgba(255,255,255,0.35);font-family:monospace">[Model:${data.infer_ms}ms]</span>`;
-          asrTiming.style.display = 'block';
-          asrTiming.textContent = (asrTiming.textContent || '') + `  Model: ${data.infer_ms}ms`;
         }
         if (streamingMsg && streamingMsg.chunkId === msg.chunk_id && streamingMsg.el.isConnected) {
           streamingMsg.el.innerHTML = label;
@@ -1569,10 +1565,6 @@ function handleMessage(msg) {
       break;
     case 'audio':
       if (data.audio) {
-        if (data.tts_ms != null && data.tts_ms > 0) {
-          asrTiming.style.display = 'block';
-          asrTiming.textContent = (asrTiming.textContent || '') + `  TTS: ${data.tts_ms}ms`;
-        }
         enqueueAudio(data.audio, data.sample_rate || 24000, msg.chunk_id);
       }
       break;
@@ -1632,8 +1624,6 @@ async function startCall() {
   controls.classList.add('active');
   statusBdg.style.display = 'block';
   callHist.style.display = 'flex';
-  asrTiming.style.display = 'block';
-  asrTiming.textContent = '';
   connectWs();
 }
 
