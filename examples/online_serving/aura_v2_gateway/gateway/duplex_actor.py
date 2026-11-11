@@ -218,6 +218,8 @@ class DuplexActor:
         self._tool_last_at = 0.0
         self._tool_dones = asyncio.Event()
         self._tool_dones.set()
+        # Audio sent per response (ms, item id), acked once it is all sent.
+        self._sent_audio: dict[str, list] = {}
 
     def _log(self, message: str) -> None:
         print(f"[duplex:{self._session_id[:8]}] {message}", flush=True)
@@ -360,6 +362,12 @@ class DuplexActor:
             self._last_frames = frames
         if self._vision_locked() or not frames:
             return
+        # Each vision turn gets its own tool budget, like each native video
+        # chunk. Resetting only on speech/typed turns let the round cap stop
+        # every later vision turn's follow-up: its tool result never came
+        # back, history filled with unanswered calls, and the model kept
+        # calling on every turn.
+        self._reset_tools()
         self._unacked.append(_Commit(chunk))
         await self._backend_send(
             {
@@ -444,6 +452,38 @@ class DuplexActor:
                 continue
             await self._on_event(ws, event)
 
+    async def _ack_playback(self, event: dict[str, Any], kind: str, rid: str) -> None:
+        """Ack a response's whole audio once it has all been sent to the page.
+
+        The backend counts assistant audio that was sent but never acked as a
+        response still in progress (``assistant_playback_active``). The
+        realtime_web page acks what it plays; this page never did, so after
+        any spoken reply the next tool follow-up's ``response.create`` was
+        refused with ``response_already_active`` and the turn hung.
+        """
+        if not rid:
+            return
+        if kind == "response.output_audio.delta":
+            delta = event.get("delta") or ""
+            sent = self._sent_audio.setdefault(rid, [0.0, ""])
+            if delta:
+                sent[0] += len(base64.b64decode(delta)) / 2 / _TTS_RATE * 1000
+            sent[1] = str(event.get("item_id") or sent[1])
+        elif kind in ("response.output_audio.done", "response.done"):
+            sent = self._sent_audio.pop(rid, None)
+            if not sent or sent[0] <= 0:
+                return
+            played_ms = int(sent[0]) + 1
+            ack: dict[str, Any] = {
+                "type": "playback.ack",
+                "response_id": rid,
+                "played_ms": played_ms,
+                "committed_ms": played_ms,
+            }
+            if sent[1]:
+                ack["item_id"] = sent[1]
+            await self._backend_send(ack)
+
     async def _turn_done(self, ws, resp: _Response | None) -> None:
         if resp is None or resp.done_sent:
             return
@@ -462,6 +502,7 @@ class DuplexActor:
             self._log("backend " + json.dumps(brief, ensure_ascii=False)[:2000])
         rid = _response_id(event)
         resp = self._responses.get(rid) if rid else None
+        await self._ack_playback(event, kind, rid)
 
         if kind == "input_audio_buffer.committed":
             if self._unacked:
