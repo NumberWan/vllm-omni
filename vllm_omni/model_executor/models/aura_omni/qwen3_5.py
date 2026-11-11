@@ -9,6 +9,7 @@ text / token ids, so full-prefix hidden D2H is left off.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from transformers import Qwen3_5Config
@@ -23,8 +24,27 @@ from vllm.model_executor.models.qwen3_vl import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
+# Running video clock for the prompt being processed. Thread-local so
+# concurrent sessions processed on different threads cannot share one clock.
+_VIDEO_CLOCK = threading.local()
+
 
 class AuraQwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
+    def _get_video_second_idx(self, metadata: dict[str, Any], *args: Any, **kwargs: Any) -> list[float]:
+        """Run video timestamps on across the clips of one prompt.
+
+        AURA_v2 sees its retained history as consecutive clips. The native
+        gateway served it with a patched vLLM ``qwen3_vl.py`` in which clip k
+        starts at the summed duration of clips 0..k-1. Stock vLLM restarts
+        every clip at 0 s, so the whole history claims to be the first second.
+        """
+        timestamps = super()._get_video_second_idx(metadata, *args, **kwargs)
+        base = getattr(_VIDEO_CLOCK, "seconds", 0.0)
+        _VIDEO_CLOCK.seconds = base + float(metadata["duration"])
+        if not base:
+            return timestamps
+        return [timestamp + base for timestamp in timestamps]
+
     def get_hf_config(self) -> Any:
         try:
             return self.ctx.get_hf_config(Qwen3_5Config)
@@ -47,8 +67,19 @@ class AuraQwen3_5ProcessingInfo(Qwen3_5ProcessingInfo):
         )
 
 
+class AuraQwen3VLMultiModalProcessor(Qwen3VLMultiModalProcessor):
+    def _apply_hf_processor_main(self, *args: Any, **kwargs: Any) -> Any:
+        # One call processes every clip of one prompt in order: the clock
+        # starts at 0 s here, exactly where the native patch reset it.
+        _VIDEO_CLOCK.seconds = 0.0
+        try:
+            return super()._apply_hf_processor_main(*args, **kwargs)
+        finally:
+            _VIDEO_CLOCK.seconds = 0.0
+
+
 @MULTIMODAL_REGISTRY.register_processor(
-    Qwen3VLMultiModalProcessor,
+    AuraQwen3VLMultiModalProcessor,
     info=AuraQwen3_5ProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
