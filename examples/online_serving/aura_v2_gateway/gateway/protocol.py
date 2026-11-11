@@ -169,7 +169,7 @@ def build_downstream_event(
     video_timestamp_ms: int = 0,
     wall_time_ms: int = 0,
 ) -> Chunk:
-    if type_ not in {"session", "asr_text", "text", "audio", "toolcall", "turn_done", "error", "status"}:
+    if type_ not in {"session", "asr_text", "text", "text_delta", "audio", "toolcall", "turn_done", "error", "status"}:
         raise ProtocolError(f"invalid downstream event type: {type_}")
     if not isinstance(data, dict):
         raise ProtocolError("downstream data must be an object")

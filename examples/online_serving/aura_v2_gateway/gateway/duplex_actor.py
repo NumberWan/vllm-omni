@@ -59,6 +59,9 @@ _ASR_RATE = 16000
 _TTS_RATE = 24000
 # Vision-follow turns carry no speech; the backend still wants an audio append.
 _VISION_SILENCE = base64.b64encode(b"\x00\x00" * 160).decode("ascii")
+# A typed turn rides a speech commit; aura_forced_user_text replaces whatever
+# Stage0 hears in this pad.
+_TYPED_SILENCE = base64.b64encode(b"\x00\x00" * 1600).decode("ascii")
 _MAX_TOOL_FOLLOWUPS = 3
 _CLOSE_WAIT_S = 5.0
 _SESSION_WAIT_S = 30.0
@@ -67,8 +70,11 @@ _SESSION_WAIT_S = 30.0
 _VISION_LOCK_MAX_S = 30.0
 _EMPTY_DONE_GRACE_S = 1.5
 _CLIENT_TOOL_RESULT = "CLIENT_TOOL_RESULT "
-_TEXT_UNSUPPORTED = "AURA duplex 不支援文字輸入，請按住說話。"
+_NO_FRAMES = "还没有画面，请稍后再输入文字。"
 _BOX_PATTERN = re.compile(r"<\|box_start\|>(.*?)<\|box_end\|>")
+# A streaming transcript can stop inside a box or a special token.
+_OPEN_BOX_TAIL = re.compile(r"<\|box_start\|>[^<]*$")
+_SPECIAL_TAIL = re.compile(r"<\|?[a-z_]*\|?$")
 _OBJECT_REF_TAGS = ("<|object_ref_start|>", "<|object_ref_end|>")
 _OBJECT_REF_TAIL = re.compile(r"<\|object_ref(?:_start)?$")
 _RESPOND = "<|respond|>"
@@ -121,6 +127,12 @@ def _parse_boxes(text: str) -> tuple[str, list[list[int]]]:
     return _OBJECT_REF_TAIL.sub("", text).strip(), boxes
 
 
+def _visible_partial(text: str) -> str:
+    text = _OPEN_BOX_TAIL.sub("", text.replace(_RESPOND, ""))
+    text = _SPECIAL_TAIL.sub("", text)
+    return _parse_boxes(text)[0]
+
+
 def _response_id(event: dict[str, Any]) -> str:
     rid = event.get("response_id")
     response = event.get("response")
@@ -139,17 +151,18 @@ def _done_has_function_call(event: dict[str, Any]) -> bool:
 
 
 class _Commit:
-    __slots__ = ("chunk", "sent_at", "audio_sent", "last_rid")
+    __slots__ = ("chunk", "sent_at", "audio_sent", "last_rid", "typed")
 
-    def __init__(self, chunk: Chunk) -> None:
+    def __init__(self, chunk: Chunk, *, typed: bool = False) -> None:
         self.chunk = chunk
         self.sent_at = time.time()
         self.audio_sent = False
         self.last_rid = ""
+        self.typed = typed
 
 
 class _Response:
-    __slots__ = ("rid", "commit", "text_sent", "listened", "done_sent")
+    __slots__ = ("rid", "commit", "text_sent", "listened", "done_sent", "partial", "partial_sent", "text_at")
 
     def __init__(self, rid: str, commit: _Commit) -> None:
         self.rid = rid
@@ -157,6 +170,9 @@ class _Response:
         self.text_sent = False
         self.listened = False
         self.done_sent = False
+        self.partial = ""
+        self.partial_sent = ""
+        self.text_at: float | None = None
 
 
 class DuplexActor:
@@ -189,6 +205,8 @@ class DuplexActor:
         self._responses: dict[str, _Response] = {}
         self._current_rid = ""
         self._vision_locked_at: float | None = None
+        # Typed questions without their own frames see the latest camera view.
+        self._last_frames: list[str] = []
         self._follow = {"count": 0, "gen": 0, "pending_gen": 0, "awaiting_done": False, "ready": False}
         self._tool_tasks: set[asyncio.Task] = set()
 
@@ -314,25 +332,24 @@ class DuplexActor:
             if chunk.type == "multimodal":
                 await self._speech_turn(ws, chunk)
             elif chunk.type == "video":
-                await self._vision_turn(chunk)
-                if (chunk.data.get("text") or "").strip():
-                    await self._reject_text(ws, chunk)
+                text = (chunk.data.get("text") or "").strip()
+                if text:
+                    await self._typed_turn(ws, chunk, text)
+                else:
+                    await self._vision_turn(chunk)
             elif chunk.type == "text":
-                if not chunk.data.get("text", "").startswith(_CLIENT_TOOL_RESULT):
-                    await self._reject_text(ws, chunk)
+                text = (chunk.data.get("text") or "").strip()
+                if text and not text.startswith(_CLIENT_TOOL_RESULT):
+                    await self._typed_turn(ws, chunk, text)
             else:
                 await self._send(ws, "error", {"message": f"不支援的输入类型: {chunk.type}"}, chunk)
                 await self._send(ws, "turn_done", {}, chunk)
 
-    async def _reject_text(self, ws, chunk: Chunk) -> None:
-        await self._send(ws, "error", {"message": _TEXT_UNSUPPORTED}, chunk)
-        await self._send(ws, "turn_done", {}, chunk)
-
     async def _vision_turn(self, chunk: Chunk) -> None:
-        if self._vision_locked():
-            return
         frames = _frames_from_video_url(chunk.data.get("video_url") or "")
-        if not frames:
+        if frames:
+            self._last_frames = frames
+        if self._vision_locked() or not frames:
             return
         self._unacked.append(_Commit(chunk))
         await self._backend_send(
@@ -361,6 +378,7 @@ class DuplexActor:
         if not pcm or not frames:
             await self._send(ws, "turn_done", {}, chunk)
             return
+        self._last_frames = frames
         self._follow.update(gen=self._follow["gen"] + 1, count=0, awaiting_done=False, ready=False)
         self._lock_vision()
         self._unacked.append(_Commit(chunk))
@@ -379,6 +397,31 @@ class DuplexActor:
         await self._backend_send({"type": "input_audio_buffer.commit", "create_response": True})
         if _TRACE:
             self._log(f"sent speech commit chunk={chunk.chunk_id} samples={len(pcm) // 2}")
+
+    async def _typed_turn(self, ws, chunk: Chunk, text: str) -> None:
+        frames = _frames_from_video_url(chunk.data.get("video_url") or "") or self._last_frames
+        if not frames:
+            await self._send(ws, "error", {"message": _NO_FRAMES}, chunk)
+            await self._send(ws, "turn_done", {}, chunk)
+            return
+        self._last_frames = frames
+        self._follow.update(gen=self._follow["gen"] + 1, count=0, awaiting_done=False, ready=False)
+        self._lock_vision()
+        self._unacked.append(_Commit(chunk, typed=True))
+        await self._backend_send(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": _TYPED_SILENCE,
+                "format": "pcm16",
+                "sample_rate_hz": _ASR_RATE,
+                "is_speech": True,
+                "video_frames": frames,
+                "aura_forced_user_text": text,
+            }
+        )
+        await self._backend_send({"type": "input_audio_buffer.commit", "create_response": True})
+        if _TRACE:
+            self._log(f"sent typed commit chunk={chunk.chunk_id} chars={len(text)}")
 
     # ---- downstream ----
 
@@ -421,7 +464,8 @@ class DuplexActor:
         if kind == "conversation.item.input_audio_transcription.completed":
             commit = self._items.get(str(event.get("item_id") or ""))
             text = (event.get("transcript") or "").strip()
-            if text and commit is not None:
+            # A typed turn's transcript is only the pad; the page already shows the text.
+            if text and commit is not None and not commit.typed:
                 asr_ms = int((time.time() - commit.sent_at) * 1000)
                 await self._send(ws, "asr_text", {"text": text, "asr_ms": asr_ms}, commit.chunk)
             return
@@ -439,11 +483,23 @@ class DuplexActor:
             raw_text = (event.get("transcript") if kind.endswith("transcript.done") else event.get("text")) or ""
             text, boxes = _parse_boxes(raw_text.replace(_RESPOND, ""))
             if text:
-                infer_ms = int((time.time() - resp.commit.sent_at) * 1000)
+                # Model time ends with the last text delta, not with playback.
+                infer_ms = int(((resp.text_at or time.time()) - resp.commit.sent_at) * 1000)
                 await self._send(ws, "text", {"text": text, "infer_ms": infer_ms}, resp.commit.chunk)
             if boxes:
                 await self._show_boxes(ws, boxes, resp.commit.chunk)
             self._release_vision(rid)
+            return
+        if kind in ("response.output_audio_transcript.delta", "response.output_text.delta"):
+            delta = event.get("delta") or ""
+            if resp is None or resp.text_sent or not delta:
+                return
+            resp.partial += delta
+            resp.text_at = time.time()
+            visible = _visible_partial(resp.partial)
+            if visible and visible != resp.partial_sent:
+                resp.partial_sent = visible
+                await self._send(ws, "text_delta", {"text": visible}, resp.commit.chunk)
             return
         if kind == "response.output_audio.delta":
             delta = event.get("delta") or ""

@@ -1164,6 +1164,8 @@ function drainAudioTurn(turnId) {
 /* ============================================================
    CONVERSATION UI
    ============================================================ */
+let streamingMsg = null;
+
 function addMsg(role, html) {
   const el = document.createElement('div');
   el.className = `msg ${role}`;
@@ -1521,6 +1523,7 @@ function handleMessage(msg) {
       state.videoChunkGeometry = {};
       state.latestVideoChunkId = null;
       state.latestVideoTimestampMs = -1;
+      streamingMsg = null;
       dropHeldHighlight();
       statusText.textContent = `已连接 (${data.active_sessions ?? 1})`;
       if (state.inCall && !_frameTimer) startVideoCapture();
@@ -1539,8 +1542,18 @@ function handleMessage(msg) {
         addMsg('user', escapeHtml(data.text || '') + timingHtml);
       }
       break;
+    case 'text_delta':
+      // Streaming subtitle: one bubble per turn, replaced by the final 'text'.
+      if (streamingMsg && streamingMsg.chunkId === msg.chunk_id && streamingMsg.el.isConnected) {
+        streamingMsg.el.innerHTML = escapeHtml(data.text || '');
+        chatScroll.scrollTop = chatScroll.scrollHeight;
+      } else {
+        dropHeldHighlight();
+        addMsg('assistant', escapeHtml(data.text || ''));
+        streamingMsg = { chunkId: msg.chunk_id, el: chatScroll.lastElementChild };
+      }
+      break;
     case 'text':
-      dropHeldHighlight();
       {
         let label = escapeHtml(data.text || '');
         if (data.infer_ms != null) {
@@ -1548,7 +1561,13 @@ function handleMessage(msg) {
           asrTiming.style.display = 'block';
           asrTiming.textContent = (asrTiming.textContent || '') + `  Model: ${data.infer_ms}ms`;
         }
-        addMsg('assistant', label);
+        if (streamingMsg && streamingMsg.chunkId === msg.chunk_id && streamingMsg.el.isConnected) {
+          streamingMsg.el.innerHTML = label;
+        } else {
+          dropHeldHighlight();
+          addMsg('assistant', label);
+        }
+        streamingMsg = null;
       }
       drainAudioTurn(msg.chunk_id);
       break;
