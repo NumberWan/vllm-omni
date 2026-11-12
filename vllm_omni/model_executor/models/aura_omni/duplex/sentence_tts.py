@@ -7,10 +7,17 @@ from __future__ import annotations
 from typing import Any
 
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.engine.duplex.plugin import PartialStageForward
 
 logger = init_logger(__name__)
+
+# Talker speaks about 3 codec frames (12.5 Hz) per character. A short reply
+# now and then never samples codec EOS and runs to max_tokens, holding the
+# turn for seconds. This loose bound only stops that runaway.
+_TALKER_BASE_FRAMES = 50
+_TALKER_FRAMES_PER_CHAR = 15
 
 
 class SentenceTtsOutput:
@@ -120,6 +127,26 @@ def _note_talker_handoff(orchestrator: Any, req_state: Any) -> None:
     runner.run.concurrent_turn_requests_released = True
 
 
+def _cap_talker_tokens(req_state: Any, stage_id: int, text: str) -> None:
+    """Swap in this turn's own Talker params, capped by the utterance length.
+
+    The list entry is shared by every turn of the session, so it is replaced
+    with a clone, never edited in place.
+    """
+    params_list = getattr(req_state, "sampling_params_list", None)
+    if not isinstance(params_list, list) or len(params_list) <= stage_id:
+        return
+    params = params_list[stage_id]
+    if not isinstance(params, SamplingParams):
+        return
+    cap = _TALKER_BASE_FRAMES + _TALKER_FRAMES_PER_CHAR * len(text)
+    if params.max_tokens is not None and params.max_tokens <= cap:
+        return
+    capped = params.clone()
+    capped.max_tokens = cap
+    params_list[stage_id] = capped
+
+
 def plan_partial_stage_output(
     orchestrator: Any,
     stage_id: int,
@@ -193,6 +220,9 @@ def plan_partial_stage_output(
     # text and sets streaming_input=False on the in-flight sentence, so
     # Code2Wav sees a short codec and the user hears a blip.
     queue_close_after = bool(chunk) and finished and not close_only and prior_emits > 0
+    if finished and not prior_emits and chunk:
+        # The whole utterance is in this one submit, so its length is known.
+        _cap_talker_tokens(req_state, stage_id + 1, chunk)
     _note_talker_handoff(orchestrator, req_state)
     logger.info(
         "[AURA] sentence TTS req=%s finished=%s close_only=%s text_len=%d queue_close_after=%s",

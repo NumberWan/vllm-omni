@@ -603,6 +603,35 @@ def _stage1_output(text: str, *, finished: bool) -> SimpleNamespace:
     )
 
 
+def test_one_character_reply_caps_its_own_talker_tokens() -> None:
+    # A lone "4" ran the Talker to max_tokens (1023 frames, 7 s) and the page
+    # dropped every frame until it ended.
+    orchestrator, req_state = _sentence_plan_fixture()
+    shared = SamplingParams(max_tokens=1024, min_tokens=2)
+    req_state.sampling_params_list = [SamplingParams(), SamplingParams(), shared, SamplingParams()]
+
+    plan = AuraDuplexPlugin(_encode_audio).plan_partial_stage_output(
+        orchestrator, 1, 0, _stage1_output("4", finished=True), req_state
+    )
+
+    assert plan is not None
+    assert req_state.sampling_params_list[2].max_tokens == 65
+    assert req_state.sampling_params_list[2].min_tokens == 2
+    assert shared.max_tokens == 1024
+
+
+def test_talker_cap_keeps_the_configured_limit_for_long_replies() -> None:
+    orchestrator, req_state = _sentence_plan_fixture()
+    shared = SamplingParams(max_tokens=1024)
+    req_state.sampling_params_list = [SamplingParams(), SamplingParams(), shared, SamplingParams()]
+
+    AuraDuplexPlugin(_encode_audio).plan_partial_stage_output(
+        orchestrator, 1, 0, _stage1_output("好" * 70, finished=True), req_state
+    )
+
+    assert req_state.sampling_params_list[2] is shared
+
+
 def test_multi_sentence_utterance_is_one_submit_when_stage1_finishes() -> None:
     """CustomVoice bakes the first prefill's text and then ends.
 
