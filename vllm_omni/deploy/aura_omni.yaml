@@ -93,7 +93,9 @@ stages:
       temperature: 0.5
       top_k: 50
       max_tokens: 1024
-      min_tokens: 8
+      # A one-character reply wants EOS within ~5 frames. Holding it to 8
+      # pushes it into trailing silence, where it often never samples EOS.
+      min_tokens: 2
       repetition_penalty: 1.05
       stop_token_ids: [2150]
     subtalker_sampling_params:
